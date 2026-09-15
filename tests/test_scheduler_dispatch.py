@@ -1847,7 +1847,7 @@ def test_slurm_poll_nonzero_is_unknown_not_finished() -> None:
     with pytest.raises(SchedulerError, match="squeue.*exit 1") as caught:
         dispatcher.poll([SchedulerHandle("123", "/ws/123")])
     assert "SECRET_TOKEN" not in str(caught.value)
-    assert len(str(caught.value)) < 100
+    assert len(str(caught.value)) <= 240
 
 
 def test_slurm_poll_isolates_an_explicitly_invalid_id_from_live_siblings() -> None:
@@ -1906,7 +1906,7 @@ def test_slurm_accounting_nonzero_is_unavailable() -> None:
     with pytest.raises(SchedulerError, match="sacct.*exit 1") as caught:
         dispatcher.poll_detail([SchedulerHandle("123", "/ws/123")])
     assert "SECRET_TOKEN" not in str(caught.value)
-    assert len(str(caught.value)) < 100
+    assert len(str(caught.value)) <= 240
 
 
 def test_poll_empty_handles_makes_no_call() -> None:

@@ -11,9 +11,11 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import uuid
 import venv as stdlib_venv
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -459,6 +461,99 @@ def test_verified_success_commits_and_removes_real_backup(
     receipt = _managed_receipt(marker_path)
     assert receipt is not None
     assert receipt["phase"] == "target_committed"
+
+
+@pytest.mark.parametrize(
+    ("spec_count", "ready_at", "identity", "override", "succeeds"),
+    [
+        pytest.param(0, 45.0, "exact", None, True, id="idle-startup"),
+        pytest.param(21_683, 300.0, "exact", None, True, id="loaded-startup"),
+        pytest.param(21_683, 550.0, "exact", None, True, id="loaded-headroom"),
+        pytest.param(21_683, 650.0, "exact", None, False, id="bounded-timeout"),
+        pytest.param(21_683, 650.0, "exact", "900", True, id="operator-override"),
+        pytest.param(21_683, 300.0, "wrong-sha", None, False, id="wrong-sha"),
+        pytest.param(21_683, 300.0, "wrong-tree", None, False, id="wrong-tree"),
+    ],
+)
+def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spec_count: int,
+    ready_at: float,
+    identity: str,
+    override: str | None,
+    succeeds: bool,
+) -> None:
+    """#53: delayed exact readiness commits; timeout/stale identity restores.
+
+    Model the directory entry count and elapsed startup time, not a claim
+    about this machine's filesystem speed. Service operations are stubbed;
+    the provenance poll, receipt transitions and file rollback are real.
+    """
+    from vq import rpc
+
+    prog, old_sha, new_sha, venv, backup = _fixture(tmp_path)
+    lifecycle = _lifecycle(prog, old_sha, venv, backup)
+    marker_path = _arm_receipt(prog, lifecycle)
+    _git(Path(prog.git_dir), "checkout", "--detach", new_sha)
+    result = _target_result(prog, new_sha)
+    _patch_common_completion(monkeypatch, prog, old_sha, new_sha)
+    if override is None:
+        monkeypatch.delenv("VQ_DAEMON_HEALTH_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("VQ_DAEMON_HEALTH_TIMEOUT", override)
+    queue = paths.queue_dir()
+    original_glob = Path.glob
+    monkeypatch.setattr(
+        Path, "glob",
+        lambda path, pattern, **kwargs: iter(range(spec_count))
+        if path == queue and pattern == "*.json" else original_glob(path, pattern, **kwargs),
+    )
+    elapsed = [0.0]
+    # Replace only admin's clock; do not alter subprocess/test harness timing.
+    monkeypatch.setattr(admin, "time", SimpleNamespace(
+        **{name: getattr(time, name) for name in dir(time) if not name.startswith("_")},
+    ))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(admin.time, "sleep", lambda s: elapsed.__setitem__(0, elapsed[0] + s))
+    starts: list[str] = []
+
+    def start(unused: admin._ManagedDaemonUpdate) -> tuple[bool, str]:
+        starts.append((venv / "identity.txt").read_text().strip())
+        return True, "service started"
+
+    def ping() -> dict[str, str] | None:
+        if starts[-1] == "old":
+            return {"source_sha": old_sha, "source_tree_sha256": OLD_TREE}
+        if elapsed[0] < ready_at:
+            return None
+        return {
+            "source_sha": old_sha if identity == "wrong-sha" else new_sha,
+            "source_tree_sha256": BAD_TREE if identity == "wrong-tree" else NEW_TREE,
+        }
+
+    monkeypatch.setattr(admin, "_start_managed_daemon_update", start)
+    monkeypatch.setattr(rpc, "ping_user_daemon", ping)
+
+    admin._complete_managed_daemon_update(prog, result, lifecycle)
+
+    assert result.success is succeeds, result.daemon_restart_message
+    receipt = _managed_receipt(marker_path)
+    assert receipt is not None
+    if succeeds:
+        assert starts == ["new"]
+        assert elapsed[0] == pytest.approx(ready_at, abs=0.11)
+        assert receipt["phase"] == "target_committed"
+        assert not backup.exists()
+        assert (venv / "identity.txt").read_text() == "new\n"
+        assert _git(Path(prog.git_dir), "rev-parse", "HEAD") == new_sha
+    else:
+        assert starts == ["new", "old"]
+        assert elapsed[0] == pytest.approx(600.0, abs=0.11)
+        assert receipt["phase"] == "old_restored"
+        _assert_old_state(prog, old_sha, venv, lifecycle)
+        expected = "did not respond" if ready_at > 600 else "strict identity mismatch"
+        assert expected in result.daemon_restart_message
 
 
 def test_target_digest_failure_restores_real_backup_and_attached_checkout(

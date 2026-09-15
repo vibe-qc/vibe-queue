@@ -17,11 +17,47 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
-### Public snapshot maintenance
+- Require an explicit recovery account for host bootstrap and an explicit
+  `--np N` allocation for parallel CRYSTAL runs. Update examples and synthetic
+  submitter identities to keep site choices outside product source.
 
-- Separate private operations and replace site examples with synthetic values.
-  Scheduler behavior stays at the original release revision.
-- Require an explicit recovery account and parallel CRYSTAL rank allocation.
+- Replace lab-specific test and documentation examples with synthetic site names;
+  retain portable CI validation beside the source and private deployment settings
+  with the operator tooling.
+
+
+### Maintenance: separate product source and private operations
+
+Site-specific provisioning scripts, deployment configuration and operator
+records move to private operations storage. Portable product installers remain
+in source; private helpers are installed independently. Contributor privacy
+checks support an external private terms file without publishing its contents.
+
+
+### Maintenance
+
+- Improve the portability of configuration examples and public package metadata.
+  Strengthen contributor privacy checks and keep their diagnostics redacted.
+
+### Fixed
+
+- **Detached build observers tolerate receipts still being published** (#36).
+  A receipt with the publisher's matching temporary hard link is pending
+  until publication finishes. Strict single-link reads still reject unrelated
+  aliases, extra links, mismatched inodes and unsafe permissions.
+
+- **Large queues get more startup headroom during self-update** (#53).
+  The default daemon readiness allowance is 60 seconds plus 25 ms per job
+  spec, still capped at 600 seconds. This avoids the previous 247-second
+  cutoff for a 21,683-spec queue; exact provenance, bounded failure and
+  managed rollback remain required. An explicit driver health timeout
+  continues to take precedence.
+
+- **Scheduler poll failures retain useful bounded diagnostics** (#51). Long
+  qstat, squeue and accounting argument lists no longer crowd the return code,
+  failure category or sanitized stderr out of the stored poll error. Timeouts
+  remain unknown observations. Polling, retries and lifecycle behavior are
+  unchanged; this improves diagnosis without claiming a transport repair.
 
 ## [0.26.6] - 2026-09-13 - "Raymond's Bazaar"
 

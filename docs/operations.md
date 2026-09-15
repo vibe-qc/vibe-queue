@@ -1125,15 +1125,25 @@ first, then `systemctl --user restart vq-daemon` manually.
 
 **Post-restart readiness window scales with the state dir.** After
 the restart, the update polls the daemon's RPC until it answers
-with the expected source SHA. The window is 30 s base plus 10 ms
+with the expected source identity. The window is 60 s base plus 25 ms
 per queued job spec, capped at 600 s -- a restarted daemon scans
 every `queue/*.json` before its RPC socket answers, so a driver
 carrying thousands of jobs legitimately needs minutes, not seconds
-(2026-07-25: ~12.6k specs on the workstation driver put readiness
-past a flat 30 s window, and two healthy restarts were reported as
-`daemon restart FAILED` and needed `vq admin mark-ok`). Override
-the computed window with `VQ_DAEMON_HEALTH_TIMEOUT` (seconds) in
-the client environment if a host still needs longer.
+(#53: a 21,683-spec queue exceeded the previous 247 s window under load,
+causing a valid install to roll back). That queue now gets the full 600 s
+allowance; verification returns as soon as readiness and provenance pass.
+The allowance does not guarantee a startup duration. Override it with
+`VQ_DAEMON_HEALTH_TIMEOUT` (finite positive seconds) in the client environment
+if the driver still needs longer. The local rollout driver action and fresh
+driver re-entry inherit this variable. For example:
+
+```sh
+VQ_DAEMON_HEALTH_TIMEOUT=900 vq admin rollout-latest
+```
+
+This does not configure remote hosts' readiness windows. A timeout or an
+identity mismatch still fails verification and invokes managed rollback;
+the longer allowance changes neither rollback nor service-stop semantics.
 
 ### Historical pre-v0.5.42 manual recipe
 

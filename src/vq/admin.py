@@ -7399,9 +7399,29 @@ def read_json(dir_fd, name):
 
 def optional_json(dir_fd, name):
     try:
-        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
+    # publish() links the complete temporary receipt before unlinking its
+    # temporary name. Until that unlink, the final receipt has two links and
+    # is not yet admissible to the strict single-link reader. Treat only this
+    # exact, same-directory publication window as pending; never read through
+    # it or relax the hardlink check for an unrelated alias.
+    if (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 2
+            and 0 < info.st_size <= MAX_JSON):
+        for temporary in os.listdir(dir_fd):
+            if (not temporary.startswith("." + name + ".")
+                    or TEMP.fullmatch(temporary) is None):
+                continue
+            try:
+                linked = os.stat(temporary, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                # The publisher completed; the ordinary reader below can
+                # now validate the final single-link receipt.
+                continue
+            if (linked.st_dev, linked.st_ino) == (info.st_dev, info.st_ino):
+                return None
     return read_json(dir_fd, name)
 
 
@@ -12873,21 +12893,22 @@ def resolve_vq_self_update_target(
 
 
 DAEMON_RESTART_TIMEOUT_SECONDS = 120
-DAEMON_HEALTH_TIMEOUT_SECONDS = 30
+DAEMON_HEALTH_TIMEOUT_SECONDS = 60
 """Base post-restart RPC readiness window. Enough for an idle daemon;
 :func:`_daemon_health_timeout` scales it up with the state dir size."""
 
-DAEMON_HEALTH_SECONDS_PER_SPEC = 0.01
+DAEMON_HEALTH_SECONDS_PER_SPEC = 0.025
 """Readiness allowance per queued job spec. The daemon's startup resume
 pass reads every ``queue/*.json`` before RPC answers, so a flat window
 that is generous for an idle host is far too short for a driver
-carrying thousands of jobs. 2026-07-25 developer-host incident: ~12.6k
-specs put RPC readiness 10-30 s past the flat 30 s window, so two
-consecutive self-updates reported "daemon restart FAILED" for a daemon
-that came up healthy, and each needed a manual ``vq admin mark-ok``.
-10 ms/spec gives that state dir ~156 s total — the poll returns the
-moment the ping verifies, so the headroom costs nothing when the
-daemon is quick."""
+carrying thousands of jobs. In #53 a 21,683-spec queue took more than
+242 s cold and 210 s warm under load. The old 30 s + 10 ms/spec
+allowance expired at 247 s and rolled back a valid install. A 60 s
+base plus 25 ms/spec gives that queue the full 600 s ceiling, with
+headroom over the measured lower bound rather than assuming a cold
+scan runs at the warm rate. This is a bounded allowance, not a startup
+duration guarantee; operators can still override it. The poll returns
+as soon as exact readiness is verified."""
 
 DAEMON_HEALTH_TIMEOUT_MAX_SECONDS = 600
 """Ceiling on the scaled readiness window so a corrupt or gigantic

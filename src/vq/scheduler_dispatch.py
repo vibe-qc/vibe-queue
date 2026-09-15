@@ -44,6 +44,7 @@ import os
 import re
 import shlex
 import stat
+import subprocess
 import tarfile
 import tempfile
 import uuid
@@ -803,6 +804,51 @@ class SchedulerError(RuntimeError):
 
 class SchedulerRemoteOutcomeUnknown(SchedulerError):
     """The local observer lost a scheduler-host command's outcome."""
+
+
+_POLL_COMMANDS = frozenset({"qstat", "squeue", "sacct"})
+_POLL_SECRET = re.compile(
+    r'''(?i)\b(bearer|password|secret|token)\b\s*[:=]?\s*(?:"[^"]*"|'[^']*'|\S+)'''
+)
+_POLL_QUOTED_PATH = re.compile(r'''(["'])(?:/|~/|[A-Za-z]:\\).*?\1''')
+_POLL_PATH = re.compile(r'''(?<!\w)(?:/|~/|[A-Za-z]:\\)[^\s"';,]+''')
+
+
+def _poll_diagnostic(
+    argv: Sequence[str], failure: str, *, returncode: int | None = None, stderr: str = ""
+) -> str:
+    """Keep poll failure evidence ahead of the daemon's 240-character limit.
+
+    Argument values (hundreds of handles, or private paths) are deliberately
+    absent. Sanitize stderr before bounding it, including quoted credentials
+    and paths containing spaces. This changes diagnostics, never the command.
+    """
+    command = argv[0] if argv and argv[0] in _POLL_COMMANDS else "scheduler"
+    heading = f"{command} {failure}"
+    if returncode is not None:
+        heading += f" (exit {returncode})"
+    detail = "".join(c if c.isprintable() else " " for c in stderr)
+    detail = _POLL_SECRET.sub(r"\1 <redacted>", detail)
+    detail = _POLL_QUOTED_PATH.sub("<path>", detail)
+    detail = _POLL_PATH.sub("<path>", detail)
+    detail = " ".join(detail.split()) or "(empty)"
+    return f"{heading}; stderr: {detail}"[:240]
+
+
+def _poll_remote_error_detail(exc: transport.RemoteError) -> str:
+    """Read only structured stderr, never command-bearing wrapper prose.
+
+    Transport messages can put argv on their first line or contain an argv
+    value that itself says ``stderr:``. Neither is evidence of an error stream.
+    """
+    if isinstance(exc, transport.RemoteCommandError):
+        return exc.stderr
+    if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+        captured = exc.__cause__.stderr
+        return captured.decode(errors="replace") if isinstance(captured, bytes) else (
+            captured or ""
+        )
+    return ""
 
 
 class SchedulerSubmitOutcomeUnknown(SchedulerError):
@@ -2417,13 +2463,18 @@ class SchedulerDispatcher:
                             isolated.add(jid)
                             continue
                         raise SchedulerError(
-                            f"{single_command[0]} poll failed "
-                            f"(exit {single_result.returncode})"
+                            _poll_diagnostic(
+                                single_command, "poll failed",
+                                returncode=single_result.returncode,
+                                stderr=single_result.stderr,
+                            )
                         )
                 explicitly_absent = frozenset(isolated)
             if not explicitly_absent:
                 raise SchedulerError(
-                    f"{command[0]} poll failed (exit {result.returncode})"
+                    _poll_diagnostic(
+                        command, "poll failed", returncode=result.returncode, stderr=result.stderr
+                    )
                 )
         return SchedulerPollEvidence(phases, explicitly_absent)
 
@@ -2447,7 +2498,10 @@ class SchedulerDispatcher:
         result = self.runner.run(command, check=False)
         if self.accounting_required_for_absent and result.returncode != 0:
             raise SchedulerError(
-                f"{command[0]} accounting poll failed (exit {result.returncode})"
+                _poll_diagnostic(
+                    command, "accounting poll failed",
+                    returncode=result.returncode, stderr=result.stderr,
+                )
             )
         return self.dialect.parse_qstat_detail(result.stdout)
 
@@ -3247,16 +3301,49 @@ class SshRemoteRunner:
                 max_stderr_bytes=4096 if accounting_query else None,
             )
         except transport.RemoteOutcomeUnknown as exc:
+            if argv and argv[0] in _POLL_COMMANDS:
+                failure = "remote scheduler command outcome is unknown"
+                detail = _poll_remote_error_detail(exc)
+                if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                    failure += f" (timeout after {timeout:g}s)"
+                elif isinstance(exc.__cause__, transport.SubprocessOutputLimitExceeded):
+                    failure += " (output capture limit exceeded)"
+                elif isinstance(exc.__cause__, OSError):
+                    failure += " (local observer failed)"
+                raise SchedulerRemoteOutcomeUnknown(
+                    _poll_diagnostic(argv, failure, stderr=detail)
+                ) from exc
             raise SchedulerRemoteOutcomeUnknown(
                 f"remote scheduler command outcome is unknown on "
                 f"{self._host_cfg.ssh}: {shlex.join(argv)}"
             ) from exc
         except transport.RemoteError as exc:
+            if argv and argv[0] in _POLL_COMMANDS:
+                failure = "remote scheduler command failed"
+                if isinstance(exc, transport.RemoteLaunchError):
+                    failure += " (local launch failed)"
+                raise SchedulerError(
+                    _poll_diagnostic(
+                        argv, failure,
+                        returncode=(
+                            exc.returncode
+                            if isinstance(exc, transport.RemoteCommandError) else None
+                        ),
+                        stderr=_poll_remote_error_detail(exc),
+                    )
+                ) from exc
             raise SchedulerError(
                 f"remote scheduler command failed on {self._host_cfg.ssh}: "
                 f"{shlex.join(argv)}\n  {exc}"
             ) from exc
         if proc.returncode == 255:
+            if argv and argv[0] in _POLL_COMMANDS:
+                raise SchedulerError(
+                    _poll_diagnostic(
+                        argv, "ssh transport failed", returncode=proc.returncode,
+                        stderr=proc.stderr,
+                    )
+                )
             raise SchedulerError(
                 f"ssh transport failed for scheduler command on {self._host_cfg.ssh}: "
                 f"{shlex.join(argv)}\n"

@@ -905,6 +905,177 @@ def test_embedded_observer_reads_receipts_in_reverse_publish_order() -> None:
     assert result_index < activation_index < lease_index < output_index
 
 
+@pytest.mark.parametrize(
+    "receipt", ["request.json", "lease.json", "activation.json", "result.json"],
+)
+def test_embedded_receipt_read_during_atomic_publication(
+    tmp_path: Path, receipt: str,
+) -> None:
+    """Exercise the real link-before-unlink window without a timing race."""
+    helper = admin._DETACHED_REMOTE_HELPER_SOURCE.split("\n__loader_source_b64__ =", 1)[0]
+    probe = helper + r'''
+directory_fd = os.open(sys.argv[1], DIR_FLAGS)
+receipt = sys.argv[2]
+original_link = os.link
+observations = []
+
+def link_and_observe(source, destination, **kwargs):
+    original_link(source, destination, **kwargs)
+    assert os.stat(destination, dir_fd=directory_fd).st_nlink == 2
+    observations.append(optional_json(directory_fd, receipt))
+
+os.link = link_and_observe
+try:
+    publish(directory_fd, receipt, {"proof": "complete"})
+    assert observations == [None], observations
+    assert optional_json(directory_fd, receipt) == {"proof": "complete"}
+    assert os.stat(receipt, dir_fd=directory_fd).st_nlink == 1
+finally:
+    os.close(directory_fd)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path), receipt],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "attack", ["unrelated", "wrong-receipt", "extra-link", "wrong-mode", "wrong-inode"],
+)
+def test_embedded_receipt_read_still_rejects_unsafe_links(
+    tmp_path: Path, attack: str,
+) -> None:
+    helper = admin._DETACHED_REMOTE_HELPER_SOURCE.split("\n__loader_source_b64__ =", 1)[0]
+    probe = helper + r'''
+directory_fd = os.open(sys.argv[1], DIR_FLAGS)
+attack = sys.argv[2]
+try:
+    publish(directory_fd, "activation.json", {"proof": "complete"})
+    temporary = ".activation.json." + "a" * 32 + ".tmp"
+    if attack == "unrelated":
+        temporary = "unrelated.json"
+    elif attack == "wrong-receipt":
+        temporary = ".result.json." + "a" * 32 + ".tmp"
+    elif attack == "wrong-inode":
+        fd = create_empty(directory_fd, temporary)
+        os.close(fd)
+        temporary = "unrelated.json"
+    os.link("activation.json", temporary,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    if attack == "extra-link":
+        os.link("activation.json", "extra.json",
+                src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    elif attack == "wrong-mode":
+        os.chmod("activation.json", 0o644, dir_fd=directory_fd)
+    try:
+        optional_json(directory_fd, "activation.json")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsafe hardlinked receipt was not rejected")
+finally:
+    os.close(directory_fd)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path), attack],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_embedded_receipt_publication_finishes_during_temporary_lookup(tmp_path: Path) -> None:
+    helper = admin._DETACHED_REMOTE_HELPER_SOURCE.split("\n__loader_source_b64__ =", 1)[0]
+    probe = helper + r'''
+directory_fd = os.open(sys.argv[1], DIR_FLAGS)
+try:
+    publish(directory_fd, "activation.json", {"proof": "complete"})
+    temporary = ".activation.json." + "a" * 32 + ".tmp"
+    os.link("activation.json", temporary,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+    original_stat = os.stat
+
+    def finish_then_stat(name, **kwargs):
+        if name == temporary:
+            os.unlink(temporary, dir_fd=directory_fd)
+        return original_stat(name, **kwargs)
+
+    os.stat = finish_then_stat
+    assert optional_json(directory_fd, "activation.json") == {"proof": "complete"}
+finally:
+    os.close(directory_fd)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(tmp_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_separate_observer_defers_receipt_until_publisher_unlinks(tmp_path: Path) -> None:
+    """An independent reader sees pending while the real publisher is paused."""
+    helper = admin._DETACHED_REMOTE_HELPER_SOURCE.split("\n__loader_source_b64__ =", 1)[0]
+    ready = tmp_path / "publisher-ready"
+    run_dir = tmp_path / "receipts"
+    run_dir.mkdir(mode=0o700)
+    publisher = helper + r'''
+directory_fd = os.open(sys.argv[1], DIR_FLAGS)
+original_unlink = os.unlink
+def pause_before_unlink(name, **kwargs):
+    if TEMP.fullmatch(name):
+        with open(sys.argv[2], "w") as checkpoint:
+            checkpoint.write("linked")
+        assert sys.stdin.readline() == "release\n"
+    return original_unlink(name, **kwargs)
+os.unlink = pause_before_unlink
+try:
+    publish(directory_fd, "result.json", {"proof": "complete"})
+finally:
+    os.close(directory_fd)
+'''
+    observer = helper + r'''
+directory_fd = os.open(sys.argv[1], DIR_FLAGS)
+try:
+    print(json.dumps(optional_json(directory_fd, "result.json")))
+finally:
+    os.close(directory_fd)
+'''
+    proc = subprocess.Popen(
+        [sys.executable, "-c", publisher, str(run_dir), str(ready)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + _LIVENESS_SECONDS
+        while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "publisher did not reach the link/unlink boundary"
+        assert (run_dir / "result.json").stat().st_nlink == 2
+        pending = subprocess.run(
+            [sys.executable, "-c", observer, str(run_dir)],
+            capture_output=True, text=True, timeout=_LIVENESS_SECONDS,
+        )
+        assert pending.returncode == 0, pending.stderr
+        assert json.loads(pending.stdout) is None
+        # The observer must neither read nor finish publication for the writer.
+        assert proc.poll() is None
+        assert (run_dir / "result.json").stat().st_nlink == 2
+    finally:
+        try:
+            _stdout, stderr = proc.communicate("release\n", timeout=_LIVENESS_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=_LIVENESS_SECONDS)
+            raise
+    assert proc.returncode == 0, stderr
+    complete = subprocess.run(
+        [sys.executable, "-c", observer, str(run_dir)],
+        capture_output=True, text=True, timeout=_LIVENESS_SECONDS,
+    )
+    assert complete.returncode == 0, complete.stderr
+    assert json.loads(complete.stdout) == {"proof": "complete"}
+    assert (run_dir / "result.json").stat().st_nlink == 1
+
+
 def test_embedded_helper_launches_records_and_retains_owner_only_receipts(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -48,7 +48,7 @@
   },
   {
     "changed": true,
-    "export_sha256": "13d4535840086ee38c57ab9b66f4e885e874e24f9910b2b5e13e3ea7175bf3bf",
+    "export_sha256": "67dd40893b86c9770512afb54c32c46f5c0cd533f422114379ac67e969cd4b3a",
     "mode": "100644",
     "path": "CHANGELOG.md",
     "reasons": [
@@ -56,8 +56,8 @@
       "public repository URL",
       "site alias anonymized only in the new public snapshot; original released changelog remains unchanged"
     ],
-    "source_blob": "546ecf35d8f032d3e7a6decccc943a287103527a",
-    "source_sha256": "dc4acdf8ff9a0a0551e969f120a89324fd617a51502b78985aaf316301e16915"
+    "source_blob": "71f126ea883a2872d5b1c75aa6c7fc84caf458a2",
+    "source_sha256": "21078b80d0c3eda1e799a5714bc8df7bb12c5cbe455603bfb9a8b76b482bd806"
   },
   {
     "changed": true,
@@ -805,12 +805,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "8a4870c23f73b2bd3167661c4b145306574c1029153f32dea20e5b06c837933c",
+    "export_sha256": "8b24e1e7072c20c75899d8f2e3ffc782b0434e88e2fc7bcaf33aff6bb340c859",
     "mode": "100644",
     "path": "docs/operations.md",
     "reasons": [],
-    "source_blob": "4159b0e0a49a629422a8ecf5b0c57b28a415b426",
-    "source_sha256": "8a4870c23f73b2bd3167661c4b145306574c1029153f32dea20e5b06c837933c"
+    "source_blob": "75484023293be6ded317da8c407129356f79eb1a",
+    "source_sha256": "8b24e1e7072c20c75899d8f2e3ffc782b0434e88e2fc7bcaf33aff6bb340c859"
   },
   {
     "changed": false,
@@ -1130,12 +1130,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "f18e041111438987afdf1ff00392aaab3704aa431d67e7248707fdbdc7899090",
+    "export_sha256": "5b1068f5d2c7efe44b8ef8551c8f9a0e8ffbd5b701eb840360db072a07045b5a",
     "mode": "100644",
     "path": "src/vq/admin.py",
     "reasons": [],
-    "source_blob": "37cd19ec9a473749ce46bf170ba0fc957fcee328",
-    "source_sha256": "f18e041111438987afdf1ff00392aaab3704aa431d67e7248707fdbdc7899090"
+    "source_blob": "ed23e38b102165f49d387db826fb0e486f584cb4",
+    "source_sha256": "5b1068f5d2c7efe44b8ef8551c8f9a0e8ffbd5b701eb840360db072a07045b5a"
   },
   {
     "changed": false,
@@ -1562,12 +1562,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "d756a6d764e1fb9974fb04fdd22d2a50633204514d3a97bbd5e4971ecfbf86e6",
+    "export_sha256": "76b5b3c2adabdc448cb8d2ae3effb3dc6ad3ed2f915fb2581abc122a862c4c30",
     "mode": "100644",
     "path": "src/vq/scheduler_dispatch.py",
     "reasons": [],
-    "source_blob": "ab66c8fb79b71ce2a266ce7f9650de22657e555b",
-    "source_sha256": "d756a6d764e1fb9974fb04fdd22d2a50633204514d3a97bbd5e4971ecfbf86e6"
+    "source_blob": "c5c6e618d393ba8b3f8e11a439fa81ee3166aa00",
+    "source_sha256": "76b5b3c2adabdc448cb8d2ae3effb3dc6ad3ed2f915fb2581abc122a862c4c30"
   },
   {
     "changed": false,
@@ -2048,12 +2048,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "f2e81a5f43b52076faa154baad39156653a8bac6508f3bda4d0d717bfb5aead2",
+    "export_sha256": "efac6d85690e7b6d53b204bba7b01eb397ec24ae31d36c6f2ca9556f94521e7d",
     "mode": "100644",
     "path": "tests/test_admin_managed_durable_recovery.py",
     "reasons": [],
-    "source_blob": "cdbe151a06723b4c1492d92a7ded54001b5d94c5",
-    "source_sha256": "f2e81a5f43b52076faa154baad39156653a8bac6508f3bda4d0d717bfb5aead2"
+    "source_blob": "cd5911b6213f6f8fe2f2b9d011e19fb838a0c580",
+    "source_sha256": "efac6d85690e7b6d53b204bba7b01eb397ec24ae31d36c6f2ca9556f94521e7d"
   },
   {
     "changed": false,
@@ -2840,12 +2840,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "f017ffa66fb42029ba2e1c37d231ed14554e76081665f46bf67d8f5bd323b47d",
+    "export_sha256": "7378a6b1997e8167a62fd1037dde5335452430d8b96c3adcf05fa66b3fc06a72",
     "mode": "100644",
     "path": "tests/test_fleet_rollout.py",
     "reasons": [],
-    "source_blob": "6d99e55333a919ab5001e313f38aa0ec2631f28a",
-    "source_sha256": "f017ffa66fb42029ba2e1c37d231ed14554e76081665f46bf67d8f5bd323b47d"
+    "source_blob": "4371b8bbf7366ac5bcf2c747e0caae040f74e172",
+    "source_sha256": "7378a6b1997e8167a62fd1037dde5335452430d8b96c3adcf05fa66b3fc06a72"
   },
   {
     "changed": false,
@@ -3533,12 +3533,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "1d14d60d478d48ed302c8f68f7e991fb09827c8ec1db3ce410bd4471c9825dbf",
+    "export_sha256": "644342edeaa44ffcf13c179fb862095d751f99377b6257b9c199e5faa6e89231",
     "mode": "100644",
     "path": "tests/test_scheduler_detached_build.py",
     "reasons": [],
-    "source_blob": "d92ad0c76bbc4c622cbfafc628058e57bf7467ea",
-    "source_sha256": "1d14d60d478d48ed302c8f68f7e991fb09827c8ec1db3ce410bd4471c9825dbf"
+    "source_blob": "60f121159162b2e8497640a93f684a8536add29a",
+    "source_sha256": "644342edeaa44ffcf13c179fb862095d751f99377b6257b9c199e5faa6e89231"
   },
   {
     "changed": false,
@@ -3551,12 +3551,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "23d6bd180a7cd05315ee2a3484c76560262abe754fb65d62080619358e691d6e",
+    "export_sha256": "65d42412ec06e29a594d39f616a6c0030cca37b8efbbeadd646de9d3ebb80de5",
     "mode": "100644",
     "path": "tests/test_scheduler_dispatch.py",
     "reasons": [],
-    "source_blob": "ff10cbde0f617344ff6684e2a4632ba3810e49eb",
-    "source_sha256": "23d6bd180a7cd05315ee2a3484c76560262abe754fb65d62080619358e691d6e"
+    "source_blob": "f2eeb08c4deba9954cfc2bdc3f800640847a9cc3",
+    "source_sha256": "65d42412ec06e29a594d39f616a6c0030cca37b8efbbeadd646de9d3ebb80de5"
   },
   {
     "changed": false,
@@ -3575,6 +3575,15 @@
     "reasons": [],
     "source_blob": "20db0c5475c64c274e3b2bb02addb21939afdd68",
     "source_sha256": "b36f837903d21bf5028646dda11b0df27dec95ceca4e7f7f2251d91aaf91a3e8"
+  },
+  {
+    "changed": false,
+    "export_sha256": "c93458344bb5d9cc86cab99950bbf5b206ba48488e3dc0ada95bfb2cb239f8a2",
+    "mode": "100644",
+    "path": "tests/test_scheduler_poll_diagnostics.py",
+    "reasons": [],
+    "source_blob": "f132ac206d18d076f19a47db3cb927e0d7ce4eab",
+    "source_sha256": "c93458344bb5d9cc86cab99950bbf5b206ba48488e3dc0ada95bfb2cb239f8a2"
   },
   {
     "changed": false,
@@ -4161,17 +4170,6 @@
     "export_sha256": "53f84d69867d795f46c15c3b7d36980c1b1bdb2baacc800bc88c17e7b4903ff1",
     "mode": "100644",
     "path": "config/README.md",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
-  },
-  {
-    "changed": true,
-    "export_sha256": "a656cff72d63751159fb1af0d71d1a51c5f4b1e1db9886f79b12c5d30627457f",
-    "mode": "100644",
-    "path": "PUBLIC_RELEASE_SOURCE.json",
     "reasons": [
       "generated public export guidance"
     ],

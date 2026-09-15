@@ -48,6 +48,7 @@ def test_driver_reentry_inherits_timeout_environment(
         "VQ_UPDATE_SCRIPT_TIMEOUT": "21600",
         "VQ_BUILD_STALL_TIMEOUT": "7200",
         "VQ_REMOTE_ADMIN_UPDATE_TIMEOUT": "24000",
+        "VQ_DAEMON_HEALTH_TIMEOUT": "900",
     }
     for name, value in expected.items():
         monkeypatch.setenv(name, value)
@@ -110,6 +111,7 @@ def test_rollout_action_inherits_timeout_environment(
         "VQ_UPDATE_SCRIPT_TIMEOUT": "21600",
         "VQ_BUILD_STALL_TIMEOUT": "7200",
         "VQ_REMOTE_ADMIN_UPDATE_TIMEOUT": "24000",
+        "VQ_DAEMON_HEALTH_TIMEOUT": "900",
     }
     for name, value in expected.items():
         monkeypatch.setenv(name, value)
@@ -124,7 +126,7 @@ def test_rollout_action_inherits_timeout_environment(
                 "import json, os; print(json.dumps({name: os.environ.get(name) "
                 "for name in "
                 "['VQ_UPDATE_SCRIPT_TIMEOUT', 'VQ_BUILD_STALL_TIMEOUT', "
-                "'VQ_REMOTE_ADMIN_UPDATE_TIMEOUT']}))",
+                "'VQ_REMOTE_ADMIN_UPDATE_TIMEOUT', 'VQ_DAEMON_HEALTH_TIMEOUT']}))",
             ],
             capture_output=True,
             text=True,
