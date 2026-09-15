@@ -17,6 +17,9 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+- Add GitHub issue forms and a pull request template that guide redacted reports,
+  reproducible validation and the existing contribution policy.
+
 ## [0.26.7] - 2026-09-15 - "Raymond's Bazaar"
 
 - Require an explicit recovery account for host bootstrap and an explicit

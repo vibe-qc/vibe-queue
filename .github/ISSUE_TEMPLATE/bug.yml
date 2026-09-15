@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a queue, daemon, scheduler, web console or installation problem.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Report security problems privately using SECURITY.md.
+        Before attaching files, remove credentials, private machine/account names and personal paths.
+  - type: input
+    id: release
+    attributes:
+      label: Release and commit
+      description: Include the vq version and commit ID if known.
+    validations:
+      required: true
+  - type: input
+    id: operating_system
+    attributes:
+      label: Operating system and architecture
+      placeholder: "For example: Ubuntu 24.04, x86-64"
+    validations:
+      required: true
+  - type: dropdown
+    id: install_route
+    attributes:
+      label: Installation route
+      options:
+        - scripts/install.sh
+        - pip or wheel
+        - Editable source install
+        - Managed deployment
+        - Container
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: backend_configuration
+    attributes:
+      label: Backend and minimal generic configuration
+      description: State local, PBS or Slurm execution and include only the settings needed to reproduce the issue. Never attach full site configuration, real cluster/account/host names, credentials or tokens.
+    validations:
+      required: true
+  - type: textarea
+    id: minimal_input
+    attributes:
+      label: Minimal input and reproduction command
+      description: Include the smallest job specification or input and exact commands that reproduce the problem. Replace real hostnames, scheduler accounts, endpoints and personal paths with generic placeholders.
+    validations:
+      required: true
+  - type: textarea
+    id: output_manifest
+    attributes:
+      label: Output and system manifest
+      description: Attach minimal relevant redacted vq or scheduler logs. Include the calculation .out and .system manifest only when relevant and after reviewing them for private data; otherwise explain why they do not apply.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+      description: For numerical differences, give the reference, units, settings and tolerance.
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed result
+      description: Include the error or numerical difference and whether an earlier release worked.
+    validations:
+      required: true

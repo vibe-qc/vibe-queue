@@ -28,6 +28,51 @@
   },
   {
     "changed": false,
+    "export_sha256": "832d030267d3cef1709e8d7ff11e7ed3d996b171c4a991ba72841146d77a774e",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/bug.yml",
+    "reasons": [],
+    "source_blob": "7752810f53e8a6e641ef2445b4e47e0d5e31cd15",
+    "source_sha256": "832d030267d3cef1709e8d7ff11e7ed3d996b171c4a991ba72841146d77a774e"
+  },
+  {
+    "changed": false,
+    "export_sha256": "279ac028640c01e8f70d94fd9804cc1e991d47aa3a7a79fc24a69461ace94605",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/config.yml",
+    "reasons": [],
+    "source_blob": "01cb21c34ba6d664e1c35af183d19a4d632bb7bb",
+    "source_sha256": "279ac028640c01e8f70d94fd9804cc1e991d47aa3a7a79fc24a69461ace94605"
+  },
+  {
+    "changed": false,
+    "export_sha256": "ea1335f43e41628562ec17abb24974d8cda1add7265c9fba1c614012c39d1ca9",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/feature.yml",
+    "reasons": [],
+    "source_blob": "8543e05c0a0fb5c149102fb29e172898b586ee45",
+    "source_sha256": "ea1335f43e41628562ec17abb24974d8cda1add7265c9fba1c614012c39d1ca9"
+  },
+  {
+    "changed": false,
+    "export_sha256": "3b3b865897f13dabcc5544f0b0560f750ee5caf64c31692d189b365e01a76789",
+    "mode": "100644",
+    "path": ".github/ISSUE_TEMPLATE/question.yml",
+    "reasons": [],
+    "source_blob": "603516634eab25a77b12c8ce935e683d2567988a",
+    "source_sha256": "3b3b865897f13dabcc5544f0b0560f750ee5caf64c31692d189b365e01a76789"
+  },
+  {
+    "changed": false,
+    "export_sha256": "010eccbcaec63d073db3e58fff133751517e4ef5b085483caa89317b8ff57c44",
+    "mode": "100644",
+    "path": ".github/PULL_REQUEST_TEMPLATE.md",
+    "reasons": [],
+    "source_blob": "9fc7f7e8a0b69e92527942c86e11afd9c707457d",
+    "source_sha256": "010eccbcaec63d073db3e58fff133751517e4ef5b085483caa89317b8ff57c44"
+  },
+  {
+    "changed": false,
     "export_sha256": "a3c3726bb94172cdcea3d2dd74305d34fb7fd60b423527588b39836d408ff357",
     "mode": "100644",
     "path": ".gitignore",
@@ -48,7 +93,7 @@
   },
   {
     "changed": true,
-    "export_sha256": "463a6d8caa99808ff5a87049f922fcedc1914fdb5d4ffb40855eeca8385c1a01",
+    "export_sha256": "4a16117ce0838870ca26c83881ba3b446919cf1ed7cfb841ea9b36f11379446a",
     "mode": "100644",
     "path": "CHANGELOG.md",
     "reasons": [
@@ -56,8 +101,8 @@
       "public repository URL",
       "site alias anonymized only in the new public snapshot; original released changelog remains unchanged"
     ],
-    "source_blob": "d27b50248232586cb132dd3ef1dc86eb9176d688",
-    "source_sha256": "8b491a233dfd4c77bbbbd26258495912c80d9e4b5ff5c5b5fb017180b495c817"
+    "source_blob": "b52f2339b8f7d86f3de0a190e9d29609e1830981",
+    "source_sha256": "6f7262a246f5367d72f91a6c04f5f56ed597b945349d5db94cd9e043b0932a73"
   },
   {
     "changed": true,
@@ -4170,17 +4215,6 @@
     "export_sha256": "53f84d69867d795f46c15c3b7d36980c1b1bdb2baacc800bc88c17e7b4903ff1",
     "mode": "100644",
     "path": "config/README.md",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
-  },
-  {
-    "changed": true,
-    "export_sha256": "20a33bd919344006e0b3d6645c76f847bc1b7b4c9fd35564542f3ad6ae3c1833",
-    "mode": "100644",
-    "path": "PUBLIC_RELEASE_SOURCE.json",
     "reasons": [
       "generated public export guidance"
     ],
