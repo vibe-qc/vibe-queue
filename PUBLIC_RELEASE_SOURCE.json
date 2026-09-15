@@ -1,6 +1,6 @@
 {
-  "original_tag": "v0.26.5",
-  "original_tag_commit": "da2dbca05b5295bd888d08cef74b6d3cb9af957c",
-  "sanitized_source_commit": "2d574a88f17ed5cfb32a9dfa40f06cb467c41a46",
+  "original_tag": "v0.26.6",
+  "original_tag_commit": "917c521a7af06001662d4aec053c6ffc75f158ba",
+  "sanitized_source_commit": "fe5fd6eeebe4a12d8c685a9bd3736d7d503da7b6",
   "notice": "New sanitized source snapshot; original GitLab release is immutable."
 }

@@ -13,7 +13,7 @@ which is the version the fleet was already running.
 
 > **This is a shared ledger.** Several chats append to it. When a rebase
 > conflicts here, resolve to the **union** of both sides — never
-> `--ours`/`--theirs`. See CLAUDE.md § 2 item 6.
+> `--ours`/`--theirs`. See `AGENTS.md`, "Shared files and shared trees".
 
 ## [Unreleased]
 
@@ -22,6 +22,34 @@ which is the version the fleet was already running.
 - Separate private operations and replace site examples with synthetic values.
   Scheduler behavior stays at the original release revision.
 - Require an explicit recovery account and parallel CRYSTAL rank allocation.
+
+## [0.26.6] - 2026-09-13 - "Raymond's Bazaar"
+
+### Fixed
+
+- **Lifecycle refusal messages print their suggested commands safely** (#20).
+  Refusing to replace code under a running daemon no longer executes
+  `vq self-update` and `vq admin update` through shell substitution. The
+  diagnostic retains the daemon description, action, service and venv path.
+
+- **Release discovery cannot silently certify an older release** (#52).
+  Discovery refreshes the runtime repository and every distinct configured
+  pin checkout under lifecycle locks before validating pins. Fetch failures
+  stop discovery. Dry runs name rejected newer candidates alongside any
+  fallback plan; rollout, verification and `--from-report` refuse that
+  fallback, including during final report rechecks. Report contents and
+  digests retain their existing format.
+
+### Added
+
+- **Named directory artifacts** (#55). `vq fetch --name BASENAME` retrieves a
+  complete directory, including opt-in TREXIO text output, from a workspace,
+  workdir or archived job over local or SSH transport. Files retain their
+  existing behavior; links and special files are refused. A complete staged
+  directory replaces the previous snapshot without retaining stale children.
+  Real-producer integration covers HDF5/text export, transfer, archive readback
+  and queued READ with staged inputs; TREXIO remains an optional workload
+  dependency and QVF remains the default calculation container.
 
 ## [0.26.5] - 2026-09-13 - "Raymond's Bazaar"
 

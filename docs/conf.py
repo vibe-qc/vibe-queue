@@ -125,8 +125,8 @@ intersphinx_mapping = {
 # --- What does NOT get published -------------------------------------------
 #
 # docs/ is also this project's working memory: status files, handovers,
-# per-cycle audits, design notes written to be superseded, and a 444 KB
-# roadmap. Those are legitimate artefacts and they stay in the repository,
+# per-cycle audits, design notes written to be superseded, and a 435 KB
+# roadmap history. Those are legitimate artefacts and they stay in the repository,
 # but they are not product documentation and several of them would be the
 # largest pages on the site.
 #
@@ -140,6 +140,7 @@ exclude_patterns = [
     # Working memory, not documentation.
     "STATUS.md",
     "roadmap.md",
+    "roadmap_history.md",
     "handover.md",
     "handover-*.md",
     "audits/**",

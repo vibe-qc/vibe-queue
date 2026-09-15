@@ -12,7 +12,7 @@ soft throttle vs. ``vq pause``'s hard freeze.
 ``--all`` applies to every RUNNING job (SUSPENDED jobs are skipped --
 they're already not using CPU; restore them via ``vq resume``).
 
-Key design decisions vs the v0.5.13 roadmap entry:
+Key design decisions vs the v0.5.13 entry in docs/roadmap_history.md:
 
 * **Doesn't persist across new dispatches.** A throttle applied via
   ``vq throttle --all --weight 20`` affects only the jobs that were
@@ -22,7 +22,7 @@ Key design decisions vs the v0.5.13 roadmap entry:
   if/when the use case shows up.
 
 * **cgroup-only in v0.5.13.** The fallback ``renice -n N -g pgid``
-  for non-cgroup hosts is sketched in the roadmap but not implemented
+  for non-cgroup hosts is sketched in that entry but not implemented
   here -- the only production target (workstation) is cgroup-enforced,
   and macOS doesn't need throttle (single-user dev box). When a
   second non-cgroup target appears, we add the renice path.

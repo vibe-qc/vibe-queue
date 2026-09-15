@@ -25,6 +25,43 @@ HELPER = SCRIPTS / "_venv_helpers.sh"
 OWNER_MARKER = ".vq-checkout-owner"
 
 
+def test_live_daemon_refusal_prints_commands_without_executing_them(tmp_path: Path) -> None:
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    calls = tmp_path / "vq-calls"
+    stub = stub_bin / "vq"
+    stub.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$VQ_TEST_CALLS"\nexit 2\n')
+    stub.chmod(0o700)
+    venv = tmp_path / "serving environment"
+    action = "Reinstall this environment"
+    env = {
+        **os.environ,
+        "PATH": str(stub_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "VQ_TEST_CALLS": str(calls),
+    }
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            '\n'.join([
+                'source "$1"',
+                'vq_daemon_is_running() { return 0; }',
+                'vq_daemon_describe() { printf "%s\\n" "running (pid 123)"; }',
+                'VQ_DAEMON_UNIT=custom-queue.service',
+                'vq_assert_daemon_stopped_or_managed "$2" 0 "$3"',
+            ]),
+            "diagnostic-test", str(HELPER), str(venv), action,
+        ],
+        env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert not calls.exists(), calls.read_text() if calls.exists() else ""
+    assert "a vq daemon is running (pid 123)" in result.stderr
+    assert f"{action} would swap code underneath it" in result.stderr
+    assert "Use `vq self-update` or\n`vq admin update`" in result.stderr
+    assert "systemctl --user stop custom-queue.service" in result.stderr
+    assert f"{venv}/bin/vq daemon stop" in result.stderr
+
+
 def _stamp_owner(venv: Path, project: Path = PROJECT) -> None:
     (venv / OWNER_MARKER).write_text(
         f"version=1\nproject={project.resolve()}\n",

@@ -7,7 +7,7 @@ v0.6.11 behavior) or watches ``origin/<branch>`` SHA
 (``"branch"``, new in v0.7.4). The branch-mode lets a dev-tracking
 env auto-refresh whenever main advances, without requiring a tag.
 
-See ``docs/roadmap.md`` v0.7.4 entry for the rationale (why this
+See ``docs/roadmap_history.md`` v0.7.4 entry for the rationale (why this
 wasn't here from v0.6.11 and what's changed since to make it safe).
 """
 from __future__ import annotations

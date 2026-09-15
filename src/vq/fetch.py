@@ -41,7 +41,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import BinaryIO, TypeGuard
+from typing import TypeGuard
 
 from vq import config, paths, transport
 from vq.config import HostConfig
@@ -127,6 +127,7 @@ def _validate_artifact_name(name: str) -> str:
         or candidate.is_absolute()
         or candidate.name != name
         or name in {".", ".."}
+        or "\0" in name
     ):
         raise ValueError(
             f"artifact name must be one directory-relative basename, got {name!r}"
@@ -143,23 +144,30 @@ def _sha256_path(path: Path) -> str:
 
 
 def _publish_artifact(temp_path: Path, dst: Path, *, idempotent: bool) -> Path:
-    """Atomically publish one fetched artifact, replacing a stale prior copy.
+    """Publish one completely staged artifact, replacing a stale prior copy.
 
     (#114): an existing plain-file destination is OVERWRITTEN with the
     freshly fetched bytes rather than kept. `vq fetch --name` on a live job's
     growing artifact used to fail (different content) or no-op (identical
     content); either way the operator could not simply re-read the file. Only
     a same-content copy short-circuits, and only to skip the rename.
-    ``idempotent=False`` (the `fetch-all` sweep) still refuses an existing
+    Directories replace the whole prior tree using the workspace-fetch
+    rollback path; they are never merged with stale files. Type changes and
+    destination symlinks are refused. ``idempotent=False`` still refuses an existing
     destination so the sweep can report an explicit skip.
     """
     if dst.exists() or dst.is_symlink():
         if not idempotent:
             raise FileExistsError(f"artifact destination already exists: {dst}")
-        if dst.is_symlink() or not dst.is_file():
+        if dst.is_symlink() or dst.is_dir() != temp_path.is_dir():
             raise FileExistsError(
-                f"artifact destination exists and is not a regular file: {dst}"
+                f"artifact destination has an incompatible type: {dst}"
             )
+        if temp_path.is_dir():
+            _replace_directory(temp_path, dst)
+            return dst
+        if not dst.is_file():
+            raise FileExistsError(f"artifact destination is not a regular file: {dst}")
         if _sha256_path(dst) == _sha256_path(temp_path):
             return dst
     os.replace(temp_path, dst)
@@ -1027,73 +1035,135 @@ def fetch_remote(
     return result.destination
 
 
+def _artifact_member_parts(member: tarfile.TarInfo) -> tuple[str, ...]:
+    """Accept only canonical relative names and ordinary directory/file nodes."""
+    name = member.name.rstrip("/") if member.isdir() else member.name
+    parts = tuple(name.split("/"))
+    if (
+        any(part in {"", ".", ".."} or "\0" in part for part in parts)
+        or not (member.isfile() or member.isdir())
+    ):
+        raise ValueError(f"unsafe artifact archive member: {member.name!r}")
+    return parts
+
+
+def _copy_artifact_members(
+    tf: tarfile.TarFile, members: Iterator[tarfile.TarInfo],
+    root: tuple[str, ...], destination: Path,
+) -> None:
+    """Copy a single rooted tree into private staging, never following links."""
+    seen: set[tuple[str, ...]] = set()
+    root_is_dir = False
+    for member in members:
+        parts = _artifact_member_parts(member)
+        if parts[:len(root)] != root:
+            raise ValueError(f"unexpected artifact archive member: {member.name!r}")
+        relative = parts[len(root):]
+        if parts in seen:
+            raise ValueError(f"duplicate artifact archive member: {member.name!r}")
+        if not seen:
+            if relative:
+                raise ValueError("artifact archive must start with the requested root")
+            root_is_dir = member.isdir()
+        elif not root_is_dir or not relative:
+            raise ValueError("artifact archive contains more than the requested file")
+        seen.add(parts)
+        dst = destination.joinpath(*relative)
+        if member.isdir():
+            dst.mkdir(mode=0o700, parents=True, exist_ok=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            source = tf.extractfile(member)
+            if source is None:
+                raise ValueError(f"unreadable artifact archive member: {member.name!r}")
+            with source, dst.open("xb") as out:
+                shutil.copyfileobj(source, out)
+            dst.chmod(0o600)
+    if not seen:
+        raise FileNotFoundError("artifact archive is empty")
+
+
 def _copy_named_artifact_from_archive(
     archive: Path, name: str, destination: Path
 ) -> None:
-    """Copy one regular workspace member from an archived job."""
+    """Copy one unique named file or directory, rejecting links in its tree."""
     with tarfile.open(archive, mode="r:*") as tf:
+        members = tf.getmembers()
         matches = [
-            member
-            for member in tf
-            if member.isfile()
-            and (member.name == name or member.name.endswith(f"/{name}"))
+            member for member in members
+            if member.name.rstrip("/").split("/")[-1] == name
         ]
         if len(matches) != 1:
             raise FileNotFoundError(
                 f"artifact {name!r} was not found uniquely in archive {archive}"
             )
-        source = tf.extractfile(matches[0])
-        if source is None:
-            raise FileNotFoundError(
-                f"artifact {name!r} could not be read from archive {archive}"
-            )
-        with source, destination.open("wb") as out:
-            shutil.copyfileobj(source, out)
+        root = _artifact_member_parts(matches[0])
+        # A link or special node in the selected path is not a directory.
+        for member in members:
+            parts = tuple(member.name.rstrip("/").split("/"))
+            if len(parts) < len(root) and root[:len(parts)] == parts and not member.isdir():
+                raise ValueError("artifact archive has a non-directory ancestor")
+        selected = [matches[0]]
+        selected.extend(
+            member for member in members if member is not matches[0]
+            and member.name.startswith("/".join(root) + "/")
+        )
+        _copy_artifact_members(tf, iter(selected), root, destination)
 
 
 @contextlib.contextmanager
-def _open_workdir_artifact(
-    spec: JobSpec, name: str, *, subdir: str | None = None,
-) -> Iterator[BinaryIO]:
-    """Open one regular file relative to the recorded workdir, never an archive.
-
-    Keep the directory descriptor across the child open and refuse symlinks
-    and special files. A path replacement cannot redirect the opened file.
-    """
-    if not spec.workdir:
+def _open_artifact(
+    spec: JobSpec, name: str, *, workdir: bool, subdir: str | None = None,
+) -> Iterator[int]:
+    """Anchor every path component with a descriptor and refuse symlinks."""
+    if workdir and not spec.workdir:
         raise FileNotFoundError(_no_workdir_message(spec, spec.id))
+    root = spec.workdir if workdir else spec.cwd
+    assert root is not None
     try:
-        directory_fd = os.open(
-            spec.workdir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
+        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError as exc:
+        hint = _workdir_missing_hint(spec) if workdir else ""
         raise FileNotFoundError(
-            f"workdir for job {spec.id} not found at {spec.workdir}"
-            f"{_workdir_missing_hint(spec)}"
+            f"artifact source for job {spec.id} not found at {root}{hint}"
         ) from exc
     try:
-        for part in _validate_artifact_subdir(subdir, workdir=True):
+        for part in _validate_artifact_subdir(subdir, workdir=workdir):
             child_fd = os.open(
-                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd,
             )
             os.close(directory_fd)
             directory_fd = child_fd
         fd = os.open(
-            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=directory_fd,
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd,
         )
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise ValueError(f"workdir artifact {name!r} is not a regular file")
-            source = os.fdopen(fd, "rb")
-        except BaseException:
+            yield fd
+        finally:
             os.close(fd)
-            raise
-        with source:
-            yield source
     finally:
         os.close(directory_fd)
+
+
+def _copy_artifact_fd(fd: int, destination: Path) -> None:
+    """Snapshot only regular files and directories through anchored handles."""
+    mode = os.fstat(fd).st_mode
+    if stat.S_ISREG(mode):
+        with os.fdopen(os.dup(fd), "rb") as source, destination.open("xb") as out:
+            shutil.copyfileobj(source, out)
+        destination.chmod(0o600)
+    elif stat.S_ISDIR(mode):
+        destination.mkdir(mode=0o700)
+        for name in sorted(os.listdir(fd)):
+            child = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd,
+            )
+            try:
+                _copy_artifact_fd(child, destination / name)
+            finally:
+                os.close(child)
+    else:
+        raise ValueError("artifact must contain only regular files and directories")
 
 
 def _validate_artifact_subdir(subdir: str | None, *, workdir: bool) -> tuple[str, ...]:
@@ -1128,33 +1198,10 @@ def fetch_artifact_local(
         _refresh_live_scheduler_workspace(spec)
     output_dir.mkdir(parents=True, exist_ok=True)
     dst = output_dir / name
-    fd, temp_name = tempfile.mkstemp(
-        dir=output_dir, prefix=f".{name}.vq-fetch-"
-    )
-    os.close(fd)
-    temp_path = Path(temp_name)
+    staging = Path(tempfile.mkdtemp(dir=output_dir, prefix=f".{name}.vq-fetch-"))
+    temp_path = staging / name
     try:
-        if workdir:
-            with (
-                _open_workdir_artifact(spec, name, subdir=subdir) as source,
-                temp_path.open("wb") as out,
-            ):
-                shutil.copyfileobj(source, out)
-        elif spec.is_archived and spec.archive_path:
-            archive = Path(spec.archive_path)
-            if not archive.is_file():
-                raise FileNotFoundError(
-                    f"archive for job {jobid} not found at {archive}"
-                )
-            _copy_named_artifact_from_archive(archive, name, temp_path)
-        else:
-            src = Path(spec.cwd) / name
-            if src.is_symlink() or not src.is_file():
-                raise FileNotFoundError(
-                    f"artifact {name!r} for job {jobid} not found as a "
-                    f"regular file in {spec.cwd}"
-                )
-            shutil.copyfile(src, temp_path)
+        _stage_named_artifact(spec, name, temp_path, workdir=workdir, subdir=subdir)
         published = _publish_artifact(temp_path, dst, idempotent=idempotent)
         if spec.is_terminal and not workdir:
             with contextlib.suppress(OSError, ValueError, config.ConfigError):
@@ -1167,65 +1214,37 @@ def fetch_artifact_local(
                 )
         return published
     finally:
-        temp_path.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _stage_named_artifact(
+    spec: JobSpec, name: str, destination: Path, *, workdir: bool,
+    subdir: str | None,
+) -> None:
+    if not workdir and spec.is_archived and spec.archive_path:
+        _copy_named_artifact_from_archive(Path(spec.archive_path), name, destination)
+    else:
+        with _open_artifact(spec, name, workdir=workdir, subdir=subdir) as fd:
+            _copy_artifact_fd(fd, destination)
 
 
 def emit_artifact_tar(
     jobid: str, name: str, *, multi_user: bool = False, workdir: bool = False,
     subdir: str | None = None,
 ) -> None:
-    """Internal remote transport for one regular workspace/workdir artifact."""
+    """Stream a validated snapshot of one named file or directory artifact."""
     name = _validate_artifact_name(name)
     _validate_artifact_subdir(subdir, workdir=workdir)
     _, spec = resolve_authorized_spec(jobid, multi_user=multi_user)
     if not workdir:
         _refresh_live_scheduler_workspace(spec)
-    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as out_tf:
-        if workdir:
-            with _open_workdir_artifact(spec, name, subdir=subdir) as source:
-                info = tarfile.TarInfo(name)
-                info.size = os.fstat(source.fileno()).st_size
-                info.mode = 0o644
-                out_tf.addfile(info, source)
-        elif spec.is_archived and spec.archive_path:
-            archive = Path(spec.archive_path)
-            if not archive.is_file():
-                raise FileNotFoundError(
-                    f"archive for job {jobid} not found at {archive}"
-                )
-            with tarfile.open(archive, mode="r:*") as src_tf:
-                matches = [
-                    member
-                    for member in src_tf
-                    if member.isfile()
-                    and (
-                        member.name == name
-                        or member.name.endswith(f"/{name}")
-                    )
-                ]
-                if len(matches) != 1:
-                    raise FileNotFoundError(
-                        f"artifact {name!r} was not found uniquely in "
-                        f"archive {archive}"
-                    )
-                source = src_tf.extractfile(matches[0])
-                if source is None:
-                    raise FileNotFoundError(
-                        f"artifact {name!r} could not be read from {archive}"
-                    )
-                info = tarfile.TarInfo(name)
-                info.size = matches[0].size
-                info.mode = 0o644
-                with source:
-                    out_tf.addfile(info, source)
-        else:
-            src = Path(spec.cwd) / name
-            if src.is_symlink() or not src.is_file():
-                raise FileNotFoundError(
-                    f"artifact {name!r} for job {jobid} not found as a "
-                    f"regular file in {spec.cwd}"
-                )
-            out_tf.add(src, arcname=name, recursive=False)
+    # Finish validation before emitting any bytes, including for a directory
+    # with a forbidden child. Only this private snapshot is passed to tar.
+    with tempfile.TemporaryDirectory(prefix="vq-artifact-") as temporary:
+        staged = Path(temporary) / name
+        _stage_named_artifact(spec, name, staged, workdir=workdir, subdir=subdir)
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as out_tf:
+            out_tf.add(staged, arcname=name)
 
 
 def fetch_artifact_remote(
@@ -1243,11 +1262,8 @@ def fetch_artifact_remote(
     _validate_artifact_subdir(subdir, workdir=workdir)
     output_dir.mkdir(parents=True, exist_ok=True)
     dst = output_dir / name
-    fd, temp_name = tempfile.mkstemp(
-        dir=output_dir, prefix=f".{name}.vq-fetch-"
-    )
-    os.close(fd)
-    temp_path = Path(temp_name)
+    staging = Path(tempfile.mkdtemp(dir=output_dir, prefix=f".{name}.vq-fetch-"))
+    temp_path = staging / name
     stream: transport.RemoteStream | None = None
     try:
         with (
@@ -1258,28 +1274,13 @@ def fetch_artifact_remote(
             ) as stream,
             tarfile.open(fileobj=stream.stdout, mode="r|") as tf,
         ):
-            member = tf.next()
-            if (
-                member is None
-                or not member.isfile()
-                or member.name != name
-            ):
+            try:
+                _copy_artifact_members(tf, iter(tf), (name,), temp_path)
+            except (ValueError, FileNotFoundError) as exc:
                 raise transport.RemoteError(
-                    f"remote tar-artifact for {jobid} did not contain exactly "
-                    f"the requested regular file {name!r}"
-                )
-            source = tf.extractfile(member)
-            if source is None:
-                raise transport.RemoteError(
-                    f"remote artifact {name!r} for {jobid} was unreadable"
-                )
-            with source, temp_path.open("wb") as out:
-                shutil.copyfileobj(source, out)
-            if tf.next() is not None:
-                raise transport.RemoteError(
-                    f"remote tar-artifact for {jobid} returned more than "
-                    f"the requested file {name!r}"
-                )
+                    f"remote tar-artifact did not contain exactly the requested "
+                    f"regular file or directory {name!r}: {exc}"
+                ) from exc
         return _publish_artifact(temp_path, dst, idempotent=idempotent)
     except tarfile.TarError as exc:
         remote_stderr = stream.stderr_text if stream is not None else ""
@@ -1288,7 +1289,7 @@ def fetch_artifact_remote(
             f"remote stderr: {remote_stderr or '(empty)'}"
         ) from exc
     finally:
-        temp_path.unlink(missing_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _tar_spec_path(jobid: str, *, multi_user: bool) -> Path:

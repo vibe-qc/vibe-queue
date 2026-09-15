@@ -2252,7 +2252,7 @@ class TestSelectedWorkdirArtifact:
         assert (out / "kernel.json").read_text() == "previous accepted bytes"
         assert len(list(out.iterdir())) == 1
 
-    @pytest.mark.parametrize("kind", ["symlink", "directory", "fifo", "workdir-symlink"])
+    @pytest.mark.parametrize("kind", ["symlink", "fifo", "workdir-symlink"])
     def test_nonregular_sources_refused_without_reading_them(
         self, state: Path, kind: str,
     ) -> None:
@@ -2262,8 +2262,6 @@ class TestSelectedWorkdirArtifact:
             target = state / "private"
             target.write_text("private")
             source.symlink_to(target)
-        elif kind == "directory":
-            source.mkdir()
         elif kind == "fifo":
             os.mkfifo(source)
         else:

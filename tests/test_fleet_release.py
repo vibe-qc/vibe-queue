@@ -105,6 +105,139 @@ def _write_report(repo: Path, tag: str, sha: str) -> Path:
     return path
 
 
+def _split_discovery_repos(tmp_path: Path) -> tuple[Path, dict[str, Path], dict[Path, str]]:
+    """Three stale clones with current reports already fetched into the driver."""
+    origins = {}
+    clones = {}
+    for component in ("vibe-qc", "vibe-queue", "vibe-view"):
+        parent = tmp_path / component
+        parent.mkdir()
+        origins[f"mpei/{component}"] = _init_repo(parent)
+
+    def publish(tag: str) -> None:
+        shas = {slug: _git(repo, "rev-parse", "HEAD") for slug, repo in origins.items()}
+        qc = origins["mpei/vibe-qc"]
+        _git(qc, "tag", tag)
+        payload = _report(tag, shas["mpei/vibe-qc"])
+        for name, pin in payload["pins"].items():
+            sha = shas[pin["repo"]]
+            pin["sha"] = sha
+            pin["ci_evidence"]["sha"] = sha
+            pin["deploy_flags"] = (
+                ["--tag", tag, "--expected-sha", sha]
+                if name == "release" else ["--expected-sha", sha]
+            )
+        reports = origins["mpei/vibe-queue"]
+        path = reports / "releases" / f"{tag}.json"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(payload))
+        _commit(reports, f"report {tag}")
+
+    publish("v0.15.59")
+    for slug, origin in origins.items():
+        clone = origin.parent / "clone"
+        _git(origin.parent, "clone", str(origin), str(clone))
+        clones[slug] = clone
+    before = {clone: _git(clone, "rev-parse", "HEAD") for clone in clones.values()}
+    for origin in origins.values():
+        (origin / "README").write_text("next release\n")
+        _commit(origin, "next release")
+    publish("v0.15.60")
+    driver = clones["mpei/vibe-queue"]
+    _git(driver, "fetch", "origin", "main", "--tags")
+    return driver, clones, before
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.no_autopatch_lifecycle_lock
+def test_discovery_refreshes_split_pin_sources_without_changing_worktrees(
+    tmp_path: Path, explicit: bool,
+) -> None:
+    from vq import admin
+
+    driver, clones, before = _split_discovery_repos(tmp_path)
+    stale = fleet_release.discover_latest_report(driver, fetch=False, pin_repos=clones)
+    assert stale.release.tag == "v0.15.59"
+    assert "v0.15.60" in fleet_release.discovery_warning(stale)
+    for clone in clones.values():
+        (clone / "README").write_text("operator edits\n")
+    # One checkout can appear under more than one configured slug or a symlink.
+    alias = tmp_path / "qc-alias"
+    alias.symlink_to(clones["mpei/vibe-qc"], target_is_directory=True)
+    clones["retained-alias"] = alias
+    fetched = []
+
+    def run(argv, **kwargs):
+        if argv[3] == "fetch":
+            source = Path(argv[2])
+            fetched.append(source)
+            held = admin._active_toolset_lifecycle_resources()
+            assert ("checkout", str(source)) in held
+        return subprocess.run(argv, **kwargs)
+
+    if explicit:
+        selected = fleet_release.discover_report(
+            "v0.15.60", driver, pin_repos=clones, runner=run,
+        )
+    else:
+        selected = fleet_release.discover_latest_report(driver, pin_repos=clones, runner=run)
+    assert selected.release.tag == "v0.15.60"
+    assert selected.rejected_candidates == ()
+    assert fleet_release.discovery_warning(selected) is None
+    assert sorted(fetched) == sorted(before)
+    for clone, head in before.items():
+        assert _git(clone, "rev-parse", "HEAD") == head
+        assert (clone / "README").read_text() == "operator edits\n"
+
+
+def test_discovery_refreshes_stale_component_refs(tmp_path: Path) -> None:
+    """Regression: fetching only the report clone silently selected v0.15.59."""
+    driver, clones, _ = _split_discovery_repos(tmp_path)
+    selected = fleet_release.discover_latest_report(driver, pin_repos=clones)
+    assert selected.release.tag == "v0.15.60"
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "oserror"])
+@pytest.mark.no_autopatch_lifecycle_lock
+def test_discovery_refuses_cached_pins_when_a_source_fetch_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    driver, clones, _ = _split_discovery_repos(tmp_path)
+    attempted = []
+
+    def run(argv, **kwargs):
+        if argv[3] == "fetch" and Path(argv[2]) == clones["mpei/vibe-qc"]:
+            attempted.append(argv)
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 120)
+            if failure == "oserror":
+                raise OSError("transport unavailable")
+            return subprocess.CompletedProcess(argv, 1, "", "transport unavailable")
+        return subprocess.run(argv, **kwargs)
+
+    monkeypatch.setattr(
+        fleet_release, "_load_report_from_git",
+        lambda *a, **kw: pytest.fail("must not validate cached pins after failed fetch"),
+    )
+    with pytest.raises(fleet_release.FleetReleaseError, match="could not refresh report source"):
+        fleet_release.discover_latest_report(driver, pin_repos=clones, runner=run)
+    assert len(attempted) == 1
+
+
+def test_discovery_fetch_false_performs_no_fetch(tmp_path: Path) -> None:
+    driver, clones, _ = _split_discovery_repos(tmp_path)
+
+    def run(argv, **kwargs):
+        assert argv[3] != "fetch"
+        return subprocess.run(argv, **kwargs)
+
+    report = fleet_release.discover_latest_report(
+        driver, pin_repos=clones, fetch=False, runner=run,
+    )
+    assert report.release.tag == "v0.15.59"
+    assert report.rejected_candidates
+
+
 def test_parse_report_requires_a_supported_schema_and_every_component() -> None:
     sha = "a" * 40
     payload = _report("v0.15.60", sha)
@@ -343,6 +476,19 @@ def test_discovery_skips_rejected_newer_candidate(tmp_path: Path) -> None:
     selected = fleet_release.discover_latest_report(repo, fetch=False, pin_repos=_pin_repos(repo))
 
     assert selected.release.tag == "v0.15.59"
+    assert len(selected.rejected_candidates) == 1
+    warning = fleet_release.discovery_warning(selected)
+    assert "v0.15.60.json" in warning
+    assert "all_pins_accepted is not true" in warning
+    assert "fallback v0.15.59" in warning
+    # Diagnostics do not alter the accepted identity or persisted report.
+    assert selected.digest_sha256 == hashlib.sha256(
+        (repo / selected.source_path).read_bytes()
+    ).hexdigest()
+    assert "rejected_candidates" not in selected.raw
+    assert "rejected_candidates" not in fleet_release.report_summary(selected)
+    with pytest.raises(fleet_release.FleetReleaseError, match="fallback cannot authorize"):
+        fleet_release.require_latest_report(selected)
 
 
 def test_explicit_report_discovery_selects_only_named_identity(

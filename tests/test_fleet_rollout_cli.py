@@ -261,6 +261,118 @@ def test_timeout_preflight_fails_before_rollout_discovery_ssh(
     assert touched == []
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("mode", ["--dry-run", "--verify-only", "rollout"])
+def test_fallback_report_is_visible_and_cannot_authorize_rollout_or_verification(
+    monkeypatch: pytest.MonkeyPatch, as_json: bool, mode: str,
+) -> None:
+    report = replace(
+        _report(),
+        rejected_candidates=("releases/v0.15.61.json: pin ancestry failed",),
+    )
+    plan = _plan(report, [_action(action_id="driver", decision="skip")])
+    _patch_discovery(monkeypatch, report=report, plans=[plan])
+    if mode != "--dry-run":
+        monkeypatch.setattr(
+            fleet_rollout, "reconcile_durable_operations",
+            lambda **kw: pytest.fail("fallback must stop before reconciliation"),
+        )
+        monkeypatch.setattr(
+            fleet_rollout, "collect_snapshots",
+            lambda **kw: pytest.fail("fallback must stop before host probes"),
+        )
+    result = CliRunner().invoke(main, [
+        "admin", "rollout-latest",
+        *([mode] if mode != "rollout" else []),
+        *(["--json"] if as_json else []),
+    ])
+    assert result.exit_code == (0 if mode == "--dry-run" else 1), result.output
+    assert "fallback v0.15.60" in result.output
+    assert "v0.15.61.json: pin ancestry failed" in result.output
+    if as_json:
+        payload = json.loads(result.stdout)
+        if mode == "--dry-run":
+            assert payload["discovery_warnings"]
+            assert payload["report"]["release_tag"] == "v0.15.60"
+        else:
+            assert payload["status"] == "error"
+            assert "fallback cannot authorize" in payload["error"]
+    elif mode == "--dry-run":
+        assert "WARNING:" in result.output
+        assert "rollout-latest dry run" in result.output
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_unfetched_newer_report_cannot_verify_older_fleet_as_converged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, as_json: bool,
+) -> None:
+    from tests.test_fleet_release import _split_discovery_repos
+
+    driver, clones, _ = _split_discovery_repos(tmp_path)
+    # Exercise actual report loading, including the newer report rejection.
+    report = fleet_release.discover_latest_report(driver, fetch=False, pin_repos=clones)
+    assert report.release.tag == "v0.15.59"
+    plan = _plan(report, [_action(action_id="driver", decision="skip")])
+    _patch_discovery(monkeypatch, report=report, plans=[plan])
+    result = CliRunner().invoke(main, [
+        "admin", "rollout-latest", "--verify-only", *(["--json"] if as_json else []),
+    ])
+    assert result.exit_code == 1, result.output
+    assert "v0.15.60" in result.output
+    assert "fallback v0.15.59" in result.output
+
+
+def test_report_recheck_refuses_a_new_rejection_with_unchanged_selected_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _report()
+    fallback = replace(report, rejected_candidates=("releases/v0.15.61.json: invalid pin",))
+    plan = _plan(report, [_action(action_id="driver", decision="skip")])
+    _patch_discovery(monkeypatch, report=report, plans=[plan])
+    discoveries = iter((report, fallback))
+    monkeypatch.setattr(
+        fleet_release, "discover_latest_report", lambda *a, **kw: next(discoveries),
+    )
+    checked = []
+
+    def execute(*args, report_digest_resolver, **kwargs):
+        checked.append(True)
+        report_digest_resolver()
+        pytest.fail("same fallback digest must not authorize continued execution")
+
+    monkeypatch.setattr(fleet_rollout, "execute_plan", execute)
+    result = CliRunner().invoke(main, ["admin", "rollout-latest", "--json"])
+    assert checked == [True]
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert "fallback cannot authorize" in payload["error"]
+
+
+def test_from_report_refuses_an_older_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    import click
+
+    from vq.cli import _pin_deploy_identity
+
+    report = replace(_report(), rejected_candidates=("releases/v0.15.61.json: invalid pin",))
+    monkeypatch.setattr(fleet_release, "runtime_repo", lambda: Path("/repo"))
+    monkeypatch.setattr(fleet_release, "discover_latest_report", lambda *a, **kw: report)
+    with pytest.raises(click.UsageError, match="fallback cannot authorize"):
+        _pin_deploy_identity("vibeqc-queue", expected_sha=None, expected_tag=None)
+
+
+def test_failure_epoch_refuses_fallback_before_reading_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = replace(_report(), rejected_candidates=("releases/v0.15.61.json: invalid pin",))
+    monkeypatch.setattr(fleet_release, "discover_latest_report", lambda *a, **kw: report)
+    monkeypatch.setattr(
+        fleet_rollout.subprocess, "run", lambda *a, **kw: pytest.fail("must refuse fallback"),
+    )
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="fallback cannot authorize"):
+        fleet_rollout._observe_local_failure_report_epoch(Path("/repo"))
+
+
 def test_dry_run_is_json_and_performs_no_update(monkeypatch) -> None:
     report = _report()
     plan = _plan(report, [_action(action_id="driver", decision="skip")])

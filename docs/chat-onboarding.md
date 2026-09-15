@@ -367,8 +367,10 @@ script.
   deeper; covers in-flight design state and what shipped recently.
 - [`SPEC.md`](SPEC.md) — long-term design invariants and what vq is
   explicitly not trying to become.
-- [`roadmap.md`](roadmap.md) — version-by-version what shipped, with
-  rationale.
+- [`roadmap.md`](roadmap.md) — what is being worked on next, and what is
+  released but not yet deployed or validated.
+- [`roadmap_history.md`](roadmap_history.md) — version-by-version what
+  shipped through v0.9, with rationale; `CHANGELOG.md` from v0.26.0.
 - [`remote-access.md`](remote-access.md) — internet-reachable SSH
   setup (if you're submitting from off-LAN).
 - [`config.toml.example`](config.toml.example) — annotated config

@@ -7,7 +7,7 @@
 #
 #     error: cannot pull with rebase: You have unstaged changes.
 #
-# That blocks the rebase-then-push cycle CLAUDE.md § 2 makes mandatory, for
+# That blocks the rebase-then-push cycle most sessions land with (AGENTS.md), for
 # every chat working in this repository. They are also machine-specific
 # (cpython-314) and rebuilt automatically, so they carry no information.
 __pycache__/

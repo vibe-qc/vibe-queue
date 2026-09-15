@@ -26,7 +26,7 @@ landed across v0.5.24–v0.5.44: ``--tag`` verification (v0.5.24),
 ``--all-hosts`` fleet sweep (v0.5.37), vq self-update auto-restart
 (v0.5.42 / v0.5.43 symlink fix), and the
 admin-update-in-progress marker file (v0.5.44) — see the v0.6.0
-design pin in roadmap.md for the trail.
+design pin in docs/roadmap_history.md for the trail.
 """
 from __future__ import annotations
 

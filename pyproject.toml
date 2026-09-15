@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vq"
-version = "0.26.5"
+version = "0.26.6"
 description = "Cross-machine job queue for vibe-qc workloads"
 readme = "README.md"
 authors = [{name = "Michael F. Peintinger", email = "mpei@vibe-qc.com"}]

@@ -13,7 +13,7 @@ import json
 import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -206,6 +206,8 @@ class FleetReleaseReport:
     release_version: tuple[int, int, int]
     pins: Mapping[str, FleetPin]
     raw: Mapping[str, Any]
+    # Discovery diagnostics only: never part of the immutable report or digest.
+    rejected_candidates: tuple[str, ...] = ()
 
     @property
     def release(self) -> FleetPin:
@@ -782,8 +784,9 @@ def discover_latest_report(
     immutable patch in their supported series even after a newer series opens.
     """
     repo = (repo or runtime_repo()).resolve()
+    pin_repos = resolve_pin_repos(pin_repos)
     if fetch:
-        _git(repo, "fetch", "origin", "main", "--tags", "--quiet", runner=runner)
+        _fetch_report_sources(repo, pin_repos, runner=runner)
     names = _git(
         repo,
         "ls-tree",
@@ -819,7 +822,8 @@ def discover_latest_report(
     # every dry run for no decision value. A rejected newer candidate is
     # skipped exactly as before (an unaccepted or hand-damaged report
     # must not brick discovery of the older accepted one); its rejection
-    # reason still surfaces when no candidate is acceptable at all.
+    # reasons travel with the selected report, so callers cannot mistake a
+    # fallback for proof that the newest release has converged.
     def _release_key(path: str) -> tuple[int, int, int]:
         match = _TAG.fullmatch(Path(path).stem)
         assert match is not None  # candidates are pre-filtered
@@ -828,7 +832,7 @@ def discover_latest_report(
     rejected: list[str] = []
     for path in sorted(candidates, key=_release_key, reverse=True):
         try:
-            return _load_report_from_git(
+            report = _load_report_from_git(
                 repo,
                 ref=ref,
                 path=path,
@@ -836,7 +840,9 @@ def discover_latest_report(
                 pin_repos=pin_repos,
             )
         except FleetReleaseError as exc:
-            rejected.append(str(exc))
+            rejected.append(f"{path}: {exc}")
+        else:
+            return replace(report, rejected_candidates=tuple(rejected))
     # Report the newest few rejections, not all of them. Discovery searches
     # both layouts, so a vibe-queue checkout sees every monorepo-era report
     # and rejects all of them (their tags are not in this fresh history) --
@@ -852,6 +858,62 @@ def discover_latest_report(
         if remaining > 0:
             detail += f"; (+{remaining} older candidate(s) also rejected)"
     raise FleetReleaseError(f"no accepted fleet release report: {detail}")
+
+
+def _fetch_report_sources(
+    repo: Path, pin_repos: Mapping[str, Path], *, runner: Runner,
+) -> None:
+    """Refresh each distinct checkout once, under its lifecycle fence.
+
+    A failed fetch is fatal: validating cached refs after it would turn an
+    unavailable current release into a successful stale selection. Fetch
+    changes refs only, never the checkout, index or installed environment.
+    """
+    from vq import admin
+
+    sources = sorted({repo.resolve(), *(path.resolve() for path in pin_repos.values())})
+    try:
+        resources = tuple(
+            ("checkout", str(admin._canonical_lifecycle_checkout(source)))
+            for source in sources
+        )
+        with admin.toolset_lifecycle_lock(
+            [], action="vq-report-fetch", extra_resources=resources,
+        ):
+            for source in sources:
+                try:
+                    _git(source, "fetch", "origin", "main", "--tags", "--quiet", runner=runner)
+                except (FleetReleaseError, OSError, subprocess.SubprocessError) as exc:
+                    raise FleetReleaseError(
+                        f"could not refresh report source {source}: {exc}"
+                    ) from exc
+    except admin.AdminError as exc:
+        raise FleetReleaseError(f"could not fence report source fetch: {exc}") from exc
+
+
+def discovery_warning(report: FleetReleaseReport) -> str | None:
+    """Bounded explanation when discovery selected a fallback candidate."""
+    rejected = report.rejected_candidates
+    if not rejected:
+        return None
+    detail = "; ".join(rejected[:_MAX_REPORTED_REJECTIONS])
+    remaining = len(rejected) - _MAX_REPORTED_REJECTIONS
+    if remaining > 0:
+        detail += f"; (+{remaining} other candidate(s) also rejected)"
+    return (
+        f"selected fallback {report.release.tag}; newer report candidate(s) "
+        f"rejected: {detail}"
+    )
+
+
+def require_latest_report(report: FleetReleaseReport) -> None:
+    """Do not authorize latest-release mutation or convergence from a fallback."""
+    warning = discovery_warning(report)
+    if warning is not None:
+        raise FleetReleaseError(
+            f"{warning}. Resolve the newer report rejection and retry; "
+            "a fallback cannot authorize latest-report rollout or verification."
+        )
 
 
 def discover_report(
@@ -872,8 +934,9 @@ def discover_report(
     """
     _semver(tag, field="accepted report identity")
     repo = (repo or runtime_repo()).resolve()
+    pin_repos = resolve_pin_repos(pin_repos)
     if fetch:
-        _git(repo, "fetch", "origin", "main", "--tags", "--quiet", runner=runner)
+        _fetch_report_sources(repo, pin_repos, runner=runner)
     candidates = report_paths_for(tag)
     path = candidates[0]
     last: FleetReleaseError | None = None

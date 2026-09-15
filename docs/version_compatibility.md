@@ -19,7 +19,8 @@ because:
   v0.6.x arc alone, vs. 8 vibe-qc patches over the same window).
   Stamping every vq commit with the current vibe-qc tag would lose
   per-patch granularity entirely.
-* `vibe-queue/docs/roadmap.md` records per-vq-version history;
+* `vibe-queue/docs/roadmap_history.md` (through v0.9) and `CHANGELOG.md`
+  (from v0.26.0) record per-vq-version history;
   cross-referencing it against vibe-qc tags via this matrix keeps
   the granular record useful.
 * Operators that want a specific behaviour ("the v0.6.51

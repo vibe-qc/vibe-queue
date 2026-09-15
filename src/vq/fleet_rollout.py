@@ -9518,6 +9518,7 @@ def _observe_local_failure_report_epoch(repo: Path) -> _FailureReportEpoch:
     """
     try:
         report = fleet_release.discover_latest_report(repo, fetch=False)
+        fleet_release.require_latest_report(report)
         proc = subprocess.run(
             [
                 "git",

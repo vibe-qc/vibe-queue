@@ -1043,9 +1043,9 @@ def test_workdir_docs_match_scheduler_scratch_runtime_contract() -> None:
     used to promise two directories unconditionally, which made safe-looking
     payloads overwrite their own inputs on the first route.
     """
-    # CLAUDE.md is vibe-qc's contributor-agent configuration and was not
-    # carried into this repository by the 2026-09 split; the queue's own copy
-    # of the contract is the one this repository can hold itself to.
+    # The pre-split CLAUDE.md, which also stated this contract, stayed in the
+    # archived monorepo. AGENTS.md here sends agents to agent_interaction.md,
+    # the copy of the contract this repository holds itself to.
     repo_root = Path(__file__).resolve().parents[1]
     interaction_path = repo_root / "docs" / "agent_interaction.md"
     assert interaction_path.is_file(), f"{interaction_path} is missing"

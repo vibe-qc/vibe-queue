@@ -608,11 +608,14 @@ exit nonzero while retaining the successfully copied tree and its freshness
 manifest.
 
 `vq fetch --name BASENAME` is the artifact-only path. It copies one regular
-workspace file directly into `-o DIR` and returns no `stdout.log`,
-`stderr.log`, `_vq` metadata, calculation sidecars, or diagnosis sidecar.
+workspace file or complete directory directly into `-o DIR`. It adds no queue
+logs, `_vq` metadata, sibling calculation sidecars, or diagnosis sidecar.
 Names are one basename, not paths, so traversal and symlink escapes are
 rejected. JSON results use `kind: "artifact"` and include the requested
 `name`.
+
+For opt-in TREXIO HDF5/text output, runtime checks and staged READ inputs, see
+[TREXIO export and READ through vq](trexio_queue.md).
 
 For one file in the recorded scratch workdir, combine `--workdir` and `--name`.
 If it is nested, pass the directory separately with `--subdir`:
@@ -623,7 +626,7 @@ vq fetch compute-b JOBID --workdir --subdir results --name pair-tests.xml -o evi
 vq fetch compute-b JOBID --workdir --subdir results --name provenance.json -o evidence/
 ```
 
-These commands copy only the selected regular file directly into `evidence/`.
+These commands copy only the selected file or directory directly into `evidence/`.
 They do not transfer sibling source/build trees or refresh a scheduler workspace.
 `--name` still accepts only a basename. `--subdir` requires `--workdir --name`
 and accepts relative directory components; absolute paths, `.`/`..`, and

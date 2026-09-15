@@ -106,4 +106,5 @@ writes a flag file, with a cap so a non-converging loop cannot run forever.
 ../abort
 ../retry
 ../throttle
+../trexio_queue
 ```

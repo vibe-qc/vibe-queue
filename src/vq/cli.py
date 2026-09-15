@@ -9182,7 +9182,8 @@ def resubmit(
     metavar="BASENAME",
     help="Fetch exactly one workspace artifact into -o DIR, without queue "
     "logs, metadata, or diagnosis sidecars. The name must be one basename "
-    "(for a QVF container: --name job.qvf). Combine with --workdir to select "
+    "(a file such as job.qvf or a directory such as run.trexio). "
+    "Combine with --workdir to select "
     "from the recorded scratch workdir instead of the workspace.",
 )
 @click.option(
@@ -10800,16 +10801,22 @@ def admin_rollout_latest(
             with admin_module.toolset_lifecycle_lock(
                 [driver_prog], action="vq-rollout-report-discovery",
             ):
-                return fleet_release.discover_latest_report(
+                discovered = fleet_release.discover_latest_report(
                     repo,
                     pin_repos=cfg.pin_source_repos,
                     runner=admin_module._mutating_git_run,
                 )
+                if not dry_run:
+                    fleet_release.require_latest_report(discovered)
+                return discovered
 
         def current_report_digest() -> str:
             return discover_current_report().digest_sha256
 
         report = discover_current_report()
+        discovery_warning = fleet_release.discovery_warning(report)
+        if discovery_warning is not None:
+            click.echo(f"WARNING: {discovery_warning}", err=True)
 
         def ancestry(pin_name: str, older: str, newer: str) -> bool | None:
             return fleet_release.git_is_pin_ancestor(
@@ -11354,6 +11361,8 @@ def admin_rollout_latest(
                     "selection": selection.as_dict(),
                     **plan.as_dict(),
                 }
+                if discovery_warning is not None:
+                    payload["discovery_warnings"] = [discovery_warning]
                 click.echo(json.dumps(payload, indent=2, sort_keys=True))
             else:
                 click.echo(
@@ -11708,6 +11717,7 @@ def _pin_deploy_identity(
         report = fleet_release.discover_latest_report(
             repo, runner=admin_module._mutating_git_run,
         )
+        fleet_release.require_latest_report(report)
     except fleet_release.FleetReleaseError as exc:
         raise click.UsageError(f"--from-report: {exc}") from None
     pin = report.pins[pin_name]

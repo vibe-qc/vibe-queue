@@ -124,6 +124,16 @@ A finding is in scope if it answers one of those the wrong way.
   `build_job.py`, `fetch.py`, `paths.py`: path traversal out of a workspace,
   a fetch that writes outside its destination, a spec field that escapes its
   serialization.
+  Named-artifact fetch accepts a regular file or a complete directory tree.
+  It retains the same job ownership check, basename-only selection and
+  explicit workdir/subdirectory selection. Source traversal uses open directory
+  descriptors and refuses symlinks and special files at every selected node;
+  archive transport rejects links, traversal, duplicate members and foreign
+  roots. The receiver stages the complete selected tree before publication,
+  preserving a prior destination on transfer failure. Directory refresh replaces
+  the prior tree rather than merging stale files. Fetching a directory does not
+  assert a transactionally consistent snapshot of an actively writing producer;
+  consumers requiring complete scientific output should fetch a completed job.
 - **Privileged lifecycle.** `src/vq/admin.py`, `lifecycle.py`,
   `provision.py`, `auto_update.py`, `scripts/*.sh`,
   `contrib/deploy-multi-user.sh`, `contrib/vq-multi-user-refresh*` and the

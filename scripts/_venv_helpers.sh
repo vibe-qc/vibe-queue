@@ -1165,8 +1165,8 @@ EOF
     cat >&2 <<EOF
 Error: a vq daemon is $(vq_daemon_describe "$venv").
 
-$action would swap code underneath it. Use `vq self-update` or
-`vq admin update` for a serving environment, or stop it yourself first:
+$action would swap code underneath it. Use \`vq self-update\` or
+\`vq admin update\` for a serving environment, or stop it yourself first:
     systemctl --user stop $VQ_DAEMON_UNIT     # if systemd-managed
     $venv/bin/vq daemon stop                  # otherwise
 EOF

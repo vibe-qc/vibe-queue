@@ -2,7 +2,7 @@
 
 The general round-3 audit (v0.7.13) walked the v0.6.18 → v0.7.12
 ships but stopped short of the multi-user codepaths called out
-in the roadmap's "Round-3 hardening audit + multi-user test
+in the roadmap history's "Round-3 hardening audit + multi-user test
 coverage audit" item. v0.7.14 fills the multi-user gap.
 
 Audit scope by ship — each test pins a multi-user-specific
