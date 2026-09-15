@@ -1,0 +1,46 @@
+# vq job queue daemon -- user-level systemd unit template.
+#
+# SINCE v0.26.1, PREFER `vq daemon install`. It writes this unit with
+# ExecStart pointing at the vq that ran it, records which vq installed it, and
+# enables and starts it. Copying this template by hand is what left three
+# fleet hosts with three different ExecStart lines, two of them pinned to a
+# venv path that outlived the vq it named.
+#
+#   vq daemon install              # detects the manager
+#   vq daemon install --dry-run    # print every file and command, change nothing
+#
+# This file remains as a reference for what that generates, and for a host
+# that must be provisioned before vq is installed on it.
+#
+# Manual install (per-user):
+#   mkdir -p ~/.config/systemd/user
+#   cp vq-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vq-daemon
+#
+# Logs land in the user's journal:
+#   journalctl --user -u vq-daemon -f
+#
+# Adjust ExecStart if `vq` is not in $PATH for the systemd user session
+# (typical fix: use the absolute path to the venv's vq script).
+#
+# Optional dashboard sidecar:
+#   ExecStart=%h/.local/bin/vq daemon run --web --web-host 127.0.0.1 --web-port 8765
+# This keeps the browser dashboard alive with the daemon. Use the separate
+# vq-web.service template instead if you want systemd to restart the dashboard
+# independently from the queue daemon.
+
+[Unit]
+Description=vq job queue daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vq daemon run
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet doctor{% endblock %}
+{% block content %}
+<h2>Fleet doctor</h2>
+<p class="hint">
+  The same per-host checks as <code>vq doctor --all</code>, run from the
+  console host. A sweep dials every host over SSH, so it runs only on
+  demand (30 s debounce). <a href="/fleet">← host grid</a>
+</p>
+<form class="toolbar">
+  <button type="button"
+          hx-post="/fleet/doctor/_refresh"
+          hx-swap="innerHTML"
+          hx-target="#doctor-refresh-result">Run doctor sweep</button>
+  <span id="doctor-refresh-result" class="hint"></span>
+</form>
+{% include "fleet_doctor_board.html" %}
+{% endblock %}

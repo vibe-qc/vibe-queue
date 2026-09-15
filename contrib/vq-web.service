@@ -1,0 +1,54 @@
+# vq web dashboard -- systemd-user unit template (reference / fallback).
+#
+# `vq web install` is the supported way to deploy the dashboard. It detects
+# the service manager (systemd user or system, launchd user), writes and
+# enables the unit, points ExecStart at the vq that ran it, and records the
+# install in <config-dir>/web-console-install.json so `vq web status` can
+# report later drift. `vq web install --dry-run` prints every file and
+# command first and changes nothing. See docs/fleet_console.md.
+#
+# This file remains as the reference for a host that has to hand-roll its
+# unit -- a site-managed unit directory, a distribution that packages its
+# own, or any case `vq web install` does not cover. Install it by hand:
+#   mkdir -p ~/.config/systemd/user
+#   cp vq-web.service ~/.config/systemd/user/
+#   # Edit ExecStart to use the absolute venv path (vq probably isn't on
+#   # the systemd user PATH).
+#   sed -i "s|ExecStart=.*|ExecStart=$HOME/vibeqc/vibe-queue/.venv/bin/vq web run|" \
+#       ~/.config/systemd/user/vq-web.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vq-web
+#
+# Logs land in the user's journal:
+#   journalctl --user -u vq-web -f
+#
+# Notes:
+# * Defaults to 127.0.0.1:8765 (localhost-only). Bind, port, fleet mode and
+#   the rest belong in the `[web]` section of the vq config rather than on
+#   this ExecStart line -- see docs/fleet_console.md § Configuration.
+# * As written this unit serves the single-host dashboard: read endpoints
+#   are unauthenticated and write endpoints require a bearer token (set up
+#   via `vq web init-token` once). In fleet mode with console accounts
+#   configured, the read endpoints require a login too. Do NOT bind to
+#   0.0.0.0 unless behind a trusted reverse proxy. See docs/web.md for the
+#   caddy sketch.
+# * Restart=on-failure: if uvicorn dies, systemd brings it back. The
+#   dashboard reads on-disk state, so it's safe to restart at any time.
+# * After=vq-daemon.service is *not* set: the dashboard works even
+#   without the daemon, showing the last on-disk state. Removing the
+#   ordering means a daemon restart doesn't take the dashboard down.
+
+[Unit]
+Description=vq read-only web dashboard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vq web run
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

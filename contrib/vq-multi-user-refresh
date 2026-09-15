@@ -1,0 +1,2105 @@
+#!/bin/bash -p
+# Transactional refresh for the root-owned /opt/vq multi-user installation.
+#
+# The only accepted source identity is the mandatory full SHA supplied by the
+# release operator.  Git observes and archives that explicit commit as the
+# invoking (non-root) user with repository hooks/configuration disabled and
+# optional locks off.  Root builds only the resulting sealed, root-owned
+# snapshot.  The live venv is not touched until the exact systemd unit is
+# stopped and quiescent.
+#
+# This file is installed root:root 0755 at
+# /opt/vq/bin/vq-multi-user-refresh.  It sources only the root-owned installed
+# copy of the shared toolset lifecycle-lock helper.  Do not point either path
+# back into a checkout.
+
+set -euo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+IFS=$' \t\n'
+umask 077
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP VIRTUAL_ENV
+unset VIBE_TOOLSET_LIFECYCLE_LOCK_HELPER_LOADED \
+    VIBE_TOOLSET_ADMIN_LOCK_PID VIBE_TOOLSET_ADMIN_LOCK_CHECKOUT \
+    VIBE_TOOLSET_ADMIN_LOCK_TARGET VIBE_TOOLSET_ADMIN_LOCK_CHECKOUT_PATH \
+    VIBE_TOOLSET_ADMIN_LOCK_TARGET_PATH VIBE_TOOLSET_ADMIN_LOCK_CHECKOUT_FD \
+    VIBE_TOOLSET_ADMIN_LOCK_TARGET_FD VIBE_TOOLSET_ADMIN_LOCK_PYTHON \
+    VIBE_TOOLSET_INHERITED_PID VIBE_TOOLSET_INHERITED_CHECKOUT \
+    VIBE_TOOLSET_INHERITED_TARGET VIBE_TOOLSET_INHERITED_ACTION \
+    VIBE_TOOLSET_INHERITED_CHECKOUT_PATH VIBE_TOOLSET_INHERITED_TARGET_PATH \
+    VIBE_TOOLSET_INHERITED_CHECKOUT_FD VIBE_TOOLSET_INHERITED_TARGET_FD \
+    VIBE_TOOLSET_INHERITED_HELPER_PID VIBE_TOOLSET_INHERITED_STATE
+PYTHONNOUSERSITE=1
+export PYTHONNOUSERSITE
+
+OPT_ROOT="/opt/vq"
+OPT_VENV="$OPT_ROOT/venv"
+OPT_VQ="$OPT_VENV/bin/vq"
+LOCK_HELPER="$OPT_ROOT/libexec/vibe-toolset-lifecycle-lock.sh"
+STATE_DIR="/var/lib/vq"
+RECEIPT_DIR="$OPT_ROOT/lifecycle"
+RECEIPT="$RECEIPT_DIR/vq-multi-user-refresh.json"
+RECEIPT_ARMING="$RECEIPT_DIR/.vq-multi-user-refresh.arming"
+UNIT="vq-daemon-multi-user.service"
+UNIT_FILE="/etc/systemd/system/$UNIT"
+RUNTIME_LOCK_REL="vibe-queue/contrib/vq-multi-user-runtime-requirements.txt"
+
+usage() {
+    cat <<'EOF'
+Usage: vq-multi-user-refresh --checkout DIR --expected-sha SHA [OPTIONS]
+
+Install one exact accepted vq commit into the root-owned multi-user runtime.
+Both --checkout and --expected-sha are mandatory. SHA must be the full 40-hex
+release pin; it is a cross-check against checkout HEAD and the explicit commit
+that is archived, built, installed, marked, and proved over daemon RPC.
+
+Options:
+  --checkout DIR       Canonical vibe-qc checkout owned by the sudo invoker.
+  --expected-sha SHA   Mandatory full accepted commit; downgrade/divergence
+                       from an existing installed source SHA is refused.
+  --bootstrap          Permit an absent /opt/vq/venv. The exact systemd unit
+                       must already be installed and inactive; this helper
+                       starts it and performs the same RPC proof as refresh.
+  --dry-run            Validate locks, source, ancestry, and unit; do not build
+                       or mutate anything.
+  -h, --help           Show this help.
+
+An interrupted transaction is recovered under the same checkout and target
+lifecycle locks before a new transaction is considered.
+EOF
+}
+
+die() {
+    echo "vq-multi-user-refresh: $*" >&2
+    exit 1
+}
+
+require_value() {
+    local option="$1"
+    local remaining="$2"
+    local value="${3-}"
+    if [ "$remaining" -lt 2 ] || [ -z "$value" ]; then
+        die "$option requires a non-empty argument"
+    fi
+    case "$value" in
+        -*) die "$option requires a value, not option-like argument '$value'" ;;
+    esac
+}
+
+checkout=""
+expected_sha=""
+bootstrap=0
+dry_run=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --checkout)
+            require_value "$1" "$#" "${2-}"
+            checkout="$2"
+            shift 2
+            ;;
+        --expected-sha)
+            require_value "$1" "$#" "${2-}"
+            expected_sha="$2"
+            shift 2
+            ;;
+        --bootstrap)
+            bootstrap=1
+            shift
+            ;;
+        --dry-run)
+            dry_run=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $1" ;;
+    esac
+done
+
+[ "$(id -u)" = "0" ] || die "must run as root through authenticated sudo"
+[ "$(uname -s)" = "Linux" ] || die "multi-user refresh is Linux-only"
+[ -n "$checkout" ] || die "--checkout is mandatory"
+[ -n "$expected_sha" ] || die "--expected-sha is mandatory"
+[[ "$expected_sha" =~ ^[0-9A-Fa-f]{40}$ ]] \
+    || die "--expected-sha must be exactly 40 hexadecimal characters"
+expected_sha="${expected_sha,,}"
+
+# A direct root invocation has no non-root identity under which to perform Git
+# observation. Refuse it: Git must never read a user checkout as root.
+source_user="${SUDO_USER:-}"
+[ -n "$source_user" ] && [ "$source_user" != "root" ] \
+    || die "invoke through sudo from the checkout owner; direct root use is refused"
+source_uid="$(id -u "$source_user" 2>/dev/null)" \
+    || die "cannot resolve sudo invoker '$source_user'"
+source_home="$(getent passwd "$source_user" | cut -d: -f6)"
+[ -n "$source_home" ] || die "cannot resolve home for sudo invoker '$source_user'"
+
+case "$checkout" in
+    *$'\n'*|*$'\r'*|*$'\t'*) die "checkout path contains a control character" ;;
+esac
+[ -d "$checkout/.git" ] || die "not a git checkout: $checkout"
+checkout="$(cd "$checkout" && pwd -P)"
+[ -d "$checkout/vibe-queue/src/vq" ] \
+    || die "not a vibe-qc checkout: $checkout/vibe-queue/src/vq missing"
+[ -d "$OPT_ROOT" ] && [ ! -L "$OPT_ROOT" ] \
+    || die "$OPT_ROOT must be a real root-owned directory"
+opt_root_uid="$(stat -c '%u' "$OPT_ROOT")"
+opt_root_mode="$(stat -c '%a' "$OPT_ROOT")"
+[ "$opt_root_uid" = "0" ] || die "$OPT_ROOT is not owned by root"
+case "$opt_root_mode" in
+    *[2367][0-7]|*[2367]) die "$OPT_ROOT is group- or world-writable" ;;
+esac
+
+# Validate the only sourced file before parsing it. The deployed copy is
+# immutable to non-root users and independent of the moving checkout.
+[ -f "$LOCK_HELPER" ] && [ ! -L "$LOCK_HELPER" ] \
+    || die "missing or symlinked root-owned lifecycle helper: $LOCK_HELPER"
+lock_owner="$(stat -c '%u' "$LOCK_HELPER")"
+lock_mode="$(stat -c '%a' "$LOCK_HELPER")"
+[ "$lock_owner" = "0" ] || die "$LOCK_HELPER is not owned by root"
+case "$lock_mode" in
+    *[2367][0-7]|*[2367]) die "$LOCK_HELPER is group- or world-writable" ;;
+esac
+# shellcheck source=/opt/vq/libexec/vibe-toolset-lifecycle-lock.sh
+. "$LOCK_HELPER"
+
+LOCK_PYTHON=""
+vibe_toolset_find_external_python LOCK_PYTHON "$OPT_VENV" 3 12 \
+    || die "Python 3.12+ outside $OPT_VENV is required"
+python_owner="$(stat -c '%u' "$LOCK_PYTHON")"
+python_mode="$(stat -c '%a' "$LOCK_PYTHON")"
+[ "$python_owner" = "0" ] || die "trusted Python is not root-owned: $LOCK_PYTHON"
+case "$python_mode" in
+    *[2367][0-7]|*[2367]) die "trusted Python is group- or world-writable" ;;
+esac
+runtime_python_tag="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S -c '
+import os
+import sys
+
+if os.uname().machine != "x86_64":
+    raise SystemExit("privileged runtime wheel lock supports x86_64 only")
+if sys.version_info[:2] not in {(3, 12), (3, 13), (3, 14)}:
+    raise SystemExit("privileged runtime wheel lock supports CPython 3.12-3.14 only")
+libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
+if not libc.startswith("glibc "):
+    raise SystemExit("privileged runtime wheel lock supports glibc only")
+print(f"cp{sys.version_info.major}{sys.version_info.minor}")
+')" || die "trusted Python/platform is outside the accepted runtime wheel lock"
+
+migration_receipt="$checkout/.git/vq-multi-user-bootstrap.json"
+migration_handoff=0
+validate_deploy_handoff_receipt() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$migration_receipt" "$checkout" "$expected_sha" "$source_uid" \
+        "$source_home" <<'PY_DEPLOY_HANDOFF_RECEIPT'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+checkout = pathlib.Path(sys.argv[2])
+expected_sha = sys.argv[3]
+source_uid = int(sys.argv[4])
+source_home = pathlib.Path(sys.argv[5])
+if path != checkout / ".git" / "vq-multi-user-bootstrap.json":
+    raise SystemExit("wrong deploy handoff receipt path")
+fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    metadata = os.fstat(fd)
+    raw = os.read(fd, 16385)
+finally:
+    os.close(fd)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != source_uid
+    or metadata.st_nlink != 1
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or not raw
+    or len(raw) > 16384
+):
+    raise SystemExit("unsafe deploy handoff receipt")
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate deploy handoff receipt key")
+        result[key] = value
+    return result
+
+
+data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+keys = {
+    "schema", "transaction", "phase", "expected_sha", "repo", "user_uid",
+    "user_venv", "drain_path", "drain_reason", "drain_set_at",
+    "user_was_active", "user_daemon_identity", "queue_path",
+    "queue_existed", "queue_dev", "queue_ino", "queue_mode",
+    "queue_fenced_mode", "queue_fenced_dev", "queue_fenced_ino",
+    "queue_stage_path", "queue_stage_dev", "queue_stage_ino",
+    "config_created", "config_sha256", "root_tree_sha256",
+}
+if type(data) is not dict or set(data) != keys:
+    raise SystemExit("deploy handoff receipt has the wrong schema")
+if (
+    data["schema"] != 1
+    or type(data["transaction"]) is not str
+    or re.fullmatch(r"[0-9a-f]{32}", data["transaction"]) is None
+    or data["phase"] != "root-intent"
+    or data["expected_sha"] != expected_sha
+    or data["repo"] != str(checkout)
+    or data["user_uid"] != source_uid
+    or data["user_venv"] != str(checkout / "vibe-queue" / ".venv")
+    or data["root_tree_sha256"] is not None
+    or type(data["queue_fenced_dev"]) is not int
+    or data["queue_fenced_dev"] < 0
+    or type(data["queue_fenced_ino"]) is not int
+    or data["queue_fenced_ino"] <= 0
+    or type(data["user_daemon_identity"]) is not dict
+):
+    raise SystemExit("deploy handoff receipt does not authorize this exact activation")
+if type(data["config_created"]) is not bool:
+    raise SystemExit("deploy handoff config flag is malformed")
+if data["config_created"]:
+    if type(data["config_sha256"]) is not str or re.fullmatch(
+        r"[0-9a-f]{64}", data["config_sha256"]
+    ) is None:
+        raise SystemExit("deploy handoff config digest is malformed")
+elif data["config_sha256"] is not None:
+    raise SystemExit("deploy handoff unexpectedly names a config digest")
+queue = pathlib.Path(data["queue_path"])
+if queue != source_home / ".local" / "share" / "vq" / "queue":
+    raise SystemExit("deploy handoff queue path changed")
+if data["queue_existed"]:
+    if any(
+        data[key] is not None
+        for key in ("queue_stage_path", "queue_stage_dev", "queue_stage_ino")
+    ):
+        raise SystemExit("existing queue unexpectedly has a blocker stage")
+else:
+    expected_stage = queue.parent / (
+        f".{queue.name}.vq-multi-user-bootstrap-{data['transaction']}.blocker"
+    )
+    if (
+        data["queue_stage_path"] != str(expected_stage)
+        or type(data["queue_stage_dev"]) is not int
+        or data["queue_stage_dev"] < 0
+        or type(data["queue_stage_ino"]) is not int
+        or data["queue_stage_ino"] <= 0
+        or (data["queue_stage_dev"], data["queue_stage_ino"])
+        != (data["queue_fenced_dev"], data["queue_fenced_ino"])
+    ):
+        raise SystemExit("deploy handoff blocker stage identity changed")
+PY_DEPLOY_HANDOFF_RECEIPT
+}
+
+lifecycle_action="vq-multi-user-refresh"
+if [ -e "$migration_receipt" ] || [ -L "$migration_receipt" ]; then
+    validate_deploy_handoff_receipt \
+        || die "active multi-user deploy receipt does not authorize this activation"
+    migration_handoff=1
+    lifecycle_action="vq-multi-user-deploy"
+fi
+vibe_toolset_acquire_lifecycle_lock \
+    "$LOCK_PYTHON" "$checkout" "$OPT_VENV" "$lifecycle_action" \
+    || die "could not acquire exact checkout and /opt/vq lifecycle locks"
+if [ "$migration_handoff" = "1" ]; then
+    validate_deploy_handoff_receipt \
+        || die "active multi-user deploy receipt changed after lifecycle locking"
+fi
+
+work_dir=""
+transaction_active=0
+
+fsync_dir() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+' "$1"
+}
+
+fsync_tree_no_follow() {
+    local root="$1"
+    local trusted_python="$2"
+    local flush="${3:-1}"
+    [ "$root" = "$OPT_VENV" ] || return 1
+    [ "$trusted_python" = "$LOCK_PYTHON" ] || return 1
+    [ "$flush" = "0" ] || [ "$flush" = "1" ] || return 1
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$root" "$trusted_python" 0 "$flush" <<'PY_FSYNC_TREE'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+expected_owner = int(sys.argv[3])
+flush = sys.argv[4] == "1"
+root_stat = root.lstat()
+if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != expected_owner:
+    raise SystemExit("installed venv root is not a root-owned directory")
+
+# fwalk supplies descriptor-relative names. Never follow a symlink; venvs
+# legitimately contain interpreter symlinks, which have no data blocks to
+# flush. Refuse devices, FIFOs, and sockets inside the executable runtime.
+for _dirpath, dirnames, filenames, dirfd in os.fwalk(
+    root, topdown=False, follow_symlinks=False
+):
+    directory = os.fstat(dirfd)
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or directory.st_uid != expected_owner
+        or stat.S_IMODE(directory.st_mode) & 0o022
+    ):
+        raise SystemExit("installed venv contains an unsafe directory")
+    for name in [*dirnames, *filenames]:
+        item = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if item.st_uid != expected_owner:
+            raise SystemExit("installed venv contains a non-root-owned entry")
+        if stat.S_ISLNK(item.st_mode):
+            link_path = pathlib.Path(_dirpath) / name
+            try:
+                resolved = link_path.resolve(strict=True)
+                resolved.relative_to(root)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                # Standard venv interpreter links may resolve to the trusted
+                # root-owned external Python selected before the transaction.
+                resolved = link_path.resolve(strict=True)
+                if resolved != pathlib.Path(sys.argv[2]).resolve(strict=True):
+                    raise SystemExit("installed venv contains an unsafe symlink")
+            target = resolved.stat()
+            if (
+                target.st_uid != expected_owner
+                or stat.S_IMODE(target.st_mode) & 0o022
+                or not (stat.S_ISREG(target.st_mode) or stat.S_ISDIR(target.st_mode))
+            ):
+                raise SystemExit("installed venv symlink resolves to an unsafe target")
+            continue
+        if stat.S_ISDIR(item.st_mode):
+            if stat.S_IMODE(item.st_mode) & 0o022:
+                raise SystemExit("installed venv contains a writable directory")
+            continue
+        if not stat.S_ISREG(item.st_mode):
+            raise SystemExit("unsupported special file in installed venv")
+        if stat.S_IMODE(item.st_mode) & 0o022:
+            raise SystemExit("installed venv contains a writable regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(name, flags, dir_fd=dirfd)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (item.st_dev, item.st_ino):
+                raise SystemExit("installed venv entry changed during fsync")
+            if flush:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+    if flush:
+        os.fsync(dirfd)
+PY_FSYNC_TREE
+    # Persist the venv directory entry and its parent transaction namespace.
+    if [ "$flush" = "1" ]; then
+        fsync_dir "$OPT_ROOT"
+    fi
+}
+
+remove_exact_target() {
+    [ "$1" = "$OPT_VENV" ] || return 1
+    if [ -e "$OPT_VENV" ] || [ -L "$OPT_VENV" ]; then
+        rm -rf -- "$OPT_VENV"
+        fsync_dir "$OPT_ROOT"
+    fi
+}
+
+clear_receipt() {
+    local transaction="$1"
+    local expected_digest=""
+    load_receipt || return 1
+    [ "${RECEIPT_FIELDS[1]}" = "$transaction" ] || return 1
+    expected_digest="${RECEIPT_FIELDS[19]}"
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$RECEIPT" "$RECEIPT_ARMING" "$transaction" "$expected_digest" \
+        <<'PY_CLEAR_RECEIPT'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+arming = pathlib.Path(sys.argv[2])
+transaction = sys.argv[3]
+expected_digest = sys.argv[4]
+scratch = path.with_name(f".{path.name}.{transaction}.tmp")
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+
+def read_owned(candidate):
+    fd = os.open(candidate, flags)
+    try:
+        metadata = os.fstat(fd)
+        raw = os.read(fd, 16385)
+    finally:
+        os.close(fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not raw
+        or len(raw) > 16384
+    ):
+        raise SystemExit(f"unsafe refresh receipt artifact: {candidate}")
+    data = json.loads(raw.decode("utf-8"))
+    if type(data) is not dict or data.get("transaction") != transaction:
+        raise SystemExit(f"refresh receipt artifact has wrong transaction: {candidate}")
+    return metadata, data, raw
+
+
+canonical_stat, canonical, canonical_raw = read_owned(path)
+if (
+    canonical_stat.st_nlink != 1
+    or hashlib.sha256(canonical_raw).hexdigest() != expected_digest
+):
+    raise SystemExit("canonical refresh receipt has an unexpected link count")
+if os.path.lexists(arming):
+    arming_stat, _, _ = read_owned(arming)
+    if (arming_stat.st_dev, arming_stat.st_ino) != (
+        canonical_stat.st_dev,
+        canonical_stat.st_ino,
+    ):
+        raise SystemExit("arming artifact is not the canonical receipt inode")
+    os.unlink(arming)
+if os.path.lexists(scratch):
+    scratch_stat, pending, _ = read_owned(scratch)
+    if scratch_stat.st_nlink != 1 or set(pending) != set(canonical):
+        raise SystemExit("unsafe refresh receipt update scratch")
+    immutable = set(canonical) - {"phase", "new_tree", "new_dev", "new_ino"}
+    if any(pending[key] != canonical[key] for key in immutable):
+        raise SystemExit("refresh receipt update scratch changed immutable fields")
+    transitions = {
+        ("prepared", "stopping"),
+        ("stopping", "stopped"),
+        ("stopped", "backup-pending"),
+        ("stopped", "backup-moved"),
+        ("backup-pending", "backup-moved"),
+        ("backup-moved", "installing"),
+        ("installing", "stage-pending"),
+        ("stage-pending", "staged"),
+        ("staged", "target-created"),
+        ("target-created", "installed"),
+        ("installed", "committed"),
+    }
+    if (canonical.get("phase"), pending.get("phase")) not in transitions:
+        raise SystemExit("refresh receipt scratch is not the exact pending transition")
+    os.unlink(scratch)
+os.unlink(path)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+PY_CLEAR_RECEIPT
+}
+
+reconcile_initial_receipt() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$RECEIPT" "$RECEIPT_ARMING" <<'PY_RECONCILE_ARMING'
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+arming = pathlib.Path(sys.argv[2])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+
+
+def inspect(candidate):
+    fd = os.open(candidate, flags)
+    try:
+        metadata = os.fstat(fd)
+        raw = os.read(fd, 16385)
+    finally:
+        os.close(fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not raw
+        or len(raw) > 16384
+    ):
+        raise SystemExit(f"unsafe refresh receipt artifact: {candidate}")
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate refresh arming key")
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid refresh arming receipt: {error}") from error
+    keys = {
+        "schema", "transaction", "phase", "checkout", "target", "backup",
+        "stage", "unit", "expected_sha", "previous_sha", "previous_tree",
+        "new_tree", "original_dev", "original_ino", "new_dev", "new_ino",
+        "start_after", "archive_sha256", "wheelhouse_sha256",
+    }
+    if type(data) is not dict or set(data) != keys:
+        raise SystemExit("refresh arming receipt does not have the exact schema")
+    transaction = data.get("transaction")
+    if (
+        data.get("schema") != 1
+        or data.get("phase") != "prepared"
+        or type(transaction) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", transaction) is None
+    ):
+        raise SystemExit("invalid refresh arming receipt identity")
+    target = pathlib.Path(data.get("target", ""))
+    if data.get("backup") != str(target.parent / f".venv-backup-{transaction}"):
+        raise SystemExit("arming receipt backup is not transaction-bound")
+    if data.get("stage") != str(target.parent / f".venv-new-{transaction}"):
+        raise SystemExit("arming receipt stage is not transaction-bound")
+    return metadata
+
+
+has_path = os.path.lexists(path)
+has_arming = os.path.lexists(arming)
+if not has_arming:
+    raise SystemExit(0)
+arming_stat = inspect(arming)
+if has_path:
+    path_stat = inspect(path)
+    if (path_stat.st_dev, path_stat.st_ino) != (
+        arming_stat.st_dev,
+        arming_stat.st_ino,
+    ):
+        raise SystemExit("arming artifact does not match canonical refresh receipt")
+else:
+    if arming_stat.st_nlink != 1:
+        raise SystemExit("unpublished arming receipt has an unexpected link count")
+    os.link(arming, path, follow_symlinks=False)
+    dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+os.unlink(arming)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+PY_RECONCILE_ARMING
+}
+
+write_initial_receipt() {
+    local transaction="$1"
+    local backup="$2"
+    local stage="$3"
+    local previous_sha="$4"
+    local previous_tree="$5"
+    local start_after="$6"
+    local archive_sha="$7"
+    local wheelhouse_sha="$8"
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$RECEIPT" "$RECEIPT_ARMING" "$transaction" "$checkout" \
+        "$OPT_VENV" "$backup" "$stage" \
+        "$UNIT" "$expected_sha" "$previous_sha" "$previous_tree" \
+        "$start_after" "$archive_sha" "$wheelhouse_sha" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+(path_text, arming_text, transaction, checkout, target, backup, stage, unit, expected_sha,
+ previous_sha, previous_tree, start_after, archive_sha,
+ wheelhouse_sha) = sys.argv[1:]
+path = pathlib.Path(path_text)
+arming = pathlib.Path(arming_text)
+payload = {
+    "schema": 1,
+    "transaction": transaction,
+    "phase": "prepared",
+    "checkout": checkout,
+    "target": target,
+    "backup": backup,
+    "stage": stage,
+    "unit": unit,
+    "expected_sha": expected_sha,
+    "previous_sha": previous_sha or None,
+    "previous_tree": previous_tree or None,
+    "new_tree": None,
+    "original_dev": None,
+    "original_ino": None,
+    "new_dev": None,
+    "new_ino": None,
+    "start_after": start_after == "1",
+    "archive_sha256": archive_sha,
+    "wheelhouse_sha256": wheelhouse_sha,
+}
+target_path = pathlib.Path(target)
+try:
+    original = target_path.lstat()
+except FileNotFoundError:
+    if previous_sha or previous_tree:
+        raise SystemExit("previous identity has no original target inode")
+else:
+    if not previous_sha or not previous_tree or not stat.S_ISDIR(original.st_mode):
+        raise SystemExit("original target inode disagrees with previous identity")
+    payload["original_dev"] = original.st_dev
+    payload["original_ino"] = original.st_ino
+data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+# Only a fully written, fsynced inode ever receives the discoverable arming
+# name. A kill during the write can leave an inert uniquely named file, but it
+# cannot create a malformed fence or authorize any mutation.
+temporary = arming.with_name(f"{arming.name}.{os.getpid()}.{transaction}.tmp")
+fd = os.open(temporary, flags, 0o600)
+try:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short write while creating refresh receipt")
+        remaining = remaining[written:]
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o600
+    ):
+        raise OSError("unsafe refresh arming receipt")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+if os.path.lexists(arming):
+    raise SystemExit("refresh arming receipt already exists")
+os.rename(temporary, arming)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+os.link(arming, path, follow_symlinks=False)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+os.unlink(arming)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+PY
+}
+
+update_receipt() {
+    local transaction="$1"
+    local phase="$2"
+    local new_tree="${3-}"
+    local new_dev="${4-}"
+    local new_ino="${5-}"
+    local current_phase expected_digest
+    load_receipt || return 1
+    [ "${RECEIPT_FIELDS[1]}" = "$transaction" ] || return 1
+    current_phase="${RECEIPT_FIELDS[2]}"
+    expected_digest="${RECEIPT_FIELDS[19]}"
+    case "$current_phase:$phase" in
+        prepared:stopping|stopping:stopped|stopped:backup-pending|\
+        stopped:backup-moved|backup-pending:backup-moved|\
+        backup-moved:installing|installing:stage-pending|staged:target-created) \
+            [ -z "$new_tree$new_dev$new_ino" ] || return 1 ;;
+        stage-pending:staged)
+            [ -z "$new_tree" ] && [[ "$new_dev" =~ ^[0-9]+$ ]] \
+                && [[ "$new_ino" =~ ^[1-9][0-9]*$ ]] || return 1
+            ;;
+        target-created:installed)
+            [[ "$new_tree" =~ ^[0-9a-f]{64}$ ]] \
+                && [ -z "$new_dev$new_ino" ] || return 1
+            ;;
+        installed:committed)
+            [ "$new_tree" = "${RECEIPT_FIELDS[10]}" ] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$RECEIPT" "$transaction" "$current_phase" "$phase" \
+        "$new_tree" "$new_dev" "$new_ino" "$expected_digest" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+(
+    transaction,
+    current_phase,
+    phase,
+    new_tree,
+    new_dev,
+    new_ino,
+    expected_digest,
+) = sys.argv[2:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+read_fd = os.open(path, flags)
+try:
+    st = os.fstat(read_fd)
+    raw = os.read(read_fd, 16385)
+finally:
+    os.close(read_fd)
+if (not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_nlink != 1 or
+        stat.S_IMODE(st.st_mode) != 0o600 or not raw or len(raw) > 16384 or
+        hashlib.sha256(raw).hexdigest() != expected_digest):
+    raise SystemExit("unsafe refresh receipt")
+payload = json.loads(raw.decode("utf-8"))
+if (payload.get("schema") != 1 or payload.get("transaction") != transaction or
+        payload.get("phase") != current_phase):
+    raise SystemExit("wrong refresh receipt")
+payload["phase"] = phase
+if new_tree:
+    payload["new_tree"] = new_tree
+if phase == "staged":
+    payload["new_dev"] = int(new_dev)
+    payload["new_ino"] = int(new_ino)
+data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+tmp = path.with_name(".%s.%s.tmp" % (path.name, transaction))
+if os.path.lexists(tmp):
+    tmp_fd = os.open(tmp, flags)
+    try:
+        tmp_stat = os.fstat(tmp_fd)
+        pending = os.read(tmp_fd, 16385)
+    finally:
+        os.close(tmp_fd)
+    if (
+        not stat.S_ISREG(tmp_stat.st_mode)
+        or tmp_stat.st_uid != 0
+        or tmp_stat.st_nlink != 1
+        or stat.S_IMODE(tmp_stat.st_mode) != 0o600
+        or pending != data
+    ):
+        raise SystemExit("refresh receipt scratch does not match exact transition")
+    os.replace(tmp, path)
+    dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(dirfd)
+    finally:
+        os.close(dirfd)
+    raise SystemExit(0)
+fd = os.open(
+    tmp,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+    0o600,
+)
+try:
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("short write while updating refresh receipt")
+        remaining = remaining[written:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+os.replace(tmp, path)
+dirfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+PY
+}
+
+reconcile_receipt_scratch() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - "$RECEIPT" 0 \
+        <<'PY_RECONCILE_REFRESH_SCRATCH'
+import json
+import hashlib
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_owner = int(sys.argv[2])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+keys = {
+    "schema", "transaction", "phase", "checkout", "target", "backup",
+    "unit", "expected_sha", "previous_sha", "previous_tree", "new_tree",
+    "original_dev", "original_ino", "new_dev", "new_ino", "start_after",
+    "archive_sha256", "wheelhouse_sha256", "stage",
+}
+transitions = {
+    "prepared": "stopping",
+    "stopping": "stopped",
+    "stopped": {"backup-pending", "backup-moved"},
+    "backup-pending": "backup-moved",
+    "backup-moved": "installing",
+    "installing": "stage-pending",
+    "stage-pending": "staged",
+    "staged": "target-created",
+    "target-created": "installed",
+    "installed": "committed",
+}
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate refresh receipt key")
+        result[key] = value
+    return result
+
+
+def read_exact(candidate):
+    fd = os.open(candidate, flags)
+    try:
+        metadata = os.fstat(fd)
+        raw = os.read(fd, 16385)
+    finally:
+        os.close(fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_owner
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or not raw
+        or len(raw) > 16384
+    ):
+        raise SystemExit("unsafe refresh receipt scratch state")
+    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    if type(data) is not dict or set(data) != keys or data.get("schema") != 1:
+        raise SystemExit("refresh receipt scratch changed schema")
+    return data
+
+
+current = read_exact(path)
+transaction = current.get("transaction")
+if type(transaction) is not str or re.fullmatch(r"[0-9a-f]{32}", transaction) is None:
+    raise SystemExit("invalid refresh receipt transaction")
+scratch = path.with_name(f".{path.name}.{transaction}.tmp")
+if not os.path.lexists(scratch):
+    raise SystemExit(0)
+pending = read_exact(scratch)
+allowed = transitions.get(current.get("phase"))
+if isinstance(allowed, set):
+    phase_ok = pending.get("phase") in allowed
+else:
+    phase_ok = pending.get("phase") == allowed
+if not phase_ok or pending.get("transaction") != transaction:
+    raise SystemExit("refresh receipt scratch is not the next exact transition")
+mutable = {"phase"}
+if current["phase"] == "stage-pending" and pending["phase"] == "staged":
+    mutable |= {"new_dev", "new_ino"}
+    if (
+        type(pending["new_dev"]) is not int
+        or pending["new_dev"] < 0
+        or type(pending["new_ino"]) is not int
+        or pending["new_ino"] <= 0
+        or current["new_dev"] is not None
+        or current["new_ino"] is not None
+    ):
+        raise SystemExit("refresh staged scratch has an invalid inode")
+elif current["phase"] == "target-created" and pending["phase"] == "installed":
+    mutable.add("new_tree")
+    if (
+        type(pending["new_tree"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", pending["new_tree"]) is None
+        or current["new_tree"] is not None
+    ):
+        raise SystemExit("refresh installed scratch has an invalid tree")
+if any(pending[key] != current[key] for key in keys - mutable):
+    raise SystemExit("refresh receipt scratch changed immutable transaction state")
+os.replace(scratch, path)
+parent = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY_RECONCILE_REFRESH_SCRATCH
+}
+
+load_receipt() {
+    local output
+    reconcile_receipt_scratch || return 1
+    output="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$RECEIPT" "$checkout" "$OPT_VENV" "$UNIT" 0 <<'PY_RECEIPT'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+expected_checkout, expected_target, expected_unit = sys.argv[2:5]
+expected_owner = int(sys.argv[5])
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    st = os.fstat(fd)
+    raw = os.read(fd, 16385)
+finally:
+    os.close(fd)
+if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or
+        stat.S_IMODE(st.st_mode) != 0o600 or st.st_uid != expected_owner or
+        not raw or len(raw) > 16384):
+    raise SystemExit("unsafe refresh receipt")
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate refresh receipt key")
+        result[key] = value
+    return result
+
+data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
+keys = {
+    "schema", "transaction", "phase", "checkout", "target", "backup",
+    "unit", "expected_sha", "previous_sha", "previous_tree", "new_tree",
+    "original_dev", "original_ino", "new_dev", "new_ino", "start_after",
+    "archive_sha256", "wheelhouse_sha256", "stage",
+}
+if type(data) is not dict or set(data) != keys:
+    raise SystemExit("refresh receipt does not have the exact schema")
+if type(data["schema"]) is not int or data["schema"] != 1:
+    raise SystemExit("unsupported refresh receipt schema")
+transaction = data["transaction"]
+if type(transaction) is not str or re.fullmatch(r"[0-9a-f]{32}", transaction) is None:
+    raise SystemExit("invalid refresh transaction")
+phases_without_tree = {
+    "prepared", "stopping", "stopped", "backup-pending", "backup-moved",
+    "installing", "stage-pending", "staged", "target-created",
+}
+phases_with_tree = {"installed", "committed"}
+phase = data["phase"]
+if type(phase) is not str or phase not in phases_without_tree | phases_with_tree:
+    raise SystemExit("invalid refresh phase")
+if (type(data["checkout"]) is not str or data["checkout"] != expected_checkout or
+        type(data["target"]) is not str or data["target"] != expected_target or
+        type(data["unit"]) is not str or data["unit"] != expected_unit):
+    raise SystemExit("refresh receipt is bound to a different operation")
+expected_backup = str(
+    pathlib.Path(expected_target).parent / f".venv-backup-{transaction}"
+)
+if type(data["backup"]) is not str or data["backup"] != expected_backup:
+    raise SystemExit("refresh backup is not bound to its transaction")
+expected_stage = str(
+    pathlib.Path(expected_target).parent / f".venv-new-{transaction}"
+)
+if type(data["stage"]) is not str or data["stage"] != expected_stage:
+    raise SystemExit("refresh stage is not bound to its transaction")
+hex40 = re.compile(r"[0-9a-f]{40}")
+hex64 = re.compile(r"[0-9a-f]{64}")
+if type(data["expected_sha"]) is not str or hex40.fullmatch(data["expected_sha"]) is None:
+    raise SystemExit("invalid expected source SHA")
+for key in ("archive_sha256", "wheelhouse_sha256"):
+    if type(data[key]) is not str or hex64.fullmatch(data[key]) is None:
+        raise SystemExit(f"invalid {key}")
+previous_sha = data["previous_sha"]
+previous_tree = data["previous_tree"]
+if (previous_sha is None) != (previous_tree is None):
+    raise SystemExit("incoherent previous provenance pair")
+if previous_sha is not None and (
+    type(previous_sha) is not str or hex40.fullmatch(previous_sha) is None or
+    type(previous_tree) is not str or hex64.fullmatch(previous_tree) is None
+):
+    raise SystemExit("invalid previous provenance pair")
+original_dev = data["original_dev"]
+original_ino = data["original_ino"]
+if previous_sha is None:
+    if original_dev is not None or original_ino is not None:
+        raise SystemExit("bootstrap unexpectedly binds an original inode")
+elif (
+    type(original_dev) is not int
+    or original_dev < 0
+    or type(original_ino) is not int
+    or original_ino <= 0
+):
+    raise SystemExit("refresh receipt is missing the original inode")
+new_tree = data["new_tree"]
+if phase in phases_without_tree:
+    if new_tree is not None:
+        raise SystemExit("pre-install phase unexpectedly has a new tree")
+elif type(new_tree) is not str or hex64.fullmatch(new_tree) is None:
+    raise SystemExit("installed phase is missing its new tree")
+new_dev = data["new_dev"]
+new_ino = data["new_ino"]
+if phase in {"staged", "target-created", "installed", "committed"}:
+    if (
+        type(new_dev) is not int
+        or new_dev < 0
+        or type(new_ino) is not int
+        or new_ino <= 0
+    ):
+        raise SystemExit("refresh receipt is missing the new target inode")
+elif new_dev is not None or new_ino is not None:
+    raise SystemExit("pre-creation phase unexpectedly binds a new inode")
+if type(data["start_after"]) is not bool:
+    raise SystemExit("start_after is not a boolean")
+
+# Any existing target or backup root is privileged transaction state. Reject
+# symlinks (including dangling ones), non-directories, wrong owners, or a
+# directory writable by non-root before the caller can stop or move anything.
+for candidate_text in (expected_target, expected_backup, expected_stage):
+    candidate = pathlib.Path(candidate_text)
+    try:
+        candidate_stat = candidate.lstat()
+    except FileNotFoundError:
+        continue
+    if (not stat.S_ISDIR(candidate_stat.st_mode) or
+            candidate_stat.st_uid != expected_owner or
+            stat.S_IMODE(candidate_stat.st_mode) & 0o022):
+        raise SystemExit("unsafe refresh transaction path")
+
+fields = (
+    data["schema"], transaction, phase, data["checkout"], data["target"],
+    data["backup"], data["unit"], data["expected_sha"], previous_sha or "",
+    previous_tree or "", new_tree or "", original_dev if original_dev is not None else "",
+    original_ino if original_ino is not None else "", new_dev if new_dev is not None else "",
+    new_ino if new_ino is not None else "",
+    "1" if data["start_after"] else "0", data["archive_sha256"],
+    data["wheelhouse_sha256"],
+    data["stage"],
+)
+for value in fields:
+    text = str(value)
+    if any(character in text for character in "\x00\r\n"):
+        raise SystemExit("invalid refresh receipt field")
+    print(text)
+print(hashlib.sha256(raw).hexdigest())
+PY_RECEIPT
+    )" || return 1
+    mapfile -t RECEIPT_FIELDS <<<"$output"
+    [ "${#RECEIPT_FIELDS[@]}" = "20" ] || return 1
+}
+
+inspect_uncheckpointed_stage() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$1" "$OPT_VENV" "$OPT_ROOT" 0 inspect "" \
+        <<'PY_INSPECT_EMPTY_REFRESH_STAGE'
+import os
+import pathlib
+import stat
+import sys
+
+stage = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+parent = pathlib.Path(sys.argv[3])
+expected_owner = int(sys.argv[4])
+action = sys.argv[5]
+expected_identity = sys.argv[6]
+if action not in {"inspect", "remove"}:
+    raise SystemExit("invalid uncheckpointed-stage action")
+if stage.parent != parent or target.parent != parent:
+    raise SystemExit("refresh stage is outside the exact target parent")
+if os.path.lexists(target):
+    raise SystemExit("uncheckpointed refresh stage has a competing target")
+parent_stat = parent.lstat()
+if (
+    not stat.S_ISDIR(parent_stat.st_mode)
+    or parent_stat.st_uid != expected_owner
+    or stat.S_IMODE(parent_stat.st_mode) & 0o022
+):
+    raise SystemExit("unsafe refresh target parent")
+stage_stat = stage.lstat()
+if (
+    not stat.S_ISDIR(stage_stat.st_mode)
+    or stage_stat.st_uid != expected_owner
+    or stage_stat.st_dev != parent_stat.st_dev
+    or stage_stat.st_nlink != 2
+    or stat.S_IMODE(stage_stat.st_mode) != 0o755
+):
+    raise SystemExit("unsafe uncheckpointed refresh stage")
+parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+parent_flags |= getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open(parent, parent_flags)
+try:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    stage_fd = os.open(stage.name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(stage_fd)
+        if (opened.st_dev, opened.st_ino) != (stage_stat.st_dev, stage_stat.st_ino):
+            raise SystemExit("uncheckpointed refresh stage changed during inspection")
+        if os.listdir(stage_fd):
+            raise SystemExit("uncheckpointed refresh stage is not empty")
+    finally:
+        os.close(stage_fd)
+    identity = f"{stage_stat.st_dev}:{stage_stat.st_ino}"
+    if action == "remove":
+        if expected_identity != identity:
+            raise SystemExit("uncheckpointed refresh stage inode changed")
+        current = os.stat(stage.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (stage_stat.st_dev, stage_stat.st_ino):
+            raise SystemExit("uncheckpointed refresh stage changed before removal")
+        os.rmdir(stage.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+print(identity)
+PY_INSPECT_EMPTY_REFRESH_STAGE
+}
+
+remove_uncheckpointed_stage() {
+    PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+        "$1" "$OPT_VENV" "$OPT_ROOT" 0 remove "$2" \
+        <<'PY_REMOVE_EMPTY_REFRESH_STAGE'
+import os
+import pathlib
+import stat
+import sys
+
+stage = pathlib.Path(sys.argv[1])
+target = pathlib.Path(sys.argv[2])
+parent = pathlib.Path(sys.argv[3])
+expected_owner = int(sys.argv[4])
+expected_identity = sys.argv[6]
+if stage.parent != parent or target.parent != parent or os.path.lexists(target):
+    raise SystemExit("uncheckpointed refresh stage scope changed")
+parent_stat = parent.lstat()
+stage_stat = stage.lstat()
+identity = f"{stage_stat.st_dev}:{stage_stat.st_ino}"
+if (
+    not stat.S_ISDIR(parent_stat.st_mode)
+    or parent_stat.st_uid != expected_owner
+    or stat.S_IMODE(parent_stat.st_mode) & 0o022
+    or not stat.S_ISDIR(stage_stat.st_mode)
+    or stage_stat.st_uid != expected_owner
+    or stage_stat.st_dev != parent_stat.st_dev
+    or stage_stat.st_nlink != 2
+    or stat.S_IMODE(stage_stat.st_mode) != 0o755
+    or identity != expected_identity
+):
+    raise SystemExit("uncheckpointed refresh stage identity changed")
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+flags |= getattr(os, "O_NOFOLLOW", 0)
+parent_fd = os.open(parent, flags)
+try:
+    stage_fd = os.open(stage.name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(stage_fd)
+        if (opened.st_dev, opened.st_ino) != (stage_stat.st_dev, stage_stat.st_ino):
+            raise SystemExit("uncheckpointed refresh stage changed before removal")
+        if os.listdir(stage_fd):
+            raise SystemExit("uncheckpointed refresh stage became nonempty")
+    finally:
+        os.close(stage_fd)
+    current = os.stat(stage.name, dir_fd=parent_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (stage_stat.st_dev, stage_stat.st_ino):
+        raise SystemExit("uncheckpointed refresh stage was substituted")
+    os.rmdir(stage.name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY_REMOVE_EMPTY_REFRESH_STAGE
+}
+
+verify_unit_contract() {
+    local fragment user exec_start environment dropins property value
+    [ -f "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] || {
+        echo "vq-multi-user-refresh: $UNIT_FILE is missing, not regular, or symlinked" >&2
+        return 1
+    }
+    [ "$(stat -c '%u:%a' "$UNIT_FILE")" = "0:644" ] || {
+        echo "vq-multi-user-refresh: $UNIT_FILE must be root-owned mode 0644" >&2
+        return 1
+    }
+    fragment="$(systemctl show "$UNIT" --property=FragmentPath --value)" || return 1
+    user="$(systemctl show "$UNIT" --property=User --value)" || return 1
+    exec_start="$(systemctl show "$UNIT" --property=ExecStart --value)" || return 1
+    environment="$(systemctl show "$UNIT" --property=Environment --value)" || return 1
+    dropins="$(systemctl show "$UNIT" --property=DropInPaths --value)" || return 1
+    [ "$fragment" = "$UNIT_FILE" ] || {
+        echo "vq-multi-user-refresh: $UNIT is loaded from '$fragment', expected '$UNIT_FILE'" >&2
+        return 1
+    }
+    [ -z "$user" ] || [ "$user" = "root" ] || return 1
+    case "$exec_start" in
+        *"path=$OPT_VQ ; argv[]=$OPT_VQ daemon run ;"*) ;;
+        *)
+            echo "vq-multi-user-refresh: $UNIT ExecStart is not exactly $OPT_VQ daemon run" >&2
+            return 1
+            ;;
+    esac
+    [ "${exec_start#*argv[]=}" = "${exec_start##*argv[]=}" ] || {
+        echo "vq-multi-user-refresh: $UNIT has multiple ExecStart commands" >&2
+        return 1
+    }
+    [ "$environment" = "VQ_CONFIG_DIR=/etc/vq" ] || return 1
+    [ -z "$dropins" ] || {
+        echo "vq-multi-user-refresh: $UNIT has unsupported drop-in overrides" >&2
+        return 1
+    }
+    for property in ExecCondition ExecStartPre ExecStartPost ExecReload \
+        ExecStop ExecStopPost EnvironmentFiles PassEnvironment RootDirectory; do
+        value="$(systemctl show "$UNIT" --property="$property" --value)" \
+            || return 1
+        [ -z "$value" ] || {
+            echo "vq-multi-user-refresh: $UNIT has unsupported $property=$value" >&2
+            return 1
+        }
+    done
+}
+
+require_quiescent() {
+    local active_state sub_state main_pid
+    active_state="$(systemctl show "$UNIT" --property=ActiveState --value)" \
+        || return 1
+    sub_state="$(systemctl show "$UNIT" --property=SubState --value)" \
+        || return 1
+    main_pid="$(systemctl show "$UNIT" --property=MainPID --value)" || return 1
+    [ "$active_state" = "inactive" ] \
+        && [ "$sub_state" = "dead" ] \
+        && [ "$main_pid" = "0" ]
+}
+
+installed_identity() {
+    local vq_bin="$1"
+    local sha tree
+    [ -x "$vq_bin" ] || return 1
+    sha="$(/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+        "$vq_bin" source-sha)" || return 1
+    tree="$(/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+        "$vq_bin" source-tree-sha256)" || return 1
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [[ "$tree" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n%s\n' "$sha" "$tree"
+}
+
+rpc_proof() {
+    local want_sha="$1"
+    local want_tree="$2"
+    local ping_err ping_json="" proven_pid current_main_pid
+    ping_err="$(mktemp "$OPT_ROOT/.refresh-ping.XXXXXX")" || return 1
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        if ping_json="$(/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+            PYTHONNOUSERSITE=1 VQ_CONFIG_DIR=/etc/vq VQ_STATE_DIR="$STATE_DIR" \
+            "$OPT_VQ" daemon ping --json --verbose localhost 2>"$ping_err")"; then
+            break
+        fi
+        ping_json=""
+        sleep 2
+    done
+    if [ -z "$ping_json" ]; then
+        echo "vq-multi-user-refresh: $UNIT did not answer RPC: $(cat "$ping_err" 2>/dev/null || true)" >&2
+        rm -f -- "$ping_err"
+        return 1
+    fi
+    rm -f -- "$ping_err"
+    proven_pid="$(printf '%s' "$ping_json" | \
+        PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S -c '
+import json
+import sys
+
+want_sha, want_tree, want_python, want_vq, want_socket = sys.argv[1:]
+data = json.load(sys.stdin)
+identity = data.get("process_identity")
+service = data.get("system_service")
+if data.get("ok") is not True or not isinstance(identity, dict):
+    raise SystemExit("missing verbose process identity")
+if not isinstance(service, dict) or service.get("status") != "ok":
+    raise SystemExit("missing systemd service identity")
+pid = identity.get("pid")
+valid = (
+    identity.get("status") == "ok"
+    and type(pid) is int and pid > 0
+    and identity.get("euid") == 0
+    and identity.get("python_executable") == want_python
+    and identity.get("argv") == [want_vq, "daemon", "run"]
+    and identity.get("multi_user") is True
+    and identity.get("socket_path") == want_socket
+    and identity.get("source_sha") == want_sha
+    and identity.get("source_tree_sha256") == want_tree
+    and service.get("main_pid") == pid
+    and service.get("active_state") == "active"
+    and service.get("sub_state") == "running"
+    and service.get("user") == "root"
+    and service.get("executable") == want_vq
+    and service.get("argv") == [want_vq, "daemon", "run"]
+)
+if not valid:
+    raise SystemExit("RPC responder is not the exact root systemd MainPID")
+print(pid)
+' "$want_sha" "$want_tree" "$OPT_VENV/bin/python" "$OPT_VQ" \
+            "$STATE_DIR/daemon.sock")" || {
+        echo "vq-multi-user-refresh: verbose RPC identity did not bind the responder to the exact systemd unit" >&2
+        return 1
+    }
+    [[ "$proven_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    current_main_pid="$(systemctl show "$UNIT" --property=MainPID --value)" \
+        || return 1
+    [ "$current_main_pid" = "$proven_pid" ] \
+        && systemctl is-active --quiet "$UNIT" || {
+        echo "vq-multi-user-refresh: $UNIT changed after its RPC identity proof" >&2
+        return 1
+    }
+}
+
+recover_receipt() {
+    local receipt_transaction phase receipt_checkout receipt_target backup
+    local receipt_unit receipt_expected previous_sha previous_tree new_tree
+    local original_dev original_ino new_dev new_ino start_after stage identity=()
+    local target_kind="absent" backup_present=0 stage_present=0 path_identity
+    local uncheckpointed_stage=0 uncheckpointed_stage_identity=""
+    [ -e "$RECEIPT" ] || [ -L "$RECEIPT" ] || return 0
+    echo "vq-multi-user-refresh: recovering interrupted privileged transaction" >&2
+    load_receipt || return 1
+    [ "${RECEIPT_FIELDS[0]}" = "1" ] || return 1
+    receipt_transaction="${RECEIPT_FIELDS[1]}"
+    phase="${RECEIPT_FIELDS[2]}"
+    receipt_checkout="${RECEIPT_FIELDS[3]}"
+    receipt_target="${RECEIPT_FIELDS[4]}"
+    backup="${RECEIPT_FIELDS[5]}"
+    receipt_unit="${RECEIPT_FIELDS[6]}"
+    receipt_expected="${RECEIPT_FIELDS[7]}"
+    previous_sha="${RECEIPT_FIELDS[8]}"
+    previous_tree="${RECEIPT_FIELDS[9]}"
+    new_tree="${RECEIPT_FIELDS[10]}"
+    original_dev="${RECEIPT_FIELDS[11]}"
+    original_ino="${RECEIPT_FIELDS[12]}"
+    new_dev="${RECEIPT_FIELDS[13]}"
+    new_ino="${RECEIPT_FIELDS[14]}"
+    start_after="${RECEIPT_FIELDS[15]}"
+    stage="${RECEIPT_FIELDS[18]}"
+    [ "$receipt_checkout" = "$checkout" ] && [ "$receipt_target" = "$OPT_VENV" ] \
+        && [ "$receipt_unit" = "$UNIT" ] || return 1
+    [[ "$receipt_transaction" =~ ^[0-9a-f]{32}$ ]] || return 1
+    [ "$backup" = "$OPT_ROOT/.venv-backup-$receipt_transaction" ] || return 1
+    [[ "$receipt_expected" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [ -z "$previous_sha" ] || [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [ -z "$previous_tree" ] || [[ "$previous_tree" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [ -z "$new_tree" ] || [[ "$new_tree" =~ ^[0-9a-f]{64}$ ]] || return 1
+    # Classify every privileged transaction path before touching systemd or
+    # deleting/moving anything. A same-root operator substitution is ambiguous,
+    # so recovery retains the receipt instead of acting on a merely plausible
+    # directory at one of the derived names.
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+        [ -n "$previous_sha" ] || return 1
+        path_identity="$(stat -c '%d:%i' "$backup")" || return 1
+        [ "$path_identity" = "$original_dev:$original_ino" ] || return 1
+        backup_present=1
+    fi
+    if [ -e "$stage" ] || [ -L "$stage" ]; then
+        if [ -n "$new_dev" ] && [ -n "$new_ino" ]; then
+            path_identity="$(stat -c '%d:%i' "$stage")" || return 1
+            [ "$path_identity" = "$new_dev:$new_ino" ] || return 1
+        elif [ "$phase" = "stage-pending" ]; then
+            # No package build starts before the staged-inode checkpoint.  A
+            # kill after mkdir+fsync can therefore leave only this exact empty
+            # directory.  Observe its inode now and require the same object
+            # immediately before rmdir; never infer ownership of a nonempty or
+            # differently shaped root path.
+            uncheckpointed_stage_identity="$(
+                inspect_uncheckpointed_stage "$stage"
+            )" || return 1
+            uncheckpointed_stage=1
+        else
+            return 1
+        fi
+        stage_present=1
+    fi
+    if [ -e "$OPT_VENV" ] || [ -L "$OPT_VENV" ]; then
+        path_identity="$(stat -c '%d:%i' "$OPT_VENV")" || return 1
+        if [ -n "$previous_sha" ] \
+            && [ "$path_identity" = "$original_dev:$original_ino" ]; then
+            [ "$backup_present" = "0" ] || return 1
+            target_kind="original"
+        elif [ -n "$new_dev" ] && [ -n "$new_ino" ] \
+            && [ "$path_identity" = "$new_dev:$new_ino" ]; then
+            target_kind="new"
+        else
+            return 1
+        fi
+    fi
+    [ "$stage_present" = "0" ] || [ "$target_kind" = "absent" ] || return 1
+    if [ -n "$previous_sha" ]; then
+        [ "$backup_present" = "1" ] || [ "$target_kind" = "original" ] \
+            || return 1
+    else
+        [ "$backup_present" = "0" ] && [ "$target_kind" != "original" ] \
+            || return 1
+    fi
+    if [ "$phase" = "committed" ]; then
+        [ "$target_kind" = "new" ] && [ "$stage_present" = "0" ] || return 1
+    fi
+    verify_unit_contract || return 1
+
+    if [ "$phase" = "committed" ]; then
+        [ "$(stat -c '%d:%i' "$OPT_VENV")" = "$new_dev:$new_ino" ] || return 1
+        mapfile -t identity < <(installed_identity "$OPT_VQ") || return 1
+        [ "${identity[0]}" = "$receipt_expected" ] \
+            && [ "${identity[1]}" = "$new_tree" ] || return 1
+        systemctl start "$UNIT" || return 1
+        systemctl is-active --quiet "$UNIT" || return 1
+        rpc_proof "$receipt_expected" "$new_tree" || return 1
+        [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+        if [ -e "$backup" ] || [ -L "$backup" ]; then
+            [ "$(stat -c '%d:%i' "$backup")" = "$original_dev:$original_ino" ] \
+                || return 1
+            rm -rf -- "$backup"
+        fi
+        fsync_dir "$OPT_ROOT"
+        clear_receipt "$receipt_transaction"
+        return
+    fi
+
+    systemctl stop "$UNIT" || return 1
+    require_quiescent || return 1
+    if [ "$uncheckpointed_stage" = "1" ]; then
+        remove_uncheckpointed_stage \
+            "$stage" "$uncheckpointed_stage_identity" || return 1
+    elif [ "$stage_present" = "1" ]; then
+        [ "$(stat -c '%d:%i' "$stage")" = "$new_dev:$new_ino" ] || return 1
+        rm -rf -- "$stage"
+        fsync_dir "$OPT_ROOT"
+    fi
+    if [ -n "$previous_sha" ]; then
+        if [ -e "$backup" ] && [ ! -L "$backup" ]; then
+            [ "$(stat -c '%d:%i' "$backup")" = "$original_dev:$original_ino" ] \
+                || return 1
+            if [ -e "$OPT_VENV" ] || [ -L "$OPT_VENV" ]; then
+                [ -n "$new_dev" ] && [ -n "$new_ino" ] \
+                    && [ "$(stat -c '%d:%i' "$OPT_VENV")" = "$new_dev:$new_ino" ] \
+                    || return 1
+            fi
+            remove_exact_target "$OPT_VENV" || return 1
+            mv -- "$backup" "$OPT_VENV" || return 1
+            fsync_dir "$OPT_ROOT"
+        elif [ ! -e "$backup" ] && [ -d "$OPT_VENV" ] && [ ! -L "$OPT_VENV" ]; then
+            [ "$(stat -c '%d:%i' "$OPT_VENV")" = "$original_dev:$original_ino" ] \
+                || return 1
+        else
+            return 1
+        fi
+        mapfile -t identity < <(installed_identity "$OPT_VQ") || return 1
+        [ "${identity[0]}" = "$previous_sha" ] \
+            && [ "${identity[1]}" = "$previous_tree" ] || return 1
+        if [ "$start_after" = "1" ]; then
+            systemctl start "$UNIT" || return 1
+            rpc_proof "$previous_sha" "$previous_tree" || return 1
+        fi
+    else
+        # Bootstrap has no old runtime to restore.
+        [ ! -e "$backup" ] && [ ! -L "$backup" ] || return 1
+        if [ -e "$OPT_VENV" ] || [ -L "$OPT_VENV" ]; then
+            [ -n "$new_dev" ] && [ -n "$new_ino" ] \
+                && [ "$(stat -c '%d:%i' "$OPT_VENV")" = "$new_dev:$new_ino" ] \
+                || return 1
+            remove_exact_target "$OPT_VENV" || return 1
+        fi
+    fi
+    # Replay may find the old target already restored after a prior move whose
+    # parent-directory fsync did not survive power loss. Persist the proven
+    # terminal namespace unconditionally before deleting recovery authority.
+    fsync_dir "$OPT_ROOT"
+    clear_receipt "$receipt_transaction"
+}
+
+cleanup() {
+    local status="$?"
+    trap - EXIT
+    if [ "$transaction_active" = "1" ] \
+        && { [ -e "$RECEIPT" ] || [ -L "$RECEIPT" ]; }; then
+        if ! recover_receipt; then
+            echo "vq-multi-user-refresh: automatic rollback failed; receipt retained at $RECEIPT" >&2
+        fi
+    fi
+    if [ -n "$work_dir" ]; then
+        case "$work_dir" in
+            /opt/vq/.refresh-work.*) rm -rf -- "$work_dir" ;;
+            *) echo "vq-multi-user-refresh: refusing unexpected work directory cleanup: $work_dir" >&2 ;;
+        esac
+    fi
+    vibe_toolset_release_lifecycle_lock || true
+    exit "$status"
+}
+trap cleanup EXIT
+
+[ ! -L "$RECEIPT_DIR" ] || die "refusing symlinked receipt directory $RECEIPT_DIR"
+if [ "$dry_run" = "1" ]; then
+    # A dry-run is observational. An interrupted transaction needs the normal
+    # activation command, whose first action is locked exact recovery; never
+    # stop/start a service or move/delete a runtime from this validation path.
+    if [ -e "$RECEIPT_DIR" ]; then
+        [ -d "$RECEIPT_DIR" ] || die "$RECEIPT_DIR is not a directory"
+        receipt_dir_mode="$(stat -c '%a:%u:%g' "$RECEIPT_DIR")"
+        [ "$receipt_dir_mode" = "700:0:0" ] \
+            || die "$RECEIPT_DIR must be root:root mode 0700, got $receipt_dir_mode"
+    fi
+    if [ -e "$RECEIPT" ] || [ -L "$RECEIPT" ] \
+        || [ -e "$RECEIPT_ARMING" ] || [ -L "$RECEIPT_ARMING" ]; then
+        die "interrupted refresh receipt state exists under $RECEIPT_DIR; dry-run is read-only, so run the normal helper to recover it"
+    fi
+else
+    install -d -m 0700 -o root -g root "$RECEIPT_DIR"
+    receipt_dir_mode="$(stat -c '%a:%u:%g' "$RECEIPT_DIR")"
+    [ "$receipt_dir_mode" = "700:0:0" ] \
+        || die "$RECEIPT_DIR must be root:root mode 0700, got $receipt_dir_mode"
+    # Publish a fully validated arming inode left by a kill between its durable
+    # creation and canonical hard-link. This precedes every canonical check and
+    # all source/build work.
+    reconcile_initial_receipt \
+        || die "could not reconcile refresh receipt arming state"
+    # A mutating invocation recovers before observing or building a new pin.
+    recover_receipt \
+        || die "could not safely recover $RECEIPT; no new refresh started"
+fi
+
+command -v runuser >/dev/null || die "runuser is required to observe Git as $source_user"
+RUNUSER="$(command -v runuser)"
+case "$RUNUSER" in /usr/bin/runuser|/usr/sbin/runuser) ;; *) die "untrusted runuser path: $RUNUSER" ;; esac
+
+for guarded in "$checkout" "$checkout/.git" "$checkout/vibe-queue"; do
+    guarded_uid="$(stat -c '%u' "$guarded")"
+    [ "$guarded_uid" = "0" ] || [ "$guarded_uid" = "$source_uid" ] \
+        || die "$guarded is not owned by root or sudo invoker $source_user"
+    guarded_mode="$(stat -c '%a' "$guarded")"
+    case "$guarded_mode" in
+        *[2367][0-7]|*[2367]) die "$guarded is group- or world-writable" ;;
+    esac
+done
+
+git_observe() {
+    "$RUNUSER" -u "$source_user" -- /usr/bin/env -i \
+        HOME="$source_home" USER="$source_user" LOGNAME="$source_user" \
+        PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_REPLACE_OBJECTS=1 \
+        /usr/bin/git -c core.fsmonitor= -c core.hooksPath=/dev/null \
+        -c core.attributesFile=/dev/null -c credential.helper= \
+        -c core.pager=cat "$@"
+}
+
+[ ! -e "$checkout/.git/info/attributes" ] \
+    || die "untracked .git/info/attributes could rewrite the accepted archive"
+[ ! -e "$checkout/.git/info/grafts" ] \
+    || die "untracked .git/info/grafts could rewrite ancestry"
+
+derived_sha="$(git_observe -C "$checkout" rev-parse --verify 'HEAD^{commit}')" \
+    || die "could not resolve checkout HEAD as $source_user"
+[ "$derived_sha" = "$expected_sha" ] \
+    || die "checkout HEAD is $derived_sha, not accepted pin $expected_sha"
+git_observe -C "$checkout" cat-file -e "$expected_sha^{commit}" \
+    || die "accepted pin is not a commit in $checkout"
+dirty="$(git_observe -C "$checkout" status --porcelain=v1 --untracked-files=all -- vibe-queue)"
+[ -z "$dirty" ] \
+    || die "vibe-queue/ is dirty; accepted SHA cannot describe the install"
+
+verify_unit_contract || die "refusing to touch /opt/vq without the exact unit contract"
+
+previous_sha=""
+previous_tree=""
+start_after=1
+if [ "$bootstrap" = "1" ]; then
+    [ ! -e "$OPT_VENV" ] && [ ! -L "$OPT_VENV" ] \
+        || die "--bootstrap requires an absent $OPT_VENV"
+    require_quiescent || die "--bootstrap requires $UNIT to be inactive and quiescent"
+else
+    [ -d "$OPT_VENV" ] && [ ! -L "$OPT_VENV" ] \
+        || die "unsupported legacy target at $OPT_VENV; use --bootstrap only when it is absent"
+    systemctl is-active --quiet "$UNIT" \
+        || die "refresh requires the exact multi-user daemon to be active"
+    fsync_tree_no_follow "$OPT_VENV" "$LOCK_PYTHON" 0 \
+        || die "existing privileged runtime has unsafe ownership, modes, or links"
+    mapfile -t previous_identity < <(installed_identity "$OPT_VQ") \
+        || die "existing /opt/vq provenance is missing or malformed"
+    previous_sha="${previous_identity[0]}"
+    previous_tree="${previous_identity[1]}"
+    if ! git_observe -C "$checkout" merge-base --is-ancestor \
+        "$previous_sha" "$expected_sha"; then
+        die "accepted pin $expected_sha is not a descendant of installed $previous_sha; downgrade/divergence refused"
+    fi
+fi
+
+echo "checkout:  $checkout"
+echo "commit:    $expected_sha"
+echo "install:   $OPT_VENV (root-owned transaction)"
+if [ "$dry_run" = "1" ]; then
+    echo "dry-run: exact source, ancestry, lifecycle locks, and unit contract verified"
+    exit 0
+fi
+
+work_dir="$(mktemp -d "$OPT_ROOT/.refresh-work.XXXXXX")"
+chmod 0700 "$work_dir"
+archive="$work_dir/source.tar"
+snapshot="$work_dir/snapshot"
+builder="$work_dir/builder"
+wheelhouse="$work_dir/wheelhouse"
+dependency_stage="$work_dir/dependency-download"
+download_lock="$work_dir/dependency-requirements.txt"
+mkdir -m 0700 "$snapshot" "$wheelhouse" "$dependency_stage"
+
+# Archive the explicit commit as the invoking user. Root owns the output file,
+# then extracts and builds only that immutable snapshot, never the worktree.
+git_observe -C "$checkout" archive --format=tar "$expected_sha" vibe-queue >"$archive" \
+    || die "could not archive accepted pin $expected_sha"
+archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+tar --extract --file "$archive" --directory "$snapshot" \
+    --no-same-owner --no-same-permissions
+chown -R root:root "$snapshot"
+chmod -R go-w "$snapshot"
+
+expected_tree="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+    "$snapshot/vibe-queue/src/vq" 0 <<'PY_EXPECTED_TREE'
+import hashlib
+import pathlib
+import stat
+import sys
+root = pathlib.Path(sys.argv[1]).resolve()
+expected_owner = int(sys.argv[2])
+files = []
+for path in sorted(root.rglob("*")):
+    entry = path.lstat()
+    if stat.S_ISLNK(entry.st_mode) or (
+        not stat.S_ISREG(entry.st_mode) and not stat.S_ISDIR(entry.st_mode)
+    ):
+        raise SystemExit("accepted package tree contains a symlink or special file")
+    if entry.st_uid != expected_owner or stat.S_IMODE(entry.st_mode) & 0o022:
+        raise SystemExit("accepted package tree has unsafe ownership or mode")
+    if (
+        stat.S_ISREG(entry.st_mode)
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+        and path.name not in {"SOURCE-SHA", "SOURCE-TREE-SHA256"}
+    ):
+        files.append(path)
+if not files:
+    raise SystemExit("accepted source tree contains no package files")
+digest = hashlib.sha256()
+for path in files:
+    digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY_EXPECTED_TREE
+)"
+
+# Prove the moving checkout did not change while the explicit archive was
+# produced. The lifecycle lock serializes supported writers; this catches any
+# unsupported writer that ignored it.
+recheck_sha="$(git_observe -C "$checkout" rev-parse --verify 'HEAD^{commit}')"
+recheck_dirty="$(git_observe -C "$checkout" status --porcelain=v1 --untracked-files=all -- vibe-queue)"
+[ "$recheck_sha" = "$expected_sha" ] && [ -z "$recheck_dirty" ] \
+    || die "checkout changed during sealed archive creation"
+
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+    "$LOCK_PYTHON" -I -m venv "$builder"
+runtime_lock="$snapshot/$RUNTIME_LOCK_REL"
+[ -f "$runtime_lock" ] && [ ! -L "$runtime_lock" ] \
+    || die "accepted commit is missing its privileged runtime lock"
+
+# Build the pure-Python vq wheel with the trusted stdlib only. This avoids
+# running a caller-selected PEP 517 backend as root. Dependency wheels are
+# downloaded as the non-root invoker under the exact hash lock carried by the
+# accepted commit, then independently inspected and copied into the root-owned
+# wheelhouse without following symlinks.
+PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+    "$snapshot/vibe-queue" "$wheelhouse" <<'PY_BUILD_VQ_WHEEL'
+import base64
+import csv
+import hashlib
+import io
+import pathlib
+import stat
+import sys
+import tomllib
+import zipfile
+
+project = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+metadata = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"))
+version = metadata["project"]["version"]
+if not isinstance(version, str) or not version or any(c not in "0123456789." for c in version):
+    raise SystemExit("unsupported vq version in accepted pyproject")
+wheel_name = f"vq-{version}-py3-none-any.whl"
+wheel_path = destination / wheel_name
+package = project / "src" / "vq"
+members = {}
+for path in sorted(package.rglob("*")):
+    entry = path.lstat()
+    if stat.S_ISLNK(entry.st_mode) or (not stat.S_ISREG(entry.st_mode) and not stat.S_ISDIR(entry.st_mode)):
+        raise SystemExit(f"unsupported source entry in accepted vq package: {path}")
+    if stat.S_IMODE(entry.st_mode) & 0o022:
+        raise SystemExit(f"writable source entry in sealed vq package: {path}")
+    if stat.S_ISREG(entry.st_mode):
+        members[(pathlib.Path("vq") / path.relative_to(package)).as_posix()] = path.read_bytes()
+dist_info = f"vq-{version}.dist-info"
+members[f"{dist_info}/METADATA"] = (
+    "Metadata-Version: 2.4\n"
+    "Name: vq\n"
+    f"Version: {version}\n"
+    "Summary: Cross-machine job queue for vibe-qc workloads\n"
+    "License-Expression: MPL-2.0\n"
+    "Requires-Python: >=3.12\n"
+    "Requires-Dist: click>=8.0\n"
+    "Requires-Dist: pydantic>=2.0\n\n"
+).encode()
+members[f"{dist_info}/WHEEL"] = (
+    "Wheel-Version: 1.0\n"
+    "Generator: vq-multi-user-refresh-stdlib\n"
+    "Root-Is-Purelib: true\n"
+    "Tag: py3-none-any\n\n"
+).encode()
+members[f"{dist_info}/entry_points.txt"] = b"[console_scripts]\nvq = vq.cli:main\n"
+rows = []
+for name, data in sorted(members.items()):
+    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+    rows.append((name, f"sha256={digest}", str(len(data))))
+record_name = f"{dist_info}/RECORD"
+rows.append((record_name, "", ""))
+record = io.StringIO(newline="")
+csv.writer(record, lineterminator="\n").writerows(rows)
+members[record_name] = record.getvalue().encode()
+with zipfile.ZipFile(wheel_path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+    for name, data in sorted(members.items()):
+        info = zipfile.ZipInfo(name)
+        info.date_time = (1980, 1, 1, 0, 0, 0)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.external_attr = 0o100644 << 16
+        archive.writestr(info, data)
+PY_BUILD_VQ_WHEEL
+
+source_gid="$(id -g "$source_user")" \
+    || die "cannot resolve primary group for $source_user"
+chown "$source_uid:$source_gid" "$dependency_stage"
+install -m 0400 -o "$source_uid" -g "$source_gid" \
+    "$runtime_lock" "$download_lock"
+chmod 0711 "$work_dir"
+"$RUNUSER" -u "$source_user" -- /usr/bin/env -i \
+    HOME="$source_home" USER="$source_user" LOGNAME="$source_user" \
+    PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 PIP_CONFIG_FILE=/dev/null \
+    "$builder/bin/pip" download --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --require-hashes --no-deps \
+    --dest "$dependency_stage" --requirement "$download_lock" \
+    || die "could not download every exact hash-locked runtime wheel"
+chmod 0700 "$work_dir"
+
+PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
+    "$runtime_lock" "$dependency_stage" "$wheelhouse" \
+    "$runtime_python_tag" <<'PY_SEAL_RUNTIME_WHEELS'
+import email.parser
+import hashlib
+import io
+import os
+import pathlib
+import re
+import shlex
+import stat
+import sys
+import zipfile
+
+lock = pathlib.Path(sys.argv[1])
+source = pathlib.Path(sys.argv[2])
+destination = pathlib.Path(sys.argv[3])
+runtime_tag = sys.argv[4]
+logical = " ".join(
+    line.strip().removesuffix("\\").strip()
+    for line in lock.read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+)
+requirements = {}
+current = None
+for token in shlex.split(logical):
+    requirement = re.fullmatch(r"([A-Za-z0-9_-]+)==([A-Za-z0-9.]+)", token)
+    accepted_hash = re.fullmatch(r"--hash=sha256:([0-9a-f]{64})", token)
+    if requirement:
+        name, version = requirement.groups()
+        name = name.lower().replace("_", "-")
+        if name in requirements:
+            raise SystemExit("invalid privileged runtime lock")
+        requirements[name] = (version, set())
+        current = name
+    elif accepted_hash and current is not None:
+        requirements[current][1].add(accepted_hash.group(1))
+    else:
+        raise SystemExit("invalid privileged runtime lock")
+expected_names = {
+    "annotated-types", "click", "pydantic", "pydantic-core",
+    "typing-extensions", "typing-inspection",
+}
+if set(requirements) != expected_names or any(
+    not hashes for _, hashes in requirements.values()
+):
+    raise SystemExit("privileged runtime lock must name the exact dependency closure")
+accepted_by_hash = {}
+for accepted_name, (_, hashes) in requirements.items():
+    for digest in hashes:
+        if digest in accepted_by_hash:
+            raise SystemExit("privileged runtime lock reuses an artifact hash")
+        accepted_by_hash[digest] = accepted_name
+entries = sorted(source.iterdir())
+if len(entries) != len(requirements):
+    raise SystemExit("download did not contain exactly one wheel per accepted dependency")
+seen = set()
+for wheel in entries:
+    entry = wheel.lstat()
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_uid == 0
+        or entry.st_nlink != 1
+        or entry.st_size <= 0
+        or entry.st_size > 64 * 1024 * 1024
+        or re.fullmatch(r"[A-Za-z0-9_.+-]+\.whl", wheel.name) is None
+    ):
+        raise SystemExit("unsafe dependency download entry")
+    fd = os.open(wheel, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(fd)
+        if (
+            (opened.st_dev, opened.st_ino, opened.st_size)
+            != (entry.st_dev, entry.st_ino, entry.st_size)
+        ):
+            raise SystemExit("dependency wheel changed while sealing")
+        data = bytearray()
+        while chunk := os.read(fd, 1024 * 1024):
+            data.extend(chunk)
+    finally:
+        os.close(fd)
+    digest = hashlib.sha256(data).hexdigest()
+    accepted_name = accepted_by_hash.get(digest)
+    if accepted_name is None:
+        raise SystemExit("dependency wheel hash is not accepted by the release lock")
+    with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+        metadata_names = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        if len(metadata_names) != 1:
+            raise SystemExit("dependency wheel has ambiguous metadata")
+        expanded_size = 0
+        for info in archive.infolist():
+            member = pathlib.PurePosixPath(info.filename)
+            member_mode = info.external_attr >> 16
+            expanded_size += info.file_size
+            if (
+                not info.filename
+                or info.filename.startswith("/")
+                or ".." in member.parts
+                or "\\" in info.filename
+                or "\x00" in info.filename
+                or stat.S_ISLNK(member_mode)
+                or (
+                    member_mode
+                    and not stat.S_ISREG(member_mode)
+                    and not stat.S_ISDIR(member_mode)
+                )
+                or expanded_size > 128 * 1024 * 1024
+            ):
+                raise SystemExit("dependency wheel contains an unsafe archive member")
+        message = email.parser.BytesParser().parsebytes(archive.read(metadata_names[0]))
+    name = message["Name"].lower().replace("_", "-") if message["Name"] else ""
+    version = message["Version"] or ""
+    if name not in requirements or name in seen:
+        raise SystemExit("dependency wheel is not uniquely named by the accepted lock")
+    want_version, hashes = requirements[name]
+    if name != accepted_name or version != want_version or digest not in hashes:
+        raise SystemExit("dependency wheel does not match the accepted version/hash")
+    if name == "pydantic-core":
+        if (
+            f"-{runtime_tag}-{runtime_tag}-" not in wheel.name
+            or not wheel.name.endswith("x86_64.whl")
+            or "manylinux" not in wheel.name
+        ):
+            raise SystemExit("pydantic-core wheel does not match the trusted Python ABI")
+    elif not wheel.name.endswith("-py3-none-any.whl"):
+        raise SystemExit("pure-Python dependency wheel has an unexpected platform tag")
+    target = destination / wheel.name
+    out = os.open(
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(out, remaining)
+            if written <= 0:
+                raise OSError("short write while sealing dependency wheel")
+            remaining = remaining[written:]
+        os.fsync(out)
+    finally:
+        os.close(out)
+    seen.add(name)
+if seen != set(requirements):
+    raise SystemExit("download did not contain exactly one wheel per accepted dependency")
+dirfd = os.open(destination, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(dirfd)
+finally:
+    os.close(dirfd)
+PY_SEAL_RUNTIME_WHEELS
+rm -rf -- "$dependency_stage"
+rm -f -- "$download_lock"
+chmod 0700 "$work_dir"
+mapfile -t vq_wheels < <(find "$wheelhouse" -maxdepth 1 -type f -name 'vq-*.whl' -print)
+[ "${#vq_wheels[@]}" = "1" ] || die "wheel build produced ${#vq_wheels[@]} vq wheels"
+vq_wheel="${vq_wheels[0]}"
+wheelhouse_sha="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - "$wheelhouse" <<'PY'
+import hashlib
+import pathlib
+import sys
+h = hashlib.sha256()
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.whl"), key=lambda p: p.name):
+    h.update(path.name.encode())
+    h.update(b"\0")
+    h.update(hashlib.sha256(path.read_bytes()).digest())
+print(h.hexdigest())
+PY
+)"
+
+transaction="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S -c 'import secrets; print(secrets.token_hex(16))')"
+backup="$OPT_ROOT/.venv-backup-$transaction"
+stage="$OPT_ROOT/.venv-new-$transaction"
+[ ! -e "$backup" ] && [ ! -L "$backup" ] || die "backup path already exists: $backup"
+[ ! -e "$stage" ] && [ ! -L "$stage" ] || die "stage path already exists: $stage"
+write_initial_receipt "$transaction" "$backup" "$stage" "$previous_sha" \
+    "$previous_tree" "$start_after" "$archive_sha" "$wheelhouse_sha"
+transaction_active=1
+
+update_receipt "$transaction" "stopping"
+systemctl stop "$UNIT"
+require_quiescent || die "$UNIT did not become exactly inactive with MainPID=0"
+update_receipt "$transaction" "stopped"
+
+if [ -n "$previous_sha" ]; then
+    update_receipt "$transaction" "backup-pending"
+    [ "$(stat -c '%d:%i' "$OPT_VENV")" \
+        = "${RECEIPT_FIELDS[11]}:${RECEIPT_FIELDS[12]}" ] \
+        || die "original runtime inode changed before backup"
+    mv -- "$OPT_VENV" "$backup"
+    fsync_dir "$OPT_ROOT"
+    [ "$(stat -c '%d:%i' "$backup")" \
+        = "${RECEIPT_FIELDS[11]}:${RECEIPT_FIELDS[12]}" ] \
+        || die "backup does not contain the receipt-bound original runtime"
+fi
+update_receipt "$transaction" "backup-moved"
+
+# Re-hash the sealed artifact after quiescence and before using it. Create the
+# new venv directly at its final path; a built venv is never renamed.
+current_wheelhouse_sha="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - "$wheelhouse" <<'PY'
+import hashlib
+import pathlib
+import sys
+h = hashlib.sha256()
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.whl"), key=lambda p: p.name):
+    h.update(path.name.encode())
+    h.update(b"\0")
+    h.update(hashlib.sha256(path.read_bytes()).digest())
+print(h.hexdigest())
+PY
+)"
+[ "$current_wheelhouse_sha" = "$wheelhouse_sha" ] \
+    || die "sealed wheelhouse changed before activation"
+
+update_receipt "$transaction" "installing"
+update_receipt "$transaction" "stage-pending"
+mkdir -m 0755 -- "$stage"
+fsync_dir "$stage"
+fsync_dir "$OPT_ROOT"
+stage_identity="$(stat -c '%d:%i' "$stage")"
+stage_dev="${stage_identity%%:*}"
+stage_ino="${stage_identity##*:}"
+update_receipt "$transaction" "staged" "" "$stage_dev" "$stage_ino"
+[ ! -e "$OPT_VENV" ] && [ ! -L "$OPT_VENV" ] \
+    || die "new target path appeared before staged activation"
+[ "$(stat -c '%d:%i' "$stage")" = "$stage_dev:$stage_ino" ] \
+    || die "staged runtime inode changed before activation"
+mv -- "$stage" "$OPT_VENV"
+fsync_dir "$OPT_ROOT"
+[ "$(stat -c '%d:%i' "$OPT_VENV")" = "$stage_dev:$stage_ino" ] \
+    || die "new target does not contain the receipt-bound staged inode"
+update_receipt "$transaction" "target-created"
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+    "$LOCK_PYTHON" -I -m venv "$OPT_VENV"
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+    "$OPT_VENV/bin/pip" install --disable-pip-version-check --no-cache-dir \
+    --no-index --no-deps "$wheelhouse"/*.whl
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+    "$OPT_VENV/bin/python" -I - <<'PY_VERIFY_RUNTIME_DISTS'
+import importlib.metadata
+
+expected = {
+    "annotated-types": "0.8.0",
+    "click": "8.4.2",
+    "pydantic": "2.13.4",
+    "pydantic-core": "2.46.4",
+    "typing-extensions": "4.16.0",
+    "typing-inspection": "0.4.4",
+}
+actual = {name: importlib.metadata.version(name) for name in expected}
+if actual != expected:
+    raise SystemExit(f"installed privileged runtime dependencies differ: {actual}")
+PY_VERIFY_RUNTIME_DISTS
+
+installed_tree="$("$OPT_VQ" source-tree-sha256)" \
+    || die "new installed package cannot be digested"
+[[ "$installed_tree" =~ ^[0-9a-f]{64}$ ]] || die "new package digest is malformed"
+[ "$installed_tree" = "$expected_tree" ] \
+    || die "installed vq tree $installed_tree differs from accepted commit tree $expected_tree"
+/usr/bin/env -i HOME=/root PATH=/usr/bin:/bin PYTHONNOUSERSITE=1 \
+    "$OPT_VQ" source-sha --write-marker "$expected_sha" >/dev/null
+mapfile -t new_identity < <(installed_identity "$OPT_VQ") \
+    || die "new install provenance readback failed"
+[ "${new_identity[0]}" = "$expected_sha" ] \
+    && [ "${new_identity[1]}" = "$installed_tree" ] \
+    || die "new install marker/tree readback disagrees"
+fsync_tree_no_follow "$OPT_VENV" "$LOCK_PYTHON" \
+    || die "could not durably flush the verified new runtime"
+update_receipt "$transaction" "installed" "$installed_tree"
+
+verify_unit_contract || die "unit contract changed during refresh"
+systemctl start "$UNIT"
+systemctl is-active --quiet "$UNIT" || die "$UNIT failed to start"
+rpc_proof "$expected_sha" "$installed_tree" \
+    || die "$UNIT failed exact post-activation RPC proof"
+
+# Commit is durable before backup cleanup. Recovery of a committed receipt
+# keeps the proved new install; every earlier phase restores the exact old one.
+verify_unit_contract || die "unit contract changed after RPC proof"
+rpc_proof "$expected_sha" "$installed_tree" \
+    || die "$UNIT changed before the durable commit boundary"
+update_receipt "$transaction" "committed" "$installed_tree"
+if [ -e "$backup" ] || [ -L "$backup" ]; then
+    [ "$(stat -c '%d:%i' "$backup")" \
+        = "${RECEIPT_FIELDS[11]}:${RECEIPT_FIELDS[12]}" ] \
+        || die "receipt-bound backup changed before commit cleanup"
+    rm -rf -- "$backup"
+fi
+fsync_dir "$OPT_ROOT"
+clear_receipt "$transaction"
+transaction_active=0
+
+echo "provenance: source-tree $installed_tree; source $expected_sha"
+echo "running:   $UNIT source $expected_sha; tree $installed_tree"
+echo "OK: /opt/vq transaction committed and exact daemon RPC proof passed."

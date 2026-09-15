@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet jobs{% endblock %}
+{% block content %}
+<h2>Fleet jobs</h2>
+<p class="hint">
+  Every job across the fleet, from the console's cached snapshot
+  {% if snapshot %}({{ snapshot.gathered_at[:19] | replace("T", " ") }} UTC){% endif %}.
+  <a href="/fleet">← host grid</a>
+</p>
+
+<form class="toolbar" method="get" action="/fleet/jobs">
+  <label>
+    search
+    <input type="search" name="q" value="{{ query.q }}" autocomplete="off">
+  </label>
+  <label>
+    host
+    <select name="host">
+      <option value="all" {% if query.host == "all" %}selected{% endif %}>all</option>
+      {% for host in host_options %}
+      <option value="{{ host }}" {% if query.host == host %}selected{% endif %}>{{ host }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    state
+    <select name="state">
+      <option value="all" {% if query.state == "all" %}selected{% endif %}>all</option>
+      {% for state in state_options %}
+      <option value="{{ state }}" {% if query.state == state %}selected{% endif %}>{{ state }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    tag
+    <input type="text" name="tag" value="{{ query.tag }}" size="10" autocomplete="off">
+  </label>
+  <label>
+    submitter
+    <input type="text" name="submitter" value="{{ query.submitter }}" size="10" autocomplete="off">
+  </label>
+  <label>
+    rows
+    <select name="limit">
+      {% for value in row_limit_options %}
+      <option value="{{ value }}" {% if query.limit == value|string %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Apply</button>
+  <a class="button-link" href="/fleet/jobs">Reset</a>
+  <span class="hint">{{ shown_count }} / {{ filtered_count }} shown{% if filtered_count != total_count %} ({{ total_count }} total){% endif %}</span>
+</form>
+
+{% include "fleet_jobs_table.html" %}
+{% endblock %}

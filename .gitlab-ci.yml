@@ -1,0 +1,144 @@
+# Portable build and validation rules.
+stages:
+  - test
+  - build
+  - deploy
+
+
+workflow:
+  auto_cancel:
+    on_new_commit: conservative
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+
+
+ruff:
+  stage: test
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  before_script:
+    - pip install ruff==0.15.13
+  script:
+    - ruff check src/vq tests
+
+
+test:
+  stage: test
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  cache:
+    - key: pip-vq-python313
+      paths:
+        - .cache/pip/
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends
+      git openssh-client procps rsync util-linux
+    # The suite must not run as root: vq refuses several operations for
+    # root, and the lifecycle lock binds a checkout to its owning uid.
+    - useradd --no-create-home --uid 10001 --user-group vqtest
+    - install -d -o vqtest -g vqtest "/tmp/vqtest-$CI_JOB_ID"
+    - >-
+      runuser -u vqtest -- mkdir -p
+      "/tmp/vqtest-$CI_JOB_ID/tmp"
+      "/tmp/vqtest-$CI_JOB_ID/xdg-data"
+      "/tmp/vqtest-$CI_JOB_ID/xdg-config"
+      "/tmp/vqtest-$CI_JOB_ID/xdg-cache"
+      "/tmp/vqtest-$CI_JOB_ID/vq-state"
+      "/tmp/vqtest-$CI_JOB_ID/vq-config"
+      "/tmp/vqtest-$CI_JOB_ID/vq-archive"
+      "/tmp/vqtest-$CI_JOB_ID/vq-multi-user"
+      "/tmp/vqtest-$CI_JOB_ID/pycache"
+    - chown vqtest:vqtest "$CI_PROJECT_DIR"
+    - >-
+      runuser -u vqtest -- env HOME="/tmp/vqtest-$CI_JOB_ID"
+      GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
+      git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    - pip install -e ".[test,web]"
+    - >-
+      runuser -u vqtest -- env -u PYTEST_ADDOPTS
+      HOME="/tmp/vqtest-$CI_JOB_ID"
+      TMPDIR="/tmp/vqtest-$CI_JOB_ID/tmp"
+      XDG_DATA_HOME="/tmp/vqtest-$CI_JOB_ID/xdg-data"
+      XDG_CONFIG_HOME="/tmp/vqtest-$CI_JOB_ID/xdg-config"
+      XDG_CACHE_HOME="/tmp/vqtest-$CI_JOB_ID/xdg-cache"
+      VQ_STATE_DIR="/tmp/vqtest-$CI_JOB_ID/vq-state"
+      VQ_CONFIG_DIR="/tmp/vqtest-$CI_JOB_ID/vq-config"
+      VQ_ARCHIVE_DIR="/tmp/vqtest-$CI_JOB_ID/vq-archive"
+      VQ_MULTI_USER_ROOT="/tmp/vqtest-$CI_JOB_ID/vq-multi-user"
+      VQ_TEST_SANDBOX_ROOT="/tmp/vqtest-$CI_JOB_ID"
+      VQ_TEST_SHORT_TMPDIR="/tmp/vqtest-$CI_JOB_ID/tmp"
+      VQ_TEST_SYSTEM_CONFIG_FILE="/tmp/vqtest-$CI_JOB_ID/vq-config/system-config.toml"
+      VQ_WEB_TOKEN_FILE="/tmp/vqtest-$CI_JOB_ID/vq-config/web-token"
+      GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
+      PYTHONPYCACHEPREFIX="/tmp/vqtest-$CI_JOB_ID/pycache"
+      PYTHONPATH="$CI_PROJECT_DIR/src"
+      python -m pytest tests -q -p no:cacheprovider
+
+# --------------------------------------------------------------------
+# Documentation site: Sphinx + furo, published under
+# https://vibe-qc.com/vibe-queue/docs/
+#
+# vibe-qc.com has several publishers, each rsyncing into a subtree it
+# alone owns. vq owns /vibe-queue/docs/ and nothing above it. Widening
+# DEPLOY_PATH would let --delete-after prune another publisher's tree.
+
+
+.docs_deps: &docs_deps
+  - pip install --quiet
+    'sphinx>=7.4'
+    'myst-parser>=4.0'
+    'linkify-it-py>=2'
+    'furo>=2024.5'
+    'sphinx-copybutton>=0.5'
+    'sphinx-design>=0.6'
+
+
+docs-build:
+  stage: build
+  image: python:3.13-slim-bookworm
+  tags:
+    - docker
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  cache:
+    key: pip-docs-${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip/
+  # Start immediately rather than waiting for the test stage. A Sphinx build
+  # has no dependency on the pytest suite, so that ordering was a false
+  # coupling: it delayed docs feedback by the length of the suite (~10 min),
+  # and it meant an unrelated test failure skipped docs-build entirely, taking
+  # docs-deploy down with it. That happened for six consecutive pipelines in
+  # 2026-09 and blocked publishing a docs-only change.
+  #
+  # docs-deploy still `needs: docs-build`, and is still manual, so a human
+  # decides whether to publish. What is gone is a dependency that never
+  # existed in fact.
+  needs: []
+  before_script:
+    - *docs_deps
+  script:
+    # -W: the tree builds clean today, so any new warning is a real
+    # regression (a broken cross-reference, an unlexable code fence, a page
+    # dropped out of every toctree). --keep-going reports all of them in one
+    # run rather than one per push.
+    - sphinx-build -b html -W --keep-going docs public
+  artifacts:
+    paths:
+      - public
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'

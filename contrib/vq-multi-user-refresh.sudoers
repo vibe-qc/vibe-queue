@@ -1,0 +1,9 @@
+# RETIRED TOMBSTONE - DO NOT INSTALL.
+#
+# The former NOPASSWD rule let any vq-admins member select a Git commit whose
+# build backend root would execute. Restricting the command path did not make
+# the caller-selected source trustworthy. deploy-multi-user.sh removes any
+# installed /etc/sudoers.d/vq-multi-user-refresh fragment. Operators now use
+# ordinary authenticated sudo with a full SHA accepted by the fleet release.
+#
+# This file intentionally contains no sudoers rule.

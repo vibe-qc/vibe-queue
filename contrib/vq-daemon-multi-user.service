@@ -1,0 +1,80 @@
+# vq job queue daemon -- system-level unit for multi-user deployments.
+#
+# Runs the vq daemon as root so it can create per-user job scopes via
+# `systemd-run --uid`. Each submitted job is dropped to its submitter's
+# uid/gid before it executes -- the DAEMON is root, the JOBS are not.
+# Multi-user mode activates when [multi_user] enabled = true is set in
+# the daemon's config (/etc/vq/config.toml).
+#
+# ---------------------------------------------------------------------
+# SECURITY: run vq from a ROOT-OWNED install -- never a user checkout.
+# ---------------------------------------------------------------------
+# The daemon executes as root. If `ExecStart` pointed at a vq inside a
+# user-writable tree (e.g. ~/gitlab/vibeqc-queue/.../venv/bin/vq), that
+# user could edit the code root then runs -- a trivial root escalation.
+# Bootstrap or refresh the root-owned venv only through the transactional
+# helper after accepting one exact release SHA:
+#
+#   sudo /opt/vq/bin/vq-multi-user-refresh \
+#     --checkout /path/to/vibeqc-queue --expected-sha <accepted-40-hex-sha>
+#
+# The helper builds only an explicit sealed commit, mutates /opt/vq/venv only
+# after quiescence, and keeps a durable same-filesystem rollback transaction.
+# Direct pip or editable installs are unsupported.
+#
+# ---------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------
+#   sudo cp contrib/vq-daemon-multi-user.service /etc/systemd/system/
+#   sudo mkdir -p /etc/vq /var/lib/vq
+#   sudo cp docs/config.toml.example /etc/vq/config.toml   # then edit
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vq-daemon-multi-user
+#
+# Logs:  sudo journalctl -u vq-daemon-multi-user -f
+#
+# Full runbook + the migration step from a single-user install:
+#   docs/multi_user_deployment.md
+#
+# Minimal multi-user config (/etc/vq/config.toml):
+#   [multi_user]
+#   enabled = true
+#   admin_group = "vq-admins"
+#
+#   [quotas]
+#   default_max_pending_jobs = 20
+#   default_max_concurrent_cpus = 16
+#
+# The daemon refuses to start in multi-user mode if `systemd-run` is
+# not on PATH -- without it there is no way to drop a job's privileges,
+# and a multi-user daemon that ran jobs as root would be unsafe.
+
+[Unit]
+Description=vq job queue daemon (multi-user)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+
+# Absolute path: systemd has no shell PATH, and vq lives in a venv.
+# MUST be a root-owned install -- see the SECURITY note above.
+ExecStart=/opt/vq/venv/bin/vq daemon run
+
+# The daemon's config lives at /etc/vq/config.toml. Without this the
+# root daemon would look under /root/.config/vq/ and never find it.
+Environment=VQ_CONFIG_DIR=/etc/vq
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Sanity limits for the daemon ITSELF -- it is a scheduler, not a
+# worker. Jobs run in their own `systemd-run` scopes (separate
+# cgroups), so these caps do not constrain job processes.
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

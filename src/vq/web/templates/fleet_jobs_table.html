@@ -1,0 +1,62 @@
+<div id="fleet-jobs-table" hx-get="{{ table_refresh_url }}" hx-trigger="every 10s, refresh" hx-swap="outerHTML">
+{% if snapshot is none %}
+<p class="empty">Gathering the first fleet snapshot…</p>
+{% else %}
+{% if filtered_count > shown_count %}
+<p class="hint">Showing newest {{ shown_count }} of {{ filtered_count }} matching jobs. Increase rows or filter to narrow the table.</p>
+{% endif %}
+{% if jobs %}
+{# Inside #fleet-jobs-table for the same reason as queue_table.html: the 10 s
+   poll swaps this fragment in for the hx element itself, so the scroll box has
+   to be part of the fragment rather than a wrapper around it. Eleven columns
+   -- this is the table that used to pan the header and nav off screen. #}
+<div class="table-scroll">
+<table class="queue">
+  <thead>
+    {# Every rendered column sorts. A header that looks like the others
+       but does not respond reads as a broken control. #}
+    <tr>
+      <th><a href="{{ sort_href('id') }}">id{{ sort_label('id') }}</a></th>
+      <th><a href="{{ sort_href('host') }}">host{{ sort_label('host') }}</a></th>
+      <th><a href="{{ sort_href('state') }}">state{{ sort_label('state') }}</a></th>
+      <th><a href="{{ sort_href('sched') }}">sched{{ sort_label('sched') }}</a></th>
+      <th><a href="{{ sort_href('cpus') }}">cpus{{ sort_label('cpus') }}</a></th>
+      <th><a href="{{ sort_href('mem') }}">mem MB{{ sort_label('mem') }}</a></th>
+      <th><a href="{{ sort_href('submitted') }}">submitted (UTC){{ sort_label('submitted') }}</a></th>
+      <th><a href="{{ sort_href('submitter') }}">submitter{{ sort_label('submitter') }}</a></th>
+      <th><a href="{{ sort_href('name') }}">name / tags{{ sort_label('name') }}</a></th>
+      <th><a href="{{ sort_href('cwd') }}">workdir{{ sort_label('cwd') }}</a></th>
+      <th><a href="{{ sort_href('diagnosis') }}">diagnosis{{ sort_label('diagnosis') }}</a></th>
+      <th><a href="{{ sort_href('command') }}">command{{ sort_label('command') }}</a></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for job in jobs %}
+    <tr class="state-{{ job.state }}">
+      <td class="jobid"><a href="/fleet/jobs/{{ job.id }}?host={{ job.host }}">{{ job.id }}</a></td>
+      <td>{{ job.host }}</td>
+      <td class="state state-{{ job.state }}">{{ job.state }}</td>
+      <td>{{ job.sched or "-" }}</td>
+      <td class="num">{{ job.cpus if job.cpus else "-" }}</td>
+      <td class="num">{{ job.mem_mb if job.mem_mb else "-" }}</td>
+      <td class="ts">{{ job.submitted_at[:19] | replace("T", " ") if job.submitted_at else "-" }}</td>
+      <td class="who">{{ job.submitter or "-" }}</td>
+      <td>
+        {{ job.name or "-" }}
+        {% if job.tags %}<span class="hint">[{{ job.tags | join(", ") }}]</span>{% endif %}
+      </td>
+      {# Truncated from the LEFT: the distinguishing part of a workdir is
+         its tail (which checkout, which job id), not the shared prefix. #}
+      <td class="cwd" title="{{ job.cwd }}"><code>{{ ("…" + job.cwd[-44:]) if job.cwd | length > 45 else (job.cwd or "-") }}</code></td>
+      <td class="diag">{{ job.diagnosis or "-" }}</td>
+      <td class="cmd"><code>{{ job.command | truncate(80, true) }}</code></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No jobs match.</p>
+{% endif %}
+{% endif %}
+</div>

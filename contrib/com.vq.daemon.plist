@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd user-agent template for the vq daemon with dashboard sidecar.
+
+  Install per user:
+    mkdir -p ~/Library/LaunchAgents
+    cp contrib/com.vq.daemon.plist ~/Library/LaunchAgents/
+
+    # Edit ProgramArguments[0] to the absolute venv python path for this host.
+    # Edit StandardOutPath / StandardErrorPath if desired.
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vq.daemon.plist
+    launchctl enable gui/$(id -u)/com.vq.daemon
+    launchctl kickstart -k gui/$(id -u)/com.vq.daemon
+
+  The template starts python -m vq daemon run with the web sidecar flag, so the
+  browser dashboard is a daemon-owned sidecar at http://127.0.0.1:8768/queue.
+  Keep the bind loopback-only unless a separate reverse proxy owns access
+  control.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vq.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/vibe-queue/.venv/bin/python</string>
+    <string>-m</string>
+    <string>vq</string>
+    <string>daemon</string>
+    <string>run</string>
+    <string>--max-cpus</string>
+    <string>18</string>
+    <string>--max-jobs</string>
+    <string>4</string>
+    <string>--max-mem-mb</string>
+    <string>104858</string>
+    <string>--web</string>
+    <string>--web-host</string>
+    <string>127.0.0.1</string>
+    <string>--web-port</string>
+    <string>8768</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/absolute/path/to/vibeqc-queue</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/vq-daemon.out</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/vq-daemon.err</string>
+</dict>
+</plist>

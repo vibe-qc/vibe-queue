@@ -1,0 +1,51 @@
+<div id="queue-table" hx-get="{{ table_refresh_url }}" hx-trigger="every 3s, refresh" hx-swap="outerHTML">
+{% if filtered_count > shown_count %}
+<p class="hint">Showing newest {{ shown_count }} of {{ filtered_count }} matching jobs. Increase rows or filter to narrow the table.</p>
+{% endif %}
+{% if jobs %}
+{# The scroll box goes INSIDE #queue-table, not around it: hx-swap="outerHTML"
+   replaces #queue-table with this whole fragment, so a wrapper placed around
+   the hx element would be re-emitted inside the surviving old one and nest a
+   level deeper on every 3 s poll. Around the table, it is regenerated with
+   the rest of the fragment and stays exactly one deep. #}
+<div class="table-scroll">
+<table class="queue">
+  <thead>
+    <tr>
+      <th><a href="{{ sort_href('id') }}">id{{ sort_label('id') }}</a></th>
+      <th><a href="{{ sort_href('state') }}">state{{ sort_label('state') }}</a></th>
+      <th><a href="{{ sort_href('host') }}">host{{ sort_label('host') }}</a></th>
+      <th><a href="{{ sort_href('sched') }}">sched{{ sort_label('sched') }}</a></th>
+      <th><a href="{{ sort_href('cpus') }}">cpus{{ sort_label('cpus') }}</a></th>
+      <th><a href="{{ sort_href('mem') }}">mem MB{{ sort_label('mem') }}</a></th>
+      <th><a href="{{ sort_href('wall') }}">wall s{{ sort_label('wall') }}</a></th>
+      <th><a href="{{ sort_href('submitted') }}">submitted (UTC){{ sort_label('submitted') }}</a></th>
+      <th><a href="{{ sort_href('diagnosis') }}">diagnosis{{ sort_label('diagnosis') }}</a></th>
+      <th><a href="{{ sort_href('submitter') }}">submitter{{ sort_label('submitter') }}</a></th>
+      <th><a href="{{ sort_href('command') }}">command{{ sort_label('command') }}</a></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for job in jobs %}
+    {% set spec = job.spec %}
+    <tr class="state-{{ spec.state }}">
+      <td class="jobid"><a href="/jobs/{{ spec.id }}">{{ spec.id }}</a></td>
+      <td class="state state-{{ spec.state }}">{{ spec.state }}</td>
+      <td>{{ job.queue_host }}</td>
+      <td>{{ job.scheduler_phase if spec.scheduler_target else "-" }}</td>
+      <td class="num">{{ spec.cpus }}</td>
+      <td class="num">{{ spec.mem_mb if spec.mem_mb else "-" }}</td>
+      <td class="num">{{ spec.wall_time_seconds if spec.wall_time_seconds else "-" }}</td>
+      <td class="ts">{{ spec.submitted_at[:19] | replace("T", " ") }}</td>
+      <td class="diag">{{ job.diagnosis_summary or "-" }}</td>
+      <td class="who">{{ spec.submitter or "-" }}</td>
+      <td class="cmd"><code>{{ spec.command | join(" ") | truncate(80, true) }}</code></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No jobs.</p>
+{% endif %}
+</div>

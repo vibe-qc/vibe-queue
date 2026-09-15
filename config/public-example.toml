@@ -1,0 +1,7 @@
+# Copy outside the source checkout as config.toml. All values are examples.
+default_host = "compute"
+
+[hosts.compute]
+ssh = "compute.example.org"
+remote_vq = "vq"
+remote_python = "/opt/vibe-qc/venv/bin/python"

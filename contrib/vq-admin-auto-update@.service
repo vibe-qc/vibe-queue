@@ -1,0 +1,15 @@
+# RETIRED: privileged unattended updates from an environment's configured
+# user-owned checkout are not a supported trust boundary. This tombstone is
+# intentionally safe to copy over an older installed template: it executes no
+# vq code and fails closed if an obsolete timer or operator starts it.
+
+[Unit]
+Description=RETIRED vq privileged auto-update for env %i
+Documentation=file:/opt/vq/venv/share/doc/vq/multi_user_deployment.md
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/false
+StandardOutput=journal
+StandardError=journal

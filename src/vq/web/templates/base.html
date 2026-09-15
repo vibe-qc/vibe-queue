@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ site_title }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <a href="/queue"><strong>{{ site_title }}</strong></a>
+      {# The version chip says WHOSE version it is. Rendered bare, it was
+         read as a property of the fleet -- which is how a console 1081
+         commits stale looked like a fleet running old vq (2026-08-05). #}
+      <span class="version" title="{{ console.describe() }}">console v{{ console.version }}</span>
+      {% if fleet_mode %}
+      <nav class="fleet-nav">
+        <a href="/fleet">fleet</a>
+        <a href="/fleet/jobs">jobs</a>
+        <a href="/fleet/doctor">doctor</a>
+        {% if identity and identity.role == "admin" %}
+        <a href="/fleet/audit">audit</a>
+        {% endif %}
+      </nav>
+      {% if identity and identity.user %}
+      <form class="session-chip" method="post" action="/fleet/logout">
+        <span class="version">{{ identity.user }} ({{ identity.role }})</span>
+        <button type="submit">log out</button>
+      </form>
+      {% endif %}
+      {% endif %}
+    </div>
+    <div class="status">
+      {# This badge is about the machine SERVING the page, not the fleet.
+         Unlabelled, it read as a fleet verdict -- and a coordinator that
+         deliberately runs no jobs of its own showed a permanent red
+         "daemon: down" next to a grid of green per-host badges. In fleet
+         mode it says whose daemon it means; in single-host mode there is
+         only one daemon and the short form is unambiguous. #}
+      {% if daemon_running %}
+        <span class="badge badge-ok">{% if fleet_mode %}this host's {% endif %}daemon: running (pid {{ daemon_pid }})</span>
+      {% elif fleet_mode %}
+        <span class="badge" style="background: var(--muted); color: white;"
+              title="The vq daemon on the machine serving this console. A coordinator that runs no jobs of its own has none, which is normal — per-host daemon health is on the cards below.">this host's daemon: not running</span>
+      {% else %}
+        <span class="badge badge-bad">daemon: down</span>
+      {% endif %}
+    </div>
+  </header>
+  <main>
+    {# Self-audit. A console cannot notice on its own that it is serving
+       stale code -- every page looks normal. So it asks the daemon beside
+       it, which the same update path installs, and says so out loud when
+       they disagree. This banner is the check that would have surfaced
+       the 2026-08-05 drift on the day it started. #}
+    {% set staleness = console_staleness() %}
+    {% if staleness.stale %}
+    <div class="banner banner-bad" role="alert">
+      <strong>This console is running stale code.</strong>
+      {{ staleness.reason }}
+    </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    <small>
+      <a href="/health/live">live</a> ·
+      <a href="/health/ready">ready</a> ·
+      <a href="/docs">docs</a>
+    </small>
+  </footer>
+</body>
+</html>

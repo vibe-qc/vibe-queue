@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet login{% endblock %}
+{% block content %}
+<h2>Fleet console login</h2>
+{% if not auth_configured %}
+<p class="hint">
+  No accounts are configured, so the fleet console is open (tunnel
+  posture) and login is not required. Create accounts with
+  <code>vq web user add USER --role viewer|operator|admin</code>.
+</p>
+{% else %}
+{% if error %}
+<p class="host-card-error">{{ error }}</p>
+{% endif %}
+<form class="toolbar" method="post" action="/fleet/login">
+  <input type="hidden" name="next" value="{{ next }}">
+  <label>
+    user
+    <input type="text" name="user" autocomplete="username" autofocus>
+  </label>
+  <label>
+    password
+    <input type="password" name="password" autocomplete="current-password">
+  </label>
+  <button type="submit">Log in</button>
+</form>
+<p class="hint">
+  Sessions last 12 h. Roles: viewer (read), operator (job actions),
+  admin (audit trail).
+</p>
+{% endif %}
+{% endblock %}

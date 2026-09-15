@@ -1,0 +1,9 @@
+<section class="logs"
+         hx-get="/jobs/{{ spec.id }}/_log"
+         hx-trigger="every 5s"
+         hx-swap="outerHTML">
+  <h3>stdout (last 200 lines)</h3>
+  <pre class="log">{{ stdout_text or "(empty)" }}</pre>
+  <h3>stderr (last 200 lines)</h3>
+  <pre class="log">{{ stderr_text or "(empty)" }}</pre>
+</section>

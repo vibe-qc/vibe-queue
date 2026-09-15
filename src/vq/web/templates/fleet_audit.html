@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet audit{% endblock %}
+{% block content %}
+<h2>Fleet audit trail</h2>
+<p class="hint">
+  Every console login and write action, newest first (last
+  {{ records | length }} records). Full history in
+  <code>fleet-audit.jsonl</code> under the console host's vq state dir.
+  <a href="/fleet">← host grid</a>
+</p>
+{% if records %}
+<div class="table-scroll">
+<table class="queue">
+  <thead>
+    <tr><th>ts (UTC)</th><th>user</th><th>role</th><th>action</th><th>job</th><th>host</th><th>outcome</th></tr>
+  </thead>
+  <tbody>
+    {% for r in records %}
+    <tr>
+      <td class="ts">{{ r.ts[:19] | replace("T", " ") if r.ts else "-" }}</td>
+      <td class="who">{{ r.user or "-" }}</td>
+      <td>{{ r.role or "-" }}</td>
+      <td class="kind">{{ r.action }}</td>
+      <td class="jobid">
+        {% if r.jobid %}<a href="/fleet/jobs/{{ r.jobid }}{% if r.host %}?host={{ r.host }}{% endif %}">{{ r.jobid }}</a>{% else %}-{% endif %}
+      </td>
+      <td>{{ r.host or "-" }}</td>
+      <td class="diag {% if r.outcome and not r.outcome.startswith('ok') %}host-card-error{% endif %}">{{ r.outcome }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">No audit records yet.</p>
+{% endif %}
+{% endblock %}

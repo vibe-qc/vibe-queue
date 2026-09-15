@@ -1,0 +1,385 @@
+/* vq read-only dashboard. Plain CSS, no framework, no build step. */
+
+:root {
+  --fg:           #1a1a1a;
+  --bg:           #fafafa;
+  --muted:        #666;
+  --border:       #ddd;
+  --table-stripe: #f3f3f3;
+  --code-bg:      #f0f0f0;
+  --link:         #1a5fb4;
+  --ok:           #2ec27e;
+  --bad:          #e01b24;
+  --warn:         #ff7800;
+  --running:      #1c71d8;
+  --pending:      #888;
+  --completed:    #2ec27e;
+  --failed:       #e01b24;
+  --killed:       #e01b24;
+  --interrupted:  #c01c5c;
+  --aborted:      #c01c5c;
+  --watchdog:     #c061cb;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.6rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  background: white;
+}
+
+.brand a {
+  color: var(--fg);
+  text-decoration: none;
+  font-size: 1.2em;
+}
+
+.brand .version {
+  color: var(--muted);
+  font-size: 0.85em;
+  margin-left: 0.5em;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15em 0.6em;
+  border-radius: 3px;
+  font-size: 0.85em;
+  font-weight: 500;
+}
+.badge-ok  { background: var(--ok);  color: white; }
+.badge-bad { background: var(--bad); color: white; }
+/* --pending is grey and IS defined, so the amber fallback never fired and
+   the three "something is happening to this host" chips (draining,
+   throttled, update in flight) rendered as the least salient thing on the
+   card. They are warnings; use the warning colour. */
+.badge-warn { background: var(--warn); color: white; }
+
+/* Page-level banners: things true of the whole console, not one host. */
+.banner {
+  padding: 0.7rem 0.9rem;
+  margin: 0 0 1rem 0;
+  border-radius: 6px;
+  border-left: 4px solid;
+  line-height: 1.45;
+}
+.banner strong { display: block; margin-bottom: 0.15rem; }
+.banner-bad  { background: color-mix(in srgb, var(--failed) 12%, transparent); border-color: var(--failed); }
+.banner-warn { background: color-mix(in srgb, var(--warn) 14%, transparent); border-color: var(--warn); }
+
+/* Fleet mode (docs/fleet_dashboard_design.md M0) */
+.fleet-nav { display: inline-flex; gap: 0.75rem; margin-left: 1rem; }
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: 1rem;
+}
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.host-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+.host-card-bad  { border-color: var(--bad); }
+.host-card-down { opacity: 0.6; }
+.host-card-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.host-card-badges { margin: 0.4rem 0; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.host-card-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 0.25rem 0.75rem;
+  margin: 0.5rem 0 0.25rem;
+}
+.host-card-stats div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.host-card-stats dt { color: var(--muted); font-size: 0.85em; }
+.host-card-stats dd { margin: 0; font-variant-numeric: tabular-nums; }
+.host-card-error { color: var(--bad); }
+
+main { padding: 1.5rem; max-width: 1400px; }
+
+footer {
+  padding: 0.5rem 1.5rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  background: white;
+}
+footer a { color: var(--muted); margin-right: 0.5em; }
+
+a { color: var(--link); }
+
+h2 { margin: 0 0 0.5em 0; font-weight: 600; }
+h3 { margin: 1.2em 0 0.4em 0; font-size: 1em; font-weight: 600; }
+
+.hint  { color: var(--muted); font-size: 0.9em; }
+.empty { color: var(--muted); font-style: italic; }
+
+.cockpit-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.65rem;
+  margin: 1rem 0;
+}
+.metric {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+  padding: 0.65rem 0.8rem;
+}
+.metric-label {
+  display: block;
+  color: var(--muted);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+.metric strong {
+  font-size: 1.45rem;
+  font-variant-numeric: tabular-nums;
+}
+.metric-unit {
+  color: var(--muted);
+  margin-left: 0.2rem;
+}
+.metric-alert {
+  border-color: var(--warn);
+}
+
+.toolbar {
+  align-items: end;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 0.8rem 0;
+}
+.toolbar label {
+  color: var(--muted);
+  display: grid;
+  font-size: 0.78rem;
+  gap: 0.15rem;
+  text-transform: uppercase;
+}
+.toolbar input,
+.toolbar select,
+.toolbar button,
+.button-link {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: white;
+  color: var(--fg);
+  font: inherit;
+  min-height: 2rem;
+  padding: 0.25rem 0.45rem;
+}
+.toolbar button,
+.button-link {
+  cursor: pointer;
+  text-decoration: none;
+}
+.toolbar button {
+  background: var(--link);
+  border-color: var(--link);
+  color: white;
+}
+.toolbar button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+.checkline {
+  align-items: center;
+  display: flex !important;
+  flex-direction: row;
+  min-height: 2rem;
+}
+.danger-zone {
+  border-top: 1px solid var(--border);
+  padding-top: 0.7rem;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9em;
+}
+th, td {
+  padding: 0.4em 0.6em;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  background: white;
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.85em;
+  text-transform: uppercase;
+}
+th a {
+  color: inherit;
+  text-decoration: none;
+}
+th a:hover {
+  color: var(--link);
+}
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+tbody tr:hover           { background: #fff3c5; }
+
+td.num, td.ts            { font-variant-numeric: tabular-nums; }
+td.diag                  { max-width: 22rem; color: var(--muted); }
+td.jobid a, .jobid       { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.cmd code, .events code  { font-family: ui-monospace, "SF Mono", Menlo, monospace;
+                           font-size: 0.92em;
+                           background: var(--code-bg);
+                           padding: 0.05em 0.35em;
+                           border-radius: 3px; }
+
+.state {
+  padding: 0.1em 0.5em;
+  border-radius: 3px;
+  font-size: 0.85em;
+  font-weight: 500;
+  color: white;
+  text-transform: uppercase;
+}
+.state-running       { background: var(--running); }
+.state-pending       { background: var(--pending); }
+.state-completed     { background: var(--completed); }
+.state-failed        { background: var(--failed); }
+.state-killed        { background: var(--killed); }
+.state-interrupted   { background: var(--interrupted); }
+.state-aborted_by_queue  { background: var(--aborted); }
+.state-oom_killed    { background: var(--watchdog); }
+.state-starved       { background: var(--watchdog); }
+.state-time_exceeded { background: var(--watchdog); }
+
+dl.spec, .spec dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.3em 1em;
+}
+dt {
+  color: var(--muted);
+  font-weight: 500;
+}
+dd {
+  margin: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+pre.log {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  padding: 0.8em 1em;
+  border-radius: 4px;
+  overflow-x: auto;
+  font-size: 0.85em;
+  max-height: 30em;
+  overflow-y: auto;
+  white-space: pre;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* ---- Fleet summary strip (v0.25.0) -------------------------------------
+   The /fleet page had no fleet-level numbers at all: it led with how long
+   the sweep took, and you read every card to learn whether anything was
+   broken. */
+.fleet-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 0.75rem 0;
+}
+.fleet-summary .tile {
+  display: flex;
+  flex-direction: column;
+  min-width: 5.5rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  background: var(--card, #fff);
+}
+.tile-value { font-size: 1.35rem; font-weight: 600; line-height: 1.1; }
+.tile-label { font-size: 0.75rem; opacity: 0.7; }
+.tile-bad  { border-color: var(--failed); }
+.tile-bad  .tile-value { color: var(--failed); }
+.tile-warn { border-color: var(--warn); }
+.tile-warn .tile-value { color: var(--warn); }
+
+/* The machine's own name, when it disagrees with the config key. */
+.host-card-identity {
+  margin: 0.1rem 0 0.4rem 0;
+  font-size: 0.78rem;
+  opacity: 0.75;
+}
+
+/* Per-host program versions -- forwarded to the card in v0.25.0. */
+.host-card-envs {
+  margin: 0.4rem 0 0 0;
+  font-size: 0.78rem;
+  border-top: 1px solid var(--border, #eee);
+  padding-top: 0.35rem;
+}
+.host-card-envs > div { display: flex; justify-content: space-between; gap: 0.5rem; }
+.host-card-envs dt { opacity: 0.7; }
+.host-card-envs dd { margin: 0; text-align: right; }
+.env-dirty { color: var(--warn); font-weight: 600; }
+.env-error { color: var(--failed); }
+
+/* Failure text lives in the card body now, not in a title= tooltip:
+   tooltips are keyboard-inaccessible, invisible on touch, and uncopyable. */
+.host-card-error {
+  margin: 0.4rem 0 0 0;
+  font-size: 0.78rem;
+  color: var(--failed);
+  overflow-wrap: anywhere;
+}
+
+/* Wide tables must scroll in their own box rather than panning the page.
+   The 11-column fleet jobs table dragged the header and the fleet nav off
+   screen on a narrow window until the templates actually used this class.
+   overscroll-behavior-x stops a trackpad swipe that reaches the end of the
+   table from chaining outward and panning the page anyway -- which would
+   put back exactly the behaviour the box exists to remove. */
+.table-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+/* The doctor board's check table sits in a host card, and there the scroll
+   box on its own does nothing: a grid item's automatic minimum size is its
+   own min-content width, and the card is the grid item -- being a scroll
+   container exempts the box, not its ancestors. Measured at a 375px
+   viewport, one 140-char check message stretched the card to 891px and
+   panned the page to 915px, box or no box. min-width:0 lets the card stay
+   in its track (327px) so the box is the thing that scrolls. Harmless for
+   the /fleet cards: their long text is already `overflow-wrap: anywhere`
+   and they measured 327px either way. */
+.fleet-grid > .host-card { min-width: 0; }
+
+@media (max-width: 640px) {
+  .fleet-summary .tile { min-width: 4.5rem; flex: 1 1 30%; }
+  .fleet-grid { grid-template-columns: 1fr; }
+}
+
+/* Workdir column: monospace and left-truncated in the template, because
+   what distinguishes two workdirs is the tail, not the shared prefix. */
+td.cwd code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.88em;
+  white-space: nowrap;
+}

@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet{% endblock %}
+{% block content %}
+<h2>Fleet</h2>
+<p class="hint">
+  One card per configured host. Auto-refreshes every 10 s from the
+  console's cached snapshot; the snapshot itself is refreshed by a
+  background SSH sweep. <a href="/fleet/jobs">Cross-host job table →</a>
+  · <a href="/fleet/doctor">Doctor board →</a>
+</p>
+<form class="toolbar">
+  <button type="button"
+          hx-post="/fleet/_refresh"
+          hx-swap="innerHTML"
+          hx-target="#fleet-refresh-result">Sweep fleet now</button>
+  <span id="fleet-refresh-result" class="hint"></span>
+</form>
+{% include "fleet_grid.html" %}
+{% endblock %}

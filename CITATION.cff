@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use vibe-queue in your work, please cite it as below."
+title: "vibe-queue: a job scheduler for quantum-chemistry calculations"
+abstract: >
+  vibe-queue (command vq) submits, tracks and fetches quantum-chemistry
+  jobs across workstations and HPC schedulers, with per-commit runtime
+  pinning so a calculation records the exact source it ran against. It
+  drives vibe-qc out of process and never imports it.
+type: software
+authors:
+  - family-names: Peintinger
+    given-names: Michael F.
+    website: "https://vibe-qc.com/"
+version: 0.26.5
+date-released: 2026-09-13
+url: "https://vibe-qc.com/"
+repository-code: "https://github.com/vibe-qc/vibe-queue"
+license: MPL-2.0
+keywords:
+  - job scheduler
+  - high-performance computing
+  - quantum chemistry

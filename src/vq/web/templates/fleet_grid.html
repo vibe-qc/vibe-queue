@@ -1,0 +1,163 @@
+<div id="fleet-grid" hx-get="/fleet/_grid" hx-trigger="every 10s, refresh" hx-swap="outerHTML">
+{% if snapshot is none %}
+{% if refresh_error %}
+<div class="banner banner-bad" role="alert">
+  <strong>The last fleet refresh failed.</strong> {{ refresh_error }}
+</div>
+{% endif %}
+<p class="empty">Gathering the first fleet snapshot…{% if refreshing %} Refresh in progress for {{ refresh_elapsed }}.{% endif %}</p>
+{% else %}
+
+{% if refreshing %}
+<div class="banner banner-warn" role="status">
+  <strong>Refresh in progress for {{ refresh_elapsed }}.</strong>
+  Displayed data was observed {{ snapshot_age }} ago.
+  The next automatic sweep starts {{ interval_seconds }} s after this one finishes.
+</div>
+{% elif refresh_error %}
+<div class="banner banner-bad" role="alert">
+  <strong>The last fleet refresh failed.</strong> {{ refresh_error }}
+  Displayed data was observed {{ snapshot_age }} ago; another sweep will be attempted.
+</div>
+{% elif snapshot_stale %}
+<div class="banner banner-bad" role="alert">
+  <strong>This snapshot is {{ snapshot_age }} old.</strong>
+  No recent sweep has completed. Check the console's logs for refresh failures.
+  Automatic sweeps wait {{ interval_seconds }} s after the preceding sweep finishes.
+</div>
+{% endif %}
+
+{# Two config keys naming one machine is a real defect, not a cosmetic one:
+   both are swept, both render, and every job on that machine is counted
+   twice in the jobs table and the JSON API. #}
+{% for hostname, keys in duplicate_enrolments %}
+<div class="banner banner-warn" role="alert">
+  <strong>{{ keys | join(" and ") }} are the same machine ({{ hostname }}).</strong>
+  Both are swept and both are shown below, so every job on {{ hostname }} is counted
+  twice in the jobs table and totals. Remove the duplicate <code>[hosts.*]</code>
+  entry from this console's config.
+</div>
+{% endfor %}
+
+<div class="fleet-summary">
+  <div class="tile"><span class="tile-value">{{ summary.hosts }}</span><span class="tile-label">hosts</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.running }}</span><span class="tile-label">running</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.pending }}</span><span class="tile-label">pending</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.running_cpus }}</span><span class="tile-label">cpus busy</span></div>
+  <div class="tile {% if summary.unreachable %}tile-bad{% endif %}">
+    <span class="tile-value">{{ summary.unreachable }}</span><span class="tile-label">unreachable</span>
+  </div>
+  <div class="tile {% if summary.degraded %}tile-bad{% endif %}">
+    <span class="tile-value">{{ summary.degraded }}</span><span class="tile-label">degraded</span>
+  </div>
+  {# The number an operator running a rolling update is actually watching. #}
+  <div class="tile {% if not summary.converged %}tile-warn{% endif %}">
+    <span class="tile-value">{{ summary.vq_versions | length }}</span>
+    <span class="tile-label">vq version{{ "" if summary.vq_versions | length == 1 else "s" }}</span>
+  </div>
+</div>
+
+<p class="hint">
+  {% if snapshot_age %}updated {{ snapshot_age }} ago{% else %}updated just now{% endif %}
+  · sweep took {{ snapshot.duration_seconds }} s
+  {% if summary.vq_versions %}· vq {{ summary.vq_versions | join(", ") }}{% endif %}
+  {% if not summary.converged %}<strong>— fleet is not on one vq version</strong>{% endif %}
+</p>
+
+<div class="fleet-grid">
+  {% for card in cards %}
+  <div class="host-card {% if card.admin_down %}host-card-down{% elif not card.reachable %}host-card-bad{% endif %}">
+    <div class="host-card-head">
+      <strong>{{ card.host }}</strong>
+      {# Never an empty chip: a real version, else the helper SHA a
+         daemonless scheduler host does have, else an explicit unknown.
+         Silence used to be indistinguishable from agreement. #}
+      <span class="version" {% if card.self_reported %}title="read in this console's own process, not over the network"{% endif %}>{{ card.version_label }}</span>
+    </div>
+
+    {# The machine's own name for itself, shown when it differs from the
+       config key. This is what makes a duplicate enrolment or a
+       machine-relative key ("localhost") self-evident on the page. #}
+    {% if card.identity_mismatch %}
+    <p class="host-card-identity">calls itself <strong>{{ card.reported_hostname }}</strong></p>
+    {% endif %}
+
+    <div class="host-card-badges">
+      {% if card.admin_down %}
+        <span class="badge badge-bad">admin down</span>
+      {% elif not card.reachable %}
+        <span class="badge badge-bad">unreachable</span>
+      {% else %}
+        {% if card.daemon_ok %}
+          <span class="badge badge-ok">daemon ok</span>
+        {% elif card.daemon_ok is sameas false %}
+          <span class="badge badge-bad">daemon degraded</span>
+        {% endif %}
+        {% if card.draining %}<span class="badge badge-warn">draining</span>{% endif %}
+        {% if card.throttled %}<span class="badge badge-warn">throttled</span>{% endif %}
+        {% if card.admin_marker_summary %}
+          <span class="badge badge-warn">update: {{ card.admin_marker_summary }}</span>
+        {% endif %}
+      {% endif %}
+    </div>
+
+    {% if card.reachable %}
+    <dl class="host-card-stats">
+      <div><dt>running</dt><dd>{{ card.running }}</dd></div>
+      <div><dt>pending</dt><dd>{{ card.pending }}</dd></div>
+      <div><dt>cpus</dt><dd>{{ card.running_cpus }}{% if card.max_cpus %} / {{ card.max_cpus }}{% else %} / ?{% endif %}</dd></div>
+      {% if card.mem_total_mb %}
+      <div><dt>free mem</dt><dd>{{ card.mem_available_mb }} / {{ card.mem_total_mb }} MB</dd></div>
+      {% endif %}
+      {% if card.idle %}
+      <div><dt>idle</dt><dd>{{ card.idle }}</dd></div>
+      {% endif %}
+      <div><dt>jobs listed</dt><dd>{{ card.job_count }}</dd></div>
+    </dl>
+    {% if card.scheduler_queue_counts %}
+    <p class="hint">scheduler phases:
+      {% for phase, n in card.scheduler_queue_counts.items() %}{{ phase }}={{ n }}{% if not loop.last %}, {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+
+    {# Program versions the view used to drop, making this page strictly
+       less informative than `vq overview` and unable to answer "which
+       vibe-qc is deployed here?". #}
+    {% if card.envs %}
+    <dl class="host-card-envs">
+      {% for env in card.envs %}
+      <div>
+        <dt>{{ env.name }}</dt>
+        <dd>
+          {% if env.error %}<span class="env-error">{{ env.error | truncate(60, true) }}</span>
+          {% else %}{{ env.version or "?" }}{% if env.dirty %} <span class="env-dirty">dirty</span>{% endif %}{% endif %}
+        </dd>
+      </div>
+      {% endfor %}
+    </dl>
+    {% endif %}
+    {% endif %}
+
+    {# Failure detail in the card body, not a title= tooltip: a tooltip is
+       keyboard-inaccessible, invisible on touch, and uncopyable -- and
+       these strings are the ones an operator needs to paste somewhere. #}
+    {% if card.admin_down %}
+    <p class="host-card-error">{{ card.admin_down }}</p>
+    {% elif not card.reachable and card.error %}
+    <p class="host-card-error">{{ card.error | truncate(200, true) }}</p>
+    {% endif %}
+    {% if card.jobs_error %}
+    <p class="host-card-error">job listing failed: {{ card.jobs_error | truncate(200, true) }}
+      {% if card.reachable %}<br><small>counts above come from the host overview and are still current; “jobs listed” is not.</small>{% endif %}
+    </p>
+    {% endif %}
+    {% if card.admin_marker_stale_reason %}
+    <p class="host-card-error">{{ card.admin_marker_stale_reason }}</p>
+    {% endif %}
+
+    <p class="hint"><a href="/fleet/jobs?host={{ card.host }}">jobs on {{ card.host }} →</a></p>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+</div>

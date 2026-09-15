@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vq"
+version = "0.26.5"
+description = "Cross-machine job queue for vibe-qc workloads"
+readme = "README.md"
+authors = [{name = "Michael F. Peintinger", email = "mpei@vibe-qc.com"}]
+license = "MPL-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.0",
+    "pydantic>=2.0",
+]
+
+[project.urls]
+Homepage = "https://vibe-qc.com/"
+Documentation = "https://vibe-qc.com/vibe-queue/docs/"
+Repository = "https://github.com/vibe-qc/vibe-queue"
+Issues = "https://github.com/vibe-qc/vibe-queue/issues"
+Changelog = "https://github.com/vibe-qc/vibe-queue/blob/main/CHANGELOG.md"
+
+[project.scripts]
+vq = "vq.cli:main"
+
+[project.optional-dependencies]
+# pytest 8.2 introduced the session-wide PYTEST_VERSION ancestry marker used
+# by the fail-closed persistence boundary, including collection-time children.
+test = ["pytest>=8.2", "httpx>=0.27", "jsonschema>=4"]
+dev = ["ruff", "mypy"]
+# Read-only web UI dashboard (v0.5+). Optional install:
+#   pip install -e '.[web]'
+# Then `vq web run` serves the dashboard at http://127.0.0.1:8080/
+# (or under the systemd-user unit at contrib/vq-web.service).
+web = [
+    # Starlette 1.x switched TestClient to the separate httpx2 package.
+    # vq's supported web stack still uses httpx 0.x, so keep this pair
+    # together until the web API has been migrated and tested end-to-end.
+    "fastapi>=0.115,<0.140",
+    "starlette>=0.46,<1",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+plugins = ["pydantic.mypy"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vq"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+minversion = "8.2"
+testpaths = ["tests"]
+pythonpath = ["src"]

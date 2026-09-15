@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 48" role="img" aria-label="vq">
+  <title>vq</title>
+  <desc>vq wordmark: a teal queue glyph in a unit-cell frame, followed by the lowercase name vq in a geometric sans-serif.</desc>
+  <g id="vq-glyph" transform="translate(4,8)">
+    <rect x="3" y="3" width="26" height="26" rx="5" ry="5" fill="none" stroke="#0F766E" stroke-width="2"/>
+    <rect x="6" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E"/>
+    <rect x="13.5" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E" opacity="0.55"/>
+    <rect x="21" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E" opacity="0.25"/>
+    <line x1="6" y1="21.5" x2="26" y2="21.5" stroke="#0F766E" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <g stroke="#0F172A" fill="#0F172A" stroke-linejoin="round">
+    <line x1="44.00" y1="16" x2="50.00" y2="32" stroke-width="3.2" stroke-linecap="round"/><line x1="56.00" y1="16" x2="50.00" y2="32" stroke-width="3.2" stroke-linecap="round"/><circle cx="64.00" cy="24.00" r="4.80" fill="none" stroke-width="3.2"/><line x1="68.80" y1="16" x2="68.80" y2="38" stroke-width="3.2" stroke-linecap="round"/>
+  </g>
+</svg>

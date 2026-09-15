@@ -1,0 +1,48 @@
+<div id="doctor-board" hx-get="/fleet/doctor/_board" hx-trigger="every 5s, refresh" hx-swap="outerHTML">
+{% if refreshing %}
+<p class="hint">Doctor sweep running…</p>
+{% endif %}
+{% if results is none %}
+<p class="empty">No doctor sweep yet. Press "Run doctor sweep" to probe the fleet.</p>
+{% else %}
+<p class="hint">
+  swept {{ gathered_at[:19] | replace("T", " ") }} UTC ·
+  <span class="badge badge-ok">{{ ok_count }} ok</span>
+  {% if bad_count %}<span class="badge badge-bad">{{ bad_count }} not ok</span>{% endif %}
+</p>
+<div class="fleet-grid">
+  {% for r in results %}
+  <div class="host-card {% if not r.ok %}host-card-bad{% endif %}">
+    <div class="host-card-head">
+      <strong>{{ r.host }}</strong>
+      {% if r.ok %}
+        <span class="badge badge-ok">ok</span>
+      {% else %}
+        <span class="badge badge-bad">not ok</span>
+      {% endif %}
+      {% if r.scheduler and r.scheduler != "local" %}
+      <span class="version">{{ r.scheduler }}{% if r.driver %} via {{ r.driver }}{% endif %}</span>
+      {% endif %}
+    </div>
+    {# A check message runs to 140 chars and is often one unbreakable path or
+       ssh error, which stretched the whole card and panned the page. This box
+       only helps together with the `min-width: 0` on .fleet-grid > .host-card
+       -- see the comment on that rule. Placed inside #doctor-board, which the
+       5 s poll replaces wholesale, so it is regenerated rather than nested. #}
+    <div class="table-scroll">
+    <table class="events">
+      <tbody>
+        {% for c in r.checks %}
+        <tr>
+          <td class="kind">{% if c.ok %}✓{% else %}✗{% endif %} {{ c.name }}</td>
+          <td class="detail">{{ c.message | truncate(140, true) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+</div>

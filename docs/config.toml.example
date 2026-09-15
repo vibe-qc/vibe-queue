@@ -1,0 +1,681 @@
+# Example vq config. All host aliases and deployment paths are fictional.
+# Site wrappers in the advanced examples must be provisioned separately.
+# Keep real fleet configuration outside the source checkout.
+# Copy to ~/.config/vq/config.toml and edit. Do NOT commit your real
+# config -- it's per-user and not tracked.
+#
+# vq looks up this file in (highest priority first):
+#   1. $VQ_CONFIG_DIR/config.toml
+#   2. $XDG_CONFIG_HOME/vq/config.toml
+#   3. ~/.config/vq/config.toml
+#
+# Missing file is fine -- you just have to pass HOST explicitly to every
+# command and there's no default --python for submits.
+
+# v0.26.1: the oldest vq allowed to load this file, as "X.Y.Z".
+#
+# Leave it unset and any vq loads the file, warning about and ignoring the
+# top-level keys it does not recognize. That default exists because a fleet is
+# routinely mixed-version and an addition here must not be fatal there: when
+# `pin_source_repos` landed, vq 0.25.7 rejected the whole config with a
+# pydantic dump, which takes a host out entirely rather than costing it one
+# key it could not have used.
+#
+# Set it when a key you are adding must NOT be ignored -- a `[multi_user]`
+# policy, a pin repository the loader has to consult -- so an older vq refuses
+# the file and names the version it needs, instead of running half-read. Raise
+# it in the same commit that adds the key; nothing infers it for you.
+#
+# min_vq_version = "0.26.1"
+
+# Host used when you omit the positional HOST argument.
+# Comment out or delete to require explicit hosts on every command.
+default_host = "compute"
+
+# v0.26.1: extra absolute directories prepended to PATH for a build this
+# host runs (`update_script` / `post_update_script`).
+#
+# A remote command runs under a non-login shell, so anything a login profile
+# puts on PATH is missing. On Arch/Manjaro that is /usr/bin/core_perl, and
+# libecpint's vendored libcerf dies generating man pages with `pod2man`. The
+# Arch perl directories are already built in; this is for the next gap, so it
+# does not need a vq release and a fleet rollout.
+#
+# Directories that do not exist on a given host are skipped, so one shared
+# config is safe across a mixed fleet. See docs/fleet_update_runbook.md.
+#
+# build_path_dirs = ["/opt/site/bin"]
+
+# v0.26.1: budget for each `vq doctor` check during a rollout sweep.
+#
+# The sweep runs `vq doctor --all --json` and, until this existed, could not
+# pass a budget at all -- so every host got the 10 s default forever. That is
+# not much for a check making three remote vq calls inside it: on 2026-09-10
+# pbs-cluster's login node needed 1.6-2.5 s each, `source-sha` intermittently ran
+# out, and five supersede attempts refused as "not converged" with nothing
+# wrong on the host.
+#
+# It is a budget, not a delay: a healthy host answers well under it, so the
+# sweep is no slower. Unset keeps the 10 s default.
+#
+# A timed-out probe is now reported as a timeout rather than a negative
+# verdict, so the refusal it causes is retryable (`locked`, exit 75) instead
+# of final. Raising this only makes it rarer -- see docs/orchestration.md.
+#
+# [fleet]
+# check_timeout_seconds = 30
+
+# Optional canonical order for `vq admin rollout-latest`. Hosts omitted here
+# follow in sorted order. Alias and excluded roles remain non-targets even if
+# named here. A local-scheduler vq-only host receives only its required
+# vibeqc-queue user-install lane when its target-side program registration is
+# valid.
+fleet_rollout_order = ["compute"]
+
+
+# v0.16.0: capacity caps for the daemon running ON THIS HOST. Each key
+# mirrors the `vq daemon run` flag of the same name; an explicit CLI
+# flag wins, the config value fills in only when the flag is absent.
+# Put the caps here rather than hand-editing the systemd unit's
+# ExecStart line -- unit rewrites (fresh installs, cap re-deployments,
+# contrib-file copies) have repeatedly dropped flags in the field, while
+# nothing rewrites this file. Absent section = no caps (legacy).
+#
+# [daemon]
+# max_cpus           = 8      # concurrent CPU slots
+# max_jobs           = 2      # concurrent local jobs
+# max_mem_mb         = 51218  # host memory budget (MB)
+# default_job_mem_mb = 4000   # assumed + cgroup-capped MB for jobs
+#                             # submitted without --mem-mb
+
+
+# Per-host SSH + remote-vq settings. Add a [hosts.<name>] block for
+# every machine you submit to.
+#
+# `name` is your label for the host (used as `vq submit <name> ...`).
+# It does NOT have to match the actual hostname.
+
+[hosts.compute]
+# ssh: target understood by your local ssh client. An alias from
+# ~/.ssh/config is the cleanest option ("compute"); user@host.example.com
+# also works. The user's SSH key must already grant passwordless access
+# (test with `ssh <target> hostname`).
+#
+# Internet-reachable host? The non-standard port, public hostname, and
+# key path live in ~/.ssh/config, NOT here. vq stays transport-agnostic
+# -- it just runs `ssh <alias>`. Keep `ssh = "compute"` as the alias and
+# put the rest in ~/.ssh/config:
+#     Host compute
+#         HostName compute.example.com
+#         Port 49999
+#         User myuser
+#         IdentityFile ~/.ssh/compute_ed25519
+#         IdentitiesOnly yes
+# Full setup (router forward, sshd hardening, key generation) is in
+# docs/remote-access.md.
+ssh = "compute"
+
+# Fleet rollout topology. `auto` is the backward-compatible default, but a
+# production fleet should make intent explicit:
+#   managed  = canonical runtime target
+#   vq-only  = coordinator; receives only vibeqc-queue, never chemistry/view
+#   alias    = another queue/campaign name for fleet_canonical_host
+#   excluded = deliberately outside release maintenance
+fleet_role = "managed"
+# For an alias use both:
+# fleet_role = "alias"
+# fleet_canonical_host = "compute"
+
+# remote_vq: the command line that invokes vq on the remote.
+# Default is "vq" (relies on the remote shell's PATH). Use an absolute
+# venv path if vq isn't on the remote PATH (common with system Python +
+# venv-only installs).
+remote_vq = "/home/USER/vibeqc/vibe-queue/.venv/bin/vq"
+
+# admin_token_file: optional absolute path on the REMOTE host. For a
+# multi-user host with a root daemon, set this to that host's protected
+# bearer-token file so delegated `vq admin ... HOST` and `--all-hosts`
+# operations authenticate without copying token contents through the fleet
+# driver. The SSH user running remote_vq must be able to read the file.
+# Leave unset for single-user hosts or when passing one explicit token.
+# admin_token_file = "/etc/vq/web-token"
+#
+# update_script_timeout_seconds: optional wall-clock cap, in seconds, for a
+# managed venv update's update script on this host (default 14400, four
+# hours). Raise it for a small host whose cold native rebuild needs longer.
+# An explicitly set VQ_UPDATE_SCRIPT_TIMEOUT still wins, and a delegated
+# update forwards the cap to the host, detached builds included.
+# update_script_timeout_seconds = 28800
+
+# remote_python: optional. If set, single-file submits to this host
+# default to `<remote_python> input.py` instead of `python input.py`.
+# Point at a venv where vibe-qc is installed so jobs can import vibeqc
+# without ceremony.
+remote_python = "/home/USER/vibeqc-dev/.venv/bin/python"
+
+
+# v0.5.6: named-branch routing (optional). Lets `vq submit --branch
+# NAME input.py` pick a Python interpreter without the chat knowing the
+# absolute path. Typical use: route between a dev clone (tracking main)
+# and a release clone (tracking the latest tag).
+#
+# `branches` keys are canonical names; values are absolute interpreter
+# paths on the remote.
+[hosts.compute.branches]
+main    = "/home/USER/vibeqc-dev/.venv/bin/python"
+release = "/home/USER/vibeqc-release/.venv/bin/python"
+
+# `branch_aliases` keys are alternate spellings; values must be canonical
+# branch names from above. Validated at config-load time -- a typo here
+# fails fast rather than at submit time.
+[hosts.compute.branch_aliases]
+dev         = "main"
+development = "main"
+latest      = "release"
+
+# Then submit with:
+#   vq submit foo.py --branch main      # the dev venv
+#   vq submit foo.py --branch release   # the release venv
+#   vq submit foo.py --branch latest    # alias -> release
+#
+# `--branch` is mutually exclusive with `--python` (same purpose, two
+# UIs) and only applies to single-file submit. For -d / -c, encode the
+# interpreter path in the explicit command instead.
+
+
+# Multi-host example -- repeat the block:
+# [hosts.compute2]
+# ssh = "compute2"
+# remote_vq = "/home/USER/vibeqc/vibe-queue/.venv/bin/vq"
+# remote_python = "/home/USER/vibeqc/.venv/bin/python"
+
+# vq-only coordinator example. The role is valid only with the local scheduler
+# (the default). `rollout-latest` plans exactly one report-pinned user-vq lane
+# for this host and never invents vibeqc-release, vibeqc-dev, or vibe-view
+# lanes. The [hosts.coordinator] block belongs in the fleet driver's config:
+# [hosts.coordinator]
+# ssh = "coordinator"
+# remote_vq = "/home/USER/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq"
+# fleet_role = "vq-only"
+#
+# The following program registration belongs in the coordinator TARGET's own
+# config, not only in the driver config. Its Python must be the same venv used
+# by the user daemon/service. Missing or invalid registration is a rollout
+# configuration block; failed or contradictory remote discovery defers.
+# [programs.vibeqc-queue]
+# kind = "venv"
+# python = "/home/USER/gitlab/vibeqc-queue/vibe-queue/.venv/bin/python"
+# git_dir = "/home/USER/gitlab/vibeqc-queue"
+# branch = "main"
+# update_script = "vibe-queue/scripts/update.sh"
+# import_check = "vq"
+# fail_on_dirty = true
+# description = "vq coordinator user install"
+#
+# Set `extras` when this venv serves more than the daemon. `vq admin update`
+# otherwise rebuilds it with whatever profile it was last built with, which is
+# `core` for a plain install -- so a venv that also runs `vq web run` loses
+# uvicorn on the next rebuild and its console unit fails on every start. The
+# declaration is a floor, never a ceiling: it can only add to what the venv
+# already had. `update_script` may NOT carry `--extras`; a serving venv's
+# install target comes from this validated key or from nowhere.
+# extras = ["web"]                     # names from [project.optional-dependencies]:
+#                                      # web, test, dev. Applied by the managed
+#                                      # daemon transaction (`vq admin update`
+#                                      # on the env serving this host's daemon,
+#                                      # `vq self-update`); an update that
+#                                      # cannot apply it says so.
+#
+# Ordering, and it bites: an older vq rejects an unknown program key outright
+# and then fails to load this file at all. Update the host, then add the key.
+
+
+# Scheduler-backed cluster example (PBS/TORQUE). The scheduler host runs no
+# vq daemon; jobs and cluster maintenance are driven by scheduler_driver.
+# [hosts.pbs-cluster]
+# ssh = "uni-cluster"                  # login-node SSH alias
+# scheduler = "pbs"
+# scheduler_dialect = "torque"
+# scheduler_driver = "compute"         # host with the always-on vq daemon
+# scratch_root = "/home/USER"  # absolute path on the scheduler host
+# submit_extra = ["-q", "compute"]
+# scheduler_mem_directive = "omit"     # Torque moms turn `-l mem=` into a hard
+#                                      # per-process RLIMIT_DATA that bad_allocs
+#                                      # tightly-sized jobs (BUG 118); "omit"
+#                                      # drops the directive, "request" (default)
+#                                      # renders mem_mb as before.
+# scheduler_gnu_time_command = "/usr/bin/time" # absolute compute-node path;
+#                                                # override when GNU Time lives
+#                                                # elsewhere on the cluster.
+# scheduler_prologue = ["source /home/USER/cluster-env.sh"]
+# scheduler_epilogue = ["rm -f scratch.tmp"]
+# scheduler_update_command = "/home/USER/vibe-queue/contrib/update-scheduler-vq.sh"
+# scheduler_update_host = "cluster-build" # optional: SSH target that can compile
+# scheduler_update_stage = "/shared/USER/vq-admin/pbs-cluster" # optional shared base
+# scheduler_install_command = "/home/USER/vibeqc-dev/scripts/install_cluster.sh"
+# scheduler_update_timeout_seconds = 7200
+#
+# Managed program runtimes are independent from the scheduler-side vq helper.
+# Each deployment command receives:
+#   --program NAME --expected-sha FULL_SHA [--tag TAG]
+# after any operator --update-script-arg values. It must build in a staging
+# path, run its health checks, and atomically switch the active path only on
+# success. The verify command runs independently on the scheduler login host
+# and must print exactly one JSON object:
+#   {"program":"vibeqc-release","source_sha":"<40 hex>",
+#    "tag":"v0.15.45","healthy":true,"activation":"atomic",
+#    "quiescent":true,"updater_pid":null,
+#    "active_path":"/placeholder/runtime/releases/<40 hex>/source/.venv/bin/python",
+#    "health_detail":"import and banner ok"}
+# active_path is the exact immutable executable or launcher used at argv[0],
+# not the enclosing release directory or the mutable current symlink.
+# Use null for tag on branch-tip deployments.
+#
+# The isolated SKALA scheduler handle points at the stable launcher installed
+# from the private site wrapper installation. It is a binary registration because the Python
+# lives behind the launcher's atomic `current` selection.
+# [programs.vibeqc-skala-dev]
+# kind = "binary"
+# binary = "/home/USER/.local/libexec/vq-pbs-cluster/bin/vibeqc-skala-dev-python"
+# description = "isolated pbs-cluster CPython-3.13 SKALA development runtime"
+# BinaryProgram inventory checks the launcher's executable bit only. The
+# scheduler deployment verifier is authoritative; operators can also run
+# probe-pbs-cluster-vibeqc-skala-dev-runtime directly for an on-demand strict check.
+# Repeat this [programs.vibeqc-skala-dev] registration in the pbs-cluster login
+# helper's private config so `vq programs pbs-cluster --require vibeqc-skala-dev`
+# verifies the remote inventory. The scheduler_runtime_deployments block below
+# belongs only in the driver's config.
+#
+# [hosts.pbs-cluster.scheduler_runtime_deployments.vibeqc-release]
+# update_command = "/site/bin/deploy-vibeqc-release"
+# install_command = "/site/bin/install-vibeqc-release"
+# update_host = "cluster-build"       # optional dedicated build SSH target
+# verify_command = "/site/bin/verify-vibeqc-release"
+# timeout_seconds = 14400
+#
+# [hosts.pbs-cluster.scheduler_runtime_deployments.vibeqc-dev]
+# update_command = "/site/bin/deploy-vibeqc-dev"
+# update_host = "cluster-build"
+# verify_command = "/site/bin/verify-vibeqc-dev"
+# timeout_seconds = 14400
+#
+# Experimental SKALA gets its own CPython-3.13 runtime. It never changes the
+# ordinary dev/release programs. The tracked preparer hash-locks an official
+# CPU-only Torch wheel and the pinned model; the modern build host imports
+# native vibe-qc + Torch + TorchScript before activation. See
+# docs/scheduler_runtime_deployment.md for the complete split-gate contract.
+# [hosts.pbs-cluster.scheduler_runtime_deployments.vibeqc-skala-dev]
+# update_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/deploy-pbs-cluster-runtime"
+# update_host = "cluster-build"
+# detached_build = true
+# verify_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/verify-pbs-cluster-runtime"
+# feed_source_mirror = ".local/share/vq-pbs-cluster/vibeqc.git"
+# prepare_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/prepare-pbs-cluster-runtime-source"
+# prepare_timeout_seconds = 1800
+# timeout_seconds = 14400
+#
+# [hosts.pbs-cluster.scheduler_runtime_deployments.vibe-view]
+# update_command = "/site/bin/deploy-vibe-view"
+# update_host = "cluster-build"
+# verify_command = "/site/bin/verify-vibe-view"
+# timeout_seconds = 3600
+#
+# Each scheduler_program_hooks key must match a configured [programs.NAME].
+# `vq doctor pbs-cluster` reports unknown hook keys before submit.
+# [hosts.pbs-cluster.scheduler_program_hooks.orca]
+# prologue = ["source /home/USER/orca-env.sh"]
+# epilogue = ["cp -f orca.out artifacts/ 2>/dev/null || true"]
+# command_wrapper = ["/home/USER/bin/orcasub"]
+#
+# With that configured:
+#   vq admin update pbs-cluster
+#   vq admin update pbs-cluster --cluster-install
+#   vq admin update vibeqc-release pbs-cluster --tag v0.15.45 \
+#       --expected-sha <immutable-40-hex-release-sha>
+#   vq admin update vibeqc-dev pbs-cluster --expected-sha <main-40-hex-sha>
+#   vq admin update vibeqc-skala-dev pbs-cluster --expected-sha <main-40-hex-sha>
+#   vq admin update vibe-view pbs-cluster --expected-sha <main-40-hex-sha>
+
+
+# Scheduler-backed cluster example (SLURM / slurm-cluster-style). Keep production
+# values local/private: real account names, workspace roots, user IDs, and
+# licensed binary paths do not belong in the repo.
+# [hosts.slurm-cluster]
+# ssh = "slurm-cluster"                       # SSH alias from ~/.ssh/config
+# scheduler = "slurm"
+# scheduler_dialect = "slurm"
+# scheduler_driver = "compute"         # host with the always-on vq daemon
+# scratch_root = "/workspace/USER/vq" # absolute shared workspace root
+# node_scratch_dir = "/tmp/$USER"      # compute-node local scratch template
+# submit_extra = [
+#   "--account", "<group-account>",
+#   "--partition", "<partition>",
+# ]
+# scheduler_gnu_time_command = "/usr/bin/time" # absolute compute-node path
+# scheduler_prologue = ["module purge"]
+# The configured partition's MaxTime must cover every submitted --wall-time.
+# Prefer a production partition over a short development partition for long jobs.
+#
+# Optional program hooks stay placeholder-only. For ORCA PAL jobs on slurm-cluster,
+# site management found that SLURM `--ntasks=N --cpus-per-task=1` should match
+# `%pal nprocs N`; submit those with `vq submit slurm-cluster --ntasks N --cpus 1 ...`
+# or encode a private wrapper/profile policy outside the public example.
+# [hosts.slurm-cluster.scheduler_program_hooks.orca]
+# prologue = ["module load ORCA/<version-placeholder>"]
+# command_wrapper = ["/path/to/private/orca-slurm-wrapper"]
+#
+# Managed runtimes on a daemonless SLURM host that has no fixed build node.
+# Instead of pbs-cluster's `update_host = "cluster-build"` SSH target, each deployment
+# names an `update_allocation`: vq submits the (plain, allocation-agnostic)
+# deployment command from the login host as an `sbatch --parsable --wait` batch
+# job with these args, so the compile lands on a compute node and runs
+# server-side (a multi-hour cold build survives an SSH blip a foreground srun
+# would not). `update_host` and `update_allocation` are mutually exclusive.
+# Point the program hooks *or* branches at a STABLE wrapper the deployment
+# flips atomically (e.g. the deploy re-publishes vibeqc-release-python) so no
+# config edit is needed per update.
+#
+# COMPOSITION CONTRACT — pick ONE, never both. `command_wrapper` is an argv
+# prefix prepended to the submitted command, and a single-file submit's command
+# is always [interpreter, script]. Setting `branches.release` AND
+# `command_wrapper` to the same launcher makes it receive its own path as the
+# script argument: the wrapper's python parses the wrapper's shell source and
+# the job dies at `SyntaxError: set -euo pipefail`. That cost ~250 pbs-cluster jobs on
+# 2026-07-20. vq de-duplicates this at dispatch and `vq doctor HOST` fails the
+# `scheduler_command_wrapper` check, but configure it correctly rather than
+# relying on the dedup to guess your intent.
+# See docs/operations.md "The command_wrapper composition contract".
+#
+# The partition's MaxTime must cover a full cold native rebuild, so use a
+# build/production partition, not a short one.
+#
+# `verify_command` runs on the login host under a 60 s cap by default. A slurm-cluster
+# runtime refuses to run outside an allocation, so its verify must itself `srun`
+# a compute node; set `verify_timeout_seconds` high enough to wait for that node
+# plus the in-node import/banner check. The tracked verifier removes the Slurm
+# task-step rank variables only from its nested serial wrapper probe, so a
+# runtime without mpi4py is not misclassified as a broken MPI launch. It keeps
+# SLURM_JOB_ID in the parent and child. The verifier must still print the
+# one-line JSON receipt (see the pbs-cluster block above).
+#
+# `stage_source = true`: the build host has no repo credentials, so vq archives
+# vibe-qc at `--expected-sha` from the driver's local checkout (top-level
+# `scheduler_runtime_source_repo`, below), uploads it to a stage dir under
+# `scratch_root`, and appends `--source-archive <remote-path>` to the deployment
+# command. The deploy script builds from that tarball instead of cloning.
+#
+# DEPRECATED since v0.26.1 -- this is the [pin_source_repos] "mpei/vibe-qc"
+# entry under an older name, from before the 2026-09-08 split when one
+# checkout held every program. Still accepted, and still authoritative when
+# pin_source_repos has no vibe-qc entry, but setting it warns once. Setting
+# both to different paths is an error, not a precedence rule.
+#
+# [pin_source_repos]
+# "mpei/vibe-qc"    = "/home/USER/gitlab/vibe-qc"
+# "mpei/vibe-queue" = "/home/USER/gitlab/vibe-queue"
+# "mpei/vibe-view"  = "/home/USER/gitlab/vibe-view"
+#
+# scheduler_runtime_source_repo = "/home/USER/gitlab/vibeqc"  # driver-local vibe-qc checkout
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibeqc-release]
+# update_command = "/site/bin/deploy-slurm-cluster-runtime"
+# install_command = "/site/bin/deploy-slurm-cluster-runtime"
+# verify_command = "srun --account=<group-account> --partition=<partition> --time=00:05:00 --ntasks=1 /site/bin/verify-slurm-cluster-runtime"
+# verify_timeout_seconds = 900
+# timeout_seconds = 14400
+# stage_source = true
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibeqc-release.update_allocation]
+# scheduler = "slurm"
+# sbatch_args = ["--account=<group-account>", "--partition=<build-partition>", "--time=04:00:00", "--ntasks=1", "--cpus-per-task=8", "--mem=48G"]
+#
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibeqc-dev]
+# update_command = "/site/bin/deploy-slurm-cluster-runtime"
+# verify_command = "srun --account=<group-account> --partition=<partition> --time=00:05:00 --ntasks=1 /site/bin/verify-slurm-cluster-runtime"
+# verify_timeout_seconds = 900
+# stage_source = true
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibeqc-dev.update_allocation]
+# scheduler = "slurm"
+# sbatch_args = ["--account=<group-account>", "--partition=<build-partition>", "--time=04:00:00", "--ntasks=1", "--cpus-per-task=8", "--mem=48G"]
+#
+# The vibe-view lane uses the same deploy/verify scripts (the program gate
+# dispatches on --program). The viewer build is a pure-Python wheel plus the
+# site Mesa module for headless capture — no compilation — so its allocation
+# is much smaller than the vibeqc native builds.
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibe-view]
+# update_command = "/site/bin/deploy-slurm-cluster-runtime"
+# install_command = "/site/bin/deploy-slurm-cluster-runtime"
+# verify_command = "srun --account=<group-account> --partition=<partition> --time=00:05:00 --ntasks=1 /site/bin/verify-slurm-cluster-runtime"
+# verify_timeout_seconds = 900
+# timeout_seconds = 3600
+# stage_source = true
+# [hosts.slurm-cluster.scheduler_runtime_deployments.vibe-view.update_allocation]
+# scheduler = "slurm"
+# sbatch_args = ["--account=<group-account>", "--partition=<build-partition>", "--time=01:00:00", "--ntasks=1", "--cpus-per-task=4", "--mem=16G"]
+#
+# With that configured (identical CLI to pbs-cluster, builds land on a compute node):
+#   vq admin update vibeqc-release slurm-cluster --tag v0.15.50 \
+#       --expected-sha <immutable-40-hex-release-sha>
+#   vq admin update vibeqc-dev slurm-cluster --expected-sha <main-40-hex-sha>
+#   vq admin update vibe-view slurm-cluster --expected-sha <main-40-hex-sha>
+
+
+# ----------------------------------------------------------------------
+# v0.11.0: host pools for `vq submit auto` (memory-aware placement). Group
+# hosts so a submit can be scoped to a subset, and optionally set
+# default_pool so a bare `vq submit auto` excludes the daily-driver /
+# gaming boxes. Each pool host must be a defined [hosts.*] (checked at
+# config load). Usage: `vq submit auto --pool compute my.py`.
+#
+# default_pool = "compute"      # top-level; bare `vq submit auto` uses it
+# [pools.compute]
+# hosts = ["compute", "compute2"]
+#
+# Scheduler hosts can be pool members too. They run no vq daemon, so
+# `vq submit auto --pool clusters` reads queue depth from scheduler_driver
+# specs tagged for that cluster and then submits to the scheduler host, which
+# forwards to the driver as usual.
+# [pools.clusters]
+# hosts = ["pbs-cluster"]
+
+# v0.11.0: automatic memory estimate for `vq submit auto`. Point this at a
+# LOCAL vibe-qc interpreter; when a bare `vq submit auto job.py` is submitted
+# without --mem-mb, the submit host runs job.py's vibe-qc dry-run once with it
+# to read the job's estimated peak memory and place by free RAM. QC jobs are
+# memory-bound, so this is the right placement signal. Single-file vibe-qc
+# `.py` submits only; anything else (or any failure) falls back to core-fit.
+# Belongs on the host you SUBMIT from.
+# estimate_python = "/home/USER/vibeqc-dev/.venv/bin/python"
+
+
+# ----------------------------------------------------------------------
+# v0.5.18: program registry. What `vq programs` lists, and the source
+# of truth for the future v0.6.0 `vq admin update <name>` CLI.
+#
+# IMPORTANT: programs live in the config on the host that actually has
+# the binaries / venvs. When a chat runs `vq programs` from the laptop
+# with default_host=compute, the laptop delegates via SSH to
+# `vq programs localhost` on compute — so the AVAILABILITY checks
+# happen where the files actually live. Put the [programs.X] section
+# in compute's ~/.config/vq/config.toml, NOT the laptop's.
+#
+# Three kinds:
+#   binary  - an executable file (CRYSTAL, ORCA, Psi4)
+#   venv    - a python interpreter + a git checkout (vibeqc-dev/release)
+#   import  - a python module importable from an interpreter (PySCF)
+
+# [programs.crystal]
+# kind = "binary"
+# binary = "/home/USER/bin/crystal"
+# description = "CRYSTAL14 serial SCF"
+#
+# [programs.Pcrystal]
+# kind = "binary"
+# binary = "/home/USER/bin/Pcrystal"
+# description = "CRYSTAL14 parallel SCF (OpenMPI)"
+#
+# [programs.orca]
+# kind = "binary"
+# binary = "/home/USER/bin/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/orca"
+# description = "ORCA 6.1.1"
+#
+# [programs.psi4]
+# kind = "binary"
+# binary = "/home/USER/psi4conda/bin/psi4"
+# description = "Psi4 (conda install)"
+#
+# xtb semiempirical (GFN-xTB / GFN-FF). External program vq runs
+# out-of-process, like CRYSTAL / ORCA. Linux: prebuilt static tarball from
+# grimme-lab/xtb releases unpacked in ~/xtb-dist. macOS: source build (no
+# prebuilt exists). Auto-locates its GFN parameters relative to the binary.
+# [programs.xtb]
+# kind = "binary"
+# binary = "/home/USER/xtb-dist/bin/xtb"
+# description = "xtb 6.7.1 GFN-xTB/GFN-FF semiempirical (Grimme group, LGPL-3.0)"
+#
+# [programs.vibeqc-dev]
+# kind = "venv"
+# python = "/home/USER/vibeqc-dev/.venv/bin/python"
+# git_dir = "/home/USER/vibeqc-dev"
+# branch = "main"
+# update_script = "scripts/update.sh --dev"   # relative to git_dir; v0.5.39 supports args
+# import_check = "vibeqc"   # runtime core identity/freshness + atomic rollback
+# # v0.26.1: what `vq admin install` needs to bring a host up from nothing.
+# # Without these, git_dir has to be cloned and built by hand before vq can
+# # manage the host at all -- the one step of a fleet migration that cannot go
+# # through vq, and so the step most likely to be done inconsistently.
+# #
+# # `upstream` is only used to CREATE git_dir; an existing checkout keeps
+# # whatever origin it has and vq never repoints it. `install_script` is the
+# # program's own installer, run once after the clone -- `vq admin install`
+# # never runs update_script, and `vq admin update` never runs this one.
+# upstream = "ssh://git@gitlab.example.invalid:26/mpei/vibe-qc.git"
+# install_script = "scripts/install.sh --editable --extras dev"
+# description = "vibe-qc development (main branch)"
+# # v0.5.47: optional. Names of [hosts.X.branches] entries this env
+# # serves at submit time. When `vq admin update vibeqc-dev` runs, only
+# # jobs whose spec.branch matches one of these get paused/resumed —
+# # surgical pause instead of pause-all. Jobs running through other
+# # envs (e.g. vibeqc-release) keep dispatching. Omit (or set to []) to
+# # fall back to whole-queue pause/resume.
+# provides_branches = ["main", "dev", "development"]
+#
+# Headless docs/figure capture via vibe-view. Manage this through
+# `vq admin update vibeview-dev HOST`; do not hand-edit managed git checkouts.
+# The update script installs `pip install -e vibe-view/` into a lean,
+# capture-only venv and validates offscreen rendering. `xvfb-run -a` is the
+# portable healthcheck form; the managed venv may provide an `xvfb-run` shim
+# that falls back to direct `PYVISTA_OFF_SCREEN=True` VTK/OSMesa offscreen
+# capture when the host has no system xvfb-run. Pinned `vq admin update` calls
+# append `--ref SHA` or `--branch TAG`; this updater treats that selector as an
+# exact checkout-HEAD assertion and never fetches or switches refs itself.
+# [programs.vibeview-dev]
+# kind = "venv"
+# python = "/home/USER/vibeqc-dev/.venv-vibeview/bin/python"
+# git_dir = "/home/USER/vibeqc-dev"
+# branch = "main"
+# update_script = "scripts/update_vibeview_capture_env.sh"
+# import_check = "vibeview"
+# healthcheck_command = "xvfb-run -a vibe-view capture-selftest"
+# description = "vibe-view headless capture environment (main branch)"
+# Jobs submitted with `--program vibeview-dev` can call
+# `$VQ_PROGRAM_BIN/vibe-view` without hard-coding this host's checkout path.
+#
+# [programs.vibeqc-release]
+# kind = "venv"
+# python = "/home/USER/vibeqc-release/.venv/bin/python"
+# git_dir = "/home/USER/vibeqc-release"
+# branch = "release"
+# update_script = "scripts/update.sh"
+# import_check = "vibeqc"   # runtime core identity/freshness + atomic rollback
+# # Optional deployment finalizer after a successful pull/update_script.
+# # For vibe-qc release clones this installs bundled .g94 basis data into
+# # the rebuilt libint data directory without letting jobs write to the
+# # managed checkout.
+# post_update_script = "scripts/setup_basis_library.sh"
+# description = "vibe-qc release (latest tag)"
+# provides_branches = ["release", "latest"]
+# # Optional production guard: `vq submit --program vibeqc-release ...`
+# # rejects the job if the configured checkout or imported module version has
+# # drifted from the paper/release pin. The submitted pin is stored on the job
+# # spec and rechecked before dispatch, so pending jobs fail closed if the
+# # checkout and registry move together after submission. Short git SHA
+# # prefixes are accepted.
+# # expected_git_sha = "2f62d9a"
+# # expected_import_version = "0.15.1"
+#
+# # v0.6.3: CRYSTAL23 demo binaries (full feature set, 10-atom primitive
+# # cell limit). Same fleet shape as crystal / Pcrystal / properties /
+# # Pproperties — no parallel variant (demo is serial-only).
+# # [programs.crystal23demo]
+# # kind = "binary"
+# # binary = "/home/USER/bin/crystal23demo"
+# # description = "CRYSTAL23 demo SCF (serial; 10-atom cell limit)"
+# #
+# # [programs.properties23demo]
+# # kind = "binary"
+# # binary = "/home/USER/bin/properties23demo"
+# # description = "PROPERTIES23 demo post-processing (serial; 10-atom cell limit)"
+#
+# [programs.pyscf]
+# kind = "import"
+# python = "/home/USER/vibeqc-dev/.venv/bin/python"
+# import_check = "pyscf"
+# description = "PySCF 2.13 (in vibeqc-dev venv)"
+
+
+# ----------------------------------------------------------------------
+# v0.5.35: terminal-state webhook notifications. When a job hits a
+# terminal state — COMPLETED, FAILED, KILLED, OOM_KILLED, STARVED,
+# TIME_EXCEEDED, ABORTED_BY_QUEUE — the daemon POSTs a small JSON
+# payload to the URL below. Absent / empty = disabled (default).
+#
+# This section belongs on the DAEMON HOST (where the daemon runs and
+# the state transitions happen), NOT the laptop's config.
+#
+# Slack / Discord / Mattermost incoming webhooks all work with the
+# same URL — the payload carries both `text` (Slack/Mattermost) and
+# `content` (Discord) keys; each platform reads its preferred field.
+# Microsoft Teams is NOT supported (Teams uses Adaptive Card / Message
+# Card; a Teams integration would need its own POST format).
+#
+# Fire-and-forget, 5s HTTP timeout, no retry. If you need delivery
+# guarantees, point the webhook at a relay that owns retry policy.
+#
+# Restart the daemon after editing this section
+# (`systemctl --user restart vq-daemon`) — config is read at startup.
+
+# [notifications]
+# webhook_url = "https://hooks.slack.com/services/T.../B.../X..."
+
+
+# ----------------------------------------------------------------------
+# v0.6.x: multi-user deployment. When enabled and the daemon runs as
+# root, vq manages per-user state dirs under /var/lib/vq/users/<uid>/.
+# Ownership checks apply to kill/fetch/resubmit.
+#
+# This section belongs on the DAEMON HOST.
+
+# [multi_user]
+# enabled = true
+# # Unix group whose members bypass ownership checks.
+# admin_group = "vq-admins"
+
+
+# ----------------------------------------------------------------------
+# v0.6.x: per-user quotas. Only meaningful with multi-user mode.
+# Global defaults apply to every user; per-user overrides keyed by UID.
+#
+# This section belongs on the DAEMON HOST.
+
+# [quotas]
+# # Global defaults (unlimited when not set).
+# default_max_pending_jobs = 20
+# default_max_concurrent_cpus = 16
+#
+# # Per-user overrides (UID = string).
+# [quotas.users]
+# [quotas.users."1000"]
+# max_pending_jobs = 30
+# max_concurrent_cpus = 24
+# [quotas.users."1001"]
+# max_pending_jobs = 10
+# max_concurrent_cpus = 8

@@ -1,0 +1,646 @@
+[
+  {
+    "version": "0.7.0",
+    "name": "Hoare's Pipeline",
+    "file": "7-vq-v0.7.0-hoares-pipeline.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections, shallow depth of field. A slender polished rail crosses the lower third of the frame from edge to edge, carrying a single-file row of identical matte-white ceramic tokens with rounded corners, each with one thin illuminated edge in translucent teal. The rail passes through a horizontal tube of frosted optical glass, and each token inside the tube is wrapped in its own faint teal envelope of light, isolated from its neighbours. Violet light picks out the tube's rims. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Per-job workdir and the agent protocol",
+    "treatment": "A. Light studio",
+    "status": "Shipped; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections, shallow depth of field. A slender polished rail crosses the lower third of the frame from edge to edge, carrying a single-file row of identical matte-white ceramic tokens with rounded corners, each with one thin illuminated edge in translucent teal. The rail passes through a horizontal tube of frosted optical glass, and each token inside the tube is wrapped in its own faint teal envelope of light, isolated from its neighbours. Violet light picks out the tube's rims. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "White ceramic tokens with teal edges pass through a frosted glass tube with violet rims on a polished rail.",
+    "caption": "Per-job working directories isolate each task within the agent protocol."
+  },
+  {
+    "version": "0.8.0",
+    "name": "Dahl's Simula",
+    "file": "8-vq-v0.8.0-dahls-simula.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender polished rail crosses the lower third carrying a row of identical matte-white ceramic tokens with thin teal illuminated edges. Standing upright across the rail, edge-on to the camera, is a tall pane of frosted glass with a violet glow along its edge. The tokens do not pass through it: the last token on the near side rests against the pane, and an identical token stands just beyond it on the far side, so the boundary is unmistakably real and something crossed it anyway. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Daemon-side RPC: vq's first IPC boundary",
+    "treatment": "A. Light studio",
+    "status": "Shipped; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender polished rail crosses the lower third carrying a row of identical matte-white ceramic tokens with thin teal illuminated edges. Standing upright across the rail, edge-on to the camera, is a tall pane of frosted glass with a violet glow along its edge. The tokens do not pass through it: the last token on the near side rests against the pane, and an identical token stands just beyond it on the far side, so the boundary is unmistakably real and something crossed it anyway. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A violet-edged frosted glass pane divides a rail, with matching ceramic tokens resting on opposite sides.",
+    "caption": "Daemon-mediated RPC gives administrative state an explicit process boundary."
+  },
+  {
+    "version": "0.9.0",
+    "name": "Tukey's Window",
+    "file": "9-vq-v0.9.0-tukeys-window.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A long rail crosses the lower third carrying a row of many identical matte-white ceramic tokens. A precision-machined rectangular aperture frame, white anodised aluminium with a fine teal inner bevel, hovers just above the row. The four or five tokens framed by the aperture are crisply lit and razor sharp with bright teal edges; every token outside the aperture falls away into soft blur and dim violet shadow. The transition at the aperture's edges is smooth, tapered, not abrupt. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "vq top, a live per-job resource view",
+    "treatment": "A. Light studio",
+    "status": "Shipped; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "edit_prompt": "Refine this release artwork, retaining the photorealistic 3-D product-render style, 16:9 landscape composition, pale-blue near-white seamless studio background, glossy white surface, precision-machined white aluminium rectangular aperture frame with teal inner bevel, and soft violet blur outside it. Change only the ceramic token design across the whole row: replace the hourglass-shaped pieces with identical upright matte-white ceramic rectangular slabs, rounded corners, roughly domino proportions, absolutely blank faces. The five tokens inside the aperture must each have a clearly bright fine teal illuminated edge and razor-sharp ceramic detail. Outside the aperture the identical slabs fade smoothly and progressively into blur and dim violet shadow, with a tapered transition near the aperture boundaries. Preserve all other composition, objects, framing, and lighting. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "canvas": [
+      1672,
+      941
+    ],
+    "alt": "A white rectangular aperture frames five sharp ceramic tokens, while the surrounding row fades into violet blur.",
+    "caption": "The live vq top view brings one window of job resource activity into focus.",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas"
+  },
+  {
+    "version": "0.10.0",
+    "name": "Lampson's Hint",
+    "file": "10-vq-v0.10.0-lampsons-hint.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. Three slender parallel rails run left to right across the lower half, each carrying identical matte-white ceramic tokens with teal illuminated edges. Beside the middle rail stands a small teal pennant on a slim polished post -- clearly only a marker, nothing blocking the track, the rail beyond it completely clear and unobstructed. The tokens approaching it have visibly changed lanes onto the outer two rails, leaving the middle rail empty past the pennant. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "vq host down/up: advisory host availability",
+    "treatment": "A. Light studio",
+    "status": "Shipped; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. Three slender parallel rails run left to right across the lower half, each carrying identical matte-white ceramic tokens with teal illuminated edges. Beside the middle rail stands a small teal pennant on a slim polished post -- clearly only a marker, nothing blocking the track, the rail beyond it completely clear and unobstructed. The tokens approaching it have visibly changed lanes onto the outer two rails, leaving the middle rail empty past the pennant. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "White tokens occupy the outer rails beside a small teal pennant; the middle rail beyond the marker is empty.",
+    "caption": "Advisory host availability uses vq host down/up to guide dispatch."
+  },
+  {
+    "version": "0.11.0",
+    "name": "Eager's Sharing",
+    "file": "11-vq-v0.11.0-eagers-sharing.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A single slender rail enters from the left carrying identical matte-white ceramic tokens with teal illuminated edges, and divides through a smooth machined junction into four parallel rails of exactly equal length running to the right edge. Each of the four rails carries precisely the same number of tokens, evenly spaced, conspicuously balanced. Faint violet light traces the junction's dividing curves. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "[pools] host groups and default_pool",
+    "treatment": "A. Light studio",
+    "status": "Shipped; name confirmed 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A single slender rail enters from the left carrying identical matte-white ceramic tokens with teal illuminated edges, and divides through a smooth machined junction into four parallel rails of exactly equal length running to the right edge. Each of the four rails carries precisely the same number of tokens, evenly spaced, conspicuously balanced. Faint violet light traces the junction's dividing curves. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "One polished rail divides into four branches carrying equal rows of white ceramic tokens, with violet light at the junction.",
+    "caption": "Host pools and a default pool organize how work is shared across machines."
+  },
+  {
+    "version": "0.12.0",
+    "name": "Hopper's Bug",
+    "file": "12-vq-v0.12.0-hoppers-bug.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, a dark reflective floor. A slender rail crosses the lower third carrying a row of identical matte-white ceramic tokens, their edges glowing electric blue. One token near the centre has cleanly fractured. Resting on the fractured token is a single real moth, photoreal and anatomically correct, small, wings folded, softly lit. From the fracture a fine filament of warm amber light traces backward along the rail through several tokens to a single point that glows brightly, making the cause of the break traceable by eye. Cinematic, high contrast, no clutter. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Hardened daemonless scheduler hosts; crash feedback",
+    "treatment": "B. Dark cinematic",
+    "status": "Shipped; name confirmed 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, a dark reflective floor. A slender rail crosses the lower third carrying a row of identical matte-white ceramic tokens, their edges glowing electric blue. One token near the centre has cleanly fractured. Resting on the fractured token is a single real moth, photoreal and anatomically correct, small, wings folded, softly lit. From the fracture a fine filament of warm amber light traces backward along the rail through several tokens to a single point that glows brightly, making the cause of the break traceable by eye. Cinematic, high contrast, no clutter. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A moth rests on a fractured ceramic token in a blue-lit queue; an amber filament traces backward to a bright point.",
+    "caption": "Tracing a failure back to its cause makes the queue diagnosable."
+  },
+  {
+    "version": "0.13.0",
+    "name": "Gray's Log",
+    "file": "13-vq-v0.13.0-grays-log.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail crosses the lower third carrying a row of identical matte-white ceramic tokens with teal illuminated edges, moving to the right. Behind and slightly above the rail, a long continuous ribbon of frosted glass unspools from a polished reel and runs off the left edge of the frame. The ribbon carries a series of small raised teal marks, one per token that has already passed, evenly spaced along its whole visible length -- abstract impressions, tactile, never characters or symbols. The ribbon is unbroken and clearly cannot be rewound. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Job lifecycle timeline (vq events), pending-reason diagnostics",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail crosses the lower third carrying a row of identical matte-white ceramic tokens with teal illuminated edges, moving to the right. Behind and slightly above the rail, a long continuous ribbon of frosted glass unspools from a polished reel and runs off the left edge of the frame. The ribbon carries a series of small raised teal marks, one per token that has already passed, evenly spaced along its whole visible length -- abstract impressions, tactile, never characters or symbols. The ribbon is unbroken and clearly cannot be rewound. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A frosted glass ribbon with evenly spaced raised teal marks unspools above a row of ceramic tokens.",
+    "caption": "The job lifecycle timeline records ordered transitions and pending reasons."
+  },
+  {
+    "version": "0.14.0",
+    "name": "Needham's Principal",
+    "file": "14-vq-v0.14.0-needhams-principal.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. In the foreground, two seals of identical size and finish -- solid machined cylinders of brushed steel, each with a differently cut face -- stand side by side before a single recessed reader plate of white ceramic. The reader's fine ring illuminates bright teal for the left seal and remains completely dark for the right one, though the two seals are otherwise indistinguishable. Behind them a slender rail carries a row of matte-white ceramic tokens, softly out of focus. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "vq doctor --as-driver; post-restart provenance ping",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. In the foreground, two seals of identical size and finish -- solid machined cylinders of brushed steel, each with a differently cut face -- stand side by side before a single recessed reader plate of white ceramic. The reader's fine ring illuminates bright teal for the left seal and remains completely dark for the right one, though the two seals are otherwise indistinguishable. Behind them a slender rail carries a row of matte-white ceramic tokens, softly out of focus. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Two brushed-steel seals stand before a ceramic reader plate; the left ring glows teal and the right ring stays dark.",
+    "caption": "Identity checks distinguish the principal behind a driver operation."
+  },
+  {
+    "version": "0.15.0",
+    "name": "Schroeder's Authority",
+    "file": "15-vq-v0.15.0-schroeders-authority.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail crosses the lower third carrying identical matte-white ceramic tokens with teal illuminated edges. The rail is interrupted by a precisely machined gate of white anodised aluminium, closed, with tokens halted and stacked behind it. A single slender polished rod runs from the gate away to the right and up to a small sealed cylinder of brushed steel resting on its own plinth, glowing faint violet -- visibly the thing holding the gate shut. The linkage between gate and cylinder is unbroken and easy to follow by eye. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Dispatch stops attributed to their authority; detached builds survive SSH drops",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail crosses the lower third carrying identical matte-white ceramic tokens with teal illuminated edges. The rail is interrupted by a precisely machined gate of white anodised aluminium, closed, with tokens halted and stacked behind it. A single slender polished rod runs from the gate away to the right and up to a small sealed cylinder of brushed steel resting on its own plinth, glowing faint violet -- visibly the thing holding the gate shut. The linkage between gate and cylinder is unbroken and easy to follow by eye. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Ceramic tokens wait at a closed metal gate connected by a polished rod to a violet-lit steel cylinder.",
+    "caption": "Dispatch stops are attributed to the authority holding them in place."
+  },
+  {
+    "version": "0.16.0",
+    "name": "Sutherland's Sketchpad",
+    "file": "16-vq-v0.16.0-sutherlands-sketchpad.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. Four parallel slender rails run left to right across the lower half, each carrying identical matte-white ceramic tokens with teal illuminated edges. Suspended above them at a shallow angle is a large sheet of optically clear glass. Etched into the glass in fine teal line-work are simplified contour outlines of the tokens below, positioned to match them exactly, one contour per real token. A single contour is picked out in bright violet and joined to its corresponding physical token by one taut, hair-fine violet filament running down through the air. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Fleet console M0/M1: fleet mode, live cross-host drill-down",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. Four parallel slender rails run left to right across the lower half, each carrying identical matte-white ceramic tokens with teal illuminated edges. Suspended above them at a shallow angle is a large sheet of optically clear glass. Etched into the glass in fine teal line-work are simplified contour outlines of the tokens below, positioned to match them exactly, one contour per real token. A single contour is picked out in bright violet and joined to its corresponding physical token by one taut, hair-fine violet filament running down through the air. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "refinement_prompts": [
+      "Correct this product render to have exactly FOUR distinct parallel polished rails, each with a row of identical upright rounded matte-white ceramic domino slabs. Add the missing fourth rail and its tokens; keep the camera angle and pale-blue studio lighting. The physical clear-glass sheet above must carry FOUR matching rows of etched teal token contours, one contour directly aligned above each physical token. Only one contour is violet and joined by exactly one taut fine violet filament to only its corresponding token. Keep the glass physically transparent with visible edges and supports, never a screen. Preserve the ceramic token design, 16:9 full-frame composition and photoreal materials. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation."
+    ],
+    "alt": "Four rows of ceramic tokens sit beneath etched contours on a suspended glass sheet, with one violet filament linking a contour to a token.",
+    "caption": "The first fleet console views connect a cross-host overview to live job detail."
+  },
+  {
+    "version": "0.17.0",
+    "name": "Corbató's Password",
+    "file": "17-vq-v0.17.0-corbatos-password.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. In the foreground a row of eight short cylinders of brushed steel stand upright, identical in size, each capped with a differently cut key profile in polished metal. Exactly one cylinder glows warm amber from within, its light spilling across the reflective floor; the rest are cold and unlit. Behind them, receding into darkness, a wall of dim identical recessed slots, most empty. Faint electric-blue rim light along the cylinders' edges. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Console M2: accounts, sessions, audited write actions",
+    "treatment": "B. Dark cinematic",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09; revised to remove cross-shaped key profile",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. In the foreground a row of eight short cylinders of brushed steel stand upright, identical in size, each capped with a differently cut key profile in polished metal. Exactly one cylinder glows warm amber from within, its light spilling across the reflective floor; the rest are cold and unlit. Behind them, receding into darkness, a wall of dim identical recessed slots, most empty. Faint electric-blue rim light along the cylinders' edges. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Eight steel cylinders have differently cut key profiles; one glows amber against a dark wall of recessed slots.",
+    "caption": "Console accounts and sessions distinguish authenticated access.",
+    "refinement_prompts": [
+      "Edit this image. Replace the cross-shaped polished metal key profile on the fifth cylinder from the left, the only amber-lit cylinder, with a plain asymmetric mechanical key blade: a slim upright rectangular metal tab with two small rounded notches cut into only its right edge, and a gently sloping top. Its outline must be visibly non-symbolic, like a machined lock component. Absolutely no cross, cruciform, plus sign, or religious symbol anywhere. Preserve the eight steel cylinders, all their positions and proportions, the other seven neutral geometric key profiles, the exactly one warm amber glowing cylinder and reflection, electric-blue rim lights, dark recessed-slot wall, navy-black backdrop, dark reflective floor, camera and photoreal materials. Keep the full 16:9 composition at 1672 x 941 PNG. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation."
+    ],
+    "constraints": "No crosses, cruciform profiles, plus signs or religious symbols; use neutral mechanical key profiles."
+  },
+  {
+    "version": "0.18.0",
+    "name": "Abadi's Delegation",
+    "file": "18-vq-v0.18.0-abadis-delegation.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A chain of four seals of decreasing size runs from left to right across the frame, each a machined cylinder of brushed steel standing on the white surface. Each seal's face is pressed against the top of the next smaller one, so an impression is visibly being handed along the line. The final and smallest seal rests on a matte-white ceramic token sitting on a slender rail, having just stamped it; that token's edge glows teal while the tokens ahead of it on the rail remain unlit. A soft violet glow marks each point of contact. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Fleet rollout orchestration; per-host delegated-admin auth",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A chain of four seals of decreasing size runs from left to right across the frame, each a machined cylinder of brushed steel standing on the white surface. Each seal's face is pressed against the top of the next smaller one, so an impression is visibly being handed along the line. The final and smallest seal rests on a matte-white ceramic token sitting on a slender rail, having just stamped it; that token's edge glows teal while the tokens ahead of it on the rail remain unlit. A soft violet glow marks each point of contact. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Four progressively smaller steel seals touch in a chain, ending at a teal-lit ceramic token on a rail.",
+    "caption": "Delegated administration carries authority across a fleet rollout."
+  },
+  {
+    "version": "0.19.0",
+    "name": "Merkle's Hash",
+    "file": "19-vq-v0.19.0-merkles-hash.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A structure of small polished spheres rises above a slender rail: eight silver-white spheres in a row at the base, pairing upward through four, then two, to a single sphere at the apex, joined by taut hair-fine teal filaments under visible tension. One base sphere has been lifted very slightly out of its seat, and the entire path of filaments and spheres from that sphere to the apex glows bright violet while every other path stays cool teal. Beneath the structure the rail carries matte-white ceramic tokens, softly out of focus. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Release-only CI; report-pinned rollouts on exact-SHA evidence",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A structure of small polished spheres rises above a slender rail: eight silver-white spheres in a row at the base, pairing upward through four, then two, to a single sphere at the apex, joined by taut hair-fine teal filaments under visible tension. One base sphere has been lifted very slightly out of its seat, and the entire path of filaments and spheres from that sphere to the apex glows bright violet while every other path stays cool teal. Beneath the structure the rail carries matte-white ceramic tokens, softly out of focus. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "refinement_prompts": [
+      "Correct only the fine filaments in this photoreal physical sculpture. Preserve all fifteen polished spheres, their positions, the lifted leftmost bottom sphere, teal and violet lighting, white ceramic seats, rail, pale-blue studio background, materials and camera. The sculpture is a strict binary tree: eight spheres at the base, four above, two above them, one apex. Each of the four spheres directly above the bottom row connects to exactly two adjacent base spheres: first to bottom positions one and two, second to three and four, third to five and six, fourth to seven and eight. REMOVE all extra bottom-level filaments: no crossing filaments, no third children, no base sphere has two parents. Exactly fourteen fine filaments total throughout the sculpture. Preserve the violet path from the lifted leftmost base sphere through its ancestors to the apex; every other filament stays teal. Every filament is a taut physical hair-fine strand. Keep photographed physical-object style and 16:9 canvas. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+      "Make exactly one surgical change to this image: erase the diagonal teal filament running DOWN AND RIGHT from the LEFTMOST sphere in the row of four middle spheres to the THIRD sphere from the left in the bottom row of eight. In this 1672 by 941 image, it runs approximately from (630, 405) to (677, 505). Remove this one strand completely and reconstruct the plain pale-blue background behind it. Keep the near-vertical strand from that same parent sphere to the SECOND base sphere, keep its violet strand to the FIRST base sphere, and keep the diagonal strand from the NEXT parent sphere to the THIRD base sphere. Preserve everything else exactly, including all fifteen spheres, all remaining filaments, ceramic seats, rail, physical photorealistic materials, lighting and 16:9 composition. Do not add anything. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation."
+    ],
+    "alt": "Polished spheres form an eight-to-four-to-two-to-one tree above a rail, with a violet path from a lifted base sphere to the apex.",
+    "caption": "Exact-SHA release evidence binds rollout decisions to content-addressed reports."
+  },
+  {
+    "version": "0.20.0",
+    "name": "Herlihy's Wait-Free",
+    "file": "20-vq-v0.20.0-herlihys-wait-free.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. Two slender rails cross each other at a shallow angle near the centre of the frame, each carrying a steady row of identical matte-white ceramic tokens with teal illuminated edges. At the crossing point there is no gate, no signal post, no barrier and no mechanism of any kind -- just clean empty polished surface -- and the two streams of tokens interleave smoothly through the intersection with even spacing, none of them stopped or bunched. Every token's edge is lit; not one is dim. The absence of machinery at the junction is the most noticeable thing in the frame. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Scheduler runtime update no longer drains or waits for running work",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. Two slender rails cross each other at a shallow angle near the centre of the frame, each carrying a steady row of identical matte-white ceramic tokens with teal illuminated edges. At the crossing point there is no gate, no signal post, no barrier and no mechanism of any kind -- just clean empty polished surface -- and the two streams of tokens interleave smoothly through the intersection with even spacing, none of them stopped or bunched. Every token's edge is lit; not one is dim. The absence of machinery at the junction is the most noticeable thing in the frame. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Two polished rails cross without a barrier, carrying evenly spaced white ceramic tokens with teal edges.",
+    "caption": "Scheduler runtime updates proceed without draining or waiting for running work."
+  },
+  {
+    "version": "0.21.0",
+    "name": "Kilburn's Page",
+    "file": "21-vq-v0.21.0-kilburns-page.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A bank of twelve identical machined drawers in white anodised aluminium fills the frame in a three-by-four grid, each with the same plain polished pull and the same blank front plate. Five drawers are pulled out to visibly different depths. Each open drawer holds exactly one matte-white ceramic token on a fitted teal-lined tray, and every token is subtly distinct -- different bevel, different surface finish, different edge glow intensity -- though the drawer fronts are indistinguishable. Faint violet light in the depths of the open drawers. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Per-SHA runtime slot layout for venv hosts",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A bank of twelve identical machined drawers in white anodised aluminium fills the frame in a three-by-four grid, each with the same plain polished pull and the same blank front plate. Five drawers are pulled out to visibly different depths. Each open drawer holds exactly one matte-white ceramic token on a fitted teal-lined tray, and every token is subtly distinct -- different bevel, different surface finish, different edge glow intensity -- though the drawer fronts are indistinguishable. Faint violet light in the depths of the open drawers. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A bank of twelve white metal drawers has five open trays, each holding one ceramic token with a different finish or shape.",
+    "caption": "One program name maps to separate runtime slots for different source revisions."
+  },
+  {
+    "version": "0.22.0",
+    "name": "Little's Law",
+    "file": "22-vq-v0.22.0-littles-law.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender rail carrying identical matte-white ceramic tokens with teal illuminated edges passes across the face of a large precision gauge: a circular instrument in brushed steel and white enamel with a polished glass cover, a single slim teal needle, and a plain engraved arc with fine unlabelled tick marks and no numerals at all. The needle rests partway along the arc. A short violet index mark is set on the arc ahead of the needle. The gauge is clearly measuring the row of tokens crossing it. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "default_max_concurrent_cpus surfaced in vq overview",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender rail carrying identical matte-white ceramic tokens with teal illuminated edges passes across the face of a large precision gauge: a circular instrument in brushed steel and white enamel with a polished glass cover, a single slim teal needle, and a plain engraved arc with fine unlabelled tick marks and no numerals at all. The needle rests partway along the arc. A short violet index mark is set on the arc ahead of the needle. The gauge is clearly measuring the row of tokens crossing it. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A large steel gauge with an unnumbered arc, teal needle and violet index mark stands behind a rail of white tokens.",
+    "caption": "The concurrency quota becomes visible in vq overview."
+  },
+  {
+    "version": "0.23.0",
+    "name": "Saltzer's Binding",
+    "file": "23-vq-v0.23.0-saltzers-binding.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. In the centre, two lengths of slender polished rail meet in a precision machined coupling, closed and seated, with bright teal light at the seam and matte-white ceramic tokens running continuously across the join. To either side, two further rail segments end in identical couplings that are open and unconnected, their faces clean and unlit, with no tokens on them. The connected join is the only lit thing in the frame. Shallow depth of field. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "runtime_slot_root config key, opt-in per program",
+    "treatment": "A. Light studio",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. In the centre, two lengths of slender polished rail meet in a precision machined coupling, closed and seated, with bright teal light at the seam and matte-white ceramic tokens running continuously across the join. To either side, two further rail segments end in identical couplings that are open and unconnected, their faces clean and unlit, with no tokens on them. The connected join is the only lit thing in the frame. Shallow depth of field. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A central rail coupling glows teal beneath ceramic tokens; detached rail sections on either side are empty and unlit.",
+    "caption": "The runtime_slot_root setting makes runtime placement an explicit binding."
+  },
+  {
+    "version": "0.24.0",
+    "name": "Cheney's Semispace",
+    "file": "24-vq-v0.24.0-cheneys-semispace.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Two identical rectangular bays sit side by side, each a recessed machined plate with a grid of fitted mounting points. The left bay holds an assembly of matte-white ceramic tokens, dimly lit in cold blue, with several mounting points already standing empty. The right bay holds a complete, brightly lit duplicate of that assembly, warm amber, fully seated. Between the two bays, three tokens hang in mid-air along a trail of fine amber light, caught being carried across. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Runtime-slot ladder: build beside the live venv, flip on success, reclaim",
+    "treatment": "B. Dark cinematic",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Two identical rectangular bays sit side by side, each a recessed machined plate with a grid of fitted mounting points. The left bay holds an assembly of matte-white ceramic tokens, dimly lit in cold blue, with several mounting points already standing empty. The right bay holds a complete, brightly lit duplicate of that assembly, warm amber, fully seated. Between the two bays, three tokens hang in mid-air along a trail of fine amber light, caught being carried across. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Three ceramic tokens hang along amber trails between a partly empty blue-lit bay and a full amber-lit bay.",
+    "caption": "Build beside the live runtime, switch on success, and reclaim the old space."
+  },
+  {
+    "version": "0.25.0",
+    "name": "Härder's Atomicity",
+    "file": "25-vq-v0.25.0-haerders-atomicity.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Two polished docking cradles face each other with a gap between them. A single matte-white ceramic token hangs precisely at the midpoint of the gap, suspended in a taut cage of hair-fine electric-blue filaments radiating to both cradles, held absolutely still and touching neither. Directly beneath it, recessed into the floor, a shallow well holds an exact mirror duplicate of the token, dimly lit in warm amber, fully seated and immobile. Nothing in the frame is half-placed or partially inserted. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Managed exact self-update, durable recovery, failure-atomic lifecycle transactions",
+    "treatment": "B. Dark cinematic",
+    "status": "Approved 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Two polished docking cradles face each other with a gap between them. A single matte-white ceramic token hangs precisely at the midpoint of the gap, suspended in a taut cage of hair-fine electric-blue filaments radiating to both cradles, held absolutely still and touching neither. Directly beneath it, recessed into the floor, a shallow well holds an exact mirror duplicate of the token, dimly lit in warm amber, fully seated and immobile. Nothing in the frame is half-placed or partially inserted. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Blue filaments suspend a white token between two docking cradles above a duplicate seated in an amber-lit floor recess.",
+    "caption": "Managed self-update preserves recoverable state across lifecycle transactions."
+  },
+  {
+    "version": "0.26.0",
+    "name": "Raymond's Bazaar",
+    "file": "26-vq-v0.26.0-raymonds-bazaar.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender polished rail carrying identical matte-white ceramic tokens with teal illuminated edges runs from a single enclosed channel on the left out into open space on the right, where it divides into many short rails fanning outward at slightly different angles, each with its own tokens. The enclosure's end is open and unsealed, its frame catching a soft violet edge light. On the open side the surface is brighter and less shadowed than inside the channel. Calm, clinical, scientific product-shot aesthetic, generous empty space. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "The release where vq became publishable: licence, security policy, contributor guide, changelog, documentation site, codename catalogue, release procedure",
+    "treatment": "A. Light studio",
+    "status": "Cut 2026-09-09; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. A slender polished rail carrying identical matte-white ceramic tokens with teal illuminated edges runs from a single enclosed channel on the left out into open space on the right, where it divides into many short rails fanning outward at slightly different angles, each with its own tokens. The enclosure's end is open and unsealed, its frame catching a soft violet edge light. On the open side the surface is brighter and less shadowed than inside the channel. Calm, clinical, scientific product-shot aesthetic, generous empty space. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A row of white tokens emerges from a violet-rimmed enclosure and branches onto several polished rails in bright studio light.",
+    "caption": "Licensing, security, contributor guidance and documentation make vq publishable."
+  },
+  {
+    "version": "0.27.0",
+    "name": "Fidge's Timestamp",
+    "file": "27-vq-v0.27.0-fidges-timestamp.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface, gentle reflections. Two slender polished rails run left to right at different heights, each carrying identical matte-white ceramic tokens with teal illuminated edges, the two rows advancing at visibly different spacings. Every token carries a small brushed-brass detent ring set into its face, machined with fine radial steps, each ring rotated one step further than the token behind it. Where the two rails pass closest, one token from each row has its ring turned to exactly the same step, and both glow violet. There is no clock, dial, or timepiece anywhere in the frame. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Logical ordering without a shared timepiece. Colin Fidge's vector clocks (1988) capture causality between hosts that share no wall clock. Lamport's own clock is already taken by v0.7.1.",
+    "treatment": "A. Light studio",
+    "status": "Provisional; reconfirm when the release is cut. Artwork regenerated 2026-09-10 to depict the renamed concept (issue #6): the first render predated the rename in e1088f1 and showed the previous name's concept.",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Two brass detent rings per token, side by side, the right one lagging: a vector clock rather than a scalar one. The shipped render gives each token a single ring, which reads as Lamport's clock, and Lamport already holds v0.7.1 (issue #6).",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "refinement_prompts": [
+      "Change only the orientations and machined detail of the small brass detent rings set into the token faces. Keep both rails, every white ceramic token, their spacings, two violet-highlighted tokens, camera, white glossy surface, pale-blue studio lighting, and 16:9 composition unchanged. Each brass ring must have fine radial mechanical detent steps and a clearly visible narrow notch. Along each row the notch rotates progressively clockwise from token to token by a conspicuous increment, visibly different at every neighboring token. Do not leave all notches at twelve o'clock. The two violet-highlighted rings, one on each rail, must have exactly matching notch orientation; arrange neighboring rings on each side as successively different rotations away from this matched pair. Brass rings remain mechanical indexing collars with blank white centers, never clock faces. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+      "Two brass detent rings per token, side by side, the right one lagging: a vector clock rather than a scalar one. The shipped render gives each token a single ring, which reads as Lamport's clock, and Lamport already holds v0.7.1 (issue #6)."
+    ],
+    "alt": "Two rails carry differently spaced ceramic tokens, each token bearing two brushed-brass detent rings side by side at differing steps; one token on each rail glows violet where the rails pass closest.",
+    "caption": "Provisional concept: logical ordering across hosts without a shared timepiece. Two rings per token, one count per participant."
+  },
+  {
+    "version": "0.28.0",
+    "name": "Mattern's Cut",
+    "file": "28-vq-v0.28.0-matterns-cut.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Four slender rails run left to right at different heights, each carrying identical matte-white ceramic tokens with edges glowing electric blue. A single sheet of pale amber light stands vertically across all four rails, thin as a blade and perfectly flat. Every token behind the sheet is frozen mid-travel with a fine crust of frost on its leading face; every token ahead of it is clean and still moving, caught with faint motion blur. The sheet meets each rail at a different point along its length, yet reads unmistakably as one instant. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "A consistent cut across hosts that are never stopped together. Friedemann Mattern's \"Virtual Time and Global States\" (1989) is the canonical treatment of consistent cuts. Chandy's snapshot is already taken by v0.8.16.",
+    "treatment": "B. Dark cinematic",
+    "status": "Provisional; reconfirm when release is cut; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nComposition clarification: use a three-quarter perspective view of a real physical studio installation. Four parallel rails are staggered in depth and elevation. The amber light sheet is ONE tall, continuous, perfectly flat translucent rectangle, like a laser plane suspended in air, with straight uninterrupted edges spanning from above the highest rail down to the reflective floor. Show its broad face obliquely so the viewer can see it is one continuous plane. NEVER split the sheet into separate panels or a staircase; align the frost/motion transitions to this plane. Keep the rail tokens sharply recognizable as physical ceramic domino slabs, not abstract marks. Follow the scene prompt:\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Four slender rails run left to right at different heights, each carrying identical matte-white ceramic tokens with edges glowing electric blue. A single sheet of pale amber light stands vertically across all four rails, thin as a blade and perfectly flat. Every token behind the sheet is frozen mid-travel with a fine crust of frost on its leading face; every token ahead of it is clean and still moving, caught with faint motion blur. The sheet meets each rail at a different point along its length, yet reads unmistakably as one instant. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Four blue-lit rows of ceramic tokens meet an amber light plane, with frost on one side and motion blur on the other.",
+    "caption": "Provisional concept: a consistent snapshot across independently running hosts.",
+    "discarded_generation": {
+      "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. Four slender rails run left to right at different heights, each carrying identical matte-white ceramic tokens with edges glowing electric blue. A single sheet of pale amber light stands vertically across all four rails, thin as a blade and perfectly flat. Every token behind the sheet is frozen mid-travel with a fine crust of frost on its leading face; every token ahead of it is clean and still moving, caught with faint motion blur. The sheet meets each rail at a different point along its length, yet reads unmistakably as one instant. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+      "refinement_prompts": [
+        "Correct this photoreal dark studio scene so the amber sheet is ONE unbroken perfectly flat plane intersecting all FOUR rails. Replace the four disconnected vertical amber blade segments with a single thin pale-amber translucent planar sheet seen obliquely, extending continuously from above the top rail to below the bottom rail. Its two visible side edges must be straight continuous lines, with no stair steps, offsets, folds, or separate panels. Align the change from frosted stationary tokens to clean motion-blurred tokens to the intersections with this ONE plane; adjust camera perspective slightly if needed so the plane intersects each rail at a different point along its length. Preserve the four polished rails, identical white ceramic domino tokens, blue illuminated edges, frost, dark navy background, reflective floor and amber/blue cinematic lighting. Photographed physical objects, no diagram. 16:9 full frame. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation."
+      ]
+    }
+  },
+  {
+    "version": "0.29.0",
+    "name": "Braden's Requirements",
+    "file": "29-vq-v0.29.0-bradens-requirements.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. On the left, a wide flared intake funnel of white anodised aluminium receives a jumble of tokens of visibly different sizes, thicknesses, bevels and finishes, some chipped, some skewed, tumbling in loosely. On the right, a narrow precision-machined outlet emits a single-file row of perfectly identical matte-white ceramic tokens, evenly spaced, every teal illuminated edge the same brightness, running away along a slender rail. Violet light rims the intake; teal light rims the outlet. The contrast between the two mouths is the subject of the picture. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Liberal in what you accept, conservative in what you emit. Bob Braden's RFC 1122, \"Requirements for Internet Hosts\", is where that posture became a host requirement -- which is exactly the subject here. Postel's own robustness is already taken by v0.7.17.",
+    "treatment": "A. Light studio",
+    "status": "Provisional; reconfirm when release is cut; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. On the left, a wide flared intake funnel of white anodised aluminium receives a jumble of tokens of visibly different sizes, thicknesses, bevels and finishes, some chipped, some skewed, tumbling in loosely. On the right, a narrow precision-machined outlet emits a single-file row of perfectly identical matte-white ceramic tokens, evenly spaced, every teal illuminated edge the same brightness, running away along a slender rail. Violet light rims the intake; teal light rims the outlet. The contrast between the two mouths is the subject of the picture. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A wide violet-rimmed funnel receives assorted chipped and skewed tokens; a teal-rimmed outlet emits a uniform row.",
+    "caption": "Provisional concept: accept varied inputs while emitting a strict, uniform form."
+  },
+  {
+    "version": "0.30.0",
+    "name": "Bloom's Filter",
+    "file": "30-vq-v0.30.0-blooms-filter.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail carrying identical matte-white ceramic tokens with teal illuminated edges runs toward a thick upright plate of white ceramic pierced by a dense irregular field of small round holes. Most tokens strike the solid plate and are stopped cleanly, their edges gone dark. A few pass through holes and continue on the far side, still lit teal. One of those has visibly been let through a hole it only partly fits, and its edge is tinted violet rather than teal. The plate is uniform, blank and unmarked. Shallow depth of field. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Cheap probabilistic membership; no false negatives. Fits dedup and idempotency keys.",
+    "treatment": "A. Light studio",
+    "status": "Provisional; reconfirm when release is cut; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail carrying identical matte-white ceramic tokens with teal illuminated edges runs toward a thick upright plate of white ceramic pierced by a dense irregular field of small round holes. Most tokens strike the solid plate and are stopped cleanly, their edges gone dark. A few pass through holes and continue on the far side, still lit teal. One of those has visibly been let through a hole it only partly fits, and its edge is tinted violet rather than teal. The plate is uniform, blank and unmarked. Shallow depth of field. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Dark-edged tokens stop at a perforated white plate while teal-lit tokens continue beyond; a violet-edged token partly fits a hole.",
+    "caption": "Provisional concept: probabilistic membership checks for deduplication and idempotency."
+  },
+  {
+    "version": "0.31.0",
+    "name": "Stonebraker's Vacuum",
+    "file": "31-vq-v0.31.0-stonebrakers-vacuum.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. A slender rail crosses the lower third carrying identical matte-white ceramic tokens; most edges glow electric blue, but a scattered several are dull, grey and visibly spent. Beneath the rail a recessed machined trough runs its length, and the spent tokens are being drawn down into it along fine threads of warm amber light, leaving clean empty seats that the lit tokens have already closed up to fill. The trough's depths are dark and its contents indistinct. The rail above is unbroken and continuous. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "Reclaiming space that is dead but still occupied. Fits archive and auto-cleanup.",
+    "treatment": "B. Dark cinematic",
+    "status": "Provisional; reconfirm when release is cut; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. A slender rail crosses the lower third carrying identical matte-white ceramic tokens; most edges glow electric blue, but a scattered several are dull, grey and visibly spent. Beneath the rail a recessed machined trough runs its length, and the spent tokens are being drawn down into it along fine threads of warm amber light, leaving clean empty seats that the lit tokens have already closed up to fill. The trough's depths are dark and its contents indistinct. The rail above is unbroken and continuous. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "Spent grey tokens descend on amber threads into a recessed trough beneath a continuous blue-lit token rail.",
+    "caption": "Provisional concept: reclaim dead space through archiving and automatic cleanup."
+  },
+  {
+    "version": "0.32.0",
+    "name": "Brewer's Partition",
+    "file": "32-vq-v0.32.0-brewers-partition.png",
+    "prompt": "Photorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. A slender rail crosses the frame and is cleanly severed at the centre, the two cut faces separated by a narrow dark gap with nothing bridging it. Both halves continue to carry identical matte-white ceramic tokens with edges glowing electric blue, each side advancing under its own warm amber light source, neither side dark or halted. The two halves are lit from opposite directions, so their shadows fall opposite ways. The empty gap is the highest-contrast element in the frame. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "The split you tolerate rather than prevent.",
+    "treatment": "B. Dark cinematic",
+    "status": "Provisional; reconfirm when release is cut; artwork generated 2026-09-09",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "Use the attached image only as a style and physical-design reference for the identical rounded, domino-proportioned matte-white ceramic tokens and slender polished rail. Create a new scene following the prompt below verbatim; do not carry over the aperture frame or its composition unless the prompt requests it. Use the lighting treatment and accent colors specified below, including dark cinematic lighting where requested. Render the full 16:9 composition; target 1672 x 941 PNG.\n\nPhotorealistic 3-D render, 16:9 landscape, dark cinematic. Deep navy-black background, dramatic high contrast, dark reflective floor. A slender rail crosses the frame and is cleanly severed at the centre, the two cut faces separated by a narrow dark gap with nothing bridging it. Both halves continue to carry identical matte-white ceramic tokens with edges glowing electric blue, each side advancing under its own warm amber light source, neither side dark or halted. The two halves are lit from opposite directions, so their shadows fall opposite ways. The empty gap is the highest-contrast element in the frame. Cinematic, high contrast, uncluttered. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A dark gap severs a polished rail; both halves carry blue-edged white tokens under opposing amber lights.",
+    "caption": "Provisional concept: tolerate a network split while each side keeps operating."
+  },
+  {
+    "version": "0.33.0",
+    "name": "Erlang's Blocking",
+    "file": "33-vq-v0.33.0-erlangs-blocking.png",
+    "prompt": "Photorealistic 3-D product render, 16:9 landscape. Near-white pale-blue seamless studio background, soft even lighting, glossy white surface. A slender rail crosses the lower third carrying identical matte-white ceramic tokens with teal illuminated edges. Midway along it, a machined white aluminium housing holds a rack of exactly three short brushed-steel permit pins standing upright in fitted sockets. Two sockets are empty, and those two pins are seated in the faces of the only two tokens occupying the stretch of rail beyond the housing. The third pin still stands in its socket. Behind the housing a queue of tokens waits with dark, unlit edges. A faint violet glow marks the two empty sockets. Calm, clinical, scientific product-shot aesthetic. No text, no lettering, no numerals, no logos, no watermark, no user interface, no screens, no code, no circuit boards, no arrows, no flowchart, no infographic, no cartoon, no illustration, no stylisation.",
+    "theme": "A counted permit. A. K. Erlang's blocking formula describes N servers and the arrivals turned away when all are busy, which is admission control and concurrency caps exactly. Dijkstra's semaphore is already taken by v0.7.3.",
+    "treatment": "A. Light studio",
+    "status": "Provisional; reconfirm when the release is cut. Artwork regenerated 2026-09-10 to depict the renamed concept (issue #6): the first render predated the rename in e1088f1 and showed the previous name's concept.",
+    "generator": "OpenAI built-in image_gen",
+    "canvas": [
+      1672,
+      941
+    ],
+    "generation_prompt": "All three service bays occupied and none free, with the waiting line unlit against a closed intake face. The shipped render leaves one permit standing in its socket, so it depicts availability rather than blocking (issue #6).",
+    "style_reference": "9-vq-v0.9.0-tukeys-window.png",
+    "source_canvas": [
+      1672,
+      941
+    ],
+    "resize": "none; generated at target canvas",
+    "alt": "A machined housing spans the rail with three service bays, all three occupied by teal-lit tokens and none free, while a long line of tokens waits behind it with dark, unlit edges.",
+    "caption": "Provisional concept: every server busy, so an arrival is turned away. Counted permits enforcing admission and concurrency limits.",
+    "refinement_prompts": [
+      "All three service bays occupied and none free, with the waiting line unlit against a closed intake face. The shipped render leaves one permit standing in its socket, so it depicts availability rather than blocking (issue #6)."
+    ]
+  }
+]

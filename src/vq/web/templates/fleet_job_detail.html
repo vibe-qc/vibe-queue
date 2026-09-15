@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}vq · fleet · {{ jobid }}{% endblock %}
+{% block content %}
+{% if error %}
+<h2>
+  <a href="/fleet/jobs">fleet jobs</a> ·
+  <span class="jobid">{{ jobid }}</span>
+</h2>
+<p class="host-card-error">
+  Could not read job {{ jobid }} on {{ queue_host }}: {{ error }}
+</p>
+<p class="hint"><a href="">Retry</a></p>
+{% else %}
+{% set s = detail.status %}
+<h2>
+  <a href="/fleet/jobs">fleet jobs</a> ·
+  <span class="jobid">{{ jobid }}</span>
+  <span class="state state-{{ s.state }}">{{ s.state }}</span>
+  <span class="version">on {{ queue_host }}{% if detail.owner_host != queue_host %} (read on {{ detail.owner_host }}){% endif %}</span>
+</h2>
+<p class="hint">Fetched live from the owning host just now. <a href="/fleet/jobs/{{ jobid }}?host={{ queue_host }}">Refresh</a></p>
+
+{% if flash %}
+<p class="hint {% if not flash.startswith('ok') %}host-card-error{% endif %}"><strong>{{ flash }}</strong></p>
+{% endif %}
+
+{% if can_act and s.state in ("pending", "running", "suspended") %}
+<section class="toolbar danger-zone" aria-label="job actions">
+  {% if s.state in ("pending", "running") %}
+  <form method="post" action="/fleet/jobs/{{ jobid }}/kill"
+        onsubmit="return confirm('Kill {{ jobid }} on {{ queue_host }}?')">
+    <input type="hidden" name="host" value="{{ queue_host }}">
+    <label>reason <input type="text" name="reason" size="18"></label>
+    <button type="submit">Kill</button>
+  </form>
+  {% endif %}
+  {% if s.state == "running" %}
+  <form method="post" action="/fleet/jobs/{{ jobid }}/pause">
+    <input type="hidden" name="host" value="{{ queue_host }}">
+    <button type="submit">Pause</button>
+  </form>
+  {% endif %}
+  {% if s.state == "suspended" %}
+  <form method="post" action="/fleet/jobs/{{ jobid }}/resume">
+    <input type="hidden" name="host" value="{{ queue_host }}">
+    <button type="submit">Resume</button>
+  </form>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="spec">
+  <h3>spec</h3>
+  <dl>
+    <dt>command</dt>           <dd><code>{{ s.command | join(" ") }}</code></dd>
+    <dt>cwd</dt>               <dd><code>{{ s.cwd }}</code></dd>
+    <dt>cpus</dt>              <dd>{{ s.cpus }}</dd>
+    <dt>mem_mb</dt>            <dd>{{ s.mem_mb or "(undeclared)" }}</dd>
+    <dt>wall_time_seconds</dt> <dd>{{ s.wall_time_seconds or "(undeclared)" }}</dd>
+    <dt>submitter</dt>         <dd>{{ s.submitter or "-" }}</dd>
+    <dt>job_name</dt>          <dd>{{ s.job_name or "-" }}</dd>
+    {% if s.tags %}
+    <dt>tags</dt>              <dd>{{ s.tags | join(", ") }}</dd>
+    {% endif %}
+    <dt>submitted</dt>         <dd>{{ s.submitted_at }}</dd>
+    {% if s.started_at %}
+    <dt>started</dt>           <dd>{{ s.started_at }}</dd>
+    {% endif %}
+    {% if s.finished_at %}
+    <dt>finished</dt>          <dd>{{ s.finished_at }}</dd>
+    {% endif %}
+    {% if s.exit_code is not none %}
+    <dt>exit_code</dt>         <dd>{{ s.exit_code | describe_exit }}</dd>
+    {% endif %}
+    {% if s.failure_reason %}
+    <dt>failure_reason</dt>    <dd>{{ s.failure_reason }}</dd>
+    {% endif %}
+  </dl>
+</section>
+
+{% if s.scheduler_target %}
+<section class="monitor">
+  <h3>scheduler</h3>
+  <dl>
+    <dt>target</dt>       <dd>{{ s.scheduler_target }}</dd>
+    {% if s.scheduler_id %}
+    <dt>scheduler_id</dt> <dd><code>{{ s.scheduler_id }}</code></dd>
+    {% endif %}
+    {% if s.pbs_state_label %}
+    <dt>scheduler state</dt> <dd>{{ s.pbs_state_label }}</dd>
+    {% endif %}
+    {% if s.fetch_state_label %}
+    <dt>fetch state</dt>  <dd>{{ s.fetch_state_label }}</dd>
+    {% endif %}
+  </dl>
+</section>
+{% endif %}
+
+{% if detail.samples %}
+<section class="monitor">
+  <h3>resource samples (last {{ detail.samples | length }}, newest first)</h3>
+  <p class="hint">
+    Watchdog samples from the owning host, ~5 s apart. CPU% is the
+    whole process group ({{ s.cpus }} core(s) declared ⇒ up to ~{{ s.cpus * 100 }}%).
+    {% if s.mem_mb %}Declared memory ceiling {{ s.mem_mb }} MB.{% endif %}
+  </p>
+  {# Four narrow columns, but a 19-char timestamp plus three numerics still
+     exceeds a phone viewport once main's padding is taken off. #}
+  <div class="table-scroll">
+  <table class="events">
+    <thead><tr><th>ts</th><th>cpu %</th><th>rss MB</th>{% if s.mem_mb %}<th>mem %</th>{% endif %}</tr></thead>
+    <tbody>
+      {% for smp in detail.samples | reverse %}
+      <tr>
+        <td class="ts">{{ smp.ts[:19] | replace("T", " ") if smp.ts else "-" }}</td>
+        <td class="num">{{ "%.0f" | format(smp.cpu_percent) if smp.cpu_percent is not none else "-" }}</td>
+        <td class="num">{{ "%.0f" | format(smp.rss_mb) if smp.rss_mb is not none else "-" }}</td>
+        {% if s.mem_mb %}
+        <td class="num">{{ "%.1f" | format(100.0 * smp.rss_mb / s.mem_mb) if smp.rss_mb is not none else "-" }}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="logs">
+  <h3>stdout (tail)</h3>
+  {% if s.stdout %}<pre>{{ s.stdout }}</pre>{% else %}<p class="empty">No stdout captured yet.</p>{% endif %}
+  <h3>stderr (tail)</h3>
+  {% if s.stderr %}<pre>{{ s.stderr }}</pre>{% else %}<p class="empty">No stderr captured yet.</p>{% endif %}
+</section>
+
+<section class="events">
+  <h3>events ({{ detail.events | length }})</h3>
+  {% if detail.events %}
+  {# Same unbounded detail cell as job_detail.html. #}
+  <div class="table-scroll">
+  <table class="events">
+    <thead><tr><th>ts</th><th>kind</th><th>detail</th></tr></thead>
+    <tbody>
+      {% for e in detail.events %}
+      <tr>
+        <td class="ts">{{ e.ts }}</td>
+        <td class="kind">{{ e.kind }}</td>
+        <td class="detail">
+          {%- set core = ["ts", "kind", "jobid"] -%}
+          {%- for k, v in e.items() if k not in core -%}
+            <strong>{{ k }}</strong>: <code>{{ v }}</code>{% if not loop.last %} · {% endif %}
+          {%- endfor -%}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No events recorded (pre-v0.6.54 job, or workspace cleaned up).</p>
+  {% endif %}
+</section>
+{% endif %}
+{% endblock %}

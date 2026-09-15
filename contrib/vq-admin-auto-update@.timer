@@ -1,0 +1,9 @@
+# RETIRED: there is deliberately no schedule and no enablement target.
+# deploy-multi-user.sh disables existing instances and installs this tombstone
+# so stale enabled timers cannot run privileged code from user-owned checkouts.
+
+[Unit]
+Description=RETIRED vq privileged auto-update timer for env %i
+
+[Timer]
+Unit=vq-admin-auto-update@%i.service

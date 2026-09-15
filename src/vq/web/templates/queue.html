@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}vq · queue{% endblock %}
+{% block content %}
+<h2>Queue</h2>
+<p class="hint">Auto-refreshes every 3 s. Click a job ID for details.</p>
+
+<section class="cockpit-summary" aria-label="queue summary">
+  <div class="metric">
+    <span class="metric-label">jobs</span>
+    <strong>{{ summary.total }}</strong>
+  </div>
+  <div class="metric">
+    <span class="metric-label">active</span>
+    <strong>{{ summary.active }}</strong>
+  </div>
+  <div class="metric">
+    <span class="metric-label">pending</span>
+    <strong>{{ summary.pending }}</strong>
+  </div>
+  <div class="metric">
+    <span class="metric-label">active CPUs</span>
+    <strong>{{ summary.active_cpus }}</strong>
+  </div>
+  <div class="metric">
+    <span class="metric-label">declared memory</span>
+    <strong>{{ summary.declared_mem_mb }}</strong>
+    <span class="metric-unit">MB</span>
+  </div>
+  <div class="metric {% if summary.terminal_attention %}metric-alert{% endif %}">
+    <span class="metric-label">needs triage</span>
+    <strong>{{ summary.terminal_attention }}</strong>
+  </div>
+</section>
+
+{% if summary.scheduler_hosts %}
+<p class="hint">scheduler hosts: {{ summary.scheduler_hosts | join(", ") }}</p>
+{% endif %}
+
+<form class="toolbar" method="get" action="/queue">
+  <label>
+    search
+    <input type="search" name="q" value="{{ query.q }}" autocomplete="off">
+  </label>
+  <label>
+    state
+    <select name="state">
+      <option value="all" {% if query.state == "all" %}selected{% endif %}>all</option>
+      {% for state in state_options %}
+      <option value="{{ state }}" {% if query.state == state %}selected{% endif %}>{{ state }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    host
+    <select name="host">
+      <option value="all" {% if query.host == "all" %}selected{% endif %}>all</option>
+      {% for host in host_options %}
+      <option value="{{ host }}" {% if query.host == host %}selected{% endif %}>{{ host }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    sort
+    <select name="sort">
+      {% for value, label in [
+        ("submitted", "submitted"),
+        ("state", "state"),
+        ("host", "host"),
+        ("sched", "scheduler"),
+        ("cpus", "cpus"),
+        ("mem", "memory"),
+        ("wall", "wall"),
+        ("diagnosis", "diagnosis"),
+        ("submitter", "submitter"),
+        ("command", "command"),
+        ("id", "id")
+      ] %}
+      <option value="{{ value }}" {% if query.sort == value %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    dir
+    <select name="dir">
+      <option value="desc" {% if query.dir == "desc" %}selected{% endif %}>desc</option>
+      <option value="asc" {% if query.dir == "asc" %}selected{% endif %}>asc</option>
+    </select>
+  </label>
+  <label>
+    rows
+    <select name="limit">
+      {% for value in row_limit_options %}
+      <option value="{{ value }}" {% if query.limit == value|string %}selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="checkline">
+    <input type="checkbox" name="triage" value="1" {% if query.triage %}checked{% endif %}>
+    triage
+  </label>
+  <button type="submit">Apply</button>
+  <a class="button-link" href="/queue">Reset</a>
+  <span class="hint">{{ shown_count }} / {{ filtered_count }} shown{% if filtered_count != total_count %} ({{ total_count }} total){% endif %}</span>
+</form>
+
+<section class="toolbar danger-zone" aria-label="clear old failed jobs">
+  <label>
+    clear failed older than
+    <input id="clear-failed-age" type="text" value="7d" size="5">
+  </label>
+  <label>
+    web token
+    <input id="clear-failed-token" type="password" autocomplete="off">
+  </label>
+  <button type="button" id="clear-failed-button">Clear</button>
+  <span id="clear-failed-result" class="hint"></span>
+</section>
+
+{# v0.6.23: host-pressure banner. Visible only when pressure >= 80%
+   (matches `vq daemon health` WARN threshold) OR the watchdog has
+   currently paused jobs. Inline-styled to avoid template edits in
+   base.html. #}
+{% if host_pressure_active or (host_pressure_pct is not none and host_pressure_pct >= 80.0) %}
+<div style="background:#fff3cd;border:1px solid #ffe69c;border-radius:4px;padding:.5rem .75rem;margin:.5rem 0;color:#664d03;">
+  <strong>⚠ Host memory pressure
+    {% if host_pressure_pct is not none %}{{ "%.1f"|format(host_pressure_pct) }}%{% endif %}
+  </strong>
+  {% if host_pressure_active %}
+    — v0.6.20 watchdog has auto-paused
+    <strong>{{ host_pressure_paused_jobs }}</strong>
+    job(s); they will SIGCONT when pressure drops below the resume threshold.
+  {% else %}
+    — watchdog auto-pauses running jobs at 85% to avoid OOM cascade.
+  {% endif %}
+</div>
+{% endif %}
+
+{% include "queue_table.html" %}
+{% endblock %}

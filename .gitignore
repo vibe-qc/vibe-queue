@@ -1,0 +1,29 @@
+# Python bytecode.
+#
+# 294 .pyc files were committed by mistake in 505a0cf (2026-09-08) during the
+# repository split. Because they are tracked AND regenerated on every test
+# run, the working tree was permanently dirty, and `git pull --rebase` then
+# refuses outright:
+#
+#     error: cannot pull with rebase: You have unstaged changes.
+#
+# That blocks the rebase-then-push cycle CLAUDE.md § 2 makes mandatory, for
+# every chat working in this repository. They are also machine-specific
+# (cpython-314) and rebuilt automatically, so they carry no information.
+__pycache__/
+*.py[cod]
+
+# Test and packaging artefacts.
+.pytest_cache/
+*.egg-info/
+
+# Virtualenvs. A venv built by scripts/install.sh already ignores itself
+# (.venv/.gitignore holds `*`); this covers one created any other way.
+.venv/
+venv/
+
+# Rendered documentation. `docs/_build/` is what a local `sphinx-build`
+# writes by default; `public/` is what the docs-build CI job writes and
+# uploads as an artifact.
+docs/_build/
+/public/

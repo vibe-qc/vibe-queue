@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="vq">
+  <title>vq</title>
+  <desc>A rounded square frame containing three tokens advancing along a rail, the leading one solid and the rest fading: a job queue.</desc>
+  <g id="vq-glyph">
+    <rect x="3" y="3" width="26" height="26" rx="5" ry="5" fill="none" stroke="#0F766E" stroke-width="2"/>
+    <rect x="6" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E"/>
+    <rect x="13.5" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E" opacity="0.55"/>
+    <rect x="21" y="9.5" width="5" height="9" rx="1.6" ry="1.6" fill="#0F766E" opacity="0.25"/>
+    <line x1="6" y1="21.5" x2="26" y2="21.5" stroke="#0F766E" stroke-width="2" stroke-linecap="round"/>
+  </g>
+</svg>
