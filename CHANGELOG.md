@@ -17,6 +17,8 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+## [0.26.7] - 2026-09-15 - "Raymond's Bazaar"
+
 - Require an explicit recovery account for host bootstrap and an explicit
   `--np N` allocation for parallel CRYSTAL runs. Update examples and synthetic
   submitter identities to keep site choices outside product source.
@@ -58,6 +60,15 @@ checks support an external private terms file without publishing its contents.
   failure category or sanitized stderr out of the stored poll error. Timeouts
   remain unknown observations. Polling, retries and lifecycle behavior are
   unchanged; this improves diagnosis without claiming a transport repair.
+
+### Known limitations
+
+- The #53 startup allowance is source-validated; actual host timing and graceful
+  service stop during rollback remain open. The #37 logout-survival and
+  multiplexing-disabled checks still need separately admitted host validation.
+- The #51 diagnostic improvement does not establish the scheduler transport
+  failure's cause or prove runtime recovery. A release alone does not establish
+  fleet convergence.
 
 ## [0.26.6] - 2026-09-13 - "Raymond's Bazaar"
 

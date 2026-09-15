@@ -48,7 +48,7 @@
   },
   {
     "changed": true,
-    "export_sha256": "67dd40893b86c9770512afb54c32c46f5c0cd533f422114379ac67e969cd4b3a",
+    "export_sha256": "463a6d8caa99808ff5a87049f922fcedc1914fdb5d4ffb40855eeca8385c1a01",
     "mode": "100644",
     "path": "CHANGELOG.md",
     "reasons": [
@@ -56,20 +56,20 @@
       "public repository URL",
       "site alias anonymized only in the new public snapshot; original released changelog remains unchanged"
     ],
-    "source_blob": "71f126ea883a2872d5b1c75aa6c7fc84caf458a2",
-    "source_sha256": "21078b80d0c3eda1e799a5714bc8df7bb12c5cbe455603bfb9a8b76b482bd806"
+    "source_blob": "d27b50248232586cb132dd3ef1dc86eb9176d688",
+    "source_sha256": "8b491a233dfd4c77bbbbd26258495912c80d9e4b5ff5c5b5fb017180b495c817"
   },
   {
     "changed": true,
-    "export_sha256": "6c7cd5c10d95b45faf76f8a02a4d860a7a40c59bb863081e259b3b1ebbb78d63",
+    "export_sha256": "0efd28fe21488711d6b951db89b98cfe5a6ffae65234993923138ebbb648956f",
     "mode": "100644",
     "path": "CITATION.cff",
     "reasons": [
       "public citation repository URL",
       "public maintainer website"
     ],
-    "source_blob": "518edb96c14e0b1af42ba1737370aa627508a52d",
-    "source_sha256": "982cbb6350ebb15c38eea8988cedec04a90d3e21427bc2896211047d430432e0"
+    "source_blob": "bd86af3f2cd4d23d747168cdbb0e1e219f03542d",
+    "source_sha256": "786260bb9e46bb5d4caae5f5cfe710fd69175982b2d7e2b54360545e5f31018b"
   },
   {
     "changed": true,
@@ -1010,15 +1010,15 @@
   },
   {
     "changed": false,
-    "export_sha256": "916dd92dcd9ab36d1f1ad814b45c3a85ecc381a0c7d1707dccf93b08f1dab8dd",
+    "export_sha256": "f039e6a9dee693b3b6070064d1784cf44151e9c158180b00ca3391a78c5d8875",
     "mode": "100644",
     "path": "pyproject.toml",
     "reasons": [
       "public package issues URL",
       "public package repository URL"
     ],
-    "source_blob": "3fafc3a8e3fef6f7efde0d735728242d37916c4e",
-    "source_sha256": "916dd92dcd9ab36d1f1ad814b45c3a85ecc381a0c7d1707dccf93b08f1dab8dd"
+    "source_blob": "89a51f02d96ca286ef4962b1878c0e3163727a34",
+    "source_sha256": "f039e6a9dee693b3b6070064d1784cf44151e9c158180b00ca3391a78c5d8875"
   },
   {
     "changed": false,
@@ -1094,12 +1094,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "a94618d9f638367fd2f8c09a4d438c91fcd51cf079a016eba66c78028cf6b9a0",
+    "export_sha256": "e3a95039edf0ac59793f2fe22c97eff4ce1bc2026ed9941e1e3e353c0e915f7a",
     "mode": "100644",
     "path": "src/vq/__init__.py",
     "reasons": [],
-    "source_blob": "1932d0ba3843cd8ad44f02a12123598f38eb297c",
-    "source_sha256": "a94618d9f638367fd2f8c09a4d438c91fcd51cf079a016eba66c78028cf6b9a0"
+    "source_blob": "2f03f253104d9844482cf06e8cd8dbae3bcc47ef",
+    "source_sha256": "e3a95039edf0ac59793f2fe22c97eff4ce1bc2026ed9941e1e3e353c0e915f7a"
   },
   {
     "changed": false,
@@ -4170,6 +4170,17 @@
     "export_sha256": "53f84d69867d795f46c15c3b7d36980c1b1bdb2baacc800bc88c17e7b4903ff1",
     "mode": "100644",
     "path": "config/README.md",
+    "reasons": [
+      "generated public export guidance"
+    ],
+    "source_blob": null,
+    "source_sha256": null
+  },
+  {
+    "changed": true,
+    "export_sha256": "20a33bd919344006e0b3d6645c76f847bc1b7b4c9fd35564542f3ad6ae3c1833",
+    "mode": "100644",
+    "path": "PUBLIC_RELEASE_SOURCE.json",
     "reasons": [
       "generated public export guidance"
     ],
