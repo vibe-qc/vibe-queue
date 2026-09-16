@@ -17,6 +17,8 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+## [0.26.8] - 2026-09-16 - "Raymond's Bazaar"
+
 ### Changed
 
 - Read accepted fleet reports from explicit external `fleet_report_repo`
