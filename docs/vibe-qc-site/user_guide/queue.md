@@ -74,14 +74,28 @@ shape for interactive work: for notebooks, use the
 
 ## Install it once, on both sides
 
-vq is installed from **its own repository**, not from your vibe-qc checkout:
+vq is installed from **its own repository**. Clone it before installing:
+
+Clone the public source snapshot over HTTPS:
 
 ```sh
 git clone https://github.com/vibe-qc/vibe-queue.git
+```
+
+Developers with private GitLab access should use the clone URL supplied by
+an administrator. Keep its host, port and SSH settings in external operator
+configuration. GitLab remains the canonical development repository.
+
+After cloning:
+
+```sh
 cd vibe-queue
 ./scripts/install.sh
 .venv/bin/vq --version
 ```
+
+See [vq clone and download options](https://vibe-qc.com/vibe-queue/docs/installation.html)
+for source archives and mirror availability.
 
 You need it on the laptop you submit from and on the machine that runs the
 work. It needs Python 3.12 or newer, and it installs nothing on the remote

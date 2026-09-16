@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -29,6 +31,42 @@ def report_script():
 
 RELEASE_SHA = "a" * 40
 TAG_OBJECT = "e" * 40
+
+
+def test_report_output_refuses_product_paths_and_symlink_escape(report_script, tmp_path):
+    source = tmp_path / "source"
+    outside = tmp_path / "private"
+    source.mkdir()
+    outside.mkdir()
+    (source / "external").symlink_to(outside, target_is_directory=True)
+    for candidate in (source / "report.json", source / "external" / "report.json"):
+        with pytest.raises(ValueError, match="outside product"):
+            report_script._output_path(str(candidate), source_repos=[source])
+    accepted = report_script._output_path(str(outside / "report.json"), source_repos=[source])
+    assert accepted == outside / "report.json"
+
+
+def test_report_output_refuses_git_metadata_and_bare_databases(report_script, tmp_path):
+    with pytest.raises(ValueError, match="Git metadata"):
+        report_script._output_path(str(tmp_path / ".git" / "report.json"), source_repos=[])
+    bare = tmp_path / "archive.git"
+    (bare / "objects").mkdir(parents=True)
+    (bare / "refs").mkdir()
+    (bare / "HEAD").write_text("ref: refs/heads/main\n")
+    with pytest.raises(ValueError, match="Git object stores"):
+        report_script._output_path(str(bare / "report.json"), source_repos=[])
+
+
+def test_report_records_are_private_and_do_not_truncate_hardlinks(report_script, tmp_path):
+    path = tmp_path / "report.json"
+    report_script._write_private_report(path, '{"accepted":true}')
+    assert path.read_text() == '{"accepted":true}\n'
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    alias = tmp_path / "alias.json"
+    os.link(path, alias)
+    with pytest.raises(ValueError, match="one link"):
+        report_script._write_private_report(path, "changed")
+    assert alias.read_text() == '{"accepted":true}\n'
 
 VERSIONS = {
     (RELEASE_SHA, "pyproject.toml"): "0.15.62",

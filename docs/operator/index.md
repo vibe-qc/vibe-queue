@@ -27,6 +27,8 @@ mode, not what you get by using `sudo`.
 
 ## Setting a host up
 
+* [Clone, download, and install](../installation.md) — the standalone
+  repository, GitHub mirror, and installation profiles.
 * [Host records](../hosts.md) — what to know about a machine before you point
   a queue at it, and why the filled-in inventory for this project's own fleet
   is deliberately not in this repository.

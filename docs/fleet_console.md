@@ -34,10 +34,11 @@ is read live each time, so logs and events are exactly current.
 * **One coordinator host** that can `ssh` to every fleet host
   non-interactively (`BatchMode=yes` must work -- key auth, no prompt).
   Verify with `vq doctor` before you start.
-* **vq installed with the web extra** on that host:
+* **vq installed with the web extra** on that host.
+  [Clone vibe-queue](installation.md#clone), then run from its root:
 
   ```bash
-  ./vibe-queue/scripts/install.sh --extras web
+  ./scripts/install.sh --extras web
   ```
 
   Without it, `vq web run` exits with `vq web requires the 'web' extra`.

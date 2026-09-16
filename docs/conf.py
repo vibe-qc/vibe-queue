@@ -195,16 +195,14 @@ html_favicon = "_static/logo/vq-favicon.svg"
 # into /web/vibe-queue/docs/ and nothing above it; keep the two in lockstep.
 html_baseurl = "https://vibe-qc.com/vibe-queue/docs/"
 
-# Furo's `source_repository` only understands the hosted forges it ships
-# patterns for; a self-hosted GitLab makes it emit two warnings per page and
-# render no link. Give it the URLs directly instead.
+# Explicit public source and edit links for the documentation theme.
 _SOURCE = "https://github.com/vibe-qc/vibe-queue"
 html_theme_options = {
     # Furo picks a light or dark wordmark from the reader's theme.
     "light_logo": "logo/vq-wordmark-light.svg",
     "dark_logo": "logo/vq-wordmark-dark.svg",
-    "source_view_link": f"{_SOURCE}/-/blob/main/docs/{{filename}}",
-    "source_edit_link": f"{_SOURCE}/-/edit/main/docs/{{filename}}",
+    "source_view_link": f"{_SOURCE}/blob/main/docs/{{filename}}",
+    "source_edit_link": f"{_SOURCE}/edit/main/docs/{{filename}}",
     "navigation_with_keys": True,
 }
 

@@ -1,12 +1,17 @@
 # Operator prompts for the release + upgrade chats
 
+> **Historical monorepo prompts.** The shared tree, version paths and tag
+> ownership described below predate the repository split. Use the current
+> [release process](release_process.md) and [installation guide](installation.md)
+> for standalone vibe-queue; do not use these prompts to clone or install it.
+
 Copy-paste prompts for the two recurring ecosystem chats, plus the standing
 process decisions they depend on.
 
 These live here because the queue chat owns `vibe-queue/docs/` and wrote the
 [fleet update runbook](fleet_update_runbook.md) the upgrade prompt points at.
 The **release** prompt follows the work the release chat owns in
-[`docs/release_process.md`](../../docs/release_process.md), including the
+[`docs/release_process.md`](https://vibe-qc.com/docs/release_process.html), including the
 sibling-version backstop. If this prompt and that process differ, the release
 process is authoritative.
 

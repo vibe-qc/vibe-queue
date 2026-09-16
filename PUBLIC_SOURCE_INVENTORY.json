@@ -81,53 +81,85 @@
     "source_sha256": "a3c3726bb94172cdcea3d2dd74305d34fb7fd60b423527588b39836d408ff357"
   },
   {
-    "changed": true,
-    "export_sha256": "0b41a3d0017056065cf4448a7d7f9448d144f852845f273eea1373ddef6542f3",
+    "changed": false,
+    "export_sha256": "fd9050b3595512aa5d9574ba25b58b5ca4dfbc553e0346bad451e9a0bd9f3fcf",
     "mode": "100644",
     "path": ".gitlab-ci.yml",
-    "reasons": [
-      "private deployment include stays in the private source repository"
-    ],
-    "source_blob": "103282a75d382af2f74088f7c87ed323737f74fe",
-    "source_sha256": "053e2feaf210f598e258f0021b81e08c40225cbd9028c45055f77b3a3caea3e9"
+    "reasons": [],
+    "source_blob": "500bf86e22aec689025accd7590bb5a24ff860c1",
+    "source_sha256": "fd9050b3595512aa5d9574ba25b58b5ca4dfbc553e0346bad451e9a0bd9f3fcf"
   },
   {
-    "changed": true,
-    "export_sha256": "4a16117ce0838870ca26c83881ba3b446919cf1ed7cfb841ea9b36f11379446a",
+    "changed": false,
+    "export_sha256": "cd1235879c564ef34f13b40f84a37142788f6a25d07dc63216d30c789a8667f7",
+    "mode": "100644",
+    "path": ".release-status/CODENAME-PROPOSAL.md",
+    "reasons": [],
+    "source_blob": "d3997a7f4aa6031cd0b93d0e2e0f46b2b2076a9b",
+    "source_sha256": "cd1235879c564ef34f13b40f84a37142788f6a25d07dc63216d30c789a8667f7"
+  },
+  {
+    "changed": false,
+    "export_sha256": "1588d9c40deef7954c0a61f158dedd35b9375f9ca50c9856b369ffa6269f2d59",
+    "mode": "100644",
+    "path": ".release-status/IMAGE-BRIEF-codename-series.md",
+    "reasons": [],
+    "source_blob": "c16e3c9eaf4714332ed50d0bc700cf431e615478",
+    "source_sha256": "1588d9c40deef7954c0a61f158dedd35b9375f9ca50c9856b369ffa6269f2d59"
+  },
+  {
+    "changed": false,
+    "export_sha256": "2ea9ff09b0501709c3af4a9c7a9a9fc8f2c30cda093b7a82195e0c76e8ae4409",
+    "mode": "100644",
+    "path": "AGENTS.md",
+    "reasons": [],
+    "source_blob": "a5e3c8e31b6d44ea3f48144742b8336e58cf5bd8",
+    "source_sha256": "2ea9ff09b0501709c3af4a9c7a9a9fc8f2c30cda093b7a82195e0c76e8ae4409"
+  },
+  {
+    "changed": false,
+    "export_sha256": "55d6a0543f5e55b03d8ab40749b64d21f3056f260f3257b4d0b440e4c4415618",
     "mode": "100644",
     "path": "CHANGELOG.md",
-    "reasons": [
-      "deployment host example",
-      "public repository URL",
-      "site alias anonymized only in the new public snapshot; original released changelog remains unchanged"
-    ],
-    "source_blob": "b52f2339b8f7d86f3de0a190e9d29609e1830981",
-    "source_sha256": "6f7262a246f5367d72f91a6c04f5f56ed597b945349d5db94cd9e043b0932a73"
+    "reasons": [],
+    "source_blob": "e68bb07c286c962b23a63d7b78d36f6784f1d2d0",
+    "source_sha256": "55d6a0543f5e55b03d8ab40749b64d21f3056f260f3257b4d0b440e4c4415618"
   },
   {
-    "changed": true,
+    "changed": false,
     "export_sha256": "0efd28fe21488711d6b951db89b98cfe5a6ffae65234993923138ebbb648956f",
     "mode": "100644",
     "path": "CITATION.cff",
-    "reasons": [
-      "public citation repository URL",
-      "public maintainer website"
-    ],
-    "source_blob": "bd86af3f2cd4d23d747168cdbb0e1e219f03542d",
-    "source_sha256": "786260bb9e46bb5d4caae5f5cfe710fd69175982b2d7e2b54360545e5f31018b"
+    "reasons": [],
+    "source_blob": "f1370efc4fab100b397bedb6e284829fbf2bffe7",
+    "source_sha256": "0efd28fe21488711d6b951db89b98cfe5a6ffae65234993923138ebbb648956f"
   },
   {
-    "changed": true,
-    "export_sha256": "999d2c6ce5d834f82bcac511c25b463ef4216043564abd905f3a85d43b26338b",
+    "changed": false,
+    "export_sha256": "8c79b9a8c679edc969b05b149e7c6fdd93a66429e727ca1ad15fe3bd4a9f77cb",
+    "mode": "100644",
+    "path": "CLAUDE.md",
+    "reasons": [],
+    "source_blob": "0aeece4eaa56f5ccf556a1577f93e25c603fe9c7",
+    "source_sha256": "8c79b9a8c679edc969b05b149e7c6fdd93a66429e727ca1ad15fe3bd4a9f77cb"
+  },
+  {
+    "changed": false,
+    "export_sha256": "6281b68e8f3586aa1472b5566079fe3033f3a89f187da8b0be723be2e90ea011",
+    "mode": "100644",
+    "path": "CODEX.md",
+    "reasons": [],
+    "source_blob": "3e5675a05db918cc6089fbfdc7163295a43e04f2",
+    "source_sha256": "6281b68e8f3586aa1472b5566079fe3033f3a89f187da8b0be723be2e90ea011"
+  },
+  {
+    "changed": false,
+    "export_sha256": "959dedc0b3a25c5cc5d8c537ed88a52ad3b8c1e84b11623241e6a298ba242b3c",
     "mode": "100644",
     "path": "CONTRIBUTING.md",
-    "reasons": [
-      "public clone URL",
-      "public repository URL",
-      "public tracker landing URL; original issue IDs are private"
-    ],
-    "source_blob": "cfff751c1fe77c2f1947ea9c94562b48deaef806",
-    "source_sha256": "01b417ef23f65241216e8d3965770e4a102d7f036558f4a733deccfc7c288022"
+    "reasons": [],
+    "source_blob": "7a70d1e3124f5ec8008be8ef8828733da69aed1c",
+    "source_sha256": "959dedc0b3a25c5cc5d8c537ed88a52ad3b8c1e84b11623241e6a298ba242b3c"
   },
   {
     "changed": false,
@@ -139,15 +171,22 @@
     "source_sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04"
   },
   {
-    "changed": true,
-    "export_sha256": "bdfd9ece031010fcd3b99d1c3baee6533b9485c4625d9dac860d54d13066dc02",
+    "changed": false,
+    "export_sha256": "d34592f56daf8f916bc03a218bc4b816eaf420e1eb06f6dd1e860ed55a637ede",
+    "mode": "100644",
+    "path": "PUBLICATION.md",
+    "reasons": [],
+    "source_blob": "03934d5bf3fb54b7d8da7b7ffe9bf0943051f0e1",
+    "source_sha256": "d34592f56daf8f916bc03a218bc4b816eaf420e1eb06f6dd1e860ed55a637ede"
+  },
+  {
+    "changed": false,
+    "export_sha256": "3cf4eb6bb51432b9659a82f93bba2856740b7626e73d5ee70b1a29055e19616d",
     "mode": "100644",
     "path": "README.md",
-    "reasons": [
-      "public repository URL"
-    ],
-    "source_blob": "dd86511ffd9d4fcda7b66eaa93a6bedb2d423c3f",
-    "source_sha256": "c0ac81d23d207ecbbee4121601265500af8e2ac66c970cb0fc7445ff09247b59"
+    "reasons": [],
+    "source_blob": "eeed83c6fc122e7249232059b0c5fcc2c6fc5135",
+    "source_sha256": "3cf4eb6bb51432b9659a82f93bba2856740b7626e73d5ee70b1a29055e19616d"
   },
   {
     "changed": false,
@@ -157,6 +196,24 @@
     "reasons": [],
     "source_blob": "4ba4b6df72237c5239c8df809261f1176a6cebb4",
     "source_sha256": "cf4e99ea6f02f8bccf5ab78c706cf47f343c8fc90c80172330fb73634b2888c5"
+  },
+  {
+    "changed": false,
+    "export_sha256": "c73e5f84b9a6f76d301639b8ba6ec9883c47935a096344a6f459de4ace060286",
+    "mode": "100644",
+    "path": "config/README.md",
+    "reasons": [],
+    "source_blob": "7b63dd9a97a1a49d706ef6656c3286cea8c64dab",
+    "source_sha256": "c73e5f84b9a6f76d301639b8ba6ec9883c47935a096344a6f459de4ace060286"
+  },
+  {
+    "changed": false,
+    "export_sha256": "6293eae8108f9c3f8c2b8edfd80c07b96028ec383e474778d71298b01a42ddbb",
+    "mode": "100644",
+    "path": "config/public-example.toml",
+    "reasons": [],
+    "source_blob": "bb1cc5e1498d29aa1916e9e7b1fb21ee5e6542bc",
+    "source_sha256": "6293eae8108f9c3f8c2b8edfd80c07b96028ec383e474778d71298b01a42ddbb"
   },
   {
     "changed": false,
@@ -664,12 +721,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "49410c51816db92b02b9e359447722d9738380598d99d8b753b04dee60310e74",
+    "export_sha256": "5692ff9ea48bfbf5cae128f3b29e9451603442c5348fc92f7fec26498ab46e00",
     "mode": "100644",
     "path": "docs/agent_prompts.md",
     "reasons": [],
-    "source_blob": "db34723a9c38dd25b92504587285877dad28f9c5",
-    "source_sha256": "49410c51816db92b02b9e359447722d9738380598d99d8b753b04dee60310e74"
+    "source_blob": "bbe282e9ded1abce01e526068dae0753d36dfa81",
+    "source_sha256": "5692ff9ea48bfbf5cae128f3b29e9451603442c5348fc92f7fec26498ab46e00"
   },
   {
     "changed": false,
@@ -691,12 +748,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "647087f082429fa52ae288934e40414334f2a8b6bec42abab4ebfb347507c55f",
+    "export_sha256": "4b36d7f51bae1d79496be47142bf43b06c97f44e8cbfdd387bb771767596b40b",
     "mode": "100644",
     "path": "docs/chat-onboarding.md",
     "reasons": [],
-    "source_blob": "479be7b33318edb01d46b975c6164141c99ea6f2",
-    "source_sha256": "647087f082429fa52ae288934e40414334f2a8b6bec42abab4ebfb347507c55f"
+    "source_blob": "62bad7bcee6805e745aa6e2d7a736ff0e39684fc",
+    "source_sha256": "4b36d7f51bae1d79496be47142bf43b06c97f44e8cbfdd387bb771767596b40b"
   },
   {
     "changed": false,
@@ -708,24 +765,22 @@
     "source_sha256": "6105eb5dfbd317de03247e37d1d591c7479bf789e554c11f0cf65298685c2a23"
   },
   {
-    "changed": true,
-    "export_sha256": "62bdf435ce6cbf6d09cc08aed7ccaeece9cc780756712d6dd4867a7f96c951ed",
+    "changed": false,
+    "export_sha256": "0fdd4978a8c2745f4c3f32e7f5f2767ab958d1d454899b6d15be83441ff27513",
     "mode": "100644",
     "path": "docs/conf.py",
-    "reasons": [
-      "public repository URL"
-    ],
-    "source_blob": "b59f00a5a5c7d599a5dbc3757d5e1643f47bfe67",
-    "source_sha256": "aeb160a01fe1e818079fc3e2f0b02204f5c3eef8357a6f87ce6b779860f5a813"
+    "reasons": [],
+    "source_blob": "8a5869c385a4830c100dd4d7737c527a173ce216",
+    "source_sha256": "0fdd4978a8c2745f4c3f32e7f5f2767ab958d1d454899b6d15be83441ff27513"
   },
   {
     "changed": false,
-    "export_sha256": "de1aa56e0010611ed330cc11c000c3d47a7040412c9ad343448e91a062affc00",
+    "export_sha256": "21638df460ad3d4f2eb7955c5ec04efdca9f51e48e7257264446a8f35325ee41",
     "mode": "100644",
     "path": "docs/config.toml.example",
     "reasons": [],
-    "source_blob": "1c3cf0461482c8216612bb7567f907eea2127e86",
-    "source_sha256": "de1aa56e0010611ed330cc11c000c3d47a7040412c9ad343448e91a062affc00"
+    "source_blob": "51d22f2c43e4e10e56fd14eaa046a720b326065c",
+    "source_sha256": "21638df460ad3d4f2eb7955c5ec04efdca9f51e48e7257264446a8f35325ee41"
   },
   {
     "changed": false,
@@ -747,12 +802,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "71fbfaa3530a48579d23dbf021fa6689eb0afe596fe30db7b357fe489a3d5386",
+    "export_sha256": "f6ca877155a05599449d977edfb58690eeb583cbe99df8f2a82107715da0eddc",
     "mode": "100644",
     "path": "docs/fleet_console.md",
     "reasons": [],
-    "source_blob": "4fcb8c4a2cdf61708ebdee5c467c3365c7e30e6e",
-    "source_sha256": "71fbfaa3530a48579d23dbf021fa6689eb0afe596fe30db7b357fe489a3d5386"
+    "source_blob": "a4d4ea346a456c1bbdd262f2b359f25ae662ad0c",
+    "source_sha256": "f6ca877155a05599449d977edfb58690eeb583cbe99df8f2a82107715da0eddc"
   },
   {
     "changed": false,
@@ -809,35 +864,40 @@
     "source_sha256": "5eb283629411c814aafd510e90150de34c9f54d236fbf60c3be5ac07a935da3f"
   },
   {
-    "changed": true,
-    "export_sha256": "2ff5925b1f66510b39b5e25095a29347c6978cd1ab91d72382cd2982108d0e2a",
+    "changed": false,
+    "export_sha256": "6a2fa889181c0855db3280a8c0ffc4350cc9068ebb3556f9a726e0d93843dd9f",
     "mode": "100644",
     "path": "docs/index.md",
-    "reasons": [
-      "private host replaced with example",
-      "public repository URL",
-      "public source URL"
-    ],
-    "source_blob": "2257d872e94c2d4c35b9594899504e2d52409671",
-    "source_sha256": "502031726f17c90a983dbf70127c8f1a6e87e340c5903261a22381e90813ff8b"
+    "reasons": [],
+    "source_blob": "67ad37e4d14ddfcaef8c64347aaf4c2a5916ab32",
+    "source_sha256": "6a2fa889181c0855db3280a8c0ffc4350cc9068ebb3556f9a726e0d93843dd9f"
   },
   {
     "changed": false,
-    "export_sha256": "10cb9c8fe29e2eea1740abed2147e883e4c681aeea4772fdde502b10f2b8935f",
+    "export_sha256": "ce5a5e654bab4fca1f67afa0c1223ae6693c81553ad5a8a8b5f6b9a12fdb1bb4",
+    "mode": "100644",
+    "path": "docs/installation.md",
+    "reasons": [],
+    "source_blob": "79425ca13f8c57c53c855ebd90b3962d0bfc971b",
+    "source_sha256": "ce5a5e654bab4fca1f67afa0c1223ae6693c81553ad5a8a8b5f6b9a12fdb1bb4"
+  },
+  {
+    "changed": false,
+    "export_sha256": "eeef69e492e6a93ec0d621dabdee9cf62b2b11da2e0d62bc1f9e0b67e76ae819",
     "mode": "100644",
     "path": "docs/lifecycle.md",
     "reasons": [],
-    "source_blob": "380b65cbaa73d13f34597548e142798ce3096164",
-    "source_sha256": "10cb9c8fe29e2eea1740abed2147e883e4c681aeea4772fdde502b10f2b8935f"
+    "source_blob": "676abe973eabfe17cfcfd54a9ddf953c90b01a55",
+    "source_sha256": "eeef69e492e6a93ec0d621dabdee9cf62b2b11da2e0d62bc1f9e0b67e76ae819"
   },
   {
     "changed": false,
-    "export_sha256": "828efa089a48da23c66798a571e14e4945b29da1d64c54feb04683e988ea3315",
+    "export_sha256": "189f6a3253001ef3a306138a45382d8768381fe1204e8e5ab7bd3e84f1edef58",
     "mode": "100644",
     "path": "docs/multi_user_deployment.md",
     "reasons": [],
-    "source_blob": "d7952b799fb92aed4a14a12904f26d85481da52b",
-    "source_sha256": "828efa089a48da23c66798a571e14e4945b29da1d64c54feb04683e988ea3315"
+    "source_blob": "2eb635eb1f10e8b215b4dc691a38c288ecbb56c6",
+    "source_sha256": "189f6a3253001ef3a306138a45382d8768381fe1204e8e5ab7bd3e84f1edef58"
   },
   {
     "changed": false,
@@ -850,21 +910,21 @@
   },
   {
     "changed": false,
-    "export_sha256": "8b24e1e7072c20c75899d8f2e3ffc782b0434e88e2fc7bcaf33aff6bb340c859",
+    "export_sha256": "a69535979eee8e8ea54437aab8bddcfb80f4664352ba2f058a12ffb6087b107b",
     "mode": "100644",
     "path": "docs/operations.md",
     "reasons": [],
-    "source_blob": "75484023293be6ded317da8c407129356f79eb1a",
-    "source_sha256": "8b24e1e7072c20c75899d8f2e3ffc782b0434e88e2fc7bcaf33aff6bb340c859"
+    "source_blob": "e321406688a9376e9137762d743ed5c2300cbe4a",
+    "source_sha256": "a69535979eee8e8ea54437aab8bddcfb80f4664352ba2f058a12ffb6087b107b"
   },
   {
     "changed": false,
-    "export_sha256": "b3a6ea6334be1b82aa47bb6f3d51b3ef1dad326d08358857cbfba5a69bd48180",
+    "export_sha256": "5f0004e1988b94d624a9544da1a5cef0d315672759049d2ddcacb8b05ddb9b89",
     "mode": "100644",
     "path": "docs/operator/index.md",
     "reasons": [],
-    "source_blob": "beab19560c648701b21bfb36bab4073760085898",
-    "source_sha256": "b3a6ea6334be1b82aa47bb6f3d51b3ef1dad326d08358857cbfba5a69bd48180"
+    "source_blob": "882a4089a26d77a1077b3cab9c3f412670e9836c",
+    "source_sha256": "5f0004e1988b94d624a9544da1a5cef0d315672759049d2ddcacb8b05ddb9b89"
   },
   {
     "changed": false,
@@ -876,15 +936,13 @@
     "source_sha256": "9214ae7336173be3fbfda94d65df17d9f517065574066f4f8c52ea2203a1f8f3"
   },
   {
-    "changed": true,
+    "changed": false,
     "export_sha256": "5fcebc1177b0570e49d052de7a1d3443260064065f4148cba3da05611ea08509",
     "mode": "100644",
     "path": "docs/pbs_dispatcher_backend_design.md",
-    "reasons": [
-      "private host replaced with example"
-    ],
-    "source_blob": "d77f90db9b8d277ea11cdd20161c75a0b029b210",
-    "source_sha256": "0d9fc170a850e0a2c32c34c48c7b980e3c00137459f2062ad736bdbaae8e7ee8"
+    "reasons": [],
+    "source_blob": "80cf321fd3d3e420b489d9f7cf3cb2ec0cd6aa50",
+    "source_sha256": "5fcebc1177b0570e49d052de7a1d3443260064065f4148cba3da05611ea08509"
   },
   {
     "changed": false,
@@ -1004,15 +1062,13 @@
     "source_sha256": "b44c547d355e76de24a4f38f4d24b1a5b974910a71e5779832a3725a0e0013cc"
   },
   {
-    "changed": true,
+    "changed": false,
     "export_sha256": "559cb424e27328177d50c8bbb96f68cb294f6386f407d94c6c0ee037bf87241c",
     "mode": "100644",
     "path": "docs/vibe-qc-site/toolset_lifecycle-vq-edits.md",
-    "reasons": [
-      "public repository URL"
-    ],
-    "source_blob": "07637bb6ddf25cf4ab64ab2548ff52bb547bc48e",
-    "source_sha256": "a25004ce62bfe69e697e86675201421dee0f3eb656fceb305e1deb81e7e2a028"
+    "reasons": [],
+    "source_blob": "5144511ce0e2ca47fa32e97c4bc69fbcdd6cb048",
+    "source_sha256": "559cb424e27328177d50c8bbb96f68cb294f6386f407d94c6c0ee037bf87241c"
   },
   {
     "changed": false,
@@ -1024,16 +1080,13 @@
     "source_sha256": "28603232ec563ae7dacce32e27464605353f19fb8a33166a88632f7e6dcd1f3e"
   },
   {
-    "changed": true,
-    "export_sha256": "46499245203f597205e43cd159eb6c14cd160b013668522c2ce6ce4a81356181",
+    "changed": false,
+    "export_sha256": "3f2d835f4f1d4b34b2285ab26a3dfe2ae4c8bbe9c74c808f203df483dc733a1c",
     "mode": "100644",
     "path": "docs/vibe-qc-site/user_guide/queue.md",
-    "reasons": [
-      "public repository URL",
-      "public source URL"
-    ],
-    "source_blob": "7c4916736ec1d940c8379c295b982b58228a35c8",
-    "source_sha256": "383b6955415dab685c6decdd24664f8cf92b06ebca3d9ca98e700abc63a4c0fe"
+    "reasons": [],
+    "source_blob": "09158d55a44ad2465748ae06992384a0324b906a",
+    "source_sha256": "3f2d835f4f1d4b34b2285ab26a3dfe2ae4c8bbe9c74c808f203df483dc733a1c"
   },
   {
     "changed": false,
@@ -1046,24 +1099,30 @@
   },
   {
     "changed": false,
-    "export_sha256": "40f7986bb17b0502056d9fc43df0407268c4a302e37b5e8b2a432168cbb3f8fb",
+    "export_sha256": "70e012c3616251833f7c22fae50e22ec044590c0df50d33a77d8379ff68aaae5",
     "mode": "100644",
     "path": "docs/web.md",
     "reasons": [],
-    "source_blob": "e883fc2f186a4ff3299ef2d55035e8438fd6f490",
-    "source_sha256": "40f7986bb17b0502056d9fc43df0407268c4a302e37b5e8b2a432168cbb3f8fb"
+    "source_blob": "ef0483115167656ff08ce5d105d584412d914dce",
+    "source_sha256": "70e012c3616251833f7c22fae50e22ec044590c0df50d33a77d8379ff68aaae5"
   },
   {
     "changed": false,
     "export_sha256": "f039e6a9dee693b3b6070064d1784cf44151e9c158180b00ca3391a78c5d8875",
     "mode": "100644",
     "path": "pyproject.toml",
-    "reasons": [
-      "public package issues URL",
-      "public package repository URL"
-    ],
+    "reasons": [],
     "source_blob": "89a51f02d96ca286ef4962b1878c0e3163727a34",
     "source_sha256": "f039e6a9dee693b3b6070064d1784cf44151e9c158180b00ca3391a78c5d8875"
+  },
+  {
+    "changed": false,
+    "export_sha256": "75bf583f7f50be944e042ae0c4a2bfdfff6193e4bc8d54fe988ebd1af7c8e6bc",
+    "mode": "100644",
+    "path": "releases/README.md",
+    "reasons": [],
+    "source_blob": "4362dc98f35d63a54c98a740f00c0bfdd6289328",
+    "source_sha256": "75bf583f7f50be944e042ae0c4a2bfdfff6193e4bc8d54fe988ebd1af7c8e6bc"
   },
   {
     "changed": false,
@@ -1103,12 +1162,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "9599683a1d6dcba0ff2a991f447884f41ca47a1081365ce6b73e14b6ab489ab5",
+    "export_sha256": "d53936f06aa84b1ad91a9ab7fb26ac1181667722799d2b0fe95ec9f4d523219b",
     "mode": "100755",
     "path": "scripts/make_release_report.py",
     "reasons": [],
-    "source_blob": "a9f06d9edc98378b95e14d8a2f97b5cb3f58fc9b",
-    "source_sha256": "9599683a1d6dcba0ff2a991f447884f41ca47a1081365ce6b73e14b6ab489ab5"
+    "source_blob": "ee3cf111b8a3e560ed538a47e36a828f7a4d2f96",
+    "source_sha256": "d53936f06aa84b1ad91a9ab7fb26ac1181667722799d2b0fe95ec9f4d523219b"
   },
   {
     "changed": false,
@@ -1265,12 +1324,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "7980b4393e3ffb573416183176328e1e833df62f685cad924c60bde74966e376",
+    "export_sha256": "198ecd37193bd6be0cf7a635c87f97e8779a194b78dc406f663de3a19271b163",
     "mode": "100644",
     "path": "src/vq/cli.py",
     "reasons": [],
-    "source_blob": "8922a91eab77d6731f53f8551fc60923348f25f4",
-    "source_sha256": "7980b4393e3ffb573416183176328e1e833df62f685cad924c60bde74966e376"
+    "source_blob": "0b8241a5ab4a84295bdd4949edc0854541275bbe",
+    "source_sha256": "198ecd37193bd6be0cf7a635c87f97e8779a194b78dc406f663de3a19271b163"
   },
   {
     "changed": false,
@@ -1283,12 +1342,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "723950ae2eeecab665d24a848b795e4a8eb36a83b6b7e7ec0366c75078988678",
+    "export_sha256": "2b7628375a8e16599ee5deffa51b06e190d901ff0d20aae26d0127956de8c99f",
     "mode": "100644",
     "path": "src/vq/config.py",
     "reasons": [],
-    "source_blob": "fb5e4c51b2fe48ffaf61f03fd65d30b6919dabe0",
-    "source_sha256": "723950ae2eeecab665d24a848b795e4a8eb36a83b6b7e7ec0366c75078988678"
+    "source_blob": "b86dd6e33404d57a7f89a92dec0be4285b6f7798",
+    "source_sha256": "2b7628375a8e16599ee5deffa51b06e190d901ff0d20aae26d0127956de8c99f"
   },
   {
     "changed": false,
@@ -1373,12 +1432,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "208df6b8fcef400fe84c83819886e7ff214fdf835049071120e379d2bc716c2e",
+    "export_sha256": "e9695cb793d5e34f085f30b21563945b23978763aa3dca97dda54a344ee35425",
     "mode": "100644",
     "path": "src/vq/fleet_release.py",
     "reasons": [],
-    "source_blob": "a161641f99138a0fd76999d76a6c8ac5c82215c9",
-    "source_sha256": "208df6b8fcef400fe84c83819886e7ff214fdf835049071120e379d2bc716c2e"
+    "source_blob": "483339a2b64f6bd94bb30d77a5455090ec377b34",
+    "source_sha256": "e9695cb793d5e34f085f30b21563945b23978763aa3dca97dda54a344ee35425"
   },
   {
     "changed": false,
@@ -2822,6 +2881,15 @@
   },
   {
     "changed": false,
+    "export_sha256": "35a30301e0ce15b725fdfbe88830f4d128cfedd7c3f178aa0deffebbeae822ca",
+    "mode": "100644",
+    "path": "tests/test_external_reports.py",
+    "reasons": [],
+    "source_blob": "e7660e23eeb34ae0ed6d94680e7e9bc17c03044b",
+    "source_sha256": "35a30301e0ce15b725fdfbe88830f4d128cfedd7c3f178aa0deffebbeae822ca"
+  },
+  {
+    "changed": false,
     "export_sha256": "8c46a575df4295d1bb777c3adb65eb5e034e1781bf806b59bd030e094875d41e",
     "mode": "100644",
     "path": "tests/test_f821_fixes_v0_12_0.py",
@@ -2894,12 +2962,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "62b421ac667df4954210f8e07352b948ecfb5ff7f546f9da5db0c848088370e1",
+    "export_sha256": "58c43c6eb2f5234dcf58006ed40a16e1d9323dc1b04a5494d0e4f27b4bee279c",
     "mode": "100644",
     "path": "tests/test_fleet_rollout_cli.py",
     "reasons": [],
-    "source_blob": "5b420006f59d3b17d85cd2bfc8d0fcb39e15a3b8",
-    "source_sha256": "62b421ac667df4954210f8e07352b948ecfb5ff7f546f9da5db0c848088370e1"
+    "source_blob": "d1540de7c854e4a6ad4df92faca001963280f9e7",
+    "source_sha256": "58c43c6eb2f5234dcf58006ed40a16e1d9323dc1b04a5494d0e4f27b4bee279c"
   },
   {
     "changed": false,
@@ -3119,12 +3187,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "2b7dae445fcf171694f4e8235c6e385eabc3f9b4feb8f161af7c00961a1013ee",
+    "export_sha256": "905c41391e060d2380c4c5d7790e77d3ade0be87246945320ddbc237e988af19",
     "mode": "100644",
     "path": "tests/test_make_release_report.py",
     "reasons": [],
-    "source_blob": "46e1bfb5931b81c82d157e80c2be953878056a83",
-    "source_sha256": "2b7dae445fcf171694f4e8235c6e385eabc3f9b4feb8f161af7c00961a1013ee"
+    "source_blob": "c1606e0a74899437d2d420370189a584d7b8c6fb",
+    "source_sha256": "905c41391e060d2380c4c5d7790e77d3ade0be87246945320ddbc237e988af19"
   },
   {
     "changed": false,
@@ -3677,12 +3745,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "e74bb1b62143e632b9ba6a3dfe0b3e4fde65c8c6d64b21938d2a662f8e4bb94c",
+    "export_sha256": "409613826117bc40099878411b09273fcc3a567457de9474ca8ce02e1ac8373d",
     "mode": "100644",
     "path": "tests/test_self_update.py",
     "reasons": [],
-    "source_blob": "89e1afaf5b6319c71d5296f54d8f10641b6fee55",
-    "source_sha256": "e74bb1b62143e632b9ba6a3dfe0b3e4fde65c8c6d64b21938d2a662f8e4bb94c"
+    "source_blob": "d26c062f2966a469220049fc4f1fd3c29007ca90",
+    "source_sha256": "409613826117bc40099878411b09273fcc3a567457de9474ca8ce02e1ac8373d"
   },
   {
     "changed": false,
@@ -4187,38 +4255,5 @@
     "reasons": [],
     "source_blob": "85e1c124fc7af4513bf5ab2ace611ca34b9d4e86",
     "source_sha256": "c078bf5eeedd9ea62903b109ccb6ffd476e6a12a218d358928169f2e6a734a67"
-  },
-  {
-    "changed": true,
-    "export_sha256": "d34592f56daf8f916bc03a218bc4b816eaf420e1eb06f6dd1e860ed55a637ede",
-    "mode": "100644",
-    "path": "PUBLICATION.md",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
-  },
-  {
-    "changed": true,
-    "export_sha256": "6293eae8108f9c3f8c2b8edfd80c07b96028ec383e474778d71298b01a42ddbb",
-    "mode": "100644",
-    "path": "config/public-example.toml",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
-  },
-  {
-    "changed": true,
-    "export_sha256": "53f84d69867d795f46c15c3b7d36980c1b1bdb2baacc800bc88c17e7b4903ff1",
-    "mode": "100644",
-    "path": "config/README.md",
-    "reasons": [
-      "generated public export guidance"
-    ],
-    "source_blob": null,
-    "source_sha256": null
   }
 ]

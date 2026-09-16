@@ -2253,6 +2253,23 @@ class Config(BaseModel):
     than a precedence rule -- there is no reading of that config that is
     obviously right. Setting this one at all warns once."""
 
+    fleet_report_repo: str | None = None
+    """External private Git checkout containing accepted fleet reports.
+
+    Report storage is independent of the running controller's source checkout.
+    Reports keep their existing ``vibe-queue/releases/`` or ``releases/`` paths.
+    Required only for commands that select accepted reports; ordinary queue
+    operation and exact-SHA updates do not require a report repository.
+    """
+
+    fleet_report_history_repo: str | None = None
+    """Retained private Git history for authenticating old report digests.
+
+    This preserves the original commits and pre-hardening ancestry proof when
+    current reports move to a separate operations repository. It is read only
+    apart from fetching refs, and never supplies the newest deployable report.
+    """
+
     pin_source_repos: dict[str, str] = Field(default_factory=dict)
     """Local checkout for each repository a release-report pin resolves in.
 

@@ -9,21 +9,22 @@ verdict.
 
 For the newcomer-facing command matrix shared by vibe-qc, vibe-view, vq, and
 vibe-basis, start with the
-[toolset lifecycle guide](../../docs/toolset_lifecycle.md). This page covers
+[toolset lifecycle guide](https://vibe-qc.com/docs/toolset_lifecycle.html). This page covers
 the additional daemon ownership and host-service contract specific to vq.
 
 ## Source-install lifecycle
 
-The supported source-install commands live in `vibe-queue/scripts/`:
+First [clone vibe-queue](installation.md#clone). Run the supported
+source-install commands from that repository root:
 
 ```sh
-./vibe-queue/scripts/install.sh --extras web
-vibe-queue/.venv/bin/vq self-update --accepted-report vX.Y.Z
-./vibe-queue/scripts/reinstall.sh   # only while no daemon runs
-./vibe-queue/scripts/uninstall.sh --dry-run
+./scripts/install.sh --extras web
+.venv/bin/vq self-update --accepted-report vX.Y.Z
+./scripts/reinstall.sh   # only while no daemon runs
+./scripts/uninstall.sh --dry-run
 ```
 
-Each command uses the dedicated `vibe-queue/.venv` unless `--venv` is
+Each command uses the dedicated `.venv` unless `--venv` is
 given. Install records the selected extras profile and whether the package
 is editable; update and reinstall preserve both unless `--extras`,
 `--editable`, or `--copied` explicitly changes them. Environment replacement
@@ -106,7 +107,7 @@ launchd-user supervision first.
 
 A separately supervised dashboard created by `vq web install` has its own
 service definition and process. After update or reinstall, rerun
-`vibe-queue/.venv/bin/vq web install` and verify `vq web status` so the service
+`.venv/bin/vq web install` and verify `vq web status` so the service
 points at the current environment and provenance. Before uninstalling the
 environment, run `vq web uninstall` while that command still exists. The macOS
 daemon plist generated with `vq daemon launchd-plist` already owns a web
@@ -147,8 +148,8 @@ sidecar; do not install a second dashboard service for that route.
    shouldn't be called from production.
 
 3. **An on-disk vq venv** that the service definition's executable
-   points at. Typical Linux layout on the current fleet:
-   `/home/$USER/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq`. The
+   points at. Example Linux layout for a standalone clone:
+   `/home/USER/vibe-queue/.venv/bin/vq`. The
    `prog.python` field of the `[programs.vibeqc-queue]` config
    entry (if registered) must point at the same venv's `bin/python`
    so the v0.5.42 self-update auto-restart detection works.

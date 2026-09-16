@@ -33,6 +33,11 @@ queue work on it.
 
 ---
 
+## Get vq
+
+Start with [clone, download, and install](installation.md) for the split
+repository layout, source archives, and the GitHub mirror.
+
 ## Three ways to read this
 
 This documentation serves three readers who want almost nothing in common.
@@ -92,7 +97,8 @@ moves onto the internet.
 * **Reporting a bug** — [`CONTRIBUTING.md`](https://github.com/vibe-qc/vibe-queue/blob/main/CONTRIBUTING.md);
   for anything security-relevant, [`SECURITY.md`](https://github.com/vibe-qc/vibe-queue/blob/main/SECURITY.md)
   rather than a public issue
-* **Source** — [source-host.invalid/mpei/vibe-queue](https://github.com/vibe-qc/vibe-queue)
+* **Public source** — [GitHub mirror](https://github.com/vibe-qc/vibe-queue).
+  Private GitLab access details come from the maintainers.
 * **Cutting a release** — [the release process](release_process.md), and
   [version compatibility](version_compatibility.md) for what a vq version
   means to a fleet
@@ -114,6 +120,7 @@ agent/index
 :hidden:
 :caption: Reference
 
+installation
 orchestration
 version_compatibility
 codenames

@@ -130,7 +130,7 @@ fleet_role = "managed"
 # Default is "vq" (relies on the remote shell's PATH). Use an absolute
 # venv path if vq isn't on the remote PATH (common with system Python +
 # venv-only installs).
-remote_vq = "/home/USER/vibeqc/vibe-queue/.venv/bin/vq"
+remote_vq = "/home/USER/vibe-queue/.venv/bin/vq"
 
 # admin_token_file: optional absolute path on the REMOTE host. For a
 # multi-user host with a root daemon, set this to that host's protected
@@ -186,8 +186,8 @@ latest      = "release"
 # Multi-host example -- repeat the block:
 # [hosts.compute2]
 # ssh = "compute2"
-# remote_vq = "/home/USER/vibeqc/vibe-queue/.venv/bin/vq"
-# remote_python = "/home/USER/vibeqc/.venv/bin/python"
+# remote_vq = "/home/USER/vibe-queue/.venv/bin/vq"
+# remote_python = "/home/USER/vibe-qc/.venv/bin/python"
 
 # vq-only coordinator example. The role is valid only with the local scheduler
 # (the default). `rollout-latest` plans exactly one report-pinned user-vq lane
@@ -195,7 +195,7 @@ latest      = "release"
 # lanes. The [hosts.coordinator] block belongs in the fleet driver's config:
 # [hosts.coordinator]
 # ssh = "coordinator"
-# remote_vq = "/home/USER/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq"
+# remote_vq = "/home/USER/vibe-queue/.venv/bin/vq"
 # fleet_role = "vq-only"
 #
 # The following program registration belongs in the coordinator TARGET's own
@@ -204,10 +204,10 @@ latest      = "release"
 # configuration block; failed or contradictory remote discovery defers.
 # [programs.vibeqc-queue]
 # kind = "venv"
-# python = "/home/USER/gitlab/vibeqc-queue/vibe-queue/.venv/bin/python"
-# git_dir = "/home/USER/gitlab/vibeqc-queue"
+# python = "/home/USER/vibe-queue/.venv/bin/python"
+# git_dir = "/home/USER/vibe-queue"
 # branch = "main"
-# update_script = "vibe-queue/scripts/update.sh"
+# update_script = "scripts/update.sh"
 # import_check = "vq"
 # fail_on_dirty = true
 # description = "vq coordinator user install"
@@ -309,7 +309,7 @@ latest      = "release"
 # update_host = "cluster-build"
 # detached_build = true
 # verify_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/verify-pbs-cluster-runtime"
-# feed_source_mirror = ".local/share/vq-pbs-cluster/vibeqc.git"
+# feed_source_mirror = ".local/share/vq-pbs-cluster/vibe-qc.git"
 # prepare_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/prepare-pbs-cluster-runtime-source"
 # prepare_timeout_seconds = 1800
 # timeout_seconds = 14400
@@ -415,7 +415,7 @@ latest      = "release"
 # "mpei/vibe-queue" = "/home/USER/gitlab/vibe-queue"
 # "mpei/vibe-view"  = "/home/USER/gitlab/vibe-view"
 #
-# scheduler_runtime_source_repo = "/home/USER/gitlab/vibeqc"  # driver-local vibe-qc checkout
+# scheduler_runtime_source_repo = "/home/USER/vibe-qc"  # driver-local vibe-qc checkout
 # [hosts.slurm-cluster.scheduler_runtime_deployments.vibeqc-release]
 # update_command = "/site/bin/deploy-slurm-cluster-runtime"
 # install_command = "/site/bin/deploy-slurm-cluster-runtime"
@@ -560,19 +560,16 @@ latest      = "release"
 #
 # Headless docs/figure capture via vibe-view. Manage this through
 # `vq admin update vibeview-dev HOST`; do not hand-edit managed git checkouts.
-# The update script installs `pip install -e vibe-view/` into a lean,
-# capture-only venv and validates offscreen rendering. `xvfb-run -a` is the
-# portable healthcheck form; the managed venv may provide an `xvfb-run` shim
-# that falls back to direct `PYVISTA_OFF_SCREEN=True` VTK/OSMesa offscreen
-# capture when the host has no system xvfb-run. Pinned `vq admin update` calls
-# append `--ref SHA` or `--branch TAG`; this updater treats that selector as an
-# exact checkout-HEAD assertion and never fetches or switches refs itself.
+# Install vibe-view from its own repository into its own `.venv`; its
+# `scripts/update.sh` maintains that checkout and environment. `xvfb-run -a`
+# is the healthcheck form on hosts with Xvfb installed. Configure a working
+# offscreen backend on the target before using it for capture jobs.
 # [programs.vibeview-dev]
 # kind = "venv"
-# python = "/home/USER/vibeqc-dev/.venv-vibeview/bin/python"
-# git_dir = "/home/USER/vibeqc-dev"
+# python = "/home/USER/vibe-view/.venv/bin/python"
+# git_dir = "/home/USER/vibe-view"
 # branch = "main"
-# update_script = "scripts/update_vibeview_capture_env.sh"
+# update_script = "scripts/update.sh"
 # import_check = "vibeview"
 # healthcheck_command = "xvfb-run -a vibe-view capture-selftest"
 # description = "vibe-view headless capture environment (main branch)"

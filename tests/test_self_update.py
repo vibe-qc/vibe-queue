@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
@@ -615,7 +616,11 @@ def test_self_update_selects_one_explicit_accepted_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prog = _program(tmp_path)
-    cfg = config.Config(programs={"vibeqc-queue": prog})
+    reports = tmp_path / "private-reports"
+    subprocess.run(["git", "init", "-q", str(reports)], check=True)
+    cfg = config.Config(
+        programs={"vibeqc-queue": prog}, fleet_report_repo=str(reports),
+    )
     pin = fleet_release.FleetPin(
         name="vq",
         sha=SHA,
@@ -648,7 +653,7 @@ def test_self_update_selects_one_explicit_accepted_report(
             if not locked
             else (
                 pytest.fail("accepted report lookup used the wrong checkout")
-                if repo != Path(prog.git_dir)
+                if repo != reports
                 else events.append(f"discover:{identity}") or report
             )
         ),

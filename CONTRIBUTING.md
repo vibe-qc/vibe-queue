@@ -29,13 +29,28 @@ and this repository is public.
 
 ## Getting set up
 
+Clone the public source snapshot over HTTPS:
+
 ```sh
 git clone https://github.com/vibe-qc/vibe-queue.git
+```
+
+Developers with private GitLab access should use the clone URL supplied by
+an administrator. Keep its host, port and SSH settings in external operator
+configuration. GitLab remains the canonical development repository.
+
+Then install from the repository root:
+
+```sh
 cd vibe-queue
 ./scripts/install.sh --editable --extras dev
 ```
 
-Or, for a plain development install:
+See [clone and download options](docs/installation.md) for availability and
+source archives. Development and the project tracker remain on canonical
+GitLab; the mirror also provides GitHub issue forms and a pull request template.
+
+Or, from the same repository root, for a plain development install:
 
 ```sh
 python -m venv .venv
@@ -183,8 +198,8 @@ why in the commit message.
 - Run the affected lanes locally and name them.
 - Keep `main` release-ready: no half-finished code paths, docs in parity,
   `CHANGELOG.md` `[Unreleased]` reflecting what you actually landed.
-- **vq versions are load-bearing for the fleet.** `releases/` holds fleet
-  release reports and runtime pins reference them by version. A change to the
+- **vq versions are load-bearing for the fleet.** Private operations storage
+  holds fleet release reports and runtime pins reference them by version. A change to the
   version scheme, the report schema, or `vq --version` output is a
   cross-repository change; raise it before you write it.
 

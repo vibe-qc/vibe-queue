@@ -24,12 +24,27 @@ Full documentation: <https://vibe-qc.com/vibe-queue/docs/>
 
 ## Install
 
-Run the source installer from the repository root:
+Clone the standalone **vibe-queue** repository before running its installer.
+Clone the public source snapshot over HTTPS:
 
 ```sh
+git clone https://github.com/vibe-qc/vibe-queue.git
+```
+
+Developers with private GitLab access should use the clone URL supplied by
+an administrator. Keep its host, port and SSH settings in external operator
+configuration. GitLab remains the canonical development repository.
+
+Then enter the cloned directory and install:
+
+```sh
+cd vibe-queue
 ./scripts/install.sh
 .venv/bin/vq --version
 ```
+
+For source archives and mirror availability, see
+[clone, download, and install](docs/installation.md).
 
 The default `core` profile provides the CLI and daemon in the dedicated
 `.venv` environment. Add the web dashboard or development tools when
@@ -81,7 +96,8 @@ HOME and the inherited pytest marker removed.
 ./scripts/uninstall.sh
 ```
 
-Update moves the whole vibe-qc Git checkout unless `--skip-git` is selected.
+Update moves only the vibe-queue Git checkout unless `--skip-git` is selected.
+The separate vibe-qc and vibe-view checkouts have their own installers and updates.
 Use `vq self-update` (or `vq admin update`) when this environment owns a
 running supervised daemon. Direct scripts never own service restart or Git +
 venv rollback together. Reinstall keeps Git unchanged and durably restores the

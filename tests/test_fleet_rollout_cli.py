@@ -125,6 +125,7 @@ def _patch_discovery(
     build_kwargs: list[dict[str, Any]] | None = None,
 ) -> None:
     cfg = config.Config(
+        fleet_report_repo="/repo",
         hosts={
             "localhost": config.HostConfig(
                 ssh="localhost",
@@ -349,13 +350,17 @@ def test_report_recheck_refuses_a_new_rejection_with_unchanged_selected_digest(
     assert "fallback cannot authorize" in payload["error"]
 
 
-def test_from_report_refuses_an_older_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_report_refuses_an_older_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import click
 
     from vq.cli import _pin_deploy_identity
 
     report = replace(_report(), rejected_candidates=("releases/v0.15.61.json: invalid pin",))
-    monkeypatch.setattr(fleet_release, "runtime_repo", lambda: Path("/repo"))
+    reports = tmp_path / "private-reports"
+    subprocess.run(["git", "init", "-q", str(reports)], check=True)
+    monkeypatch.setattr(fleet_release, "report_repo", lambda cfg=None: reports)
     monkeypatch.setattr(fleet_release, "discover_latest_report", lambda *a, **kw: report)
     with pytest.raises(click.UsageError, match="fallback cannot authorize"):
         _pin_deploy_identity("vibeqc-queue", expected_sha=None, expected_tag=None)
@@ -1049,13 +1054,16 @@ def test_real_report_discovery_config_migration_and_planner_dry_run(
             "vibe_view": raw_pin("vibe_view", "2.5.0"),
         },
     }
-    report_path = (
-        repo / fleet_release.REPORT_DIRECTORY / "v0.15.60.json"
-    )
+    from tests.test_fleet_release import _commit, _git, _init_repo
+
+    operations = tmp_path / "operations"
+    operations.mkdir()
+    reports = _init_repo(operations)
+    report_path = reports / fleet_release.REPORT_DIRECTORY / "v0.15.60.json"
     report_path.parent.mkdir(parents=True)
     report_path.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
-    git("add", ".")
-    git("commit", "-m", "accepted report")
+    _commit(reports, "accepted report")
+    _git(reports, "update-ref", "refs/remotes/origin/main", "HEAD")
     git("update-ref", "refs/remotes/origin/main", "HEAD")
     target_vq_tree_sha256 = admin.source_tree_sha256_at_git_commit(
         repo / "vibe-queue",
@@ -1207,6 +1215,7 @@ def test_real_report_discovery_config_migration_and_planner_dry_run(
         },
     )
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
+    cfg.fleet_report_repo = str(reports)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: repo)
     discover = fleet_release.discover_latest_report
     monkeypatch.setattr(
@@ -1589,6 +1598,7 @@ def test_scoped_receipt_exception_never_includes_scheduler_driver(
         extra_hosts=hosts,
     )
     cfg = config.Config(
+        fleet_report_repo="/repo",
         hosts={
             "localhost": config.HostConfig(
                 ssh="localhost",

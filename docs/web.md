@@ -120,13 +120,13 @@ alive, the daemon logs the exit code and starts a fresh sidecar. The sidecar is
 stopped when the daemon exits. Keep `--web-host` loopback-only unless a reverse
 proxy owns authentication and TLS.
 
-On macOS, use the launchd template when the dashboard should survive shell or
-Codex task exits:
+On macOS, run the launchd template from the vibe-queue checkout root when
+the dashboard should survive shell or Codex task exits:
 
 ```sh
 mkdir -p ~/Library/LaunchAgents
 vq daemon launchd-plist \
-  --python "$PWD/vibe-queue/.venv/bin/python" \
+  --python "$PWD/.venv/bin/python" \
   --working-directory "$PWD" \
   --max-cpus 18 --max-jobs 4 --max-mem-mb 104858 \
   --web-port 8768 \

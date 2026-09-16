@@ -1,3 +1,12 @@
+# Optional site deployment is selected by external CI variables. If any
+# selector is set, all three must be valid; incomplete setup fails CI lint.
+include:
+  - project: '$VIBE_QUEUE_CI_PROJECT'
+    ref: '$VIBE_QUEUE_CI_REF'
+    file: '$VIBE_QUEUE_CI_FILE'
+    rules:
+      - if: '$VIBE_QUEUE_CI_PROJECT || $VIBE_QUEUE_CI_REF || $VIBE_QUEUE_CI_FILE'
+
 # Portable build and validation rules.
 stages:
   - test

@@ -651,10 +651,10 @@ not as an unmanaged system-global Python package. The standard program entry is
 ```toml
 [programs.vibeview-dev]
 kind = "venv"
-python = "/home/USER/vibeqc-dev/.venv-vibeview/bin/python"
-git_dir = "/home/USER/vibeqc-dev"
+python = "/home/USER/vibe-view/.venv/bin/python"
+git_dir = "/home/USER/vibe-view"
 branch = "main"
-update_script = "scripts/update_vibeview_capture_env.sh"
+update_script = "scripts/update.sh"
 import_check = "vibeview"
 healthcheck_command = "xvfb-run -a vibe-view capture-selftest"
 description = "vibe-view headless capture environment (main branch)"
@@ -1068,7 +1068,7 @@ In multi-user mode it enforces the normal admin token gate. A prior update
 marker or concurrent rollout must be reconciled through its owning workflow;
 the self-update command never overwrites or replays it.
 
-When the selected program uses `vibe-queue/scripts/update.sh`, the outer admin
+When the selected program uses vibe-queue's `scripts/update.sh`, the outer admin
 transaction passes a parent-bound restart-coordination handshake. The script still
 owns its venv and build locks, install, marker, and rollback work, but leaves
 the daemon stopped after the outer transaction has quiesced it, until that
@@ -1276,10 +1276,10 @@ pgrep -laf 'systemd --user'
 
 # 3. Daemon auto-launched from disk?
 systemctl --user --no-pager status vq-daemon | head
-~/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq --version
+~/vibe-queue/.venv/bin/vq --version
 
 # 4. Inspect what got orphaned at the reset
-~/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq queue
+~/vibe-queue/.venv/bin/vq queue
 ```
 
 Jobs that were running at the moment of reset land in `killed` or
@@ -1391,7 +1391,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/gitlab/vibeqc-queue/vibe-queue/.venv/bin/vq admin auto-update vibeqc-release
+ExecStart=%h/vibe-queue/.venv/bin/vq admin auto-update vibeqc-release
 Nice=10
 IOSchedulingClass=idle
 ```
@@ -2361,6 +2361,10 @@ killed the wrong process or misattributed the exit code.
 ---
 
 ## Refreshing the root-owned `/opt/vq` install (v0.24.x+)
+
+**Legacy-layout only:** the privileged helpers still assume the former nested
+source tree. See the [split-layout limitation](multi_user_deployment.md#split-layout-limitation)
+before using this section; these commands do not provision a fresh standalone clone.
 
 Applies to multi-user hosts (`compute-d`, `compute-a`). They run **two** vq installs:
 the user daemon from a home checkout, and a root-owned multi-user daemon from

@@ -65,7 +65,7 @@ vq submit pyscf_run.py --branch main --cpus 4 --wall-time-seconds 1800
 # ORCA (use the wrapper so ORCA stdout becomes input.out and scratch is cleaned)
 vq submit -d ./calc --cpus 1 --wall-time-seconds 3600 -- \
     env ORCA_BIN=/home/USER/bin/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/orca \
-    bash /home/USER/gitlab/vibeqc-queue/vibe-queue/contrib/run-orca.sh input.inp
+    bash /home/USER/vibe-queue/contrib/run-orca.sh input.inp
 
 # CRYSTAL14 (use the wrapper — handles INPUT-file convention + scratch cleanup)
 # NOTE: prefix `env CRYSTAL_BIN=... PCRYSTAL_BIN=...` because the
@@ -75,12 +75,12 @@ vq submit -d ./calc --cpus 1 --wall-time-seconds 3600 -- \
 # Serial:
 vq submit -d ./calc --cpus 1 --wall-time-seconds 7200 -- \
     env CRYSTAL_BIN=/home/USER/bin/crystal \
-    bash /home/USER/gitlab/vibeqc-queue/vibe-queue/contrib/run-crystal.sh \
+    bash /home/USER/vibe-queue/contrib/run-crystal.sh \
     --serial input.d12
 # Parallel example (match --np to the requested --cpus allocation):
 vq submit -d ./calc --cpus 14 --wall-time-seconds 7200 -- \
     env PCRYSTAL_BIN=/home/USER/bin/Pcrystal \
-    bash /home/USER/gitlab/vibeqc-queue/vibe-queue/contrib/run-crystal.sh \
+    bash /home/USER/vibe-queue/contrib/run-crystal.sh \
     --np 14 input.d12
 
 # CRYSTAL23 demo (v0.6.3; use when the selected host registers
@@ -90,12 +90,12 @@ vq submit -d ./calc --cpus 14 --wall-time-seconds 7200 -- \
 # --demo + --np is rejected with a clear error.
 vq submit -d ./calc --cpus 1 --wall-time-seconds 7200 -- \
     env CRYSTAL23DEMO_BIN=/home/USER/bin/crystal23demo \
-    bash /home/USER/gitlab/vibeqc-queue/vibe-queue/contrib/run-crystal.sh \
+    bash /home/USER/vibe-queue/contrib/run-crystal.sh \
     --demo input.d12
 # CRYSTAL23 demo + PROPERTIES23 demo (post-processing on the same cap):
 vq submit -d ./calc --cpus 1 --wall-time-seconds 3600 -- \
     env PROPERTIES23DEMO_BIN=/home/USER/bin/properties23demo \
-    bash /home/USER/gitlab/vibeqc-queue/vibe-queue/contrib/run-crystal.sh \
+    bash /home/USER/vibe-queue/contrib/run-crystal.sh \
     --demo --properties propinput.d3
 
 # Psi4
@@ -330,7 +330,7 @@ script.
 | multi-user daemon state | `/var/lib/vq/` |
 | multi-user system config | `/etc/vq/config.toml` |
 | registered runtime/checkouts | inspect `vq programs HOST --json` |
-| engine wrappers | `vibe-queue/contrib/` in the deployed checkout |
+| engine wrappers | `contrib/` in the deployed vibe-queue checkout |
 
 ## When something looks wrong
 
@@ -375,7 +375,7 @@ script.
   setup (if you're submitting from off-LAN).
 - [`config.toml.example`](config.toml.example) — annotated config
   template.
-- Parent repo: [`docs/user_guide/queue.md`](../../docs/user_guide/queue.md)
+- Separate vibe-qc repository: [queue user guide](https://vibe-qc.com/docs/user_guide/queue.html)
   — user-facing entry point (more polished, less internals).
 
 When this doc gets stale, the version number at the top is the

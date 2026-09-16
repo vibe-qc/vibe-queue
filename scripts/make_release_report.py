@@ -48,9 +48,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 # Each pin resolves in its own GitLab project since the 2026-09-08 split.
@@ -390,6 +393,42 @@ def monorepo_layout() -> bool:
     )
 
 
+def _output_path(value: str, *, source_repos: list[Path]) -> Path:
+    """Keep operational report bytes outside all selected product trees."""
+    path = Path(value).absolute()
+    resolved = path.resolve()
+    for supplied in (path, resolved):
+        if any(part.casefold() == ".git" for part in supplied.parts):
+            raise ValueError("release report output must be outside Git metadata")
+        for source in source_repos:
+            if supplied.is_relative_to(source.resolve()):
+                raise ValueError("release report output must be outside product source trees")
+        for parent in (supplied, *supplied.parents):
+            if ((parent / "HEAD").is_file() and (parent / "objects").is_dir()
+                    and (parent / "refs").is_dir()):
+                raise ValueError("release report output must be outside Git object stores")
+    if path.is_symlink():
+        raise ValueError("release report output must not be a symlink")
+    return resolved
+
+
+def _write_private_report(path: Path, text: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("release report output must be an owned regular file with one link")
+        os.fchmod(fd, 0o600)
+        os.ftruncate(fd, 0)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as fh:
+            fh.write(text + "\n")
+            fh.flush()
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tag", required=True, help="release tag, e.g. v0.15.54")
@@ -528,8 +567,13 @@ def main() -> int:
 
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as fh:
-            fh.write(text + "\n")
+        sources = [Path.cwd(), Path(__file__).resolve().parents[1]]
+        sources.extend(Path(value) for value in (args.vq_repo, args.vibe_view_repo) if value)
+        try:
+            output = _output_path(args.output, source_repos=sources)
+        except ValueError as exc:
+            ap.error(str(exc))
+        _write_private_report(output, text)
     else:
         print(text)
 

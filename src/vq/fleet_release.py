@@ -2,7 +2,8 @@
 
 The operator-facing command deliberately accepts no tag, version, or SHA.
 Release automation writes immutable, evidence-carrying reports under
-``releases/``. The runtime clone fetches ``origin/main`` and tags,
+``releases/`` in an explicitly configured private operations checkout.
+That checkout fetches ``origin/main`` and tags,
 validates every candidate, and selects the newest semantic release.
 """
 
@@ -221,13 +222,8 @@ def runtime_repo() -> Path:
     ``vibe-queue/`` -- until the 2026-09 split. Both layouts are live during
     the transition, so the root is detected rather than assumed.
 
-    Report discovery searches every directory in :data:`REPORT_DIRECTORIES`,
-    so a standalone vibe-queue checkout does find its reports, at
-    ``releases/`` (checked 2026-09-10: ``discover_latest_report`` from a split
-    checkout returned ``releases/v0.17.0.json``), while receipts already
-    persisted on the hosts keep ``vibe-queue/releases/``. The two spellings
-    therefore meet in journal comparisons, which is why those go through
-    :func:`vq.report_paths.same_report`.
+    This identity authenticates the controller and its installed source. It
+    must never be replaced by the separately configured :func:`report_repo`.
     """
     repo = _detect_layout()[0]
     if not (repo / ".git").exists():
@@ -249,6 +245,35 @@ def runtime_repo() -> Path:
             "rollout-latest requires the managed runtime clone"
         )
     return repo
+
+
+def report_repo(cfg=None) -> Path:
+    """Resolve explicit private report storage without changing runtime identity."""
+    if cfg is None:
+        from vq import config
+
+        cfg = config.load_config()
+    value = cfg.fleet_report_repo
+    if not value or not Path(value).is_absolute():
+        raise FleetReleaseError(
+            "fleet_report_repo must name an absolute external private Git checkout; "
+            "configure accepted-report storage before using report-based updates"
+        )
+    path = Path(value).resolve()
+    for interface in (Path(value).absolute(), path):
+        for parent in (interface, *interface.parents):
+            if parent.name.casefold() == ".git" or any(
+                (parent / marker).is_file() for marker in (
+                    "src/vq/__init__.py", "vibe-queue/src/vq/__init__.py",
+                    "python/vibeqc/__init__.py", "src/vibeview/__init__.py",
+                    "conformance/run_conformance.py",
+                )
+            ):
+                raise FleetReleaseError(
+                    "fleet_report_repo must be outside product source checkouts; "
+                    "use fleet_report_history_repo only for retained historical evidence"
+                )
+    return path
 
 
 def _git(
@@ -535,6 +560,16 @@ def _repo_for_pin(
         # own history. Falls back to the runtime clone when unconfigured, so a
         # driver still on the monorepo behaves exactly as before.
         legacy = pin_repos.get(MONOREPO_PIN_SOURCE[0])
+        if legacy is None:
+            from vq import config
+
+            cfg = config.load_config()
+            if cfg.fleet_report_repo and runtime_repo_path.resolve() == report_repo(cfg):
+                raise FleetReleaseError(
+                    f"{source_path}: historical pins require an explicit retained "
+                    "monorepo under pin_source_repos; private report storage "
+                    "cannot supply product ancestry"
+                )
         return legacy if legacy is not None else runtime_repo_path
     slug = pin.repo
     if slug is None:
@@ -783,7 +818,7 @@ def discover_latest_report(
     patch release. This lets long-running consumers follow the newest accepted
     immutable patch in their supported series even after a newer series opens.
     """
-    repo = (repo or runtime_repo()).resolve()
+    repo = (repo or report_repo()).resolve()
     pin_repos = resolve_pin_repos(pin_repos)
     if fetch:
         _fetch_report_sources(repo, pin_repos, runner=runner)
@@ -933,7 +968,7 @@ def discover_report(
     different release.
     """
     _semver(tag, field="accepted report identity")
-    repo = (repo or runtime_repo()).resolve()
+    repo = (repo or report_repo()).resolve()
     pin_repos = resolve_pin_repos(pin_repos)
     if fetch:
         _fetch_report_sources(repo, pin_repos, runner=runner)
@@ -973,6 +1008,47 @@ def discover_historical_report_by_digest(
     runner: Runner = subprocess.run,
     pin_repos: Mapping[str, Path] | None = None,
 ) -> FleetReleaseReport:
+    """Authenticate a digest in current storage or its retained original history.
+
+    The historical loader still proves the exact blob and original ancestry.
+    Copying an old report into the operations repository does not grant it the
+    pre-hardening exception: only its original historical commit can do that.
+    """
+    selected = (repo or report_repo()).resolve()
+    sources = [selected]
+    from vq import config
+
+    cfg = config.load_config()
+    if cfg.fleet_report_repo and selected == report_repo(cfg):
+        history = cfg.fleet_report_history_repo
+        if history:
+            if not Path(history).is_absolute():
+                raise FleetReleaseError("fleet_report_history_repo must be absolute")
+            historical = Path(history).resolve()
+            if historical not in sources:
+                sources.append(historical)
+    failures = []
+    for source in sources:
+        try:
+            return _discover_historical_report_by_digest(
+                source_path, digest_sha256, source, ref=ref, fetch=fetch,
+                runner=runner, pin_repos=pin_repos,
+            )
+        except FleetReleaseError as exc:
+            failures.append(str(exc))
+    raise FleetReleaseError("; ".join(failures))
+
+
+def _discover_historical_report_by_digest(
+    source_path: str,
+    digest_sha256: str,
+    repo: Path | None = None,
+    *,
+    ref: str = "origin/main",
+    fetch: bool = True,
+    runner: Runner = subprocess.run,
+    pin_repos: Mapping[str, Path] | None = None,
+) -> FleetReleaseReport:
     """Authenticate one exact report blob from the mainline history.
 
     This is a migration-only primitive for pre-recorder rollout journals.  A
@@ -1001,9 +1077,9 @@ def discover_historical_report_by_digest(
             "historical report digest must be a full lowercase SHA-256"
         )
 
-    repo = (repo or runtime_repo()).resolve()
+    repo = (repo or report_repo()).resolve()
     if fetch:
-        _git(repo, "fetch", "origin", "main", "--tags", "--quiet", runner=runner)
+        _fetch_report_sources(repo, resolve_pin_repos(pin_repos), runner=runner)
     # A receipt persisted before the split records the monorepo path
     # ("vibe-queue/releases/..."), which never existed in vibe-queue's own
     # fresh history -- the identical blob lives at "releases/..." there. Search

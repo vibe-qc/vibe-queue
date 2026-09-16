@@ -1,5 +1,18 @@
 # Multi-user deployment runbook
 
+## Split-layout limitation
+
+New single-user installations use the standalone
+[vibe-queue repository](installation.md). The privileged deployment commands
+in this runbook are **legacy-layout only**: `contrib/deploy-multi-user.sh`
+still resolves a nested `vibe-queue` directory, and
+`contrib/vq-multi-user-refresh` still reads source files under that prefix.
+They do not yet support a fresh standalone clone. Changing the command's
+working directory does not fix that implementation dependency. Use the
+single-user installation guide for a new standalone checkout; these commands
+remain a reference for existing legacy deployments until the helpers are
+adapted and validated.
+
 Multi-user mode lets several people share one host's vq queue with an
 OS-account execution boundary: each user's local jobs run **as that
 user**, each user has their own state directory and resource quota,

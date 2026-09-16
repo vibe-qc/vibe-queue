@@ -2874,11 +2874,17 @@ def self_update(
                 host="localhost",
             )
             if accepted_report is not None:
-                report = fleet_release.discover_report(
-                    accepted_report,
-                    repo=Path(prog.git_dir),
-                    runner=admin_module._mutating_git_run,
-                )
+                reports = fleet_release.report_repo(cfg)
+                with admin_module.toolset_lifecycle_lock(
+                    [], action="vq-self-update-report",
+                    extra_resources=((
+                        "checkout", str(admin_module._canonical_lifecycle_checkout(reports)),
+                    ),),
+                ):
+                    report = fleet_release.discover_report(
+                        accepted_report, repo=reports,
+                        runner=admin_module._mutating_git_run,
+                    )
                 expected_sha = report.pins["vq"].sha
             assert expected_sha is not None
             repo = Path(prog.git_dir)
@@ -10752,14 +10758,18 @@ def admin_rollout_latest(
                 f"({configured_target} != {running_target})"
             )
 
+        reports = fleet_release.report_repo(cfg)
+        report_checkout = admin_module._canonical_lifecycle_checkout(reports)
+
         inherited_reentry_fence = contextlib.ExitStack()
         inherited_reentry = inherited_reentry_fence.enter_context(
             fleet_rollout.adopt_rollout_reentry_handoff(
                 expected_rollout_id=resume,
-                expected_lifecycle_resources=(
+                expected_lifecycle_resources=tuple(sorted({
                     ("checkout", str(configured_repo)),
                     ("target", str(configured_target)),
-                ),
+                    ("checkout", str(report_checkout)),
+                })),
             )
         )
 
@@ -10785,6 +10795,7 @@ def admin_rollout_latest(
             stack.enter_context(
                 admin_module.toolset_lifecycle_lock(
                     [driver_prog], action="vq-rollout-controller",
+                    extra_resources=(("checkout", str(report_checkout)),),
                 )
             )
             return stack
@@ -10802,7 +10813,7 @@ def admin_rollout_latest(
                 [driver_prog], action="vq-rollout-report-discovery",
             ):
                 discovered = fleet_release.discover_latest_report(
-                    repo,
+                    reports,
                     pin_repos=cfg.pin_source_repos,
                     runner=admin_module._mutating_git_run,
                 )
@@ -10871,7 +10882,7 @@ def admin_rollout_latest(
                         host=hold_host,
                         accepted_report=report,
                         plan=plan,
-                        repo=repo,
+                        repo=reports,
                         current_report_digest_resolver=current_report_digest,
                         control_runner=subprocess.run,
                     )
@@ -10905,7 +10916,7 @@ def admin_rollout_latest(
                 ),
                 configured_retention_hosts=frozenset(cfg.hosts),
                 retired_hosts=cfg.fleet.retired_hosts,
-                report_repo=repo,
+                report_repo=reports,
             )
             _echo_legacy_reconciliation_preview(inventory, as_json=as_json)
             return
@@ -10923,7 +10934,7 @@ def admin_rollout_latest(
             ),
             configured_retention_hosts=frozenset(cfg.hosts),
             retired_hosts=cfg.fleet.retired_hosts,
-            report_repo=repo,
+            report_repo=reports,
             acknowledge_driver_reentry=resume,
             authenticated_driver_reentry=inherited_reentry,
             control_runner=subprocess.run,
@@ -11078,7 +11089,7 @@ def admin_rollout_latest(
                         accepted_report=report,
                         plan=plan,
                         admin_status=admin_snapshot,
-                        repo=repo,
+                        repo=reports,
                         current_report_digest_resolver=current_report_digest,
                         control_runner=subprocess.run,
                     )
@@ -11106,7 +11117,7 @@ def admin_rollout_latest(
                         accepted_report=report,
                         plan=plan,
                         admin_status=admin_snapshot,
-                        repo=repo,
+                        repo=reports,
                         current_report_digest_resolver=current_report_digest,
                         control_runner=subprocess.run,
                     )
@@ -11713,12 +11724,18 @@ def _pin_deploy_identity(
             + ", ".join(sorted(fleet_rollout.PROGRAM_PINS))
         )
     try:
-        repo = fleet_release.runtime_repo()
-        report = fleet_release.discover_latest_report(
-            repo, runner=admin_module._mutating_git_run,
-        )
+        repo = fleet_release.report_repo()
+        with admin_module.toolset_lifecycle_lock(
+            [], action="vq-from-report",
+            extra_resources=((
+                "checkout", str(admin_module._canonical_lifecycle_checkout(repo)),
+            ),),
+        ):
+            report = fleet_release.discover_latest_report(
+                repo, runner=admin_module._mutating_git_run,
+            )
         fleet_release.require_latest_report(report)
-    except fleet_release.FleetReleaseError as exc:
+    except (fleet_release.FleetReleaseError, admin_module.AdminError) as exc:
         raise click.UsageError(f"--from-report: {exc}") from None
     pin = report.pins[pin_name]
     # An explicit flag that disagrees with the report is the mistake this

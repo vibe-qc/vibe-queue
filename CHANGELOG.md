@@ -17,6 +17,24 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+### Changed
+
+- Read accepted fleet reports from explicit external `fleet_report_repo`
+  configuration, independently of the controller source. Retained original
+  history authenticates old receipt digests without relaxing current deployment
+  rules. Report output stays outside product source. Configure the report store
+  before updating a managed controller; ordinary jobs and exact-SHA updates
+  remain available without report storage.
+
+- Keep public clone instructions, generic configuration and contributor guidance
+  in source. Preserve site-specific historical wording and operator handovers
+  in private operations storage with source and license provenance.
+
+- Document public HTTPS cloning, externally configured private access,
+  standalone source-download layout,
+  and component-specific update paths. Correct installation and configuration
+  examples, and identify the privileged helpers' remaining legacy-layout limit.
+
 - Add GitHub issue forms and a pull request template that guide redacted reports,
   reproducible validation and the existing contribution policy.
 
@@ -1648,6 +1666,6 @@ it, report a bug in it, or cut the next one.
   `test_scheduler_admin_update` (x2, CI); `test_admin_lifecycle_transaction`
   and `test_multi_user_refresh_helper` (x2, local only).
 
-[Unreleased]: https://github.com/vibe-qc/vibe-queue/-/compare/v0.26.1...main
-[0.26.1]: https://github.com/vibe-qc/vibe-queue/-/tags/v0.26.1
-[0.26.0]: https://github.com/vibe-qc/vibe-queue/-/tags/v0.26.0
+[Unreleased]: https://github.com/vibe-qc/vibe-queue/compare/v0.26.1...main
+[0.26.1]: https://github.com/vibe-qc/vibe-queue/releases/tag/v0.26.1
+[0.26.0]: https://github.com/vibe-qc/vibe-queue/releases/tag/v0.26.0
