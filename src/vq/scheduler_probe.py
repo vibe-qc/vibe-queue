@@ -67,6 +67,65 @@ class QueueLiveness:
 
 
 @dataclass(frozen=True)
+class NodeCapacity:
+    """One compute node's width, and how much of it is free right now."""
+
+    name: str
+    total_cpus: int | None = None
+    """Cores the node has in total (PBS ``np``, SLURM ``%c``)."""
+
+    free_cpus: int | None = None
+    """Cores a job could take on this node right now. ``0`` for a node that
+    is fully allocated *and* for one the scheduler cannot use at all."""
+
+    state: str | None = None
+    """The scheduler's own node state, verbatim."""
+
+    usable: bool = True
+    """False when the scheduler will not place work here at all (PBS
+    ``down``/``offline``, SLURM ``down``/``drain``/``fail``/``maint``). A
+    node that is merely busy stays usable: it frees up on its own."""
+
+    group: str | None = None
+    """The lane this node belongs to -- a SLURM partition, or a PBS node
+    property. ``None`` when the scheduler did not report one."""
+
+
+@dataclass(frozen=True)
+class GroupCapacity:
+    """The same two numbers for one partition or node property."""
+
+    name: str
+    max_cpus_now: int | None = None
+    max_cpus_when_free: int | None = None
+    usable_nodes: int = 0
+    unusable_nodes: int = 0
+
+
+@dataclass(frozen=True)
+class SchedulableCapacity:
+    """The largest request this host could start, now and at all.
+
+    Two numbers, because they answer different questions and #148 turned on
+    the difference. ``max_cpus_now`` answers "will this start": a request
+    wider than it waits. ``max_cpus_when_free`` answers "can this *ever*
+    start": a request wider than it waits forever, because no node the
+    scheduler can use is that wide even when idle.
+    """
+
+    max_cpus_now: int | None = None
+    max_cpus_when_free: int | None = None
+    usable_nodes: int = 0
+    unusable_nodes: int = 0
+    nodes: tuple[NodeCapacity, ...] = ()
+    groups: tuple[GroupCapacity, ...] = ()
+    error: str | None = None
+    """Why the census is unavailable. When set, every figure above is
+    ``None``/empty and NO capacity claim is made -- an unreadable census must
+    never read as "nothing is free"."""
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     """What a scheduler probe found on one host."""
 
@@ -133,6 +192,14 @@ class ProbeResult:
 
     slurm_partition_probe_error: str | None = None
     """Diagnostic from a failed ``sinfo`` availability probe, if any."""
+
+    capacity: SchedulableCapacity | None = None
+    """What the scheduler could actually start right now, per host and lane.
+
+    ``None`` when no census was attempted (the client binary is absent, or the
+    host is not a scheduler host). A census that was attempted and failed is a
+    :class:`SchedulableCapacity` carrying ``error``, so "unreadable" is never
+    confused with "nothing free"."""
 
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -276,6 +343,195 @@ def _probe_slurm_partition_availability(
     return tuple(held), None
 
 
+# A node the scheduler will not place work on at all, as opposed to one that
+# is merely busy. PBS spells this in `state` (down / offline / unknown);
+# SLURM in the %t abbreviation. Only these mean "waiting will not help".
+_PBS_UNUSABLE_STATES = ("down", "offline", "unknown")
+_SLURM_UNUSABLE_STATES = (
+    "down", "drain", "drng", "draining", "drained", "fail", "failing",
+    "maint", "unk", "unknown", "boot", "powering", "power", "resv", "inval",
+)
+
+# `jobs = 0/12345.host_f, 1/12345.host_f` or, on some Torque builds, the range
+# form `jobs = 0-127/12345.host_f`. Both name the cores, not the jobs.
+_PBS_JOB_SLOT_RE = re.compile(r"^\s*(\d+)(?:-(\d+))?/")
+
+
+def _pbs_allocated_cpus(jobs_value: str) -> int:
+    """Cores already taken on one PBS node, from its ``jobs`` attribute."""
+    taken = 0
+    for entry in jobs_value.split(","):
+        match = _PBS_JOB_SLOT_RE.match(entry)
+        if match is None:
+            continue
+        low = int(match.group(1))
+        high = int(match.group(2)) if match.group(2) else low
+        taken += max(0, high - low + 1)
+    return taken
+
+
+def _parse_pbsnodes(output: str) -> tuple[NodeCapacity, ...]:
+    """Parse ``pbsnodes -a`` into a per-node width/free-core census.
+
+    A node record is an unindented name followed by indented ``key = value``
+    lines. Only ``np``, ``state``, ``properties`` and ``jobs`` are read; every
+    other attribute is ignored, and a record missing ``np`` still counts as a
+    node with an unknown width rather than disappearing.
+    """
+    nodes: list[NodeCapacity] = []
+    name: str | None = None
+    attrs: dict[str, str] = {}
+
+    def flush() -> None:
+        if name is None:
+            return
+        state = attrs.get("state")
+        usable = not any(
+            bad in (state or "").lower() for bad in _PBS_UNUSABLE_STATES
+        )
+        total: int | None = None
+        if attrs.get("np", "").strip().isdigit():
+            total = int(attrs["np"].strip())
+        if not usable:
+            free: int | None = 0
+        elif total is None:
+            free = None
+        else:
+            free = max(0, total - _pbs_allocated_cpus(attrs.get("jobs", "")))
+        properties = attrs.get("properties", "").strip()
+        nodes.append(
+            NodeCapacity(
+                name=name,
+                total_cpus=total,
+                free_cpus=free,
+                state=state,
+                usable=usable,
+                group=properties.split(",")[0] if properties else None,
+            )
+        )
+
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            flush()
+            name, attrs = line.strip(), {}
+            continue
+        key, sep, value = line.strip().partition("=")
+        if sep:
+            attrs[key.strip()] = value.strip()
+    flush()
+    return tuple(nodes)
+
+
+def _parse_sinfo_nodes(output: str) -> tuple[NodeCapacity, ...]:
+    """Parse ``sinfo -N`` rows (``%N|%P|%t|%c|%C``) into the same census.
+
+    ``%C`` is SLURM's ``allocated/idle/other/total`` breakdown, so the idle
+    field is the free-core count directly -- no arithmetic against running
+    jobs, and no double counting on a mixed node.
+    """
+    nodes: list[NodeCapacity] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) < 5 or not fields[0].strip():
+            continue
+        name, partition, state, cpus, breakdown = (f.strip() for f in fields[:5])
+        base = state.rstrip("*~#$@+").lower()
+        usable = base not in _SLURM_UNUSABLE_STATES
+        total = int(cpus) if cpus.isdigit() else None
+        free: int | None = None
+        parts = breakdown.split("/")
+        if len(parts) == 4 and parts[1].isdigit():
+            free = int(parts[1])
+        if not usable:
+            free = 0
+        nodes.append(
+            NodeCapacity(
+                name=name,
+                total_cpus=total,
+                free_cpus=free,
+                state=state or None,
+                usable=usable,
+                group=partition.rstrip("*") or None,
+            )
+        )
+    return tuple(nodes)
+
+
+def _summarize_capacity(
+    nodes: tuple[NodeCapacity, ...],
+    *,
+    error: str | None = None,
+) -> SchedulableCapacity:
+    """Fold a node census into the per-host and per-group headline figures."""
+    if error is not None:
+        return SchedulableCapacity(error=error)
+
+    def fold(subset: tuple[NodeCapacity, ...]) -> tuple[int | None, int | None, int, int]:
+        usable = tuple(n for n in subset if n.usable)
+        now = [n.free_cpus for n in usable if n.free_cpus is not None]
+        ever = [n.total_cpus for n in usable if n.total_cpus is not None]
+        return (
+            max(now) if now else None,
+            max(ever) if ever else None,
+            len(usable),
+            len(subset) - len(usable),
+        )
+
+    max_now, max_ever, usable_count, unusable_count = fold(nodes)
+    groups: list[GroupCapacity] = []
+    for name in sorted({n.group for n in nodes if n.group}):
+        subset = tuple(n for n in nodes if n.group == name)
+        g_now, g_ever, g_usable, g_unusable = fold(subset)
+        groups.append(
+            GroupCapacity(
+                name=str(name),
+                max_cpus_now=g_now,
+                max_cpus_when_free=g_ever,
+                usable_nodes=g_usable,
+                unusable_nodes=g_unusable,
+            )
+        )
+    return SchedulableCapacity(
+        max_cpus_now=max_now,
+        max_cpus_when_free=max_ever,
+        usable_nodes=usable_count,
+        unusable_nodes=unusable_count,
+        nodes=nodes,
+        groups=tuple(groups),
+    )
+
+
+def _probe_pbs_capacity(runner: RemoteRunner) -> SchedulableCapacity:
+    """Read-only ``pbsnodes -a`` census; never mutates scheduler state."""
+    result = runner.run(["pbsnodes", "-a"], check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return _summarize_capacity((), error=detail or f"exit {result.returncode}")
+    nodes = _parse_pbsnodes(result.stdout)
+    if not nodes:
+        return _summarize_capacity((), error="pbsnodes -a reported no nodes")
+    return _summarize_capacity(nodes)
+
+
+def _probe_slurm_capacity(runner: RemoteRunner) -> SchedulableCapacity:
+    """Read-only ``sinfo -N`` census; never mutates scheduler state."""
+    result = runner.run(
+        ["sinfo", "--noheader", "--Node", "--format=%N|%P|%t|%c|%C"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return _summarize_capacity((), error=detail or f"exit {result.returncode}")
+    nodes = _parse_sinfo_nodes(result.stdout)
+    if not nodes:
+        return _summarize_capacity((), error="sinfo reported no nodes")
+    return _summarize_capacity(nodes)
+
+
 def probe(runner: RemoteRunner) -> ProbeResult:
     """Detect the scheduler dialect on the host behind ``runner``.
 
@@ -310,6 +566,9 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             liveness_notes,
         ) = _probe_pbs_liveness(runner)
         notes.extend(liveness_notes)
+    capacity: SchedulableCapacity | None = None
+    if binaries.get("pbsnodes"):
+        capacity = _probe_pbs_capacity(runner)
     slurm_partitions_not_up: tuple[str, ...] | None = None
     slurm_partition_probe_error: str | None = None
     if binaries.get("squeue"):
@@ -318,6 +577,8 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             slurm_partitions_not_up,
             slurm_partition_probe_error,
         ) = _probe_slurm_partition_availability(runner)
+        if binaries.get("sinfo"):
+            capacity = _probe_slurm_capacity(runner)
 
     if binaries.get("sbatch") and binaries.get("squeue"):
         m = _ANY_VERSION_RE.search(raw_slurm)
@@ -339,6 +600,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             slurm_squeue_error=slurm_squeue_error,
             slurm_partitions_not_up=slurm_partitions_not_up,
             slurm_partition_probe_error=slurm_partition_probe_error,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -356,6 +618,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             pbs_sched_running=pbs_sched_running,
             scheduler_daemons=scheduler_daemons,
             queues=queues,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -374,6 +637,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             pbs_sched_running=pbs_sched_running,
             scheduler_daemons=scheduler_daemons,
             queues=queues,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -403,6 +667,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
         pbs_sched_running=pbs_sched_running,
         scheduler_daemons=scheduler_daemons,
         queues=queues,
+        capacity=capacity,
         notes=tuple(notes),
     )
 
@@ -452,9 +717,61 @@ def format_report(result: ProbeResult, host: str) -> str:
         lines.append(f"  SLURM squeue: {status}")
         if result.slurm_squeue_error:
             lines.append(f"  warning: squeue failed: {result.slurm_squeue_error}")
+    lines.extend(_format_capacity(result.capacity))
     for note in result.notes:
         lines.append(f"  note: {note}")
     return "\n".join(lines)
+
+
+def _format_capacity(capacity: SchedulableCapacity | None) -> list[str]:
+    """Render the schedulable-capacity block of the probe report."""
+    if capacity is None:
+        return []
+    if capacity.error is not None:
+        return [f"  capacity: unavailable ({capacity.error})"]
+    now = "?" if capacity.max_cpus_now is None else str(capacity.max_cpus_now)
+    ever = (
+        "?" if capacity.max_cpus_when_free is None
+        else str(capacity.max_cpus_when_free)
+    )
+    lines = [
+        f"  capacity: largest job that can start now: {now} cpu(s); "
+        f"largest the usable nodes could ever run: {ever}",
+        f"  nodes: {capacity.usable_nodes} usable, "
+        f"{capacity.unusable_nodes} unusable",
+    ]
+    for group in capacity.groups:
+        g_now = "?" if group.max_cpus_now is None else group.max_cpus_now
+        g_ever = (
+            "?" if group.max_cpus_when_free is None else group.max_cpus_when_free
+        )
+        lines.append(
+            f"    {group.name}: now={g_now} when-free={g_ever} "
+            f"({group.usable_nodes} usable, {group.unusable_nodes} unusable)"
+        )
+    unusable = [n.name for n in capacity.nodes if not n.usable]
+    if unusable:
+        shown = ", ".join(unusable[:8])
+        if len(unusable) > 8:
+            shown += f", +{len(unusable) - 8} more"
+        lines.append(f"  warning: unusable node(s): {shown}")
+    # The case this whole census exists for: a request can be admitted but
+    # never started, which otherwise only shows up as days of silent queueing.
+    if (
+        capacity.max_cpus_when_free is not None
+        and capacity.unusable_nodes > 0
+    ):
+        widest_down = max(
+            (n.total_cpus or 0 for n in capacity.nodes if not n.usable),
+            default=0,
+        )
+        if widest_down > capacity.max_cpus_when_free:
+            lines.append(
+                f"  warning: an unusable node is wider ({widest_down} cpu) than "
+                f"anything the scheduler can still run ({capacity.max_cpus_when_free} "
+                "cpu); requests sized for it will queue forever"
+            )
+    return lines
 
 
 def to_json_dict(result: ProbeResult) -> dict[str, object]:
@@ -465,6 +782,13 @@ def to_json_dict(result: ProbeResult) -> dict[str, object]:
     payload["scheduler_daemons"] = (
         list(result.scheduler_daemons) if result.scheduler_daemons is not None else None
     )
+    if result.capacity is None:
+        payload["capacity"] = None
+    else:
+        capacity = asdict(result.capacity)
+        capacity["nodes"] = [asdict(node) for node in result.capacity.nodes]
+        capacity["groups"] = [asdict(group) for group in result.capacity.groups]
+        payload["capacity"] = capacity
     return payload
 
 

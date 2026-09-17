@@ -196,12 +196,29 @@ Everything else in vq can move without touching these pages, which is the
 point of linking out rather than copying.
 
 Only the `JobState` row is machine-checked, by
-`tests/test_vibeqc_site_job_states.py`. It asserts three things:
+`tests/test_vibeqc_site_job_states.py`. It asserts four things:
 
 * every backticked name in a prose sentence about states is a real state;
 * the tutorial's lifecycle block lists exactly `TERMINAL_STATES`;
 * the "are all terminal" note in `queue.md` lists every terminal state
-  except success.
+  except success;
+* every state these pages name is covered by at least one of the three
+  checks above.
+
+That last one is a constraint on how you write, so it is worth stating
+plainly. The first check reads only sentences that mention a *state*, and the
+other two read only the lifecycle block and the terminal list. So if you name
+a state in prose, either say "state" in the same sentence, or be naming one
+the block or the list already pins. Writing "the job goes `suspended` while
+the host is under pressure" otherwise leaves that name with nothing watching
+it, and a later rename in `vq.spec.JobState` would go unnoticed. The check
+fails with the states it found and what to do about them.
+
+The narrower alternative was deliberate. This section itself writes
+"`vq kill` produces `killed`, not `cancelled`", and vq does not produce
+`cancelled` at all. A check that read every backticked name on the page would
+need a list of every other identifier the prose uses, twenty of them today,
+and would then fail for reasons that have nothing to do with the enum.
 
 The first check replaced one that could never fail. That version kept only
 names already in the enum, so a renamed state dropped out of what it checked

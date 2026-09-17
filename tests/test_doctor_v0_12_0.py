@@ -609,6 +609,7 @@ class TestDoctor:
         assert payload["scheduler_lane"] == {
             "partition": "batch",
             "max_wall_time_seconds": 28_800,
+            "max_cpus": None,
             "source": "host-config",
         }
         assert captured == [

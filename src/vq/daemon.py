@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
@@ -527,6 +527,10 @@ class _SchedulerPollObservation:
     phases: dict[str, SchedulerPhase]
     explicitly_absent_job_ids: frozenset[str]
     details: dict[str, QstatDetail]
+    # Per-job "why is this still queued", for dialects that report it on the
+    # coarse poll rather than on the detail record. Empty for Torque, whose
+    # reason arrives on QstatDetail instead.
+    queued_reasons: dict[str, str] = field(default_factory=dict)
     poll_error: (
         SchedulerError
         | DialectError
@@ -987,6 +991,9 @@ class _OrphanJob:
     mem_mb: int | None
     uid: str | None = None
     spec_path: Path | None = None
+    # Armed when a kill is first observed after reattachment. The orphan
+    # keeps its resource reservation until exit or SIGKILL escalation.
+    term_deadline: float | None = None
 
 
 def _pgroup_alive(pgid: int) -> bool:
@@ -1992,7 +1999,26 @@ class Daemon:
             self.default_job_mem_mb,
             multi_user=self._multi_user,
         )
+        # #53: install the stop handlers BEFORE the startup walk, not after
+        # it. The walk reads every queued spec, which on a driver-sized queue
+        # takes minutes -- a reported 21,683-spec queue needed more than 242 s
+        # cold. Until v0.26.8 the handlers went on afterwards, so for that
+        # whole window SIGTERM kept its default disposition and killed the
+        # process outright: `vq daemon stop`, `systemctl --user stop` and
+        # `launchctl bootout` all ended in an instant death, with no shutdown
+        # and no line in the daemon log. That is the ungraceful removal a
+        # self-update rollback recorded, and the window that most needs a
+        # handler was the one window that had none.
+        self._install_stop_handlers()
         self._reattach_or_interrupt_at_startup()
+        if self._stop:
+            # Stopped during the walk. Nothing below is worth doing for a
+            # daemon that is leaving, and the RPC socket in particular must
+            # not be published: an updater polling for readiness would take
+            # it as proof this daemon came up.
+            log.info("daemon stopped during startup before RPC came up")
+            self._close_running_logs()
+            return
         self._reseed_host_pressure_pauses_at_startup()  # HP-1
         # v0.11.0: reap a stale admin-update marker left by a prior
         # daemon life — a killed `vq admin update`, or one whose host
@@ -2003,12 +2029,6 @@ class Daemon:
         # as live and correctly keeps holding dispatch. Cheap: one file
         # read + an os.kill probe, once at startup.
         self._poll_admin_update_marker()
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-        # SIGHUP = reload config, the POSIX convention. Guarded: SIGHUP does not
-        # exist on Windows, and signal.signal raises off the main thread.
-        with contextlib.suppress(ValueError, AttributeError, OSError):
-            signal.signal(signal.SIGHUP, self._handle_reload_signal)
         # v0.8.0 *Dahl's Simula*: start the RPC server so CLI
         # clients can read/write admin-status through the
         # daemon's canonical view. Failure to start is logged
@@ -2270,6 +2290,11 @@ class Daemon:
             "localhost",
             queue_dir=self.queue_dir,
             multi_user=self._multi_user,
+            # This runs every tick over every retained job, so it reads each
+            # row before locking it and skips the ones with no intent to
+            # finish (#22). A tick is a repeated sweep, not a proof: an intent
+            # armed between that read and the lock is picked up next tick.
+            omit_rows_without_intent=True,
         )
         for jobid, detail in pause_intents.errors:
             log.error(
@@ -2533,6 +2558,20 @@ class Daemon:
         # intent.
         just_aborted_running: list[JobSpec] = []
         for spec in self._iter_specs():
+            # #53: a stop that lands mid-walk is honoured at the next spec
+            # boundary. `vq daemon stop` waits 10 s, launchd and systemd
+            # escalate to SIGKILL on their own timeouts, so a daemon that
+            # merely noted the signal and then finished a several-minute
+            # scan would still be killed ungracefully. Each spec is
+            # reconciled and persisted independently, and the walk exists
+            # precisely to reconcile whatever is on disk at startup, so an
+            # unvisited spec is simply reconciled by the next daemon life.
+            if self._stop:
+                log.info(
+                    "stop requested during startup reattach; "
+                    "leaving the remaining specs for the next daemon start",
+                )
+                break
             binding_fence = self._scheduler_binding_requires_fence(spec)
             transaction_may_exist = (
                 self._scheduler_transaction_may_exist(spec)
@@ -2767,6 +2806,11 @@ class Daemon:
         # with --auto-resume, gets a sibling resubmit. Runs after the
         # main loop so the just-written sibling specs don't perturb the
         # iteration.
+        # #53: this pass still runs after an interrupted walk. It covers only
+        # the specs THIS pass aborted, and a sibling is a durable PENDING spec
+        # that the next daemon dispatches. Skipping it would lose those resumes
+        # for good: their parents are ABORTED_BY_QUEUE now, so a later startup
+        # no longer sees them enter from RUNNING.
         for spec in just_aborted_running:
             if spec.recover_on_reboot:
                 self._auto_resume(spec)
@@ -3127,7 +3171,7 @@ class Daemon:
             )
 
     def _reconcile_orphans(self) -> None:
-        """Poll orphan pgids; classify each one when its pgid disappears.
+        """Poll orphan pgids; finish exited groups and escalate killed ones.
 
         v0.4 always marked exiting orphans ABORTED_BY_QUEUE because init
         reaped them and the rc was unrecoverable. v0.5.9's command wrapper
@@ -3145,12 +3189,19 @@ class Daemon:
           state alone but stash the rc for forensics (mirrors
           :meth:`_record_finish`).
 
+        A live group whose spec becomes terminal keeps its reservation until
+        exit or the kill grace expires. Escalation releases it even if zombie
+        members still answer the group probe.
+
         The submitter should still consult stdout.log / stderr.log to
         see what the inner command actually printed before exiting.
         """
         gone: list[str] = []
         for jobid, orphan in list(self._orphans.items()):
-            if not _pgroup_alive(orphan.pgid):
+            if (
+                not _pgroup_alive(orphan.pgid)
+                or self._escalate_orphan_if_killed(jobid, orphan)
+            ):
                 gone.append(jobid)
         for jobid in gone:
             orphan = self._orphans[jobid]
@@ -3180,6 +3231,45 @@ class Daemon:
                     )
             del self._orphans[jobid]
             self.watchdog.unregister(jobid)
+
+    def _escalate_orphan_if_killed(self, jobid: str, orphan: _OrphanJob) -> bool:
+        """Bound a killed orphan's grace without waiting for zombies to vanish.
+
+        Reattached jobs have no Popen handle, so the running-child escalation
+        never sees them. Keep the orphan charged through its grace, then use
+        its captured process group rather than a mutable spec's pgid.
+        """
+        try:
+            spec, _ = self._read_active_spec(jobid, orphan)
+        except (OSError, ValueError):
+            return False
+        if not spec.is_terminal:
+            orphan.term_deadline = None
+            return False
+        if orphan.pgid == os.getpgrp():
+            return False
+        now = time.monotonic()
+        if orphan.term_deadline is None:
+            orphan.term_deadline = now + KILL_ESCALATION_GRACE_SECONDS
+            return False
+        if now < orphan.term_deadline:
+            return False
+        log.warning(
+            "job %s: terminal orphan (%s) pgid %s outlived the kill grace; "
+            "escalating to SIGKILL",
+            jobid, spec.state.value, orphan.pgid,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            killpg(orphan.pgid, signal.SIGCONT)
+        with contextlib.suppress(ProcessLookupError):
+            killpg(orphan.pgid, signal.SIGKILL)
+        self._reap_scope(jobid)
+        events.state_transition(
+            Path(spec.cwd), jobid,
+            from_state=spec.state.value, to_state=spec.state.value,
+            reason="reattached orphan outlived the kill grace; SIGKILLed",
+        )
+        return True
 
     def _record_orphan_finish(
         self,
@@ -7390,6 +7480,7 @@ class Daemon:
         attempted_at = utcnow_iso()
         phases: dict[str, SchedulerPhase] = {}
         explicitly_absent_job_ids: frozenset[str] = frozenset()
+        queued_reasons: dict[str, str] = {}
         poll_error: (
             SchedulerError
             | DialectError
@@ -7405,6 +7496,7 @@ class Daemon:
                 explicitly_absent_job_ids = frozenset(
                     evidence.explicitly_absent_job_ids
                 )
+                queued_reasons = dict(getattr(evidence, "queued_reasons", {}))
             else:
                 phases = dispatcher.poll(handles)
         except (
@@ -7438,6 +7530,7 @@ class Daemon:
             phases=phases,
             explicitly_absent_job_ids=explicitly_absent_job_ids,
             details=details,
+            queued_reasons=queued_reasons,
             poll_error=poll_error,
             accounting_error=accounting_error,
         )
@@ -7617,6 +7710,7 @@ class Daemon:
             phases = observation.phases
             explicitly_absent_job_ids = observation.explicitly_absent_job_ids
             details = observation.details
+            queued_reasons = observation.queued_reasons
             poll_error = observation.poll_error
             accounting_error = observation.accounting_error
             if poll_error is not None:
@@ -7805,7 +7899,12 @@ class Daemon:
                     sj.finished_without_marker_since = None
                     sj.finished_without_marker_misses = 0
                     self._stamp_scheduler_status(
-                        jobid, sj, spec, phase, detail
+                        jobid,
+                        sj,
+                        spec,
+                        phase,
+                        detail,
+                        queued_reason=queued_reasons.get(sj.handle.job_id),
                     )
                     continue
                 # Scheduler termination is known even when both artifact
@@ -9407,6 +9506,8 @@ class Daemon:
         spec: JobSpec,
         phase: SchedulerPhase,
         detail: QstatDetail | None,
+        *,
+        queued_reason: str | None = None,
     ) -> None:
         """Record the cluster-side status + qstat detail on a live job (§18).
 
@@ -9426,8 +9527,24 @@ class Daemon:
             cluster_state = "running"
         else:
             cluster_state = "queued"
+        # Why the cluster has not started this job, in the scheduler's own
+        # words: Slurm reports it on the coarse poll, Torque on the detail
+        # record, so take whichever arrived. A job that is no longer pending
+        # has no such answer, and keeping the last one would leave a running
+        # job explaining why it is waiting.
+        observed_reason = (
+            (queued_reason or (detail.queued_reason if detail is not None else None))
+            if phase is SchedulerPhase.PENDING
+            else None
+        )
         transitioned = spec.scheduler_state != cluster_state
         now = time.monotonic()
+        # The reason deliberately does not force a write of its own: some
+        # schedulers rewrite a queued job's comment on every cycle (an
+        # estimated start time, a queue position), and honouring that would
+        # cost one spec write per poll per job. It rides the same refresh
+        # budget as the walltime below. Clearing is unaffected, because
+        # leaving PENDING is itself a transition.
         if not transitioned and (now - sj.last_status_write) < SCHEDULER_STATUS_REFRESH_SECONDS:
             return  # unchanged + refreshed recently -> skip the write (low churn)
         spec_path = self._active_spec_path(jobid, sj)
@@ -9444,6 +9561,10 @@ class Daemon:
                 return  # a racing kill won the spec; don't stamp over it
             fresh.scheduler_state = cluster_state
             fresh.last_heartbeat_at = utcnow_iso()
+            # Unlike the fields below, this one is assigned rather than merged:
+            # a stale explanation is worse than none, so an absent reason
+            # clears it.
+            fresh.scheduler_queued_reason = observed_reason
             if detail is not None:
                 # Only overwrite with non-empty values (a queued job has no
                 # exec_host / resources_used yet -- keep any prior reading).
@@ -9705,6 +9826,22 @@ class Daemon:
     def _close_running_logs(self) -> None:
         for rj in self._running.values():
             rj.close_logs()
+
+    def _install_stop_handlers(self) -> None:
+        """Take over SIGTERM/SIGINT (and SIGHUP) before any long startup work.
+
+        Called at the top of :meth:`run`, ahead of the startup walk, so that
+        a stop arriving while the daemon is still scanning specs is recorded
+        and logged instead of killing the process at its default disposition
+        (#53). The handler only sets a flag; the walk and the main loop are
+        what act on it.
+        """
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        # SIGHUP = reload config, the POSIX convention. Guarded: SIGHUP does not
+        # exist on Windows, and signal.signal raises off the main thread.
+        with contextlib.suppress(ValueError, AttributeError, OSError):
+            signal.signal(signal.SIGHUP, self._handle_reload_signal)
 
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:
         log.info("received signal %d; stopping after current iteration", signum)

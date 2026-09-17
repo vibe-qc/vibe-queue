@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import grp
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from vq import config as config_module
@@ -149,23 +150,79 @@ def _authorization_config(
     return personal
 
 
-def _check_owner_with_config(spec: JobSpec, cfg: config_module.Config) -> None:
+@dataclass(frozen=True)
+class AuthorizationPolicy:
+    """Every authorization input that does not depend on the job row.
+
+    Resolving this is the whole cost of an ownership decision: it reads and
+    validates the personal and system configs, and in multi-user mode resolves
+    the caller's group and passwd entries.  None of that varies from one row to
+    the next, so a verb that checks many rows resolves it **once** and passes it
+    to every check -- see :func:`authorization_policy`.
+    """
+
+    enabled: bool
+    admin_group: str
+    caller_uid: int
+    caller_is_admin: bool
+
+
+def _policy_from_config(cfg: config_module.Config) -> AuthorizationPolicy:
     if not cfg.multi_user.enabled:
+        # A disabled policy decides every row on ``enabled`` alone. Resolving
+        # the admin group or the caller's membership here would both cost an
+        # NSS lookup single-user mode has never paid, and demand settings a
+        # disabled ``[multi_user]`` section is not required to carry.
+        return AuthorizationPolicy(
+            enabled=False,
+            admin_group="",
+            caller_uid=_caller_uid(),
+            caller_is_admin=True,
+        )
+    return AuthorizationPolicy(
+        enabled=True,
+        admin_group=cfg.multi_user.admin_group,
+        caller_uid=_caller_uid(),
+        caller_is_admin=_caller_is_admin(cfg),
+    )
+
+
+def authorization_policy(
+    cfg: config_module.Config | None = None,
+    *,
+    multi_user: bool = False,
+) -> AuthorizationPolicy:
+    """Resolve the authorization policy for **one** operation.
+
+    A bulk verb resolves this once and hands it to every per-row check, which
+    keeps its authorization cost independent of how many jobs the queue retains
+    (#22).  That is the boundary a single-job verb already uses: one operation
+    reads the policy once, so a revocation, an unreadable file or an invalid
+    policy takes effect on the next operation exactly as it does today.
+
+    Raises whatever resolving the policy raises -- :class:`ConfigError` for an
+    unreadable or invalid policy -- but now before the verb takes its first
+    lock rather than on its first row.
+    """
+    return _policy_from_config(_authorization_config(cfg, multi_user=multi_user))
+
+
+def _check_owner_with_policy(spec: JobSpec, policy: AuthorizationPolicy) -> None:
+    if not policy.enabled:
         return
 
-    if _caller_is_admin(cfg):
+    if policy.caller_is_admin:
         return
 
     submitter_uid = _uid_from_spec(spec)
     if submitter_uid is None:
         return
 
-    caller = _caller_uid()
-    if caller != submitter_uid:
+    if policy.caller_uid != submitter_uid:
         raise OwnershipError(
             f"job {spec.id} belongs to uid {submitter_uid}; "
-            f"caller is uid {caller}. "
-            f"Join the '{cfg.multi_user.admin_group}' group for admin access, "
+            f"caller is uid {policy.caller_uid}. "
+            f"Join the '{policy.admin_group}' group for admin access, "
             f"or run as root."
         )
 
@@ -175,6 +232,7 @@ def check_owner(
     *,
     cfg: config_module.Config | None = None,
     multi_user: bool = False,
+    policy: AuthorizationPolicy | None = None,
 ) -> None:
     """Raise :class:`OwnershipError` if the caller doesn't own this job.
 
@@ -188,12 +246,16 @@ def check_owner(
         spec: The job spec to check ownership of.
         cfg: Optional pre-loaded personal config. If None, loaded from disk.
         multi_user: Whether the caller explicitly selected multi-user paths.
+        policy: Optional policy already resolved for this operation by
+            :func:`authorization_policy`.  The decision is the same; it just
+            is not re-read for this row.  ``cfg`` is unused when given.
 
     Raises:
         OwnershipError: when the caller doesn't own the job and isn't admin.
     """
-    effective = _authorization_config(cfg, multi_user=multi_user)
-    _check_owner_with_config(spec, effective)
+    if policy is None:
+        policy = authorization_policy(cfg, multi_user=multi_user)
+    _check_owner_with_policy(spec, policy)
 
 
 def check_spec_path_owner(
@@ -201,16 +263,19 @@ def check_spec_path_owner(
     *,
     cfg: config_module.Config | None = None,
     multi_user: bool = False,
+    policy: AuthorizationPolicy | None = None,
 ) -> None:
     """Convenience: read spec from ``spec_path`` and check ownership.
 
     Raises :class:`OwnershipError` or :class:`FileNotFoundError`.
-    In single-user mode, this is a no-op.
+    In single-user mode, this is a no-op.  ``policy`` is the operation's
+    already-resolved policy, as for :func:`check_owner`.
     """
-    effective = _authorization_config(cfg, multi_user=multi_user)
-    if not effective.multi_user.enabled:
+    if policy is None:
+        policy = authorization_policy(cfg, multi_user=multi_user)
+    if not policy.enabled:
         return
     if not spec_path.exists():
         raise FileNotFoundError(f"no such job: {spec_path.stem}")
     spec = JobSpec.read(spec_path)
-    _check_owner_with_config(spec, effective)
+    _check_owner_with_policy(spec, policy)

@@ -176,6 +176,12 @@ host reports a bounded canonical partition. A request above a configured
 maximum is rejected before staging and revalidated by the daemon before
 dispatch; vq never silently clamps it.
 
+Set `scheduler_max_cpus` alongside it for the widest job that lane can ever
+run. It rides the same `scheduler_lane` metadata and is bound to the same
+effective partition, and an unset value means unknown rather than unlimited.
+A request above it is **warned about and still submitted**, unlike the wall
+time: see the capacity section below for why the two differ.
+
 Use `--admin-update` before a maintenance run such as `vq admin update pbs-cluster`.
 For scheduler hosts this adds a check for `scheduler_update_command` and notes
 whether `scheduler_install_command` is also configured, so a missing cluster
@@ -262,6 +268,28 @@ active/previous runtimes or protected sync directories as part of staging
 maintenance. A routine update no longer requires moving forensic evidence out
 of `generations/` to protect it from automatic retention cleanup.
 
+**Source-upload staging is the one exception, and it is a different thing.**
+A build host that cannot reach the source repository has the exact commit
+uploaded to it, about 110 MB per deploy, under
+`<scratch_root>/.vq-admin/runtime-source/<program>/<sha>-<uuid>/`. That
+directory belongs to exactly one deploy: the driver re-archives the same SHA
+from git on demand, and nothing reads a stage once the build has consumed the
+archive. So a deploy that verifies removes its own, and a deploy that fails
+keeps its own for forensics while older ones are trimmed to
+`RUNTIME_SOURCE_STAGES_TO_KEEP`. The reasoning that retains a helper generation
+-- another deployment may still be using it -- does not apply to these, and
+nothing here prunes a helper generation or calls the prune verb on the host.
+Before this was added, a SLURM host had accumulated 235 stages, 26 GB, one per
+deploy since July, and the shared home went over quota.
+
+`vq source-stage-prune --runtime-source <scratch_root>/.vq-admin/runtime-source`
+is the operator-facing form, for what an older vq left behind or what failed
+deploys kept. Without `--runtime-source` the verb still reads only
+`STAGE_ROOT/generations/`, which is why it reported `removed=0` against these
+stages and the disk stayed full. Both forms only ever remove a directory whose
+name is exactly `<40 hex>-<32 hex>`; anything else under the root is reported
+as skipped and left in place.
+
 Immutable venv updates likewise retain all other runtime generations after
 both new activation and verified-slot reuse. The low-level slot reclamation
 primitive is not an update step. Any separate retention operation needs a
@@ -322,7 +350,36 @@ daemon while still reminding the operator that the cluster-side vq install has a
 separate maintenance step.
 
 `vq scheduler-probe HOST --json` emits the same scheduler-client probe in a
-monitor-friendly shape. `vq programs HOST` and `vq admin status HOST` render
+monitor-friendly shape.
+
+The probe also reports **schedulable capacity** for a PBS or SLURM host, read
+from `pbsnodes -a` or `sinfo -N`. It answers two different questions, and the
+difference is what tells a job that is waiting from one that will wait forever:
+
+- `max_cpus_now` — the largest request that could **start right now**. A wider
+  request is admitted and then queues.
+- `max_cpus_when_free` — the largest request the nodes the scheduler can still
+  use could **ever** run. A wider request queues indefinitely, however long you
+  wait, because no usable node is that wide even when idle.
+
+Both are repeated per lane (`groups`: a SLURM partition, or a PBS node
+property), alongside a per-node census with each node's width, free cores and
+state. A node that is merely busy stays `usable`; only one the scheduler will
+not place work on at all (PBS `down`/`offline`, SLURM `drain`/`fail`/`maint`)
+counts as unusable, and the report names those nodes. If the census cannot be
+read, `capacity.error` is set and every figure is `null`: an unreadable census
+never reads as "nothing is free".
+
+Declare the figure you want enforced as `scheduler_max_cpus` on the scheduler
+host. `vq submit` then **warns** when a request is wider than the lane can ever
+run, naming both numbers, and submits anyway. It warns rather than refusing
+because the declared width goes stale the moment a node returns to service, and
+refusing on a stale number would reject work the cluster can now run. Leaving
+it unset warns about nothing: unknown is not unlimited.
+
+Sizing a wave against these figures is what prevents the failure this was
+built for — a full-node request whose only node of that width was offline,
+queued for six days while the local ledger recorded it as running. `vq programs HOST` and `vq admin status HOST` render
 daemonless scheduler hosts as scheduler targets rather than SSHing to them for a
 remote `vq` daemon. `vq daemon ping HOST` and `vq daemon health HOST` do the
 same lower in the stack: the scheduler host is represented as a wrapper around
@@ -2143,6 +2200,29 @@ an isolated error without its state being revealed. Failure to establish a
 valid effective multi-user policy stops the command. Exact admin admission and
 token-reconciliation proofs still scan every row under its lock, including
 terminal rows; a bulk summary is never proof of recovery.
+
+The daemon's own per-tick pause-intent sweep is not a proof, and it is the one
+caller that repeats forever, so it asks for the same saving in a narrower form:
+it reads each row before locking it and skips the ones carrying no pause
+intent. A row with an intent, and a row that cannot be read at all, still take
+the lock and the ownership check. An intent armed between that read and the
+lock is picked up by the next tick. The saving is off by default, so
+`pause_token_scope_with_proof`, which reconciles before it captures, keeps the
+exact locked scan.
+
+Every bulk verb resolves the **effective authorization policy once for the
+operation** and checks each row against that. The policy is the half of an
+ownership decision that does not depend on the job row: the personal and system
+configs, and in multi-user mode the caller's group and passwd entries. Which
+rows are checked, in what order, and with what verdict is unchanged, and the
+final verdict on a row is still taken under that row's own lock. A policy that
+cannot be established still stops the command, now before the first lock is
+taken rather than on the first row. This is the per-operation boundary the
+single-job verbs already use: a revocation between two operations takes effect
+on the next one, and a revocation *during* one bulk scan no longer takes effect
+part-way through it, which previously depended on where in the queue the scan
+had reached.
+
 Scheduler pause/resume keeps the final mutation spec lock across the exact
 handle check, `qhold`/`qrls`, owner recheck, and spec commit. If an exact
 inverse fails, vq attempts to persist

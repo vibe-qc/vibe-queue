@@ -255,6 +255,21 @@ _SCHEDULER_STAGE_GENERATION_RE = re.compile(
 )
 SCHEDULER_STAGE_GENERATIONS_TO_KEEP = 5
 
+RUNTIME_SOURCE_STAGES_TO_KEEP = 3
+"""How many runtime-source upload stages a program keeps on a build host.
+
+Unlike a helper staging generation, one of these belongs to exactly one deploy:
+the driver re-archives the exact SHA from git on demand, and nothing reads a
+stage once the build has consumed it. So a successful deploy reclaims its own,
+and this bounds what failed deploys leave behind for forensics. Before #61 a
+slurm host held 235 of them, 26 GB, one per deploy since July, and the home
+they share went over quota.
+
+This is NOT the retention rule for ``STAGE_ROOT/generations`` helper stages,
+which stay: another deployment, possibly on another host, may still be using an
+older one. See docs/operations.md, "Managed helper updates retain staging
+generations"."""
+
 
 def source_sha_marker_path() -> Path:
     """Package-local immutable source marker for daemonless scheduler helpers."""
@@ -1037,11 +1052,31 @@ def prune_scheduler_stage_generations(
     )
     if generations.is_symlink():
         raise AdminError("scheduler generations root must not be a symlink")
-    if not generations.is_dir():
-        return result
+    _prune_stage_directory(
+        generations, keep=keep, preserve=preserve_path, result=result,
+    )
+    return result
+
+
+def _prune_stage_directory(
+    parent: Path,
+    *,
+    keep: int,
+    preserve: Path | None,
+    result: SchedulerStagePruneResult,
+) -> None:
+    """Keep the newest ``keep`` recognized stages directly under ``parent``.
+
+    "Recognized" is the exact ``<40 hex>-<32 hex>`` directory name both stage
+    layouts use. Everything else under ``parent`` -- other files, other
+    directories, and any symlink whatever its name -- is reported as skipped and
+    left alone.
+    """
+    if not parent.is_dir():
+        return
 
     recognized: list[Path] = []
-    for candidate in generations.iterdir():
+    for candidate in parent.iterdir():
         if (
             candidate.is_symlink()
             or not candidate.is_dir()
@@ -1056,8 +1091,8 @@ def prune_scheduler_stage_generations(
     )
 
     retained: set[Path] = set()
-    if preserve_path is not None and preserve_path in recognized:
-        retained.add(preserve_path)
+    if preserve is not None and preserve in recognized:
+        retained.add(preserve)
     for candidate in recognized:
         if len(retained) >= keep:
             break
@@ -1068,6 +1103,67 @@ def prune_scheduler_stage_generations(
             continue
         shutil.rmtree(candidate)
         result.removed.append(str(candidate))
+
+
+RUNTIME_SOURCE_STAGE_DIR_NAME = "runtime-source"
+"""Basename of the runtime-source stage root, under ``<scratch>/.vq-admin/``."""
+
+
+def prune_runtime_source_stages(
+    stage_root: Path,
+    *,
+    keep: int = RUNTIME_SOURCE_STAGES_TO_KEEP,
+    preserve: Path | None = None,
+) -> SchedulerStagePruneResult:
+    """Prune runtime-source upload stages, which have no ``generations`` level.
+
+    ``stage_root`` is the ``runtime-source`` directory itself
+    (``<scratch_root>/.vq-admin/runtime-source``); its children are one
+    directory per program, each holding that program's stages. That layout is
+    why :func:`prune_scheduler_stage_generations` could not see these and
+    reported ``removed=0`` for them (#61).
+
+    A deploy that verifies now reclaims its own stage, so this is the supported
+    way to reclaim what older vq left behind, or what failed deploys kept. It
+    does not touch helper staging generations, which are retained deliberately.
+    """
+    if not stage_root.is_absolute():
+        raise AdminError("runtime source stage root must be an absolute path")
+    if stage_root.name != RUNTIME_SOURCE_STAGE_DIR_NAME:
+        raise AdminError(
+            "runtime source stage root must be the "
+            f"{RUNTIME_SOURCE_STAGE_DIR_NAME!r} directory itself, "
+            f"got {stage_root.name!r}"
+        )
+    if keep < 1:
+        raise AdminError("runtime source stage retention must be at least 1")
+    if preserve is not None and not preserve.is_absolute():
+        raise AdminError("preserved runtime source stage must be an absolute path")
+    if preserve is not None and preserve.parent.parent != stage_root:
+        raise AdminError(
+            "preserved runtime source stage is outside the stage root"
+        )
+    result = SchedulerStagePruneResult(
+        stage_root=str(stage_root),
+        keep=keep,
+        preserve=str(preserve) if preserve is not None else None,
+    )
+    if stage_root.is_symlink():
+        raise AdminError("runtime source stage root must not be a symlink")
+    if not stage_root.is_dir():
+        return result
+    for program_dir in sorted(stage_root.iterdir()):
+        if program_dir.is_symlink() or not program_dir.is_dir():
+            result.skipped_unrecognized.append(str(program_dir))
+            continue
+        _prune_stage_directory(
+            program_dir,
+            keep=keep,
+            preserve=preserve if (
+                preserve is not None and preserve.parent == program_dir
+            ) else None,
+            result=result,
+        )
     return result
 
 
@@ -1749,6 +1845,26 @@ class SchedulerRuntimeUpdateResult:
     shelling in and re-running the preparer by hand."""
     staged_source_archive: str | None = None
     staged_source_sha256: str | None = None
+    staged_source_stage: str | None = None
+    """Remote directory this deploy uploaded its source archive into.
+
+    Set as soon as the directory exists, so a deploy that fails partway through
+    the upload still names the stage its own cleanup has to bound (#61)."""
+    staged_source_stage_reclaimed: bool = False
+    """True when this deploy removed its own upload staging.
+
+    Only a successful deploy does: a failed one keeps its stage for forensics,
+    bounded by :data:`RUNTIME_SOURCE_STAGES_TO_KEEP`."""
+    staged_source_stages_reclaimed: int = 0
+    """Stages removed for this program on the build host, this one included."""
+    staged_source_stages_retained: int = 0
+    """Stages left behind for this program after the reclaim."""
+    staged_source_reclaim_error: str | None = None
+    """Why the reclaim did not run or did not finish.
+
+    Never a ``work_error``: failing to reclaim disk does not undo a deploy that
+    verified, and turning a good deploy into a failed one over cleanup would be
+    a worse outcome than the disk it leaves."""
     run_log_path: str | None = None
     """Transcript of this operation: phase narration, heartbeats, and the full
     build output. Retrieve with ``vq admin logs``."""
@@ -6065,6 +6181,17 @@ def _update_scheduler_runtime_guarded(
         return result
     finally:
         _release_scheduler_drain_lane(host, drain_lease_id)
+        # Before the outcome is persisted, so the receipt records what was
+        # reclaimed. A deploy that verified drops its own upload staging; one
+        # that did not keeps it for forensics, and older stages are trimmed so
+        # failures cannot accumulate without limit (#61).
+        if deployment.stage_source:
+            _reclaim_runtime_source_stage(
+                host,
+                command_host_cfg,
+                result,
+                remove_current=result.success,
+            )
         try:
             record_scheduler_runtime_outcome(result)
         except OSError as exc:
@@ -6442,6 +6569,50 @@ def source_tree_sha256_at_git_commit(
         ) from exc
 
 
+_RUNTIME_SOURCE_STAGE_SEGMENT = "/.vq-admin/runtime-source/"
+"""The path segment every runtime-source stage root contains.
+
+:func:`_reclaim_runtime_source_stage` refuses to delete anything under a root
+without it. The root is built from ``scratch_root``, which is operator config,
+and the reclaim is an ``rm -rf`` on a remote host: this keeps a mistyped or
+hostile ``scratch_root`` from turning it into one somewhere else."""
+
+_RUNTIME_SOURCE_RECLAIM_SCRIPT = """\
+set -eu
+root=$1
+keep=$2
+remove=$3
+[ -d "$root" ] || { printf 'reclaimed=0 retained=0\\n'; exit 0; }
+cd "$root"
+names=$(ls -1t 2>/dev/null | grep -E '^[0-9a-fA-F]{40}-[0-9a-fA-F]{32}$' || true)
+reclaimed=0
+retained=0
+for name in $names; do
+    if [ -L "$name" ] || [ ! -d "$name" ]; then
+        continue
+    fi
+    if [ -n "$remove" ] && [ "$name" = "$remove" ]; then
+        rm -rf -- "$name"
+        reclaimed=$((reclaimed + 1))
+        continue
+    fi
+    if [ "$retained" -lt "$keep" ]; then
+        retained=$((retained + 1))
+    else
+        rm -rf -- "$name"
+        reclaimed=$((reclaimed + 1))
+    fi
+done
+printf 'reclaimed=%s retained=%s\\n' "$reclaimed" "$retained"
+"""
+"""Reclaim one program's runtime-source stages on the build host.
+
+``ls -1t`` orders by mtime, newest first, and the ``grep`` keeps only the exact
+``<40 hex>-<32 hex>`` stage shape, so nothing else in the directory is
+considered. An in-flight upload from a concurrent deploy is the newest entry
+and is therefore inside ``keep``. Symlinks and non-directories are skipped
+rather than followed."""
+
 _RUNTIME_SOURCE_STAGE_ATTEMPTS = 6
 """Upload+verify passes for a runtime source stage before giving up.
 
@@ -6537,6 +6708,99 @@ def _resolve_tag_for_deploy(cfg: config.Config, sha: str) -> str | None:
     return _resolve_unique_tag_for_sha(Path(repo).expanduser(), sha)
 
 
+def _reclaim_runtime_source_stage(
+    host: str,
+    command_host_cfg: config.HostConfig,
+    result: SchedulerRuntimeUpdateResult,
+    *,
+    remove_current: bool,
+    keep: int = RUNTIME_SOURCE_STAGES_TO_KEEP,
+) -> None:
+    """Reclaim this deploy's upload staging and bound what the program keeps.
+
+    A runtime-source stage is upload staging for exactly one deploy: the driver
+    re-archives the same SHA from git on demand, and nothing reads a stage once
+    the build has consumed the archive. So a deploy that verified removes its
+    own, and older stages are trimmed to ``keep`` so failures cannot accumulate
+    without limit. Before #61 nothing removed them at all.
+
+    This is deliberately **not** the helper-generation rule. Those stay, because
+    another deployment may still be using an older one; see docs/operations.md.
+    Nothing here calls the ``source-stage-prune`` verb on the host either: it
+    removes exactly the directory this deploy created, by name, plus that one
+    program's own older stages.
+
+    Cleanup never fails a deploy. Any problem is recorded on the result and
+    logged, and the caller's outcome is untouched.
+    """
+    stage_path = result.staged_source_stage
+    if stage_path is None:
+        return
+    root = posixpath.dirname(stage_path)
+    current = posixpath.basename(stage_path)
+    if (
+        not stage_path.startswith("/")
+        or _RUNTIME_SOURCE_STAGE_SEGMENT not in stage_path
+        or not _SCHEDULER_STAGE_GENERATION_RE.fullmatch(current)
+    ):
+        # Fail closed: the root comes from operator config and the script runs
+        # `rm -rf` on a remote host.
+        result.staged_source_reclaim_error = (
+            f"refusing to reclaim an unrecognized stage path: {stage_path}"
+        )
+        log.error(
+            "scheduler runtime deploy on %s: %s",
+            host,
+            result.staged_source_reclaim_error,
+        )
+        return
+    try:
+        proc = transport.run_remote_shell(
+            command_host_cfg,
+            "sh", "-c", _RUNTIME_SOURCE_RECLAIM_SCRIPT, "vq-runtime-src-reclaim",
+            root, str(keep), current if remove_current else "",
+            check=False,
+            timeout=transport.DEFAULT_REMOTE_SHELL_TIMEOUT_SECONDS,
+        )
+    except transport.RemoteError as exc:
+        result.staged_source_reclaim_error = f"reclaim could not run: {exc}"
+        log.warning(
+            "scheduler runtime deploy on %s: could not reclaim source staging "
+            "under %s: %s",
+            host,
+            root,
+            exc,
+        )
+        return
+    if proc.returncode != 0:
+        detail = _combined_output(proc.stdout, proc.stderr).strip()
+        result.staged_source_reclaim_error = (
+            f"reclaim rc={proc.returncode}: {detail or '(no output)'}"
+        )
+        log.warning(
+            "scheduler runtime deploy on %s: source staging under %s was not "
+            "reclaimed (%s)",
+            host,
+            root,
+            result.staged_source_reclaim_error,
+        )
+        return
+    for token in proc.stdout.split():
+        key, _, value = token.partition("=")
+        if not value.isdigit():
+            continue
+        if key == "reclaimed":
+            result.staged_source_stages_reclaimed = int(value)
+        elif key == "retained":
+            result.staged_source_stages_retained = int(value)
+    result.staged_source_stage_reclaimed = remove_current
+    output.run_log_write(
+        f"--- runtime source staging: reclaimed "
+        f"{result.staged_source_stages_reclaimed}, retained "
+        f"{result.staged_source_stages_retained} under {root} ---"
+    )
+
+
 def _stage_scheduler_runtime_source(
     host: str,
     command_host_cfg: config.HostConfig,
@@ -6628,6 +6892,9 @@ def _stage_scheduler_runtime_source(
                 "could not create runtime source stage: "
                 + (_combined_output(mkdir.stdout, mkdir.stderr).strip() or "mkdir failed")
             )
+        # From here the directory exists on the host, so it is this deploy's to
+        # clean up even if the upload below never finishes (#61).
+        result.staged_source_stage = stage_path
         verify_script = (
             "set -eu\n"
             'stage=$1\n'

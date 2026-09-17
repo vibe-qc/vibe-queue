@@ -10,7 +10,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -247,8 +247,9 @@ def _install_owner_gate_spy(
         *,
         cfg: config.Config | None = None,
         multi_user: bool = False,
+        policy: ownership.AuthorizationPolicy | None = None,
     ) -> None:
-        del cfg, multi_user
+        del cfg, multi_user, policy
         assert depth > 0, "ownership must be decided inside the spec lock"
         if spec.id in denied_jobids:
             raise ownership.OwnershipError(f"job {spec.id} is foreign")
@@ -594,6 +595,154 @@ class TestDurablePauseIntent:
         finally:
             proc.kill()
             proc.wait(timeout=2)
+
+
+class TestPauseIntentSweepCost:
+    """The per-tick sweep must cost what is live, not what is retained (#22).
+
+    A queue keeps its terminal jobs, so on a long-lived driver almost every
+    spec this sweep visits is a finished job that can carry no intent. Taking
+    each one's lock and loading the authorization config to discover that is
+    three file opens per retained job per daemon tick.
+
+    The saving is opt-in, because it rests on an unlocked read: it belongs to
+    a caller that sweeps every tick, not to the exact admission proof, which
+    still scans every row under its lock.
+    """
+
+    @staticmethod
+    def _terminal_spec(jobid: str) -> JobSpec:
+        spec = JobSpec(
+            id=jobid,
+            command=["true"],
+            cwd=str(paths.jobs_dir() / jobid),
+            cpus=1,
+            state=JobState.COMPLETED,
+            exit_code=0,
+        )
+        spec.write(paths.spec_path(jobid))
+        return spec
+
+    @staticmethod
+    def _count_lock_and_authorize(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[list[Path], list[str]]:
+        locked: list[Path] = []
+        authorized: list[str] = []
+        real_lock = paths.spec_lock
+        real_check = ownership.check_owner
+
+        @contextlib.contextmanager
+        def counting_lock(spec_path: Path, **kwargs: object) -> Iterator[None]:
+            locked.append(spec_path)
+            with real_lock(spec_path, **kwargs):  # type: ignore[arg-type]
+                yield
+
+        def counting_check(spec: JobSpec, **kwargs: object) -> None:
+            authorized.append(spec.id)
+            real_check(spec, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(pause_resume.paths, "spec_lock", counting_lock)
+        monkeypatch.setattr(pause_resume.ownership, "check_owner", counting_check)
+        return locked, authorized
+
+    def test_retained_jobs_without_an_intent_are_not_locked_or_authorized(
+        self,
+        state: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for index in range(12):
+            self._terminal_spec(f"retained{index:08d}")
+        locked, authorized = self._count_lock_and_authorize(monkeypatch)
+
+        result = pause_resume.reconcile_pause_intents(
+            "localhost", omit_rows_without_intent=True,
+        )
+
+        assert result.success
+        assert result.completed == ()
+        assert result.cleared_gone == ()
+        assert locked == []
+        assert authorized == []
+
+    def test_the_saving_is_off_by_default_so_a_proof_still_locks_every_row(
+        self,
+        state: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`pause_token_scope_with_proof` reconciles before it captures.
+
+        An exact proof scans every row under its lock, including terminal
+        ones, so the default must stay the pre-#22 behaviour.
+        """
+        expected = [
+            paths.spec_path(self._terminal_spec(f"retained{index:08d}").id)
+            for index in range(12)
+        ]
+        locked, authorized = self._count_lock_and_authorize(monkeypatch)
+
+        result = pause_resume.reconcile_pause_intents("localhost")
+
+        assert result.success
+        assert sorted(locked) == sorted(expected)
+        assert len(authorized) == len(expected)
+
+    def test_an_intent_among_retained_jobs_is_still_finished_under_the_lock(
+        self,
+        state: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for index in range(12):
+            self._terminal_spec(f"retained{index:08d}")
+        spec, proc = _running_job_with_real_process("intentsweep1", state)
+        real_killpg = os.killpg
+
+        def die_before_signal(pgid: int, sig: signal.Signals) -> None:
+            raise SystemExit("simulated SIGKILL boundary")
+
+        monkeypatch.setattr(pause_resume.os, "killpg", die_before_signal)
+        try:
+            with pytest.raises(SystemExit):
+                pause_job("localhost", spec.id, paused_by="sweep-test")
+            monkeypatch.setattr(pause_resume.os, "killpg", real_killpg)
+            locked, authorized = self._count_lock_and_authorize(monkeypatch)
+
+            result = pause_resume.reconcile_pause_intents(
+                "localhost", omit_rows_without_intent=True,
+            )
+
+            assert result.success
+            assert result.completed == (spec.id,)
+            recovered = JobSpec.read(paths.spec_path(spec.id))
+            assert recovered.state == JobState.SUSPENDED
+            assert recovered.pause_intent_at is None
+            # Only the job that carried an intent paid for the lock and the
+            # authorization config; the twelve retained jobs paid neither.
+            assert locked == [paths.spec_path(spec.id)]
+            assert authorized == [spec.id]
+        finally:
+            _release_for_cleanup(proc, spec.pgid, killpg=real_killpg)
+            proc.kill()
+            proc.wait(timeout=2)
+
+    def test_an_unreadable_spec_still_reports_through_the_locked_path(
+        self,
+        state: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Skipping is a decision about intents, never about read failures."""
+        self._terminal_spec("retained00000000")
+        corrupt = paths.spec_path("corrupt00000001")
+        corrupt.write_text("{ this is not a job spec")
+        locked, _authorized = self._count_lock_and_authorize(monkeypatch)
+
+        result = pause_resume.reconcile_pause_intents(
+            "localhost", omit_rows_without_intent=True,
+        )
+
+        assert not result.success
+        assert [jobid for jobid, _detail in result.errors] == ["corrupt00000001"]
+        assert locked == [corrupt]
 
 
 class TestResumeScopeProof:
@@ -1265,8 +1414,9 @@ class TestPauseResumeCLI:
             *,
             cfg: config.Config | None = None,
             multi_user: bool = False,
+            policy: ownership.AuthorizationPolicy | None = None,
         ) -> None:
-            del checked, cfg, multi_user
+            del checked, cfg, multi_user, policy
             if restore_failed:
                 raise ownership.OwnershipError(
                     "policy revoked before restore retry"
@@ -1363,9 +1513,10 @@ class TestPauseResumeCLI:
             *,
             cfg: config.Config | None = None,
             multi_user: bool = False,
+            policy: ownership.AuthorizationPolicy | None = None,
         ) -> None:
             nonlocal owner_checks
-            del checked, cfg, multi_user
+            del checked, cfg, multi_user, policy
             assert depth > 0
             owner_checks += 1
             if owner_checks == 3:

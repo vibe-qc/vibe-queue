@@ -1,7 +1,8 @@
 # vq roadmap
 
 What vq is working towards next, and what has been released but is not yet
-proven on hosts. Rewritten on 2026-09-13 against `main` at `bdbeda9`. The
+proven on hosts. Rewritten on 2026-09-13 and refreshed on 2026-09-16
+against `main` at `b0d83c4`. The
 previous file had become a release log for v0.1 to v0.9 with no forward
 section; it is preserved unchanged as
 [`roadmap_history.md`](roadmap_history.md).
@@ -11,10 +12,10 @@ section; it is preserved unchanged as
 | question | authority |
 |---|---|
 | What shipped, and in which release? | `CHANGELOG.md`, from v0.26.0. Through v0.9: [`roadmap_history.md`](roadmap_history.md) |
-| What is open, and how urgent is it? | The project's GitLab issues (project 36), by `priority::P1` / `P2` |
+| What is open, and how urgent is it? | The canonical queue tracker, by `priority::P1` / `P2`. Its connection details come from external operator configuration |
 | In what order, and what gates what? | **This file** |
 | How agents work here | [`AGENTS.md`](../AGENTS.md). Decided in #24 |
-| What is deployed on which host? | `HANDOVER_FLEET.md` (the fleet ledger) and the accepted report in `releases/` |
+| What is deployed on which host? | The fleet ledger and accepted release reports, both in private operations storage (`releases/README.md`) |
 | Why the design is what it is | [`SPEC.md`](SPEC.md) |
 | Web console milestones | [`fleet_dashboard_design.md` § 6](fleet_dashboard_design.md#6-roadmap) |
 | Names for future minor releases | [`codenames.md`](codenames.md). A name is a reservation, not a scope |
@@ -37,20 +38,27 @@ chats land code, record validation, and ask for deployment.
 | v0.26.3 | 2026-09-12 | `cfddd51` | Same-SHA update validation; nonexistent root-daemon unit (#16) |
 | v0.26.4 | 2026-09-13 | `d072f92` | Revocable console sessions, bounded login admission, write audit; slurm-cluster immutable runtime publication (#17) |
 | v0.26.5 | 2026-09-13 | `da2dbca` | Detached delegated updates (#37, #34), rollback of vendored native libraries (#44), per-host update cap (#32), `UNHEALTHY` programs (#45), console runtime checks (#28), and reliability fixes (#26–#29, #35, #38, #40, #41, #49, #50) |
+| v0.26.6 | 2026-09-13 | `917c521` | Release discovery cannot silently certify an older release (#52); safe lifecycle refusal messages (#20); named directory artifacts (#55) |
+| v0.26.7 | 2026-09-15 | `6402992` | Large queues get startup headroom during self-update (#53); detached observers tolerate receipts still publishing (#36); bounded scheduler-poll diagnostics (#51); the first privacy pass for public mirroring (#54) |
+| v0.26.8 | 2026-09-16 | `d96f32c` | Accepted fleet reports move to external private storage; public clone and contribution guidance; external report consumers qualified (#54, #56) |
 
 ### Deployment
 
-* **Accepted fleet report:** `releases/v0.17.2.json` (`bdbeda9`). It pins
-  vq v0.26.5, vibe-qc v0.17.2 and vibe-view v2.16.2, all accepted under
-  rule A. **It has not been rolled.**
-* **Last recorded deployment:** the ledger's newest entry records the five
-  ordinary hosts on vq v0.26.3 (`cfddd51`) under report v0.17.1. Host changes
-  after that are not yet in the ledger.
-* **Exception:** compute-c's own vq is at `main` `01b9ca7`, installed on
-  2026-09-13 as the prerequisite for validating #37 on that host.
+**This file no longer records host state, and must not start again.** Since
+v0.26.8 the accepted reports and the fleet ledger live in private operations
+storage, outside this repository (`releases/README.md`). Read deployment
+facts there, or from a host with `vq admin status --json` and `vq programs`.
 
-Nothing from v0.26.5 is proven on a host until that report is rolled, apart
-from the #37 checks on compute-c described in § 2.
+What this repository can still say:
+
+* **A tag is not a deployment.** Everything in § 2 rides to hosts only on an
+  accepted report that pins it, rolled by the release coordinator.
+* **The v0.17.2 report** (vq v0.26.5, calculation engine v0.17.2, viewer
+  v2.16.2) was accepted on 2026-09-13 and was not rolled beyond the driver
+  that day; releases up to v0.26.8 have been cut since, so the pin an
+  operator should target is whichever report is accepted now.
+* **One host carries an exception:** compute-c's own vq was installed from
+  `main` on 2026-09-13 as the prerequisite for validating #37 there.
 
 ---
 
@@ -62,7 +70,10 @@ that checklist.
 
 | issue | pri | what | in | validation state |
 |---|---|---|---|---|
-| #37 | P1 | Delegated venv update runs as a transient systemd user unit | v0.26.5 | On compute-c (logind `KillUserProcesses=yes`) the updater runs as a user unit outside every login session, and outlived the session that launched it. The brief's test, every driver session ended for 15 minutes, **has not yet been run correctly**: the first attempt left the driver polling. Pending: a rerun, then a repeat with ssh multiplexing off. **Until it passes, native rebuilds on compute-b, compute-c and compute-d still need the manual transient-unit workaround.** |
+| #37 | P1 | Delegated venv update runs as a transient systemd user unit | v0.26.5 | **Verification is owned elsewhere since 2026-09-15** (transferred to the queue development task by the loop coordinator). The 2026-09-13 run on compute-c now reads terminal and clean — outcome ok, exit 0, installed SHA matching, LAST OK true — but the deliberate-teardown test was never run as the brief specifies, so the withdrawn PASS stays withdrawn. The staged repeat is designed, not executed. **Until it passes, native rebuilds on hosts with `KillUserProcesses=yes` still need the manual transient-unit workaround.** |
+| #57 | P2 | `observe-update --host H` observes H, not H's own `default_host` | `b0d83c4`, unreleased | Needs one read on a target whose `default_host` names a third host: the completed run must read `completed`, not `missing`. No native build needed |
+| #53 | P1 | A loaded queue gets startup headroom before self-update health fails | v0.26.7 | Needs a driver self-update on a large queue that previously rolled back |
+| #18 | P2 | A killed reattached orphan escalates to `SIGKILL` at grace expiry | `eb9be23`, unreleased | Needs a host without cgroups; reservations must release on escalation |
 | #44 | P1 | Rollback restores `third_party/*/install`; refuses an inconsistent baseline (exit 77) | v0.26.5 | Needs a host roll. compute-c's `vibeview-dev` will refuse by design until pinned to its own checkout |
 | #17 | P1 | slurm-cluster runtime publication preserves published artifacts | v0.26.4 | Only after the release-paper campaign's slurm-cluster jobs drain |
 | #32 | P2 | `[hosts.X] update_script_timeout_seconds`, forwarded to delegated updates | v0.26.5 | The **driver** must run v0.26.5 before the key has any effect |
@@ -78,19 +89,19 @@ that checklist.
 
 ### Delivery order: dependencies, not preference
 
-1. **Fix, or work around, #52 first.** `vq admin rollout-latest` silently plans
-   against an older report when a newer one fails pin validation, for
-   example when a pin checkout has not fetched. A roll that silently skips
-   `v0.17.2.json` reports every lane "at target" and deploys nothing.
-2. **Roll the v0.17.2 report, driver first.** On 2026-09-13 the driver's own
-   update to v0.26.5 rolled back on #53. It needs a health window that
-   covers the startup walk (`VQ_DAEMON_HEALTH_TIMEOUT`), or #22's spec
-   reduction, before any other host rolls. After that, the driver must carry
-   #32 before a host's configured cap is forwarded, and each target must
-   carry #37 and #34 before a detach check means anything.
-3. **Release compute-c back into the roll** once #37's remaining checks are
-   recorded.
-4. **slurm-cluster's lanes and #17's validation** come after the campaign drains.
+The two blockers this list opened with are fixed: #52 (silent fallback to an
+older report) shipped in v0.26.6 and #53 (self-update health window) in
+v0.26.7. What remains is ordering, not repair.
+
+1. **Roll an accepted report, driver first.** The driver must carry #32
+   before a host's configured update cap is forwarded, and each target must
+   carry #37 and #34 before any detach check on it means anything.
+2. **Release compute-c back into the roll** once #37's owner records the
+   remaining checks.
+3. **The cluster lanes and #17's validation** come after the campaign
+   drains.
+4. **Everything in § 2 stays open** until its own evidence exists. A tag
+   proves a build, not a behaviour on a host.
 
 ---
 
@@ -101,16 +112,12 @@ label.
 
 ### Fleet update and rollout correctness
 
-* **#52 (P1)** — rollout-latest silently falls back to an older report; see § 2.
-* **#53 (P1)** — a driver self-update rolls back a good install. The daemon
-  health window (30 s + 10 ms per spec, 247 s for about 21,700 specs) is
-  shorter than the daemon's startup walk over its queue, which measured more
-  than 242 s cold. The rollback restarts the daemon a second time, and the
-  failed attempt fences the rollout as not retry-safe.
-* **#36 (P2)** — detached-build receipts are rejected during atomic
-  publication. The fix, `03e8312`, is stranded on an unmerged branch.
-* **#20 (P2)** — lifecycle scripts blank their own guidance: an unquoted
-  heredoc runs `vq self-update` and `vq admin update`.
+Four defects that stood here — #52, #53, #36 and #20 — shipped in v0.26.6 and
+v0.26.7. #53 and #57 now wait for host evidence in § 2 instead.
+
+* **#54** — publication readiness: historical privacy findings, and keeping
+  private operational material out of the product tree. Much of it shipped
+  in v0.26.7 and v0.26.8; the issue tracks what remains before mirroring.
 
 ### Scheduler throughput and observability
 
@@ -130,10 +137,9 @@ mechanism that has not been measured.
 
 ### Kill and lifecycle correctness
 
-* **#18 (P2)** — `vq kill` never escalates to SIGKILL for a reattached orphan
-  that ignores SIGTERM. Reproduced (note 25890). The fix sketched there waits
-  on a maintainer decision (§ 4); see
-  `handovers/HANDOVER_vq_kill_escalation.md`.
+* **#18 (P2)** — fixed in `eb9be23`: a killed reattached orphan now arms a
+  monotonic grace and escalates with `SIGCONT`/`SIGKILL` at expiry, holding
+  its reservation until the group exits. Waiting on host evidence (§ 2).
 * **#31 (P2)** — tests for killed-job survivors in quota, memory, cleanup and
   drain. Tests landed in `fba3274` (v0.26.5); the issue is still open.
 
@@ -141,7 +147,6 @@ mechanism that has not been measured.
 
 * **#41** — the audit of short timeouts in `tests/`. The reaping module is
   done; `tests/test_pause_resume.py` and `tests/test_daemon.py` are next.
-* **#48 (P2)** — a 1-second status-refresh budget flakes under CI load.
 * **#46 (P2)** — `_dispatch_started` can read `COMPLETED` for a backgrounding
   command under load.
 
@@ -165,7 +170,7 @@ Still open:
 ### Carried from the archived roadmap, not filed since the split
 
 These were recorded as open before the public repository existed. None has a
-project-36 issue. **Confirm they are still wanted before filing them.**
+tracker issue. **Confirm they are still wanted before filing them.**
 
 * **RECOV-4:** guard reattach against a recycled pgid. Deferred to a Linux
   host.
@@ -180,13 +185,11 @@ project-36 issue. **Confirm they are still wanted before filing them.**
 ## 4. Decisions waiting on the maintainer
 
 * **#21** — triage notes on #10, #11 and #12. Its rule, that `(#N)` in a
-  subject means a project-36 issue, is now written in `AGENTS.md`.
+  subject means a tracker issue, is now written in `AGENTS.md`.
 * **#30** — a fleet report cannot converge while vibe-queue and vibe-view run
   untagged `main`.
 * **#43** — when release-candidate branches are deleted.
 * **#47** — should `vq admin install` honour a program's declared `extras`?
-* **#18** — go ahead with the reproduced kill-escalation fix for reattached
-  orphans, or not.
 * **#38** — disclosure of the confidential fix.
 * **#22** — whether to delete old terminal job specs on the driver. This is
   an owner decision about possibly uncollected results.
@@ -202,9 +205,9 @@ project-36 issue. **Confirm they are still wanted before filing them.**
 
 ## 5. Future minor releases
 
-No issue is assigned to a version. There are no GitLab milestones, and the
-version of the next cut is chosen by the release coordinator when a candidate
-is prepared.
+No issue is assigned to a version. The tracker defines no milestones, and
+the version of the next cut is chosen by the release coordinator when a
+candidate is prepared.
 
 [`codenames.md`](codenames.md) reserves provisional names and one-line
 concepts for v0.27.0 to v0.33.0. They are image themes, not commitments. Where

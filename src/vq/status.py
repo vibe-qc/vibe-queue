@@ -392,6 +392,12 @@ def show_status(
         lines.append(f"scheduler:    {' '.join(scheduler_bits)}")
         lines.append(f"sched_state:  {_scheduler_state_label(spec)}")
         lines.append(f"fetch_state:  {_scheduler_fetch_state_label(spec)}")
+        # The scheduler's own answer to "why has this not started yet", shown
+        # next to the queued state it explains. Without it a job that can
+        # never be scheduled is indistinguishable from one that is merely
+        # next in line.
+        if spec.scheduler_queued_reason:
+            lines.append(f"queued_why:   {spec.scheduler_queued_reason}")
         if spec.scheduler_exec_host:
             lines.append(f"exec_host:    {spec.scheduler_exec_host}")
         walltime = _format_scheduler_walltime(

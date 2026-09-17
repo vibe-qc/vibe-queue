@@ -452,9 +452,26 @@ def _dispatch_started(
     retry_max: int = 0,
     command: str = _LOCK_HOLDING_COMMAND,
     cpus: int = 1,
+    command_exits: bool = False,
 ) -> JobSpec:
-    """Dispatch a lock-holding command; return its RUNNING spec once the lock
-    is held, so the group has a member besides its leader."""
+    """Dispatch a lock-holding command; return its spec once the lock is held,
+    so the group has a member besides its leader.
+
+    ``started`` is touched only after the lock has been taken, so it is the
+    readiness signal for every caller. The state that accompanies it is not.
+    A command that holds the lock itself is still RUNNING when the lock
+    appears, and that is pinned.
+
+    ``command_exits`` says the caller's command releases the group to a
+    background child and then exits by design (``_BACKGROUNDING_COMMAND``).
+    The wrapper waits only for that foreground command, so the whole chain
+    -- child touches ``started``, command exits, wrapper exits -- can complete
+    inside the one ``iterate()`` that runs while the loop below is between
+    two checks of ``started``. ``_reconcile_running()`` leads that pass, so
+    the spec the loop then reads is already COMPLETED. Both orderings are
+    correct and which one a caller gets is scheduling work that widens under
+    load (#46), so this accepts either rather than pinning the coin flip.
+    """
     workspace = daemon.jobs_dir / jobid
     workspace.mkdir(parents=True, exist_ok=True)
     JobSpec(
@@ -470,7 +487,16 @@ def _dispatch_started(
         daemon.iterate()
         time.sleep(0.02)
     spec = JobSpec.read(daemon._spec_path(jobid))
-    assert spec.state == JobState.RUNNING
+    # A command that exits by design has nothing left to fail on: COMPLETED is
+    # its clean exit, and FAILED or SUSPENDED stay rejected either way.
+    started_states = (
+        (JobState.RUNNING, JobState.COMPLETED) if command_exits else (JobState.RUNNING,)
+    )
+    assert spec.state in started_states, (
+        f"job {jobid} is {spec.state.value} once the lock is held"
+    )
+    # Kept unconditional: the caller tears the group down by this pgid, and a
+    # finish records the outcome without clearing the run-instance fields.
     assert spec.pid is not None and spec.pid == spec.pgid
     return spec
 
@@ -632,7 +658,9 @@ class TestRunningGroupReap:
         outlive it."""
         daemon = dispatching_daemon
         jobid = "bgwrap01"
-        running = _dispatch_started(daemon, jobid, command=_BACKGROUNDING_COMMAND)
+        running = _dispatch_started(
+            daemon, jobid, command=_BACKGROUNDING_COMMAND, command_exits=True
+        )
         assert running.pgid is not None
         try:
             final = _drive(daemon, jobid, lambda _s: jobid not in daemon._running)

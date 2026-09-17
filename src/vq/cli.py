@@ -3026,24 +3026,63 @@ def source_identity() -> None:
 @click.option(
     "--keep",
     type=click.IntRange(min=1),
-    default=admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP,
-    show_default=True,
+    default=None,
+    help=(
+        "Stages to keep. Default: "
+        f"{admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP} for helper "
+        f"generations, {admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP} with "
+        "--runtime-source."
+    ),
+)
+@click.option(
+    "--runtime-source",
+    is_flag=True,
+    help=(
+        "STAGE_ROOT is a 'runtime-source' upload staging root "
+        "(<scratch_root>/.vq-admin/runtime-source), whose stages sit one per "
+        "program with no 'generations' level."
+    ),
 )
 @click.option("--preserve", type=click.Path(path_type=Path))
 @click.option("--json", "as_json", is_flag=True, help="Emit structured JSON.")
 def source_stage_prune(
     stage_root: Path,
-    keep: int,
+    keep: int | None,
+    runtime_source: bool,
     preserve: Path | None,
     as_json: bool,
 ) -> None:
-    """Prune recognized immutable scheduler-helper stage generations."""
+    """Prune recognized scheduler stage directories.
+
+    Without --runtime-source this prunes immutable scheduler-helper stage
+    generations, which a deploy never prunes on its own: another deployment
+    may still be using an older one.
+
+    With --runtime-source it prunes source-upload staging instead. Those belong
+    to exactly one deploy each, so a deploy that verifies now reclaims its own;
+    this reclaims what older vq left behind and what failed deploys kept.
+    """
     try:
-        result = admin_module.prune_scheduler_stage_generations(
-            stage_root,
-            keep=keep,
-            preserve=preserve,
-        )
+        if runtime_source:
+            result = admin_module.prune_runtime_source_stages(
+                stage_root,
+                keep=(
+                    admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
+        else:
+            result = admin_module.prune_scheduler_stage_generations(
+                stage_root,
+                keep=(
+                    admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
     except admin_module.AdminError as exc:
         raise click.ClickException(str(exc)) from None
     payload = asdict(result)
@@ -13625,6 +13664,14 @@ def admin_observe_update(
             "admin",
             "observe-update",
             run_id,
+            # Explicit, for the same reason the delegated update appends a
+            # `localhost` positional and the driver's own poller passes this
+            # flag: the run lives on the host we are talking to. A target
+            # whose own default_host is another machine would otherwise
+            # forward the observation there and answer `missing` for a run
+            # that host has never heard of.
+            "--host",
+            "localhost",
             "--offset",
             str(offset),
             "--max-bytes",

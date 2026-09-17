@@ -32,6 +32,12 @@ class FakeRunner:
     squeue_returncode: int = 0
     squeue_stdout: str = ""
     squeue_stderr: str = ""
+    pbsnodes_returncode: int = 0
+    pbsnodes_stdout: str = ""
+    pbsnodes_stderr: str = ""
+    sinfo_nodes_returncode: int = 0
+    sinfo_nodes_stdout: str = ""
+    sinfo_nodes_stderr: str = ""
 
     def run(
         self,
@@ -51,6 +57,18 @@ class FakeRunner:
             return RemoteResult(0, self.queues_stdout, "")
         if argv[:2] == ["sh", "-c"] and "pgrep -x" in argv[2]:
             return RemoteResult(self.daemon_probe_returncode, self.daemon_probe_stdout, "")
+        if argv[:2] == ["pbsnodes", "-a"]:
+            return RemoteResult(
+                self.pbsnodes_returncode,
+                self.pbsnodes_stdout,
+                self.pbsnodes_stderr,
+            )
+        if argv and argv[0] == "sinfo" and "--Node" in argv:
+            return RemoteResult(
+                self.sinfo_nodes_returncode,
+                self.sinfo_nodes_stdout,
+                self.sinfo_nodes_stderr,
+            )
         if argv and argv[0] == "squeue":
             return RemoteResult(
                 self.squeue_returncode,
@@ -247,3 +265,155 @@ def test_report_renders_config_for_detected_dialect(present: bool) -> None:
         assert "qsub" in report
     else:
         assert "UNKNOWN" in report
+
+
+# --- schedulable capacity (vibe-qc#148, queue tracker #23) -------------------
+#
+# The cluster state the incident was measured on: two 128-wide nodes, one busy
+# and one down, so a ppn=128 request was admitted and then never started.
+
+_WIDE_NARROW_PBSNODES = """\
+node01
+     state = free
+     np = 64
+     properties = wide
+     ntype = cluster
+
+node02
+     state = job-exclusive
+     np = 128
+     properties = wide
+     jobs = 0-127/12300.host_f
+     ntype = cluster
+
+node03
+     state = down,offline
+     np = 128
+     properties = wide
+     ntype = cluster
+
+node20
+     state = free
+     np = 20
+     properties = narrow
+     jobs = 0/12301.host_f, 1/12301.host_f
+"""
+
+
+def _torque(**kwargs: object) -> FakeRunner:
+    return FakeRunner(
+        binaries=_PBS_BINS, version_stdout="version: 2.5.12\n", **kwargs
+    )
+
+
+def test_pbs_capacity_separates_what_can_start_from_what_could_ever_start() -> None:
+    capacity = probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES)).capacity
+    assert capacity is not None
+    # A ppn=128 job cannot start: the only free node is 64 wide.
+    assert capacity.max_cpus_now == 64
+    # But it is not impossible -- node02 is 128 wide and merely busy.
+    assert capacity.max_cpus_when_free == 128
+    assert (capacity.usable_nodes, capacity.unusable_nodes) == (3, 1)
+
+
+def test_pbs_capacity_counts_free_cores_on_a_partly_used_node() -> None:
+    result = probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES))
+    nodes = {n.name: n for n in result.capacity.nodes}
+    assert nodes["node20"].free_cpus == 18  # np=20, two cores taken
+    assert nodes["node02"].free_cpus == 0  # the 0-127 range is the whole node
+    assert nodes["node01"].free_cpus == 64
+
+
+def test_pbs_capacity_reports_a_down_node_as_unusable_not_merely_busy() -> None:
+    result = probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES))
+    nodes = {n.name: n for n in result.capacity.nodes}
+    assert nodes["node03"].usable is False
+    assert nodes["node03"].free_cpus == 0
+    assert nodes["node03"].total_cpus == 128
+    # Busy is not unusable: waiting fixes one and not the other.
+    assert nodes["node02"].usable is True
+
+
+def test_pbs_capacity_groups_by_node_property() -> None:
+    result = probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES))
+    groups = {g.name: g for g in result.capacity.groups}
+    assert groups["wide"].max_cpus_now == 64
+    assert groups["wide"].max_cpus_when_free == 128
+    assert groups["wide"].unusable_nodes == 1
+    assert groups["narrow"].max_cpus_now == 18
+
+
+def test_report_warns_when_a_width_can_never_be_scheduled() -> None:
+    # Both 128-wide nodes down: a ppn=128 request now queues forever, which
+    # is the state no vq output could express when #148 was filed.
+    pbsnodes = _WIDE_NARROW_PBSNODES.replace(
+        "node02\n     state = job-exclusive", "node02\n     state = down"
+    )
+    result = probe(_torque(pbsnodes_stdout=pbsnodes))
+    assert result.capacity.max_cpus_when_free == 64
+    report = format_report(result, "host_f")
+    assert "queue forever" in report
+    assert "128 cpu" in report
+
+
+def test_report_does_not_warn_while_the_width_is_merely_busy() -> None:
+    report = format_report(probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES)), "host_f")
+    assert "queue forever" not in report
+    assert "largest job that can start now: 64" in report
+
+
+def test_capacity_failure_makes_no_claim() -> None:
+    # An unreadable census must never read as "nothing is free".
+    result = probe(
+        _torque(pbsnodes_returncode=127, pbsnodes_stderr="pbsnodes: not found")
+    )
+    assert result.capacity.error == "pbsnodes: not found"
+    assert result.capacity.max_cpus_now is None
+    assert result.capacity.max_cpus_when_free is None
+    assert result.capacity.nodes == ()
+    assert "capacity: unavailable" in format_report(result, "host_f")
+
+
+def test_slurm_capacity_reads_idle_cores_and_partitions() -> None:
+    runner = FakeRunner(
+        binaries=[*_SLURM_BINS, "sinfo"],
+        sbatch_version_stdout="slurm 23.02.7\n",
+        sinfo_nodes_stdout=(
+            "node001|wide*|idle|128|0/128/0/128\n"
+            "node002|wide|mix|128|64/64/0/128\n"
+            "node003|wide|drain|128|0/0/128/128\n"
+            "node004|narrow|alloc|64|64/0/0/64\n"
+        ),
+    )
+    capacity = probe(runner).capacity
+    assert capacity is not None
+    assert capacity.max_cpus_now == 128
+    assert (capacity.usable_nodes, capacity.unusable_nodes) == (3, 1)
+    nodes = {n.name: n for n in capacity.nodes}
+    assert nodes["node002"].free_cpus == 64  # the idle field of A/I/O/T
+    assert nodes["node003"].usable is False  # drained, not merely busy
+    assert nodes["node004"].free_cpus == 0
+    groups = {g.name: g for g in capacity.groups}
+    assert groups["wide"].max_cpus_now == 128  # the default-partition * is stripped
+    assert groups["narrow"].max_cpus_now == 0
+
+
+def test_capacity_is_absent_when_no_census_binary_exists() -> None:
+    # SGE ships neither pbsnodes nor sinfo: no census was attempted, which is
+    # not the same as one that failed.
+    result = probe(FakeRunner(binaries=["qhost", "qconf"], version_stdout="8.1.9\n"))
+    assert result.capacity is None
+    assert "capacity" not in format_report(result, "gridhost")
+
+
+def test_capacity_json_shape_is_serializable() -> None:
+    payload = to_json_dict(probe(_torque(pbsnodes_stdout=_WIDE_NARROW_PBSNODES)))
+    assert payload["capacity"]["max_cpus_now"] == 64
+    assert payload["capacity"]["max_cpus_when_free"] == 128
+    assert {n["name"] for n in payload["capacity"]["nodes"]} == {
+        "node01", "node02", "node03", "node20",
+    }
+    assert {g["name"] for g in payload["capacity"]["groups"]} == {"wide", "narrow"}
+    import json
+
+    json.dumps(payload)  # the --json surface must survive serialization

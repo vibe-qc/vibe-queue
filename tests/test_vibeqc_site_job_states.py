@@ -83,6 +83,23 @@ def _names_in_state_sentences(text: str) -> set[str]:
     }
 
 
+def _state_mentions(text: str) -> dict[str, bool]:
+    """Every current state the prose names, and whether the guard reads it.
+
+    The value is True when at least one sentence naming that state also
+    mentions a state, which is the filter
+    :func:`_names_in_state_sentences` applies. A state named only in
+    sentences that do not is invisible to the existence check.
+    """
+    mentions: dict[str, bool] = {}
+    for sentence in _prose_sentences(text):
+        readable = bool(_MENTIONS_A_STATE.search(sentence))
+        for name in _BARE_NAME.findall(sentence):
+            if name in _ALL_STATES:
+                mentions[name] = mentions.get(name, False) or readable
+    return mentions
+
+
 def _lifecycle_block() -> str:
     """The tutorial's ``pending -> running -> ...`` fenced block.
 
@@ -191,6 +208,58 @@ def test_queue_mds_terminal_list_names_every_terminal_state_but_success():
         "(without completed) disagree.\n"
         f"  listed but not expected: {sorted(listed - expected)}\n"
         f"  expected but not listed: {sorted(expected - listed)}"
+    )
+
+
+def test_every_state_the_pages_name_is_pinned_by_some_check():
+    """No state may be named where nothing would notice it going stale.
+
+    The three checks in this file cover different ground.
+    :func:`test_no_page_names_a_state_that_does_not_exist` reads only
+    sentences that mention a state, because a sentence is the only filter
+    that does not reduce to "names in the enum are in the enum". The two
+    set-equality checks cover the lifecycle block and ``queue.md``'s
+    terminal list, and between them every **terminal** state.
+
+    That leaves a hole this test closes. A state named in a sentence that
+    never says "state" is invisible to the existence check, and a
+    *non-terminal* state -- ``pending``, ``running``, ``suspended``,
+    ``submitting``, ``submit_outcome_unknown`` -- appears in neither of the
+    set-equality checks. Write "the job goes ``suspended`` while the host is
+    under pressure" and a later rename of that state changes nothing here:
+    every test still passes and the page still reads as current.
+
+    Verified against the pages as of this commit: all 13 states they name are
+    covered, but three mentions (``killed`` and ``starved`` in ``README.md``,
+    ``completed`` in the tutorial) already sit outside a readable sentence and
+    survive only because those states are terminal and pinned elsewhere.
+
+    Widening the existence check instead is not free, which is why this is a
+    coverage check rather than a wider scan: ``README.md`` deliberately writes
+    "``vq kill`` produces ``killed``, not ``cancelled``", and ``cancelled`` is
+    a name vq does not produce. A whole-page scan would have to carry an
+    allow-list of every backticked non-state identifier in the prose, 20 of
+    them today, and would fail for reasons that have nothing to do with the
+    enum.
+    """
+    pinned = _block_outcomes(_lifecycle_block()) | _queue_terminal_list()
+    unpinned: dict[str, list[str]] = {}
+    for page in sorted(_SITE.rglob("*.md")):
+        for name, readable in _state_mentions(page.read_text()).items():
+            if readable or name in pinned:
+                continue
+            unpinned.setdefault(name, []).append(page.name)
+
+    assert not unpinned, (
+        "these job states are named in prose that no check reads, so a "
+        "rename of them would not fail any test here:\n"
+        + "\n".join(
+            f"  {name}: {', '.join(sorted(pages))}"
+            for name, pages in sorted(unpinned.items())
+        )
+        + "\n\nEither reword the sentence so it mentions a state, or name "
+        "the state in the tutorial's lifecycle block or queue.md's terminal "
+        "list, whichever is true of it."
     )
 
 

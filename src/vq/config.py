@@ -54,7 +54,6 @@ falls back to "localhost" with no extra metadata, preserving v0.1 behavior.
 
 from __future__ import annotations
 
-import copy
 import math
 import os
 import re
@@ -63,7 +62,7 @@ import tomllib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -734,6 +733,28 @@ class HostConfig(BaseModel):
     Scheduler-host-only; local hosts must leave it unset.
     """
 
+    scheduler_max_cpus: Annotated[
+        int,
+        Field(strict=True, gt=0),
+    ] | None = None
+    """Operator-declared widest request this scheduler lane can ever run.
+
+    The companion to ``scheduler_max_wall_time_seconds``, and read the same
+    way: a pre-admission boundary, not a live capacity observation. ``None``
+    means unknown, not unlimited.
+
+    Unlike wall time, exceeding this does **not** refuse the submission. A
+    node census goes stale -- a node returns to service, a partition is
+    resized -- and refusing on a stale number would reject work the cluster
+    can now run. ``vq submit`` warns instead, which is what the vibe-qc#148
+    starvation needed: the request was admitted and then never started, with
+    nothing anywhere saying it could not.
+
+    `vq scheduler-probe HOST` reports the figure to put here as
+    ``capacity.max_cpus_when_free``. Scheduler-host-only; local hosts must
+    leave it unset.
+    """
+
     scheduler_prologue: list[str] = Field(default_factory=list)
     """Trusted shell lines inserted into every scheduler job script after the
     job has entered its working directory and before the user command runs.
@@ -937,6 +958,10 @@ class HostConfig(BaseModel):
                     "scheduler_max_wall_time_seconds must be unset when "
                     "scheduler = 'local'"
                 )
+            if self.scheduler_max_cpus is not None:
+                raise ValueError(
+                    "scheduler_max_cpus must be unset when scheduler = 'local'"
+                )
             if self.scheduler_dialect is not None:
                 raise ValueError(
                     "scheduler_dialect must be unset when scheduler = 'local'"
@@ -1099,6 +1124,7 @@ class HostConfig(BaseModel):
         return {
             "partition": partition,
             "max_wall_time_seconds": self.scheduler_max_wall_time_seconds,
+            "max_cpus": self.scheduler_max_cpus,
             "source": "host-config",
         }
 
@@ -2533,12 +2559,28 @@ def _parse_config_bytes(contents: bytes) -> dict:
     return tomllib.loads(contents.decode("utf-8"))
 
 
+def _copy_toml_value(value: Any) -> Any:
+    """Isolate TOML containers without copying immutable scalar values.
+
+    This accepts only the built-in values returned by ``tomllib.loads`` with
+    its default float parser: dicts and lists are the only mutable types.
+    Strings, numbers, booleans and date/time values can safely be shared.
+    Unlike a general object graph, parsed TOML has no cycles or aliases that
+    require deepcopy's memo table or object reconstruction protocol.
+    """
+    if isinstance(value, dict):
+        return {key: _copy_toml_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_toml_value(item) for item in value]
+    return value
+
+
 def _read_config_data(path: Path) -> dict:
     # Always open/read: mtime, size and inode are not content authorities.
     # Validation receives a private mapping because validators/callers may
     # mutate nested containers. Validation itself is deliberately not cached.
     with path.open("rb") as stream:
-        return copy.deepcopy(_parse_config_bytes(stream.read()))
+        return _copy_toml_value(_parse_config_bytes(stream.read()))
 
 
 def system_multi_user_enabled() -> bool:

@@ -25,10 +25,12 @@ from vq.scheduler_dialect import (
     SlurmDialect,
     TorqueDialect,
     dialect_for,
+    enforce_scheduler_wall_time_limit,
     format_walltime,
     parse_submit_extra,
     sanitize_job_name,
     sanitize_slurm_job_name,
+    scheduler_width_warning,
 )
 
 
@@ -342,7 +344,7 @@ def test_slurm_poll_command(slurm: SlurmDialect) -> None:
     assert slurm.poll_command(["123", "124"]) == [
         "squeue",
         "--noheader",
-        "--format=%i|%T|%M|%l|%N",
+        "--format=%i|%T|%M|%l|%N|%r",
         "--jobs",
         "123,124",
     ]
@@ -409,10 +411,10 @@ def test_phase_for_state_unknown(torque: TorqueDialect) -> None:
 
 
 _SQUEUE_TABLE = textwrap.dedent("""\
-    123|RUNNING|00:01|01:00:00|node001
-    124|PENDING|00:00|01:00:00|(Priority)
-    125|COMPLETING|00:59|01:00:00|node002
-    126|COMPLETED|01:00|01:00:00|node003
+    123|RUNNING|00:01|01:00:00|node001|None
+    124|PENDING|00:00|01:00:00|(Priority)|Priority
+    125|COMPLETING|00:59|01:00:00|node002|None
+    126|COMPLETED|01:00|01:00:00|node003|None
 """)
 
 
@@ -429,9 +431,9 @@ def test_slurm_parse_poll_maps_rows(slurm: SlurmDialect) -> None:
     "stdout",
     [
         "123\n",
-        "|RUNNING|00:01|01:00:00|node001\n",
-        "123||00:01|01:00:00|node001\n",
-        "123|RUNNING|00:01|01:00:00|node001|extra\n",
+        "|RUNNING|00:01|01:00:00|node001|None\n",
+        "123||00:01|01:00:00|node001|None\n",
+        "123|RUNNING|00:01|01:00:00|node001\n",
     ],
 )
 def test_slurm_parse_poll_rejects_malformed_nonempty_rows(
@@ -442,7 +444,7 @@ def test_slurm_parse_poll_rejects_malformed_nonempty_rows(
 
 
 def test_slurm_parse_poll_rejects_duplicate_rows(slurm: SlurmDialect) -> None:
-    row = "123|RUNNING|00:01|01:00:00|node001\n"
+    row = "123|RUNNING|00:01|01:00:00|node001|None\n"
     with pytest.raises(DialectError, match="duplicate squeue row"):
         slurm.parse_poll(row + row)
 
@@ -725,6 +727,98 @@ def test_parse_qstat_detail_queued_job_has_no_exec_host(torque: TorqueDialect) -
 
 def test_parse_qstat_detail_empty() -> None:
     assert TorqueDialect().parse_qstat_detail("") == {}
+
+
+# A queued job's `comment` is Torque's own answer to "why has this not
+# started". vq already fetched it with every detail poll and dropped it, so a
+# request that could never be scheduled looked exactly like one that was next
+# in line (vibe-qc#148).
+# Torque folds a long value onto a tab-continued line, so the reason is
+# written with an explicit "\t" rather than a literal tab in this source.
+_QSTAT_F_UNSCHEDULABLE = (
+    "Job Id: 12345.host_f\n"
+    "    Job_Name = runjob\n"
+    "    job_state = Q\n"
+    "    queue = compute\n"
+    "    Resource_List.nodes = 1:ppn=128\n"
+    "    Resource_List.walltime = 240:00:00\n"
+    "    comment = Not Running: Not enough of the right type of nodes are availab\n"
+    "\tle to run the job\n"
+    "Job Id: 12346.host_f\n"
+    "    Job_Name = running\n"
+    "    job_state = R\n"
+    "    exec_host = node02/0-127\n"
+    "    comment = Job started on Fri Aug 15 at 21:57\n"
+    "    resources_used.walltime = 02:00:00\n"
+    "    Resource_List.walltime = 240:00:00\n"
+)
+
+
+def test_parse_qstat_detail_reports_why_a_queued_job_has_not_started(
+    torque: TorqueDialect,
+) -> None:
+    detail = torque.parse_qstat_detail(_QSTAT_F_UNSCHEDULABLE)
+    assert detail["12345.host_f"].queued_reason == (
+        "Not Running: Not enough of the right type of nodes are available "
+        "to run the job"
+    )
+
+
+def test_parse_qstat_detail_does_not_call_a_running_comment_a_queued_reason(
+    torque: TorqueDialect,
+) -> None:
+    # Torque reuses `comment` for run-time annotations. Carrying one as a
+    # queued reason would have a running job explain why it is waiting.
+    assert torque.parse_qstat_detail(_QSTAT_F_UNSCHEDULABLE)[
+        "12346.host_f"
+    ].queued_reason is None
+
+
+def test_parse_qstat_detail_rejoins_a_wrapped_exec_host(
+    torque: TorqueDialect,
+) -> None:
+    # Torque wraps any long value, not just comments; a multi-node exec_host
+    # was previously truncated at the fold.
+    detail = torque.parse_qstat_detail(
+        "Job Id: 7.host_f\n"
+        "    job_state = R\n"
+        "    exec_host = node01/0-63+node02/0-63+node04/0-63+node05/0-6\n"
+        "\t3\n"
+    )
+    assert detail["7.host_f"].exec_host == (
+        "node01/0-63+node02/0-63+node04/0-63+node05/0-63"
+    )
+
+
+def test_torque_parse_poll_reasons_is_empty(torque: TorqueDialect) -> None:
+    # The coarse qstat table has no reason column; Torque answers on the
+    # detail poll instead.
+    assert torque.parse_poll_reasons(_QSTAT_TABLE) == {}
+
+
+def test_slurm_parse_poll_reasons_maps_pending_jobs(slurm: SlurmDialect) -> None:
+    assert slurm.parse_poll_reasons(_SQUEUE_TABLE) == {"124": "Priority"}
+
+
+def test_slurm_parse_poll_reasons_drops_the_running_placeholder(
+    slurm: SlurmDialect,
+) -> None:
+    # squeue prints the literal "None" for a job that is already running.
+    assert slurm.parse_poll_reasons(
+        "123|RUNNING|00:01|01:00:00|node001|None\n"
+    ) == {}
+
+
+def test_slurm_parse_poll_tolerates_a_delimiter_inside_the_reason(
+    slurm: SlurmDialect,
+) -> None:
+    # The reason is free text and trails the row, so a stray delimiter must
+    # land in the reason rather than failing the whole host's poll.
+    row = "125|PENDING|00:00|01:00:00||ReqNodeNotAvail, Reserved|maintenance\n"
+    assert slurm.parse_poll(row) == {"125": SchedulerPhase.PENDING}
+    assert slurm.parse_poll_reasons(row) == {
+        "125": "ReqNodeNotAvail, Reserved|maintenance"
+    }
 
 
 def test_slurm_parse_qstat_detail(slurm: SlurmDialect) -> None:
@@ -1055,3 +1149,41 @@ def test_slurm_satisfies_scheduler_dialect_protocol() -> None:
     assert dialect.poll_command(["1"])[0] == "squeue"
     assert dialect.detail_command("1")[0] == "sacct"
     assert dialect.cancel_command("1") == ["scancel", "1"]
+
+
+# --- lane width: warn, never refuse (vibe-qc#148 closure criterion 3) --------
+
+
+def test_width_warning_names_the_lane_and_both_numbers() -> None:
+    message = scheduler_width_warning(
+        128, 64, scheduler_host="host_f", partition="compute"
+    )
+    assert message is not None
+    assert "'host_f'" in message and "'compute'" in message
+    assert "at most 64" in message and "asks for 128" in message
+    # The point of the warning: the scheduler will take it anyway.
+    assert "may never start" in message
+
+
+@pytest.mark.parametrize(
+    ("requested", "maximum"),
+    [
+        (64, 64),  # exactly at the limit is fine
+        (32, 64),  # under it
+        (128, None),  # undeclared: None means unknown, never unlimited
+        (None, 64),  # no width asked for
+    ],
+)
+def test_width_warning_stays_quiet(
+    requested: int | None, maximum: int | None
+) -> None:
+    assert scheduler_width_warning(requested, maximum) is None
+
+
+def test_width_over_the_limit_warns_rather_than_raising() -> None:
+    # The deliberate asymmetry with enforce_scheduler_wall_time_limit: a
+    # declared width is a capacity observation and goes stale as nodes come
+    # back, so it must not refuse work the cluster can now run.
+    assert scheduler_width_warning(999, 1) is not None
+    with pytest.raises(DialectError):
+        enforce_scheduler_wall_time_limit(999, 1)

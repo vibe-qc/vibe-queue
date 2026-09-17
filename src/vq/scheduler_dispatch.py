@@ -49,7 +49,7 @@ import tarfile
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -867,6 +867,13 @@ class SchedulerPollEvidence:
 
     phases: dict[str, SchedulerPhase]
     explicitly_absent_job_ids: frozenset[str] = frozenset()
+    queued_reasons: dict[str, str] = field(default_factory=dict)
+    """The scheduler's verbatim "why is this not running" per pending job.
+
+    Populated only for dialects that carry the reason on the coarse poll
+    (Slurm's ``squeue %r``); Torque reports it on the detail poll instead, so
+    this stays empty there and the reason rides on ``QstatDetail``.
+    """
 
 
 @dataclass(frozen=True)
@@ -2412,6 +2419,7 @@ class SchedulerDispatcher:
         command = self.dialect.poll_command(ids)
         result = self.runner.run(command, check=False)
         live = self.dialect.parse_poll(result.stdout)
+        queued_reasons = self._poll_reasons(result.stdout)
         phases = {
             jid: _phase_for_polled_job(
                 jid,
@@ -2476,7 +2484,22 @@ class SchedulerDispatcher:
                         command, "poll failed", returncode=result.returncode, stderr=result.stderr
                     )
                 )
-        return SchedulerPollEvidence(phases, explicitly_absent)
+        return SchedulerPollEvidence(phases, explicitly_absent, queued_reasons)
+
+    def _poll_reasons(self, stdout: str) -> dict[str, str]:
+        """Pending reasons from one poll's stdout, never fatal to the poll.
+
+        Telemetry, not truth: a dialect that does not implement the hook, or
+        output this build cannot read, costs the operator an explanation but
+        must never turn a good observation into a failed one.
+        """
+        parse = getattr(self.dialect, "parse_poll_reasons", None)
+        if not callable(parse):
+            return {}
+        try:
+            return dict(parse(stdout))
+        except (DialectError, ValueError):
+            return {}
 
     def poll(self, handles: Iterable[SchedulerHandle]) -> dict[str, SchedulerPhase]:
         """Compatibility view of :meth:`poll_with_evidence`."""

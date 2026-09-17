@@ -16737,7 +16737,10 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
     source_path = fleet_rollout.rollout_state_path(host_e.rollout_id)
     paths = (source_path, current_path, scheduler_path)
     before = {path: path.read_bytes() for path in paths}
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             name: config.HostConfig(ssh=name, fleet_role="managed")
             for name in ("localhost", "host_a", "host_e", "host_c")
@@ -16760,17 +16763,18 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -17021,7 +17025,10 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
     assert current is not None
     assert current.legacy_failure_update_intent is not None
 
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             "localhost": config.HostConfig(ssh="localhost", fleet_role="managed"),
             "host_e": config.HostConfig(ssh="host_e", fleet_role="managed"),
@@ -17044,17 +17051,18 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",

@@ -969,6 +969,42 @@ def test_background_scheduler_detail_runner_errors_are_host_local(
     assert healthy_on_disk.scheduler_state == "running"
 
 
+def test_scheduler_queued_reason_is_recorded_then_cleared_when_it_starts(
+    daemon: Daemon,
+) -> None:
+    # vibe-qc#148: the scheduler's own "why" reached vq on every detail poll
+    # and was dropped, so a request that could never be satisfied looked
+    # exactly like one merely waiting its turn -- for six days.
+    unschedulable = (
+        "Not Running: Not enough of the right type of nodes are available "
+        "to run the job"
+    )
+    mock = MockDispatcher(
+        submit_id="12345.cluster",
+        phase=SchedulerPhase.PENDING,
+        detail=QstatDetail(raw_state="Q", queued_reason=unschedulable),
+    )
+    _inject(daemon, mock)
+    daemon._start_scheduler_job(_submit_scheduler(daemon, "queued-vq"))
+
+    daemon._reconcile_scheduler()
+
+    queued = JobSpec.read(daemon._spec_path("queued-vq"))
+    assert queued.scheduler_state == "queued"
+    assert queued.scheduler_queued_reason == unschedulable
+
+    # Once the job starts, the explanation is stale: keeping it would have a
+    # running job still explaining why it is waiting.
+    mock.phase = SchedulerPhase.RUNNING
+    mock.detail = QstatDetail(raw_state="R", exec_host="node02/0-127")
+    daemon._reconcile_scheduler()
+
+    started = JobSpec.read(daemon._spec_path("queued-vq"))
+    assert started.scheduler_state == "running"
+    assert started.scheduler_exec_host == "node02/0-127"
+    assert started.scheduler_queued_reason is None
+
+
 def test_background_status_refresh_rejects_a_pre_request_flight(
     daemon: Daemon,
 ) -> None:
@@ -981,34 +1017,48 @@ def test_background_status_refresh_rejects_a_pre_request_flight(
     daemon._background_scheduler_polling = True
 
     daemon._reconcile_scheduler()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while mock.detail_polled < 1:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+    # The poll counter advances before the worker publishes its result. Wait
+    # for publication so the next reconcile really consumes the old flight.
+    assert daemon._scheduler_poll_flights[mock].done.wait(_LIVENESS_SECONDS)
 
+    budget = min(_LIVENESS_SECONDS, daemon_mod.SCHEDULER_STATUS_RPC_MAX_SECONDS)
     results: list[dict[str, object]] = []
     request = threading.Thread(
         target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("refresh-vq", 1.0)
+            daemon.request_scheduler_status_refresh("refresh-vq", budget)
         )
     )
     request.start()
-    while daemon._scheduler_refresh_requested < 1:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+    try:
+        deadline = time.monotonic() + budget
+        while daemon._scheduler_refresh_requested < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
 
-    daemon._reconcile_scheduler()  # consume the pre-request flight
-    assert request.is_alive()
-    daemon._reconcile_scheduler()  # start the post-request flight
-    while mock.detail_polled < 2:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
+        daemon._reconcile_scheduler()  # consume the pre-request flight
+        # Check the acknowledgement state under its lock. Thread.is_alive()
+        # alone can pass when a wrongly acknowledged waiter has not run yet.
+        with daemon._scheduler_refresh_condition:
+            assert daemon._scheduler_refresh_requests == {1: "refresh-vq"}, results
+            assert daemon._scheduler_refresh_results == {}, results
+        daemon._reconcile_scheduler()  # start the post-request flight
+        assert daemon._scheduler_poll_flights[mock].done.wait(budget)
+        daemon._reconcile_scheduler()
+        request.join(timeout=budget)
+
+        assert not request.is_alive(), results
+        assert len(results) == 1, results
+        assert results == [{
+            "schema": "vq.scheduler.status_refresh/1",
+            "completed": True,
+            "observed_at": results[0].get("observed_at"),
+        }]
+        assert isinstance(results[0]["observed_at"], str)
+    finally:
+        daemon.stop()
+        request.join(timeout=budget)
 
     assert not request.is_alive()
-    assert results[0]["completed"] is True
-    assert isinstance(results[0]["observed_at"], str)
 
 
 def test_scheduler_status_refresh_times_out_without_a_new_poll(

@@ -33,6 +33,10 @@ _FORMATS = ("text", "json")
 # The digest covers every byte of the normalized public return, including JSON
 # indentation and key ordering. Scheduler snapshots intentionally include the
 # additive bounded-refresh audit introduced for BUG107.
+# The json digests moved once more for the additive `scheduler_queued_reason`
+# (vibe-qc#148): every payload gains exactly that one nullable key and nothing
+# else, which is why the text digests are unchanged -- the line renders only
+# for a queued job that has a reason.
 # To update one, temporarily replace that digest with zeros and run the focused
 # case: the assertion prints the complete normalized output and new digest for
 # review.  Never update a digest without reviewing that output diff.
@@ -44,13 +48,13 @@ _OUTPUT_SHA256 = {
     ("dependency", "text"): "fe02636c0c1059904f8327bb01cfef64adac9bc9b0ce9ab9ddb4ca51e2fb3cba",
     ("qvf", "text"): "206afbcf785783de46ee3ae4ec62a653a502d435a435dcc579d4e046a59cbf3d",
     ("terminal", "text"): "4f7442bf729216211947120167be895fee74a44c4144e394ca04f72ba7e59667",
-    ("pending", "json"): "20866e675cd35b47e1e0fa41b28b77cf889175f2a08eee3e897075390619dfa2",
-    ("running", "json"): "90c9bc4d6f45d879bbfe8a5bbb1b210f70f8ea36b557d697f1adbe47253d69f6",
-    ("scheduler", "json"): "182bc0d73dd925ede0a9a6405306df389e04278038223f8faa6b064866ac1f36",
-    ("archived", "json"): "7b67031e095a4f1903f982550f1e6eea56bb1e5a62a597e1bdf4c2a40e2880d5",
-    ("dependency", "json"): "40c16ab38127b14b48b2a3786afe4e5613e295819c1016a2cb8e4f596c747601",
-    ("qvf", "json"): "61f952e584f8058fd1957934e22ca7c2ab266ea6ae64bcbce3b2a296d482fc5e",
-    ("terminal", "json"): "c672f5bc65472c990c6d0e6c651f61b6abeabe711edc222ca697cdf4e5c36f26",
+    ("pending", "json"): "71ccf4324fa6a40ae9bbe00e9dbbf858f6403738893b5e8ccfe2eaf395e16fed",
+    ("running", "json"): "de9f420bfa9f1b79276d2441ac44bf019e14f4fbfdcba8f67ff263a2793f2b2e",
+    ("scheduler", "json"): "541c69f96f10eb33f1552436441493e6c0219ee3cc65f3ffa7d598bb43fd7fd4",
+    ("archived", "json"): "a886521c60c75a5ed411e009e8f036034bcf0fe32dae9bcf90dae433c44e5b4d",
+    ("dependency", "json"): "b945bc9b257bc63414abbb4a5f41465462828536235a7a632227d5ee2d3b2651",
+    ("qvf", "json"): "0ffce32262b888c8409238af999448e6530444af937f7b5e29e98222a237c2f9",
+    ("terminal", "json"): "0920d4c3b8fae4e49dfc67ec9ec25fd8ea35fb72d107043e928c257defddda8e",
 }
 
 

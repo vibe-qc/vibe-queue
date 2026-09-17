@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -522,13 +523,18 @@ def test_descendant_last_close_retains_lock_after_parent_context_exits(
             os.waitpid(child_pid, 0)
 
 
+@pytest.mark.parametrize("external_reports", [False, True])
 def test_reentry_subprocess_adopts_both_fences_without_parent_close_gap(
     tmp_path: Path,
+    external_reports: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     prog = _real_program(tmp_path)
     checkout = Path(prog.git_dir).resolve()
     target = Path(prog.python).parent.parent.resolve()
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
+    extra = (("checkout", str(reports)),) if external_reports else ()
     state_root = tmp_path / "state"
     monkeypatch.setattr(fleet_rollout.paths, "state_root", lambda: state_root)
     rollout_id = "v0.24.0-reentry-no-gap"
@@ -551,7 +557,9 @@ def test_reentry_subprocess_adopts_both_fences_without_parent_close_gap(
     try:
         stack.enter_context(fleet_rollout.rollout_execution_lock(rollout_id))
         stack.enter_context(
-            admin.toolset_lifecycle_lock([prog], action="test-reentry-parent")
+            admin.toolset_lifecycle_lock(
+                [prog], action="test-reentry-parent", extra_resources=extra,
+            )
         )
         lifecycle_handoff, _ = admin._active_toolset_lifecycle_handoff()
         resources = admin._active_toolset_lifecycle_resources()
@@ -562,6 +570,7 @@ def test_reentry_subprocess_adopts_both_fences_without_parent_close_gap(
             )
         )
         script = r'''
+import json
 import os
 import sys
 from pathlib import Path
@@ -569,7 +578,7 @@ from vq import admin, config, fleet_rollout
 
 rollout_id, checkout, target = sys.argv[1:4]
 ready_fd, release_fd = map(int, sys.argv[4:6])
-resources = (("checkout", checkout), ("target", target))
+resources = tuple(map(tuple, json.loads(sys.argv[6])))
 prog = config.VenvProgram(
     kind="venv",
     python=str(Path(target) / "bin" / "python"),
@@ -603,6 +612,7 @@ with fleet_rollout.adopt_rollout_reentry_handoff(
                 str(target),
                 str(ready_write),
                 str(release_read),
+                json.dumps(resources),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -635,6 +645,15 @@ with fleet_rollout.adopt_rollout_reentry_handoff(
         assert lifecycle_contender.returncode != 0
         assert "already active on this checkout" in lifecycle_contender.stderr
 
+        if external_reports:
+            with (
+                pytest.raises(admin.AdminError, match="owns checkout"),
+                admin.toolset_lifecycle_lock(
+                    [], action="report-contender", extra_resources=extra,
+                ),
+            ):
+                pytest.fail("report store lock was lost across controller reentry")
+
         os.write(release_write, b"1")
         os.close(release_write)
         release_write = -1
@@ -653,10 +672,13 @@ with fleet_rollout.adopt_rollout_reentry_handoff(
         assert lifecycle_released.returncode == 0, (
             lifecycle_released.stdout + lifecycle_released.stderr
         )
-        assert resources == (
+        assert resources == tuple(sorted((
             ("checkout", str(checkout)),
             ("target", str(target)),
-        )
+            *extra,
+        )))
+        with admin.toolset_lifecycle_lock([], action="report-released", extra_resources=extra):
+            pass
     finally:
         stack.close()
         for fd in (ready_read, ready_write, release_read, release_write):

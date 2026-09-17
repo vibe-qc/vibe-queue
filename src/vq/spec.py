@@ -520,6 +520,12 @@ class JobSpec(BaseModel):
     scheduler_exec_host: str | None = None
     scheduler_walltime_used: str | None = None
     scheduler_walltime_limit: str | None = None
+    # The scheduler's own verbatim explanation for a job that has not started
+    # -- Torque's `qstat -f` comment, Slurm's squeue Reason. Set while the
+    # cluster job is queued and cleared the moment it is not, so this never
+    # answers "why is it waiting" for a job that is already running. None for
+    # local jobs, and for a queued job whose scheduler offers no explanation.
+    scheduler_queued_reason: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     # Optional liveness timestamp introduced with schema v2. Current scheduler

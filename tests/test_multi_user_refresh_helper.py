@@ -7,10 +7,12 @@ the release runbook supplies the real-host acceptance proof.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -25,6 +27,10 @@ DEPLOY = CONTRIB / "deploy-multi-user.sh"
 SUDOERS = CONTRIB / "vq-multi-user-refresh.sudoers"
 RUNTIME_LOCK = CONTRIB / "vq-multi-user-runtime-requirements.txt"
 LIFECYCLE_HELPER = Path(__file__).parents[1] / "scripts" / "_lifecycle_lock.sh"
+
+# Budget for waiting on a helper subprocess. A liveness guard, not a timing
+# claim (#41): it has to cover an interpreter start on a loaded machine.
+_LIVENESS_SECONDS = 30.0
 
 
 def _text(path: Path) -> str:
@@ -914,12 +920,14 @@ def test_migration_operation_lock_excludes_a_second_deploy(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        # The holder shell parks in `sleep 30` to keep the lock held, so the
+        # teardown has to reap a group, not a process. See the `finally`.
+        start_new_session=True,
     )
     try:
-        for _ in range(100):
-            if ready.exists():
-                break
-            if holder.poll() is not None:
+        deadline = time.monotonic() + _LIVENESS_SECONDS
+        while not ready.exists() and holder.poll() is None:
+            if time.monotonic() > deadline:
                 break
             time.sleep(0.01)
         assert ready.exists(), holder.stderr.read() if holder.stderr else ""
@@ -942,8 +950,16 @@ def test_migration_operation_lock_excludes_a_second_deploy(
         assert contender.returncode != 0
         assert contender.stdout.strip() == "busy"
     finally:
-        holder.terminate()
-        holder.communicate(timeout=10)
+        # Kill the group. `holder.terminate()` signals only the shell, and
+        # whether that shell forks `sleep 30` or execs it is a bash-version
+        # detail: bash 5 replaces itself, bash 3.2 (macOS) forks. On the
+        # forking shell SIGTERM kills the shell alone, the `sleep` is
+        # reparented to init still holding the inherited stdout/stderr
+        # pipes, and communicate() then blocks on EOF for the rest of the
+        # 30 s (#58). An exiting group answers EPERM on Darwin (#27).
+        with contextlib.suppress(OSError):
+            os.killpg(holder.pid, signal.SIGKILL)
+        holder.communicate(timeout=_LIVENESS_SECONDS)
 
     cleanup = script[script.index("cleanup() {") : script.index("user_python() {")]
     assert '[ "$migration_operation_locked" = "1" ]' in cleanup

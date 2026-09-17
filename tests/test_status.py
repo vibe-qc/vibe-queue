@@ -761,6 +761,75 @@ class TestSchedulerStatus:
             "(scheduler handoff time, not node start)"
         ) in out
 
+    def test_scheduler_queued_reason_is_shown_next_to_the_queued_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # vibe-qc#148: five ppn=128 jobs sat queued for six days because the
+        # only nodes that wide were one busy and one down. The scheduler said
+        # so on every poll; vq showed "queued" and nothing else.
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-30T15:19:15.097243+00:00",
+            scheduler_target="host_f-big",
+            scheduler_job_id="23350.cluster.example",
+            scheduler_state="queued",
+            scheduler_queued_reason=(
+                "Not Running: Not enough of the right type of nodes are "
+                "available to run the job"
+            ),
+        )
+
+        out = show_status("localhost", "abc", queue_dir=queue)
+
+        assert (
+            "queued_why:   Not Running: Not enough of the right type of "
+            "nodes are available to run the job"
+        ) in out
+
+    def test_scheduler_queued_reason_is_carried_in_status_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-30T15:19:15.097243+00:00",
+            scheduler_target="host_f-big",
+            scheduler_job_id="23350.cluster.example",
+            scheduler_state="queued",
+            scheduler_queued_reason="Resources",
+        )
+
+        payload = json.loads(show_status_json("localhost", "abc", queue_dir=queue))
+
+        assert payload["scheduler_queued_reason"] == "Resources"
+
+    def test_a_running_job_shows_no_queued_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-25T10:00:00+00:00",
+            scheduler_target="host_f",
+            scheduler_job_id="555.cluster",
+            scheduler_state="running",
+            scheduler_exec_host="node07/0-19",
+        )
+
+        out = show_status("localhost", "abc", queue_dir=queue)
+
+        assert "queued_why:" not in out
+
     def test_scheduler_queued_status_json_exposes_effective_state(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

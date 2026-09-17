@@ -4074,6 +4074,7 @@ class TestAllHostsAggregation:
         assert payload["scheduler_lane"] == {
             "partition": "compute",
             "max_wall_time_seconds": 28_800,
+            "max_cpus": None,
             "source": "host-config",
         }
 
@@ -4109,6 +4110,7 @@ class TestAllHostsAggregation:
                 "scheduler_lane": {
                     "partition": "compute",
                     "max_wall_time_seconds": 28_800,
+                    "max_cpus": None,
                     "source": "host-config",
                 },
             }

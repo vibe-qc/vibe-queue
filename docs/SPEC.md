@@ -90,6 +90,15 @@ proposal is retired: external schedulers use a current parallel execution path.
    * `--auto-resume` is an explicit policy for a local RUNNING job lost across
      reboot. When eligible, it emits a sibling spec in the same workspace with
      lineage recorded; it is never an implicit default.
+   * **The reattachment pass is interruptible.** The daemon installs its stop
+     handlers before the pass, not after it, and the pass gives up at the next
+     spec boundary once a stop is requested. On a large queue the pass runs for
+     minutes, and a stop that had to wait for it would be escalated to
+     `SIGKILL` by the service manager. A spec the pass never reached keeps its
+     entry state and is reconciled by the next daemon start; a spec it did
+     reach is reconciled and persisted, including any `--auto-resume` sibling
+     it earned. A daemon stopped inside the pass exits without publishing its
+     RPC socket, so no reader mistakes it for a daemon that came up.
 3. **Durable record before execution.** The workspace and JobSpec exist before
    local process launch or remote scheduler submission. A crash in an
    acknowledgement window can leave an unowned process or scheduler job, but
@@ -440,8 +449,15 @@ repeating its Pydantic type declaration.
 - **Scheduler execution:** `scheduler_target`, `scheduler_job_id`,
   `scheduler_state`, `scheduler_remote_workspace_cleaned_at`,
   `scheduler_exec_host`, `scheduler_walltime_used`,
-  `scheduler_walltime_limit`. These remain `None` or inapplicable for local
-  execution; scheduler jobs do not populate the local PID fields.
+  `scheduler_walltime_limit`, `scheduler_queued_reason`. These remain `None`
+  or inapplicable for local execution; scheduler jobs do not populate the
+  local PID fields. `scheduler_queued_reason` is the batch scheduler's own
+  verbatim explanation for a job it has not started (Torque's `qstat -f`
+  `comment`, Slurm's `squeue` `Reason`). It is set only while the cluster job
+  is queued and cleared as soon as it is not, so a consumer may read a
+  present value as "this is why the job is still waiting" without checking
+  how fresh it is. A queued job whose scheduler offers no explanation keeps
+  `None`; absence therefore means "not reported", never "no reason".
 - **Dependencies, retries, and grouping:** `depends_on`, `depends_on_any`,
   `retry_max`, `retry_count`, `array_index`, `array_total`, `array_group_id`,
   `chain_index`, `chain_total`, `chain_group_id`,
@@ -925,6 +941,13 @@ waits for the group to become empty, because unreaped zombie members answer a
 liveness probe and a container's PID 1 need not reap them: the `SIGKILL` is
 the last thing vq does for the job, and the budget is released with it. Across
 a daemon restart the equivalent reap is the startup scan of Section 4.7.
+
+A job reattached while still running can also be killed after the restart.
+When reconciliation first observes its terminal spec, it starts the same
+10-second grace and keeps the orphan's resource reservation. At expiry it
+sends `SIGCONT` and `SIGKILL` to the process group captured at reattachment,
+stops any job scope, and releases the reservation without waiting for zombie
+members to disappear. An observed group exit releases the reservation sooner.
 
 A separate host-pressure pass reads Linux memory pressure. At the current
 internal defaults it pauses local running jobs at 85 percent pressure, holds

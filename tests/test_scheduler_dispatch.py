@@ -1749,10 +1749,10 @@ def test_poll_accepts_unique_torque_truncated_job_id() -> None:
 
 def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     squeue_table = textwrap.dedent("""\
-        123_0|PENDING|00:00|01:00:00|(Priority)
-        123_1|RUNNING|00:01|01:00:00|node001
-        124_0|PENDING|00:00|01:00:00|(Priority)
-        125_0|COMPLETED|00:10|01:00:00|node002
+        123_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        123_1|RUNNING|00:01|01:00:00|node001|None
+        124_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        125_0|COMPLETED|00:10|01:00:00|node002|None
     """)
 
     def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
@@ -1778,10 +1778,58 @@ def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     assert runner.first("squeue").argv == [
         "squeue",
         "--noheader",
-        "--format=%i|%T|%M|%l|%N",
+        "--format=%i|%T|%M|%l|%N|%r",
         "--jobs",
         "123,124,125,126",
     ]
+
+
+def test_slurm_poll_evidence_carries_why_a_job_is_still_queued() -> None:
+    # vibe-qc#148: the poll already knew; nothing carried it to the operator.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(
+                0,
+                "123|PENDING|00:00|01:00:00||Resources\n"
+                "124|RUNNING|00:01|01:00:00|node001|None\n",
+                "",
+            )
+        return None
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    evidence = dispatcher.poll_with_evidence(
+        [SchedulerHandle("123", "/ws/123"), SchedulerHandle("124", "/ws/124")]
+    )
+
+    assert evidence.queued_reasons == {"123": "Resources"}
+
+
+def test_poll_evidence_survives_a_dialect_without_reason_support() -> None:
+    # A reason is telemetry: a dialect that cannot supply one must cost the
+    # operator an explanation, never a failed observation.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(0, "123|RUNNING|00:01|01:00:00|node001|None\n", "")
+        return None
+
+    class _NoReasonHook:
+        """A dialect from before the reason hook existed."""
+
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            if name == "parse_poll_reasons":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    dispatcher.dialect = _NoReasonHook(dispatcher.dialect)  # type: ignore[assignment]
+
+    evidence = dispatcher.poll_with_evidence([SchedulerHandle("123", "/ws/123")])
+
+    assert evidence.phases == {"123": SchedulerPhase.RUNNING}
+    assert evidence.queued_reasons == {}
 
 
 def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
@@ -1789,7 +1837,7 @@ def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
         if argv and argv[0] == "squeue":
             return RemoteResult(
                 0,
-                "123|RUNNING|00:01|01:00:00|node001\n",
+                "123|RUNNING|00:01|01:00:00|node001|None\n",
                 "",
             )
         return None
@@ -1857,7 +1905,7 @@ def test_slurm_poll_isolates_an_explicitly_invalid_id_from_live_siblings() -> No
             if requested == "123":
                 return RemoteResult(
                     0,
-                    "123|RUNNING|00:01|01:00:00|node001\n",
+                    "123|RUNNING|00:01|01:00:00|node001|None\n",
                     "",
                 )
             if requested == "999":

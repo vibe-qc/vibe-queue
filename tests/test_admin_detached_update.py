@@ -950,6 +950,55 @@ class TestDelegation:
         assert admin_detached.validate_run_id(run_id_box[0])
         assert calls[1][:3] == ("admin", "observe-update", run_id_box[0])
 
+    def test_observing_a_remote_run_names_the_host_it_lives_on(
+        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--host H` observes H, whatever H's own `default_host` says (#57).
+
+        The first hop honours the caller. Without an explicit destination the
+        target's own CLI resolves *its* `default_host` and delegates a second
+        time, so a run that completed on H reads back as `missing` from a
+        machine that never heard of it -- a wrong-host read wearing the mask
+        of a lost receipt. The driver's own poller already says `localhost`
+        for this reason; the command has to say it too.
+        """
+        calls: list[tuple[str, ...]] = []
+
+        def fake(host_cfg, *vq_args, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append(tuple(vq_args))
+            return subprocess.CompletedProcess(
+                args=["ssh"], returncode=0, stdout="{}\n", stderr=""
+            )
+
+        monkeypatch.setattr(transport, "run_remote_vq", fake)
+        run_id = admin_detached.new_run_id()
+        result = CliRunner().invoke(
+            main,
+            [
+                "admin",
+                "observe-update",
+                run_id,
+                "--host",
+                "host_b",
+                "--offset",
+                "4096",
+                "--max-bytes",
+                "8192",
+                "--json",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1, calls
+        forwarded = calls[0]
+        assert forwarded[:3] == ("admin", "observe-update", run_id)
+        assert forwarded[forwarded.index("--host") + 1] == "localhost"
+        # The rest of the read travels unchanged: a follower's offset window
+        # and its JSON shape are the caller's, not the target default's.
+        assert forwarded[forwarded.index("--offset") + 1] == "4096"
+        assert forwarded[forwarded.index("--max-bytes") + 1] == "8192"
+        assert "--json" in forwarded
+
     def test_a_lost_launch_response_is_adopted_by_run_id(
         self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, no_sleep: None
     ) -> None:

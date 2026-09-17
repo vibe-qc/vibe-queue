@@ -17,6 +17,206 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+## [0.26.9] - 2026-09-17 - "Raymond's Bazaar"
+
+### Added
+
+- `vq submit` now warns when a scheduler request is wider than its lane can
+  ever run, against a new operator-declared `scheduler_max_cpus` per scheduler
+  host. It **warns and submits** rather than refusing: a declared width is a
+  capacity observation and goes stale as nodes return to service, so refusing
+  on it would reject work the cluster can now run. Until now this path emitted
+  nothing at all for a scheduler target, so an unsatisfiable request was
+  accepted in silence. `vq scheduler-probe` reports the figure to declare
+  (vibe-qc#148).
+
+- `vq scheduler-probe HOST` now reports **schedulable capacity** for PBS and
+  SLURM hosts, from `pbsnodes -a` / `sinfo -N`: the largest request that could
+  start now, the largest the usable nodes could ever run, and the same pair per
+  partition or node property, with a per-node width/free/state census. A node
+  that is merely busy is distinguished from one the scheduler cannot use at
+  all, and the report warns when an unusable node is wider than anything still
+  runnable — the shape of a request that will queue forever. An unreadable
+  census reports `error` and claims nothing (vibe-qc#148).
+
+- `vq status` now reports **why** a scheduler job has not started, as
+  `queued_why` in the text output and `scheduler_queued_reason` in `--json`.
+  The string is the scheduler's own: Torque's `qstat -f` `comment`, Slurm's
+  `squeue` `Reason`. It is shown only while the cluster job is queued and is
+  cleared the moment it starts, so it never explains a running job.
+
+### Fixed
+
+- **Uploaded runtime-source stages were never removed, and the prune verb could
+  not see them.** A scheduler build host that cannot reach the source
+  repository has the exact commit uploaded to it, about 110 MB per deploy,
+  under `<scratch_root>/.vq-admin/runtime-source/<program>/<sha>-<uuid>/`.
+  Nothing removed those after the build had consumed them. On the SLURM host
+  235 had accumulated since July, 26 GB, and together with job output they
+  pushed a shared ~100 GB home **over quota**: every write failed, down to a
+  bare `mkdir`. `vq source-stage-prune` was no help either -- it reads only
+  `STAGE_ROOT/generations/<name>`, and these stages have no `generations` level,
+  so it reported `removed=0` for them. A deploy that verifies now removes its
+  own stage, and a deploy that fails keeps its own for forensics while older
+  ones are trimmed to `RUNTIME_SOURCE_STAGES_TO_KEEP` (3), so failures cannot
+  accumulate either. This is deliberately **not** the rule for helper staging
+  generations, which are still retained and still pruned only by an operator:
+  another deployment may be using an older one, whereas a source-upload stage
+  belongs to exactly one deploy and nothing reads it once the build is done.
+  Nothing in the deploy path calls the prune verb on the host. Failing to
+  reclaim never fails a deploy that verified; it is recorded on the result and
+  logged. `vq source-stage-prune --runtime-source` is the operator-facing form
+  for what older vq left behind, and both forms still only remove a directory
+  named exactly `<40 hex>-<32 hex>`. (#61)
+- **A job state could be named on the vibe-qc.com pages with nothing watching
+  it.** `tests/test_vibeqc_site_job_states.py` reads only sentences that
+  mention a *state*, deliberately: a sentence is the one filter that does not
+  reduce to "names in the enum are in the enum", which is the defect `b5953c2`
+  fixed. Its other two checks read only the tutorial's lifecycle block and
+  `queue.md`'s terminal list, so between them they cover the terminal states
+  and nothing else. A non-terminal state -- `pending`, `submitting`,
+  `submit_outcome_unknown`, `running`, `suspended` -- named in a sentence that
+  never says "state" was therefore guarded by nothing, and a later rename in
+  `vq.spec.JobState` would have left the page reading as current with every
+  test passing. Found while independently verifying `b5953c2` for the
+  validation #39 asks for. No page was actually unguarded: all 13 states they
+  name are covered today, and the three mentions that already sit outside a
+  readable sentence are of terminal states pinned elsewhere. A fourth check
+  now asserts that property directly, so the hole cannot open quietly, and
+  `docs/vibe-qc-site/README.md` states the constraint it puts on how the pages
+  are written. Widening the existing check instead would need a list of every
+  backticked non-state identifier in the prose, twenty today, including the
+  `cancelled` that the README names precisely because vq does not produce it.
+  (#39)
+
+- **A daemon stopped during its startup walk died ungracefully** (#53). Before
+  answering RPC, the daemon reconciles every spec on disk, which on a
+  driver-sized queue runs for minutes. Its `SIGTERM`/`SIGINT` handlers were
+  installed only *after* that pass, so for its entire duration a stop met the
+  default disposition and killed the process outright -- `vq daemon stop`,
+  `systemctl --user stop` and `launchctl bootout` all ended in an instant
+  death with no shutdown and nothing in the daemon log. The window that most
+  needed a handler was the one window that had none, and a self-update whose
+  health check expired mid-walk rolled back by removing a daemon that could
+  not stop gracefully. The handlers now go on before the pass, and the pass
+  gives up at the next spec boundary once a stop is requested, because
+  `vq daemon stop` waits 10 s and both service managers escalate to `SIGKILL`
+  on their own timeouts. A spec the pass never reached keeps its entry state
+  for the next start; one it did reach stays reconciled, including any
+  `--auto-resume` sibling. A daemon stopped this way exits without publishing
+  its RPC socket, so an updater polling for readiness cannot mistake it for a
+  daemon that came up.
+
+- **The daemon's pause-intent sweep was sized by every job the host had ever
+  run.** Once per tick the daemon finishes any durable pause intent left by a
+  killed `vq pause`, and it did so by taking each spec's lock and loading the
+  authorization config before looking at the row -- for every spec in the
+  queue. A queue retains its terminal jobs, so on a long-lived driver that is
+  three file opens per finished job per tick to discover that a finished job
+  carries no intent, and it ran even in single-user mode, where the ownership
+  check is documented as a no-op. Because the config is parsed and validated
+  per row, the cost also scaled with the number of hosts declared in it. The
+  daemon's sweep now reads each row first and skips the ones with no intent to
+  finish; a row that carries one, and a row that cannot be read at all, still
+  go through the locked and authorized path unchanged. Specs are published by
+  atomic replace, so the unlocked read always sees one whole record, and an
+  intent armed concurrently is reconciled by the next tick exactly as one
+  armed a moment later already was. **The saving is opt-in and off by
+  default**: `pause_token_scope_with_proof` reconciles before it captures, and
+  an exact admission proof still scans every row under its lock, including
+  terminal rows. Over 20,000 retained terminal specs and a 40-host config
+  (`scripts/benchmark_pause_intent_sweep.py`) the sweep drops from a median
+  6.125 s to 0.666 s, a 9.20x speedup, and stops opening and flocking 20,000
+  lock sidecars per tick; against an empty config it is 1.761 s to 0.655 s,
+  2.69x. This is one of the three full queue scans in a tick; the other two,
+  and retained history on the admission path itself, are still open. (#22)
+
+- **A bulk pause or resume paid the whole authorization cost once per retained
+  job.** An ownership decision has two halves: a uid comparison that depends on
+  the job row, and the policy behind it, which does not. Resolving that policy
+  is the entire expense -- it reads and validates the personal and system
+  configs and, in multi-user mode, resolves the caller's group and passwd
+  entries through NSS. `vq pause --all`, `vq resume --all`, `pause --provides`,
+  the scheduler-wide variants and the pause-token proofs all resolved it again
+  for every row they checked, and a queue retains its terminal jobs. On a
+  driver that had run 16,000 jobs that is 16,000 config parses per verb, and on
+  a multi-user host 32,000 NSS lookups, to reach the same verdict every time --
+  paid in full by `vq admin update`, which pauses the queue before it starts.
+  Each verb now resolves the policy **once for the operation** and checks every
+  row against it. The rows checked, the order, the verdicts and the messages
+  are unchanged, the final verdict is still taken under the row's own lock, and
+  an unreadable or invalid policy still stops the verb -- now before it takes
+  its first lock rather than on its first row. A caller that passes no policy,
+  which is every single-job verb, resolves one per check exactly as before.
+  Over 16,000 retained terminal specs and a 40-host config
+  (`scripts/benchmark_bulk_control_authorization.py`) the filter drops from a
+  median 4.020 s to 0.516 s, a 7.79x speedup; against a one-host config it is
+  1.127 s to 0.462 s, 2.44x. What remains in both figures is reading the
+  retained specs themselves, which is the part of #22 that is still open. (#22)
+
+- **Ownership checks deep-copied the whole parsed policy on every call**,
+  so any loop that authorizes row by row scaled that copy with the number
+  of rows. The config reader now copies only TOML's mutable containers,
+  dicts and lists, and shares its immutable scalars. Complete policy bytes
+  are still read and still validated on every call, and callers and
+  validators still receive independent containers, so revocation and
+  read-error behaviour are unchanged. A synthetic 17,000-check, 40-host
+  comparison (`scripts/benchmark_queue_policy.py`) measured a median
+  5.479 s before and 3.651 s after — 0.322 s down to 0.215 s per 1,000
+  checks, a 1.50x speedup. This measures the policy check only, not
+  end-to-end admission: per-call validation, now the larger remaining
+  term, and retained terminal history are still open. (#22)
+
+- A queued scheduler job gave no reason for waiting, so a request that could
+  never be satisfied was indistinguishable from one merely next in line. vq
+  already fetched Torque's explanation with every detail poll and discarded
+  it; on a cluster where full-node requests outlived the only nodes that wide,
+  jobs sat queued for six days while the reason was on the wire the whole
+  time. The Torque detail parser now also rejoins values that Torque wrapped
+  across lines, which additionally repairs a multi-node `exec_host` that was
+  previously truncated at the fold (vibe-qc#148).
+
+- **A backgrounding command's dispatch helper no longer pins a coin flip**
+  (#46). In `tests/test_terminal_reaping.py`, `_dispatch_started` asserted
+  `RUNNING` for every caller once the job's lock appeared, but
+  `_BACKGROUNDING_COMMAND` hands the lock to a background child and then exits
+  by design. That whole chain can complete inside the one `iterate()` that
+  runs while the helper is between two checks of `started`, and
+  `_reconcile_running()` leads that pass, so the spec the helper then read was
+  already `COMPLETED` and the setup failed before the test reached what it
+  pins. A new `command_exits` flag accepts either state for such a caller; the
+  default stays strict for commands that hold the lock themselves, and the
+  test's own claim -- a normal wrapper exit leaves background members alone --
+  is unchanged. Test-only.
+
+- Escalate killed reattached local jobs to `SIGKILL` after their grace period,
+  so a command that ignores `SIGTERM` cannot run indefinitely after a daemon
+  restart. Keep its resource reservation until exit or escalation (#18).
+
+- `vq admin observe-update RUN --host HOST` now observes the host it was
+  given. It forwarded the read without naming a destination, so a target
+  whose own `default_host` pointed at a third machine delegated the
+  observation onward and answered `missing` for a run that had completed
+  successfully where it was launched. The delegated read now names
+  `localhost` explicitly, as the update launch and the driver's own poller
+  already did, and keeps the caller's offset, chunk size and JSON shape (#57).
+
+- Stabilize the background scheduler-refresh regression test under load by
+  using a consistent liveness budget and waiting for published poll results.
+  Check stale-poll rejection independently of waiter thread timing (#48).
+
+- Reap the whole holder process group in the multi-user migration
+  operation-lock test, instead of signalling the holder shell alone. On a
+  bash that forks its last command — 3.2, as macOS ships — `SIGTERM` killed
+  only the shell and left its `sleep` reparented to init, still holding the
+  inherited stdout and stderr pipes, so the teardown's `communicate()`
+  blocked on EOF until that sleep ended and the test failed deterministically
+  on Darwin while staying green on CI's bash 5. The readiness wait is now a
+  monotonic liveness deadline rather than a fixed 1 s spin that had to cover
+  an interpreter start (#58).
+
+## [0.26.8] - 2026-09-16 - "Raymond's Bazaar"
+
 ### Changed
 
 - Read accepted fleet reports from explicit external `fleet_report_repo`
