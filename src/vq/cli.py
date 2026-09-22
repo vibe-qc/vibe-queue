@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 
 import click
 
@@ -97,6 +97,7 @@ from vq.doctor import (
     scheduler_probe_check_from_payload as _scheduler_probe_check_from_payload,  # noqa: F401
 )
 from vq.fetch import (
+    FETCH_EXCLUSIONS_SIDECAR,
     BulkFetchResult,
     bulk_fetch,
     emit_artifact_tar,
@@ -110,6 +111,7 @@ from vq.fetch import (
     fetch_workdir_remote,
     mark_terminal_fetch,
     prepare_remote_bulk_fetch,
+    read_fetch_exclusions,
     require_fresh_fetch_manifest,
     require_workspace_artifact_selection,
 )
@@ -176,6 +178,7 @@ from vq.spec import (
     JobState,
     ProgramRuntimePin,
     signal_name_for_exit,
+    utcnow_iso,
 )
 from vq.spec_access import resolve_authorized_spec
 from vq.status import (
@@ -2122,6 +2125,36 @@ def _delegate_job_lookup(
         raise
 
 
+def _binary_stdout() -> IO[bytes]:
+    """Return a byte sink for this process's stdout, without asking Click.
+
+    Replaces ``click.get_binary_stream("stdout")``, which Click 8.5 deprecated
+    and Click 9.0 removes (#71). For this case Click's wrapper resolved to
+    ``_find_binary_writer(sys.stdout)``, which is two rules: hand back
+    ``sys.stdout`` itself when it is already a byte sink, otherwise its
+    ``.buffer``. Both are kept below. Nothing else of the wrapper applies here:
+    only Click's *text* streams consult a Windows console shim, and vq supports
+    Linux and macOS; and nothing was cached, so ``sys.stdout`` is resolved per
+    call and a redirection installed after import is still honoured.
+
+    ``sys.stdout.buffer`` covers every stdout this path actually meets -- a real
+    stdout, the ``TextIOWrapper`` pytest's capture installs, and the
+    ``_NamedTextIOWrapper`` Click's own ``CliRunner`` installs, whose ``.buffer``
+    is the very object Click handed back. The fallback is for a ``sys.stdout``
+    replaced by a bare binary object, which has no ``.buffer`` and takes bytes
+    directly.
+
+    Callers write already-encoded bytes straight through. Do not route remote
+    log output through a text stream: a chunk boundary can split a multi-byte
+    sequence, so a decode/encode round trip would corrupt it.
+    """
+    stream: Any = sys.stdout
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        return cast("IO[bytes]", buffer)
+    return cast("IO[bytes]", stream)
+
+
 def _stream_delegated_job_lookup(
     cfg: config.Config,
     host: str,
@@ -2139,7 +2172,7 @@ def _stream_delegated_job_lookup(
             raise click.UsageError(str(e)) from None
         try:
             with transport.stream_remote_vq(host_cfg, *remote_args) as stream:
-                stdout = click.get_binary_stream("stdout")
+                stdout = _binary_stdout()
                 for chunk in iter(lambda: stream.stdout.read(65536), b""):
                     stdout.write(chunk)
                     stdout.flush()
@@ -3026,24 +3059,63 @@ def source_identity() -> None:
 @click.option(
     "--keep",
     type=click.IntRange(min=1),
-    default=admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP,
-    show_default=True,
+    default=None,
+    help=(
+        "Stages to keep. Default: "
+        f"{admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP} for helper "
+        f"generations, {admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP} with "
+        "--runtime-source."
+    ),
+)
+@click.option(
+    "--runtime-source",
+    is_flag=True,
+    help=(
+        "STAGE_ROOT is a 'runtime-source' upload staging root "
+        "(<scratch_root>/.vq-admin/runtime-source), whose stages sit one per "
+        "program with no 'generations' level."
+    ),
 )
 @click.option("--preserve", type=click.Path(path_type=Path))
 @click.option("--json", "as_json", is_flag=True, help="Emit structured JSON.")
 def source_stage_prune(
     stage_root: Path,
-    keep: int,
+    keep: int | None,
+    runtime_source: bool,
     preserve: Path | None,
     as_json: bool,
 ) -> None:
-    """Prune recognized immutable scheduler-helper stage generations."""
+    """Prune recognized scheduler stage directories.
+
+    Without --runtime-source this prunes immutable scheduler-helper stage
+    generations, which a deploy never prunes on its own: another deployment
+    may still be using an older one.
+
+    With --runtime-source it prunes source-upload staging instead. Those belong
+    to exactly one deploy each, so a deploy that verifies now reclaims its own;
+    this reclaims what older vq left behind and what failed deploys kept.
+    """
     try:
-        result = admin_module.prune_scheduler_stage_generations(
-            stage_root,
-            keep=keep,
-            preserve=preserve,
-        )
+        if runtime_source:
+            result = admin_module.prune_runtime_source_stages(
+                stage_root,
+                keep=(
+                    admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
+        else:
+            result = admin_module.prune_scheduler_stage_generations(
+                stage_root,
+                keep=(
+                    admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
     except admin_module.AdminError as exc:
         raise click.ClickException(str(exc)) from None
     payload = asdict(result)
@@ -3291,7 +3363,7 @@ def _scheduler_workspace_reaper(
             spec,
             job_id=spec.scheduler_job_id or spec.id,
         )
-        dispatcher.cleanup_remote_workspace(handle)
+        dispatcher.cleanup_remote_workspace(handle, vq_job_id=spec.id)
 
     return _reap
 
@@ -3434,8 +3506,8 @@ def programs(
     common fields plus kind-specific fields):
       common:    name, kind, status, reason, description
       binary:    binary       (absolute path)
-      venv:      python, git_dir, branch, update_script,
-                 healthcheck_command, healthcheck_status,
+      venv:      python, git_dir, branch, install_script, update_script,
+                 extras, healthcheck_command, healthcheck_status,
                  import_check, import_symbols, import_version,
                  current_git_sha, current_git_describe,
                  current_git_branch, current_git_dirty
@@ -3980,6 +4052,17 @@ def scheduler_probe(host: str, as_json: bool) -> None:
 
     Turns an unknown scheduler into a detected one for the per-host config,
     instead of guessing the dialect at build time.
+
+    It also reports schedulable capacity per host and per lane, read from
+    ``pbsnodes -a`` or ``sinfo -N``: the largest request that could start now,
+    and the largest the usable nodes could ever run. A lane is a SLURM
+    partition, or a PBS node property. On PBS a lane is only a scheduling lane
+    when some queue's ``resources_default.neednodes`` routes to it, which is
+    read from ``qstat -Qf``; the report names that queue. A lane no queue
+    declares is marked ``[inferred]`` -- the figures are true of the nodes
+    carrying the property, but nothing proves a queue sends work there. In
+    ``--json`` the same distinction is ``capacity.groups[].authority``
+    (``partition`` / ``queue_default`` / ``node_property``).
     """
     from vq import scheduler_probe as probe_mod  # noqa: PLC0415
 
@@ -4014,7 +4097,9 @@ def _program_record(name: str, prog: config.ProgramConfig) -> dict[str, object]:
         record["python"] = prog.python
         record["git_dir"] = prog.git_dir
         record["branch"] = prog.branch
+        record["install_script"] = prog.install_script
         record["update_script"] = prog.update_script
+        record["extras"] = list(prog.extras)
         record["healthcheck_command"] = prog.healthcheck_command
         record["healthcheck_status"] = available.healthcheck_status
         record["import_check"] = prog.effective_import_check()
@@ -9380,6 +9465,11 @@ def fetch(
             ) from None
     fetched_at = manifest.get("fetched_at") if manifest else None
     stale = bool(manifest.get("stale")) if manifest else False
+    # (#62): a partial tree is a successful fetch of an INCOMPLETE workspace.
+    # It must never read as a whole one, so the count is on the success line
+    # and the list is named there too.
+    excluded = manifest.get("excluded_count") if manifest else None
+    excluded_count = excluded if isinstance(excluded, int) and excluded > 0 else 0
     if as_json:
         click.echo(
             json.dumps(
@@ -9396,6 +9486,8 @@ def fetch(
                     "destination": str(dst),
                     "fetched_at": fetched_at,
                     "stale": stale,
+                    "partial": excluded_count > 0,
+                    "excluded_count": excluded_count,
                     "queue_handle": queue_handle,
                 },
                 indent=2,
@@ -9405,6 +9497,13 @@ def fetch(
     else:
         suffix = f" (fetched_at={fetched_at})" if fetched_at else ""
         click.echo(f"{label} -> {dst}{suffix}")
+        if excluded_count:
+            click.echo(
+                f"PARTIAL: {excluded_count} entr"
+                f"{'y' if excluded_count == 1 else 'ies'} could not be "
+                f"fetched; see {dst / FETCH_EXCLUSIONS_SIDECAR}",
+                err=True,
+            )
 
 
 def _exit_suffix(exit_code: int | None) -> str:
@@ -9424,26 +9523,148 @@ def _print_fetch_all_results(label: str, results: list[BulkFetchResult]) -> bool
     state + crash-tail hint inline (closing the loop with the v0.12.0
     crash-feedback field), so the sweep doubles as a failure report.
     Returns True if any job errored.
+
+    (#62) A job whose tree landed incomplete is tagged ``[PARTIAL: N
+    excluded]`` on its own line and counted separately in the summary. It is
+    NOT counted as failed: the tree is there, and the sweep's exit code stays
+    a statement about jobs it could not fetch at all.
     """
     fetched = [r for r in results if r.outcome == "fetched"]
     skipped = [r for r in results if r.outcome == "skipped"]
     errored = [r for r in results if r.outcome == "error"]
+    partial = [r for r in fetched if r.excluded_count]
     for r in fetched:
         name = f"{r.job_name} " if r.job_name else ""
         tag = ""
         if r.state and r.state != "completed":
             tag = f"  [{r.state.upper()}"
             tag += f": {r.failure_hint}]" if r.failure_hint else "]"
+        if r.excluded_count:
+            tag += f"  [PARTIAL: {r.excluded_count} excluded]"
         click.echo(f"fetched {name}{r.jobid} -> {r.detail}{tag}")
     for r in errored:
         click.echo(f"ERROR   {r.jobid}: {r.detail}", err=True)
     parts = [f"{len(fetched)} fetched"]
+    if partial:
+        parts.append(f"{len(partial)} partial")
     if skipped:
         parts.append(f"{len(skipped)} skipped (already present)")
     if errored:
         parts.append(f"{len(errored)} failed")
     click.echo(f"{label}: {', '.join(parts)}")
+    if partial:
+        click.echo(
+            f"{label}: {len(partial)} fetched tree(s) are INCOMPLETE; each "
+            f"names what is missing in its {FETCH_EXCLUSIONS_SIDECAR}",
+            err=True,
+        )
     return bool(errored)
+
+
+FETCH_ALL_REPORT_SCHEMA = "vq.fetch-all-report.v1"
+FETCH_ALL_REPORT_RELPATH = Path("_vq") / "fetch-all-report.json"
+
+
+def _fetch_all_report_payload(
+    *,
+    output_dir: Path,
+    states: set[str] | None,
+    rows: list[tuple[str, BulkFetchResult]],
+    unreachable: list[tuple[str, str]],
+) -> dict[str, object]:
+    """The machine-readable coverage record for one `vq fetch-all` run (#62).
+
+    A summary LINE is not a manifest. A consumer of the fetched corpus could
+    see 423 directories and have no way to name the five that are missing, or
+    to tell a job that failed to fetch from one that was never selected —
+    unless it re-parsed the log. This is that record: every selected job, its
+    outcome, and for a partial tree the entries it does not contain.
+    """
+    jobs: list[dict[str, object]] = []
+    for host, result in rows:
+        entry: dict[str, object] = {
+            "jobid": result.jobid,
+            "job_name": result.job_name,
+            "host": host,
+            "outcome": result.outcome,
+            "state": result.state,
+            "detail": result.detail,
+            "partial": bool(result.excluded_count),
+            "excluded_count": result.excluded_count,
+            "excluded": None,
+        }
+        if result.outcome == "fetched":
+            entry["destination"] = result.detail
+            if result.excluded_count:
+                payload = read_fetch_exclusions(Path(result.detail))
+                if payload is not None:
+                    entry["excluded"] = payload.get("excluded")
+        jobs.append(entry)
+    counted = [result for _host, result in rows]
+    return {
+        "schema": FETCH_ALL_REPORT_SCHEMA,
+        "generated_at": utcnow_iso(),
+        "vq_version": __version__,
+        "output_dir": str(output_dir),
+        "states": sorted(states) if states else None,
+        "hosts": sorted({host for host, _result in rows}),
+        "unreachable_hosts": [
+            {"host": host, "error": error} for host, error in unreachable
+        ],
+        "totals": {
+            "selected": len(counted),
+            "fetched": sum(1 for r in counted if r.outcome == "fetched"),
+            "partial": sum(
+                1 for r in counted if r.outcome == "fetched" and r.excluded_count
+            ),
+            "skipped": sum(1 for r in counted if r.outcome == "skipped"),
+            "failed": sum(1 for r in counted if r.outcome == "error"),
+        },
+        "jobs": jobs,
+    }
+
+
+def _write_fetch_all_report(path: Path, payload: dict[str, object]) -> None:
+    """Write the sweep report atomically beside the corpus.
+
+    Best effort at the call site: a corpus that landed must not be reported as
+    a failure because its index could not be written. The caller warns.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _emit_fetch_all_report(
+    output_dir: Path,
+    report_path: Path | None,
+    *,
+    states: set[str] | None,
+    rows: list[tuple[str, BulkFetchResult]],
+    unreachable: list[tuple[str, str]],
+) -> None:
+    """Write the sweep report, or say on stderr why it could not be written."""
+    if report_path is not None and report_path.name.lower() == "none":
+        return
+    destination = (
+        report_path if report_path is not None else output_dir / FETCH_ALL_REPORT_RELPATH
+    )
+    payload = _fetch_all_report_payload(
+        output_dir=output_dir,
+        states=states,
+        rows=rows,
+        unreachable=unreachable,
+    )
+    try:
+        _write_fetch_all_report(destination, payload)
+    except OSError as exc:
+        click.echo(f"could not write fetch-all report to {destination}: {exc}", err=True)
+        return
+    click.echo(f"report -> {destination}")
 
 
 @main.command(name="fetch-all")
@@ -9479,11 +9700,21 @@ def _print_fetch_all_results(label: str, results: list[BulkFetchResult]) -> bool
     "exclusive with HOST). A host that is unreachable or errors is "
     "reported and skipped so one bad host does not abort the rest.",
 )
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Where to write the machine-readable sweep report. Default: "
+    f"<output_dir>/{FETCH_ALL_REPORT_RELPATH.as_posix()}. Pass 'none' to "
+    "write no report.",
+)
 def fetch_all(
     host: str | None,
     output_dir: Path,
     states: tuple[str, ...],
     all_hosts: bool,
+    report_path: Path | None,
 ) -> None:
     """Fetch ALL terminal jobs' workspaces from a host (or every host).
 
@@ -9508,6 +9739,15 @@ def fetch_all(
     cleaned-up workspace) and, under ``--all-hosts``, a whole unreachable host
     are reported inline and do not abort the rest, and the command exits
     non-zero if anything errored. Archived jobs are not included.
+
+    A job whose workspace holds files vq cannot read, or links it must not
+    follow, lands as a PARTIAL tree: the rest of the workspace is fetched and
+    the tree's ``_vq/fetch-exclusions.json`` names every entry that is
+    missing. That counts as fetched, not failed — the alternative loses the
+    whole job over one file — but it is flagged on the job's line and in the
+    summary. Every run also writes a machine-readable report (see
+    ``--report``) so a downstream consumer can state its own coverage without
+    parsing this output.
     """
     cfg = config.load_config()
 
@@ -9599,6 +9839,8 @@ def fetch_all(
     # bad config) is reported and skipped so one bad host never sinks the
     # sweep. For a single explicit host the error propagates as usual.
     aggregate: list[BulkFetchResult] = []
+    rows: list[tuple[str, BulkFetchResult]] = []
+    unreachable: list[tuple[str, str]] = []
     any_error = False
     for h in hosts:
         try:
@@ -9610,23 +9852,45 @@ def fetch_all(
             TypeError,
         ) as e:
             if not all_hosts:
+                # (#62) Even a single-host sweep that dies at the host level
+                # leaves a report saying so, rather than nothing at all.
+                _emit_fetch_all_report(
+                    output_dir,
+                    report_path,
+                    states=selected,
+                    rows=rows,
+                    unreachable=[*unreachable, (h, str(e))],
+                )
                 raise click.ClickException(str(e)) from None
             click.echo(f"{h}: SKIPPED ({e})", err=True)
+            unreachable.append((h, str(e)))
             any_error = True
             continue
         any_error |= _print_fetch_all_results(h, res)
         aggregate.extend(res)
+        rows.extend((h, r) for r in res)
 
     if all_hosts and len(hosts) > 1:
         tf = sum(1 for r in aggregate if r.outcome == "fetched")
+        tp = sum(1 for r in aggregate if r.outcome == "fetched" and r.excluded_count)
         ts = sum(1 for r in aggregate if r.outcome == "skipped")
         te = sum(1 for r in aggregate if r.outcome == "error")
         tot = [f"{tf} fetched"]
+        if tp:
+            tot.append(f"{tp} partial")
         if ts:
             tot.append(f"{ts} skipped")
         if te:
             tot.append(f"{te} failed")
         click.echo(f"all-hosts total: {', '.join(tot)}")
+
+    _emit_fetch_all_report(
+        output_dir,
+        report_path,
+        states=selected,
+        rows=rows,
+        unreachable=unreachable,
+    )
 
     if any_error:
         raise SystemExit(1)
@@ -9647,8 +9911,12 @@ def fetch_all(
     "--delete",
     "mode_delete",
     is_flag=True,
-    help="Delete eligible jobs: remove spec + workspace + archive (if any). "
-    "Job vanishes from `vq queue`. Requires --older-than.",
+    help="Delete eligible jobs: remove spec + workspace + workdir + archive "
+    "(whichever exist). The workdir goes too since #63 — it is usually the "
+    "bulk of the bytes — at the path the job recorded, including under a "
+    "scratch root this host has since been configured away from, and only "
+    "when that path is still the per-job directory named for the job. Job "
+    "vanishes from `vq queue`. Requires --older-than.",
 )
 @click.option(
     "--restore",
@@ -9727,9 +9995,10 @@ def fetch_all(
     "workdir_max_age_str",
     metavar="DUR",
     default=None,
-    help="Auto-cleanup: remove terminal-job workdirs older than DUR. "
-    "Format: '14d' / '4h' / '600s' etc. Only meaningful with "
-    "--auto-enable.",
+    help="Auto-cleanup: remove terminal-job workdirs older than DUR, in "
+    "every workdir root vq manages — the scratch root and, until it is "
+    "empty, the pre-#63 one under the state root. Format: '14d' / '4h' / "
+    "'600s' etc. Only meaningful with --auto-enable.",
 )
 @click.option(
     "--reason",
@@ -9819,6 +10088,16 @@ def cleanup(
     Default mode (no flag) lists terminal-state jobs with their finished_at
     age and on-disk size — useful before deciding what `--older-than`
     threshold to apply.
+
+    \b
+    Sizes cover three trees, and #63 added the middle one:
+      WORKSPACE  the submitted job's cwd, under <scratch_root>/jobs
+      WORKDIR    the job's $VQ_WORKDIR, under <scratch_root>/workdirs
+      ARCHIVE    the tarball, under <state_root>/archive
+    Each job is measured at the path it recorded, so jobs dispatched before
+    the scratch root was split out of the state root are counted where they
+    actually are. --archive tars the workspace only; --delete removes all
+    three.
     """
     # v0.5.17: --auto-* flags are mutually exclusive with the
     # one-shot --archive/--delete/--restore modes.
@@ -10131,7 +10410,7 @@ def cleanup(
                     scheduler_reaper,
                     queue_dir=c_queue_dir,
                 )
-                delete_job(c.spec, queue_dir=c_queue_dir)
+                delete_job(c.spec, queue_dir=c_queue_dir, owner_uid=c.uid)
         except Exception as e:  # noqa: BLE001 -- collect per-job, keep going
             failures.append((c.spec.id, str(e)))
     if failures:
@@ -10183,16 +10462,26 @@ def mark_fetched(jobid: str, submitted_at: str, state_name: str) -> None:
 
 @main.command("tar-workspace", hidden=True)
 @click.argument("jobid")
-def tar_workspace(jobid: str) -> None:
+@click.option("--fetch-protocol-token", hidden=True, default=None)
+def tar_workspace(jobid: str, fetch_protocol_token: str | None) -> None:
     """Internal: emit the local workspace tarball for JOBID on stdout.
 
     Used by ``vq fetch <remote-host> JOBID``: the local side ssh's into
     the remote and runs this verb, piping the resulting tar stream
     through tarfile to extract it locally.
     """
+    if fetch_protocol_token is not None and (
+        len(fetch_protocol_token) != 32
+        or any(char not in "0123456789abcdef" for char in fetch_protocol_token)
+    ):
+        raise click.BadParameter("expected 32 lowercase hexadecimal characters",
+                                 param_hint="--fetch-protocol-token")
     multi_user = _multi_user_active()
     try:
-        emit_workspace_tar(jobid, multi_user=multi_user)
+        if fetch_protocol_token is None:
+            emit_workspace_tar(jobid, multi_user=multi_user)
+        else:
+            emit_workspace_tar(jobid, multi_user=multi_user, protocol_token=fetch_protocol_token)
     except (
         config.ConfigError,
         FileNotFoundError,
@@ -10208,7 +10497,8 @@ def tar_workspace(jobid: str) -> None:
 
 @main.command("tar-workdir", hidden=True)
 @click.argument("jobid")
-def tar_workdir(jobid: str) -> None:
+@click.option("--fetch-protocol-token", hidden=True, default=None)
+def tar_workdir(jobid: str, fetch_protocol_token: str | None) -> None:
     """v0.7.7: emit the local workdir tarball for JOBID on stdout.
 
     Used by ``vq fetch <remote-host> JOBID --workdir``: the local side
@@ -10217,9 +10507,18 @@ def tar_workdir(jobid: str) -> None:
     ``tar-workspace`` but tars ``spec.workdir`` (v0.6.54's per-job
     scratch directory) instead of ``spec.cwd``.
     """
+    if fetch_protocol_token is not None and (
+        len(fetch_protocol_token) != 32
+        or any(char not in "0123456789abcdef" for char in fetch_protocol_token)
+    ):
+        raise click.BadParameter("expected 32 lowercase hexadecimal characters",
+                                 param_hint="--fetch-protocol-token")
     multi_user = _multi_user_active()
     try:
-        emit_workdir_tar(jobid, multi_user=multi_user)
+        if fetch_protocol_token is None:
+            emit_workdir_tar(jobid, multi_user=multi_user)
+        else:
+            emit_workdir_tar(jobid, multi_user=multi_user, protocol_token=fetch_protocol_token)
     except (
         config.ConfigError,
         FileNotFoundError,
@@ -10353,6 +10652,47 @@ def build_env(
 @main.group()
 def admin() -> None:
     """Queue admin verbs: refresh registered envs, etc. (v0.5.20+)."""
+
+
+@admin.command("repair-state-paths")
+@click.option("--state-root", type=click.Path(path_type=Path), required=True)
+@click.option("--from-root", "old_root", type=click.Path(path_type=Path), required=True)
+@click.option("--to-root", "new_root", type=click.Path(path_type=Path), required=True)
+@click.option("--job", "jobs", multiple=True, help="Limit the plan to exact job IDs.")
+@click.option("--dry-run", is_flag=True, help="Explicit read-only mode (the default).")
+@click.option("--json", "as_json", is_flag=True, help="Explicit JSON output (the default).")
+@click.option("--apply-plan", metavar="SHA256", help="Apply only this reviewed plan digest.")
+@click.option(
+    "--receipt-dir", type=click.Path(path_type=Path), help="New external receipt directory.",
+)
+def admin_repair_state_paths(
+    state_root: Path, old_root: Path, new_root: Path, jobs: tuple[str, ...],
+    dry_run: bool, as_json: bool, apply_plan: str | None, receipt_dir: Path | None,
+) -> None:
+    """Plan terminal-record path repair; default is read-only JSON.
+
+    OLD must directly alias NEW through the reviewed compatibility symlink.
+    Apply preserves exact original records before replacing any path fields.
+    No daemon, artifact, configuration, or scheduler workspace is changed.
+    """
+    from vq.state_path_repair import apply_repair, plan_repair
+
+    try:
+        if dry_run and apply_plan:
+            raise ValueError("--dry-run cannot be combined with --apply-plan")
+        if bool(apply_plan) != bool(receipt_dir):
+            raise ValueError("--apply-plan and --receipt-dir must be supplied together")
+        plan = plan_repair(state_root, old_root, new_root, jobs=jobs)
+        if apply_plan is not None:
+            assert receipt_dir is not None
+            result = apply_repair(plan, expected_plan_id=apply_plan, receipt_dir=receipt_dir)
+        else:
+            result = plan
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        if plan["blockers"]:
+            raise SystemExit(1)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _rollout_update_runner(
@@ -11789,7 +12129,11 @@ def _pin_deploy_identity(
     "install_script_args",
     multiple=True,
     metavar="FLAG",
-    help="Extra flag appended to the install_script invocation. Repeatable.",
+    help="Extra flag appended to the install_script invocation. Repeatable. "
+    "An `--extras` here sets the profile the venv is built with, as the "
+    "per-update request does for an update. When the program declares "
+    "`extras`, a profile that does not cover the declaration is refused "
+    "rather than silently widened.",
 )
 @click.option(
     "--force",
@@ -11840,6 +12184,33 @@ def admin_install(
 
     ENV must be a registered ``kind="venv"`` program carrying ``upstream`` and
     ``install_script``. HOST defaults to ``default_host``.
+
+    A program that declares ``extras`` has that floor applied here, not only on
+    the next managed update: vq appends ``--extras PROFILE`` to the installer,
+    resolved to the smallest profile covering both the declaration and whatever
+    the configured command asked for. It does that only for its own
+    ``scripts/install.sh`` or ``scripts/update.sh``, the same proof a managed
+    update requires before naming an install target. An install that cannot
+    apply the declaration is **refused** -- before the clone when the
+    ``install_script`` does not name one of those at all -- because a venv
+    provisioned without the runtime it declares is what the key exists to
+    prevent. Point ``install_script`` at the checkout's own installer, or drop
+    the declaration, provision, and apply the profile afterwards with:
+
+    \b
+      vq admin update ENV
+
+    That second route exists only where an ordinary update can apply the
+    floor, which since #85 means the program's ``update_script`` is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh``. On a program with no
+    ``update_script``, or a foreign one, an update runs what is configured and
+    applies no declaration, so the refusal names the missing piece for that
+    shape rather than a command that would do nothing -- and the note an
+    ordinary ``vq admin update`` prints says the same. The command carries no
+    flags: ``scripts/update.sh`` refuses a direct ``--recreate-venv`` without
+    ``--skip-git``, and the floor is applied without one.
+
+    A program that declares no extras is installed exactly as before.
 
     It refuses to write into an existing non-empty ``git_dir``: an existing
     checkout is somebody's work, and refreshing one is what ``vq admin
@@ -11968,7 +12339,16 @@ def admin_install(
     "this exact commit of the managed runtime repository instead of the "
     "live driver checkout. Fleet rollouts always pin the helper to the "
     "accepted report's vq identity. "
-    "The checkout is verified before and after the update script.",
+    "The checkout is verified before and after the update script. "
+    "For a scheduler-runtime deployment whose profile sets "
+    "`feed_source_mirror`, this commit is fed to that mirror unforced and "
+    "atomically (the immutable ref refs/vq/pins/<sha>, the lane's branch "
+    "pair, and the tags naming this commit). vq never force-pushes: if the "
+    "mirror's lane branch has moved past this commit, has diverged from it, "
+    "or holds one of its tags at another object, the feed is refused with "
+    "the mirror's own values and the mirror, the running runtime and the "
+    "LAST OK record are left unchanged. See docs/operations.md, 'Feeding "
+    "the source mirror'.",
 )
 @click.option(
     "--all-hosts",
@@ -12067,7 +12447,10 @@ def admin_install(
     "scheduler_update_command / scheduler_install_command. Forwarded "
     "transparently to remote hosts via --all-hosts. For a marked serving "
     "vq environment, profile changes require --recreate-venv and --extras "
-    "PROFILE; the managed transaction preserves its target and install mode.",
+    "PROFILE; the managed transaction preserves its target and install mode. "
+    "An `--extras` here sets the profile a declared `extras` floor is "
+    "resolved over, and a profile that does not cover the declaration is "
+    "refused rather than widened.",
 )
 @click.option(
     "--cluster-install",
@@ -12244,6 +12627,24 @@ def admin_update(
          invocation. A normal failure attempts that cleanup; a hard
          interruption retains the durable receipt and dispatch hold for
          explicit recovery rather than claiming that the queue resumed.
+
+    A program that declares ``extras`` has that floor applied at step 4,
+    wherever vq itself builds the environment -- the managed daemon
+    transaction, and any other program whose ``update_script`` is the
+    checkout's own ``scripts/install.sh`` or ``scripts/update.sh``. vq
+    appends ``--extras PROFILE`` last, resolved to the smallest published
+    profile covering both the declaration and whatever the run was going to
+    install anyway (the operator's ``--update-script-arg --extras``, else the
+    profile ``.vq-install-metadata`` records, else ``core``), so it can only
+    add capability. A profile that already covers the declaration is left
+    exactly as written, and a requested profile that does not cover it is
+    refused rather than silently widened.
+
+    With any other ``update_script`` the update runs exactly as it always
+    has and prints what it did not apply -- that script is free text which
+    has never heard of ``--extras``. ``vq doctor`` reports which programs are
+    in that position before one of them matters. A program that declares no
+    extras is updated exactly as before.
 
     DANGER -- pausing across a legacy in-place update is NOT safe on a venv
     host. A
@@ -13625,6 +14026,14 @@ def admin_observe_update(
             "admin",
             "observe-update",
             run_id,
+            # Explicit, for the same reason the delegated update appends a
+            # `localhost` positional and the driver's own poller passes this
+            # flag: the run lives on the host we are talking to. A target
+            # whose own default_host is another machine would otherwise
+            # forward the observation there and answer `missing` for a run
+            # that host has never heard of.
+            "--host",
+            "localhost",
             "--offset",
             str(offset),
             "--max-bytes",
@@ -16853,10 +17262,18 @@ def daemon_status() -> None:
             click.echo(f"daemon: running (pid {pid})")
     else:
         click.echo("daemon: not running")
-    click.echo(f"  pidfile: {paths.daemon_pidfile()}")
-    click.echo(f"  log:     {paths.daemon_logfile()}")
-    click.echo(f"  queue:   {paths.queue_dir()}")
-    click.echo(f"  jobs:    {paths.jobs_dir()}")
+    # One column for every value, and a space after every colon: the
+    # documented `awk '/scratch:/{print $2}'` idiom reads $2, which was the
+    # empty string for the one line that ran its path into the colon.
+    for label, value in (
+        ("pidfile", paths.daemon_pidfile()),
+        ("log", paths.daemon_logfile()),
+        ("queue", paths.queue_dir()),
+        ("scratch", paths.scratch_root()),
+        ("jobs", paths.jobs_dir()),
+        ("workdirs", paths.workdir_root()),
+    ):
+        click.echo(f"  {label + ':':<9} {value}")
     _echo_daemon_service_provenance()
 
 

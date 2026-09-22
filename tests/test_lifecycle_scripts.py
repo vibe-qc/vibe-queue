@@ -71,7 +71,8 @@ def _stamp_owner(venv: Path, project: Path = PROJECT) -> None:
 
 def _write_legacy_direct_url(venv: Path, project: Path = PROJECT) -> Path:
     metadata = (
-        venv / "lib" / "python3.12" / "site-packages" / "vq-0.0.dist-info" / "direct_url.json"
+        venv / "lib" / "python3.12" / "site-packages"
+        / "vibe_queue-0.0.dist-info" / "direct_url.json"
     )
     metadata.parent.mkdir(parents=True, exist_ok=True)
     metadata.write_text(
@@ -87,7 +88,7 @@ def _write_direct_url(
     """Write the PEP 610 record pip leaves for a directory install."""
     metadata = (
         venv / "lib" / "python3.12" / "site-packages"
-        / "vq-0.26.0.dist-info" / "direct_url.json"
+        / "vibe_queue-0.26.0.dist-info" / "direct_url.json"
     )
     metadata.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, object] = {"url": project.resolve().as_uri()}
@@ -533,7 +534,7 @@ def test_legacy_adoption_rejects_lib64_alias_to_independent_metadata(
         other_lib
         / "python3.12"
         / "site-packages"
-        / "vq-0.0.dist-info"
+        / "vibe_queue-0.0.dist-info"
         / "direct_url.json"
     )
     other_metadata.parent.mkdir(parents=True)
@@ -564,7 +565,7 @@ def test_legacy_adoption_rejects_independent_lib_and_lib64_metadata(
         / "lib64"
         / "python3.12"
         / "site-packages"
-        / "vq-0.0.dist-info"
+        / "vibe_queue-0.0.dist-info"
         / "direct_url.json"
     )
     lib64_metadata.parent.mkdir(parents=True)
@@ -2513,7 +2514,7 @@ def test_an_unreadable_install_shape_still_falls_back_to_the_note(
     _make_venv_shape(venv)
     metadata = (
         venv / "lib" / "python3.12" / "site-packages"
-        / "vq-0.26.0.dist-info" / "direct_url.json"
+        / "vibe_queue-0.26.0.dist-info" / "direct_url.json"
     )
     metadata.parent.mkdir(parents=True, exist_ok=True)
     metadata.write_text(
@@ -2551,7 +2552,7 @@ def test_two_dist_info_payloads_are_not_guessed_between(tmp_path: Path) -> None:
     venv = _venv_with_pip_record(tmp_path, editable=True)
     second = (
         venv / "lib64" / "python3.12" / "site-packages"
-        / "vq-0.26.0.dist-info" / "direct_url.json"
+        / "vibe_queue-0.26.0.dist-info" / "direct_url.json"
     )
     second.parent.mkdir(parents=True, exist_ok=True)
     second.write_text(
@@ -2567,3 +2568,197 @@ def test_two_dist_info_payloads_are_not_guessed_between(tmp_path: Path) -> None:
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "mode:         copied into the venv" in proc.stdout
+
+
+def _write_pre_rename_direct_url(
+    venv: Path, *, editable: bool, project: Path = PROJECT,
+) -> Path:
+    """The record a release before the rename left: distribution `vq` (#68)."""
+    metadata = (
+        venv / "lib" / "python3.12" / "site-packages"
+        / "vq-0.26.9.dist-info" / "direct_url.json"
+    )
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {"url": project.resolve().as_uri()}
+    payload["dir_info"] = {"editable": True} if editable else {}
+    metadata.write_text(json.dumps(payload), encoding="utf-8")
+    return metadata
+
+
+def test_update_reads_the_record_a_pre_rename_release_left(tmp_path: Path) -> None:
+    """A venv last installed as distribution `vq` still proves its mode (#68)."""
+    venv = tmp_path / "venv"
+    _make_venv_shape(venv)
+    _write_pre_rename_direct_url(venv, editable=True)
+    _stamp_owner(venv)
+
+    proc = _update_preview(tmp_path, venv)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "mode:         editable (-e)" in proc.stdout
+
+
+def test_both_records_present_stops_pip_deciding_the_install_mode(
+    tmp_path: Path,
+) -> None:
+    """One record under each name is two installs, and no spelling picks between them.
+
+    The rule this replaces preferred the current name on the reasoning that it
+    was the install pip performed last, which the file system does not say: a
+    legacy record written an hour later still lost. So the `copied` read there
+    outranked everything, including vq's own note recording that this
+    environment was installed editable, and a routine update converted it.
+
+    With the evidence ambiguous the detector reports nothing, and the note --
+    which is exactly what a venv vq built has, and what the fallback is for --
+    decides instead.
+    """
+    venv = _venv_with_pip_record(tmp_path, editable=False)
+    _write_pre_rename_direct_url(venv, editable=True)
+    (venv / ".vq-install-metadata").write_text(
+        "version=1\nextras=core\neditable=1\n", encoding="utf-8",
+    )
+
+    proc = _update_preview(tmp_path, venv)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "mode:         editable (-e)" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# The window in which a venv has no vq command
+# ---------------------------------------------------------------------------
+#
+# `vq_remove_legacy_distribution` uninstalls the pre-rename distribution before
+# the reinstall, because that distribution's RECORD owns bin/vq and a later
+# uninstall would delete the file the install had just written. Between the two
+# the environment has no vq at all. install.sh and reinstall.sh build into a
+# replacement venv, and the managed fleet transaction always passes
+# --recreate-venv, so both roll back; a direct in-place `scripts/update.sh`
+# owns no backup, so a pip failure there is permanent. It cannot be prevented
+# from inside the helper, so it is reported.
+
+
+def _stub_venv_python(venv: Path, *, install_rc: int, legacy_present: bool) -> None:
+    """A venv whose `bin/python` answers the four pip calls the helper makes.
+
+    In order: the build-tool upgrade, `pip show vq`, `pip uninstall vq` -- which
+    removes bin/vq, as the real one does, because the legacy RECORD owns it --
+    and the install that writes bin/vq again.
+    """
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    command = venv / "bin" / "vq"
+    command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    command.chmod(0o755)
+    final_install = (
+        'touch "$(dirname "$0")/vq"; exit 0'
+        if install_rc == 0
+        else f"exit {install_rc}"
+    )
+    python = venv / "bin" / "python"
+    # Never write through the symlink _make_venv_shape leaves here: it points
+    # at the interpreter running this suite.
+    python.unlink(missing_ok=True)
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "$VQ_TEST_PIP_LOG"\n'
+        "case \"$*\" in\n"
+        '  *"pip install"*setuptools*) exit 0 ;;\n'
+        f'  *"pip show"*) exit {0 if legacy_present else 1} ;;\n'
+        '  *"pip uninstall"*) rm -f "$(dirname "$0")/vq"; exit 0 ;;\n'
+        f'  *"pip install"*) {final_install} ;;\n'
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+
+def _install_environment(
+    venv: Path, tmp_path: Path, *, extras_spec: str = "[web]", editable: str = "0",
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash", "-c",
+            "\n".join([
+                'source "$1"',
+                'vq_install_environment "$2" "$3" "$4"',
+            ]),
+            "install-environment-test", str(HELPER), str(venv), extras_spec, editable,
+        ],
+        env={**os.environ, "VQ_TEST_PIP_LOG": str(tmp_path / "pip.log")},
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_a_failed_reinstall_after_the_legacy_removal_says_the_command_is_gone(
+    tmp_path: Path,
+) -> None:
+    """The operator must not discover a missing binary by running it.
+
+    An in-place update has no backup to roll back to, so this is a real
+    environment left with no vq: a network blip or a build error between the
+    uninstall and the install is enough. Say what happened, and hand over the
+    two commands that end it -- restore in place, or rebuild through the path
+    that does roll back.
+    """
+    venv = tmp_path / "venv"
+    _make_venv_shape(venv, with_python=False)
+    _stub_venv_python(venv, install_rc=13, legacy_present=True)
+
+    proc = _install_environment(venv, tmp_path, editable="1")
+
+    # pip's own status reaches the caller, so `set -e` in the scripts above
+    # still exits with what pip said.
+    assert proc.returncode == 13, proc.stdout + proc.stderr
+    assert not (venv / "bin" / "vq").exists()
+    assert "no longer provides a vq command" in proc.stderr
+    assert f"{venv}/bin/python -m pip install --upgrade --editable" in proc.stderr
+    assert f"{PROJECT}[web]" in proc.stderr
+    assert f"scripts/update.sh --venv {venv} --recreate-venv" in proc.stderr
+
+
+def test_a_copied_install_is_offered_a_copied_restore(tmp_path: Path) -> None:
+    """The restore line carries the mode, or it rebuilds the wrong environment."""
+    venv = tmp_path / "venv"
+    _make_venv_shape(venv, with_python=False)
+    _stub_venv_python(venv, install_rc=1, legacy_present=True)
+
+    proc = _install_environment(venv, tmp_path, extras_spec="", editable="0")
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "--editable" not in proc.stderr
+    assert f"{venv}/bin/python -m pip install --upgrade {PROJECT}" in proc.stderr
+
+
+def test_a_successful_install_says_nothing_about_a_missing_command(
+    tmp_path: Path,
+) -> None:
+    venv = tmp_path / "venv"
+    _make_venv_shape(venv, with_python=False)
+    _stub_venv_python(venv, install_rc=0, legacy_present=True)
+
+    proc = _install_environment(venv, tmp_path)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (venv / "bin" / "vq").exists()
+    assert "no longer provides a vq command" not in proc.stderr
+
+
+def test_a_venv_without_the_legacy_record_is_not_told_the_command_was_removed(
+    tmp_path: Path,
+) -> None:
+    """Nothing was uninstalled, so a failed install left bin/vq where it was.
+
+    Claiming otherwise would send an operator to restore a file that is not
+    missing, and hide whatever actually failed.
+    """
+    venv = tmp_path / "venv"
+    _make_venv_shape(venv, with_python=False)
+    _stub_venv_python(venv, install_rc=7, legacy_present=False)
+
+    proc = _install_environment(venv, tmp_path)
+
+    assert proc.returncode == 7, proc.stdout + proc.stderr
+    assert (venv / "bin" / "vq").exists()
+    assert "no longer provides a vq command" not in proc.stderr

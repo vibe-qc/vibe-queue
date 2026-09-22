@@ -37,17 +37,26 @@ vq status JOBID -n 0   # full output including events
 
 The workspace is usually **still on disk**:
 
+The workspace lives under this host's **scratch** root since v0.26.10 (#63)
+— `~/.local/share/vq-scratch/jobs/` by default, and wherever `vq daemon
+status` reports otherwise:
+
 ```bash
-ls ~/.local/share/vq/jobs/JOBID/
+WS=$(vq daemon status | awk '/jobs:/{print $2}')/JOBID
+ls "$WS"
 # Should show: stdout.log, stderr.log, _vq/, user files
 ```
 
 Check the logs:
 
 ```bash
-cat ~/.local/share/vq/jobs/JOBID/stdout.log
-cat ~/.local/share/vq/jobs/JOBID/stderr.log
+cat "$WS/stdout.log"
+cat "$WS/stderr.log"
 ```
+
+A job dispatched before v0.26.10 kept its recorded path under the state root
+(`~/.local/share/vq/jobs/JOBID/`); `vq status JOBID` prints the one that job
+actually used.
 
 If the job was writing output before it ended, the logs will show
 where it got.
@@ -57,7 +66,7 @@ where it got.
 If the job ended gracefully (bash wrap wrote its exit code):
 
 ```bash
-cat ~/.local/share/vq/jobs/JOBID/_vq/exit-code
+cat "$WS/_vq/exit-code"
 # Shows the inner command's exit code (or 128+signal for signals)
 ```
 

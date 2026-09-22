@@ -1871,6 +1871,44 @@ class TestProgramsJsonOutput:
         # binary field absent on venv kind
         assert "binary" not in rec
 
+    def test_venv_program_record_exposes_the_build_route_fields(
+        self, cfg_dir: Path, tmp_path: Path
+    ) -> None:
+        """`install_script` and `extras` are in the audit output (#84).
+
+        `install_script` became a load-bearing build route when a provision
+        started applying a declared `extras` floor, and `extras` says what the
+        venv is *for*. An operator debugging a venv missing its declared
+        runtime reaches for `vq programs --json`, and neither field was there:
+        the listing showed `update_script` alone, which is the one route that
+        program might not have.
+        """
+        import json as _json
+        venv_py = tmp_path / "venv" / "bin" / "python"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("#!/bin/sh\n")
+        venv_py.chmod(0o755)
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (cfg_dir / "config.toml").write_text(
+            'default_host = "localhost"\n'
+            "[programs.console]\n"
+            'kind = "venv"\n'
+            f'python = "{venv_py}"\n'
+            f'git_dir = "{repo}"\n'
+            'install_script = "scripts/install.sh --editable"\n'
+            'extras = ["web"]\n'
+        )
+
+        result = CliRunner().invoke(main, ["programs", "localhost", "--json"])
+
+        assert result.exit_code == 0, result.output
+        rec = _json.loads(result.output)[0]
+        assert rec["install_script"] == "scripts/install.sh --editable"
+        assert rec["extras"] == ["web"]
+        # The shape this program has: one build route, and it fires once.
+        assert rec["update_script"] is None
+
     def test_venv_program_record_exposes_runtime_identity(
         self, cfg_dir: Path, tmp_path: Path
     ) -> None:

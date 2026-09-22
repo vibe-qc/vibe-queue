@@ -60,8 +60,8 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
@@ -99,13 +99,20 @@ from vq.scheduler_dialect import (
     enforce_scheduler_wall_time_limit,
 )
 from vq.scheduler_dispatch import (
+    RememberedScratchRoot,
     SchedulerDispatcher,
     SchedulerError,
     SchedulerHandle,
+    SchedulerHostUnreachable,
     SchedulerPollEvidence,
+    SchedulerRemoteOutcomeUnknown,
     SchedulerSubmitOutcomeUnknown,
+    bound_remote_workspace,
+    parse_scheduler_scratch_roots,
     scheduler_dispatcher_for,
     scheduler_handle_for_spec,
+    scheduler_scratch_roots_payload,
+    unbound_staged_job_ids,
 )
 from vq.spec import (
     TERMINAL_STATES,
@@ -135,6 +142,44 @@ MULTI_USER_SPEC_MAX_BYTES = 8 * 1024 * 1024
 
 Eight MiB is far above normal JobSpec sizes while bounding root-daemon memory
 use. The ordinary trusted ``JobSpec.read`` contract is deliberately unchanged.
+"""
+
+SCHEDULER_POLL_BACKOFF_SECONDS = 30.0
+"""How long a scheduler host is left alone after an attempt that did not
+reach it.
+
+#51 recorded 1,760 consecutive poll failures against one host, all of them ssh
+reporting a connection that never completed. Measured on this code, one failing
+pass costs exactly three sequential ssh attempts (the live poll plus its two
+replay-safe retries) and about 36 s of a background thread, after which the next
+pass re-contacts the same host immediately: vq's own rate against a host that is
+turning it away was set by nothing but how long the failures take.
+
+The first cooldown is deliberately of the same order as one failing pass, so a
+single transient failure costs one skipped observation and no more. It doubles
+for each further attempt that does not reach the host, up to
+:data:`SCHEDULER_POLL_BACKOFF_MAX_SECONDS`.
+"""
+
+SCHEDULER_REFRESH_HOST_DEFERRED_REASON = "scheduler_host_poll_deferred"
+"""Why an explicit status refresh came back without an observation (#51).
+
+An operator asking for one exact job's state meets a wait the machine
+imposed on the whole host, and "the job was not observed" does not say
+that. The refresh does not break the cooldown: vq's own connections are
+part of what the host is turning away, so a ``vq show --refresh`` in a
+shell loop would otherwise be a remote-triggered way around it. It names
+the cause instead, and the daemon log carries the remaining interval.
+"""
+
+SCHEDULER_POLL_BACKOFF_MAX_SECONDS = 300.0
+"""Ceiling on that cooldown, so backing off can never become giving up.
+
+Five minutes is well inside the observation latency a scheduler pass already
+has (#22 measured passes of about fourteen minutes at campaign scale) and far
+inside the runtime of the jobs being observed, so a host at the ceiling is still
+polled long before its jobs could finish unnoticed. At the ceiling vq spends
+three attempts per ~336 s against a refusing host instead of three per ~36 s.
 """
 
 
@@ -489,6 +534,13 @@ class _SchedulerJob:
 
     handle: SchedulerHandle
     dispatcher: SchedulerDispatcher
+    # The configured scheduler target this job was dispatched to. Immutable
+    # admission identity, like owner_uid/spec_path below. The dispatcher above
+    # is one *generation* of that target, rebuilt whenever the config changes
+    # on disk; this names the host itself. Everything that is a fact about the
+    # host rather than about one job — the poll cooldown, the single in-flight
+    # observation, the fetch turn — is keyed on this (#51).
+    scheduler_target: str
     cpus: int
     mem_mb: int | None
     # Armed once we notice an external `vq kill` (spec terminal, scheduler job
@@ -527,6 +579,10 @@ class _SchedulerPollObservation:
     phases: dict[str, SchedulerPhase]
     explicitly_absent_job_ids: frozenset[str]
     details: dict[str, QstatDetail]
+    # Per-job "why is this still queued", for dialects that report it on the
+    # coarse poll rather than on the detail record. Empty for Torque, whose
+    # reason arrives on QstatDetail instead.
+    queued_reasons: dict[str, str] = field(default_factory=dict)
     poll_error: (
         SchedulerError
         | DialectError
@@ -550,13 +606,198 @@ class _SchedulerPollFlight:
     items: tuple[tuple[str, _SchedulerJob], ...]
     refresh_sequence: int
     done: threading.Event
+    # The generation that issued this observation, carried rather than
+    # recomputed at reap time (#51). The daemon's dispatcher cache can be
+    # rebuilt or cleared while the flight is in the air, so re-deriving the
+    # observer afterwards could hand the rows to a dialect that did not
+    # produce them.
+    observer: SchedulerDispatcher | None = None
     observation: _SchedulerPollObservation | None = None
     error: BaseException | None = None
+
+
+@dataclass
+class _SchedulerPollBackoff:
+    """One scheduler host's cooldown after an attempt that did not reach it (#51).
+
+    Armed by any poll that did not come back with an answer from the host: ssh
+    reporting a connection that never completed
+    (:class:`~vq.scheduler_dispatch.SchedulerHostUnreachable`), and equally an
+    attempt whose outcome vq never learned — its own poll timeout, a capture
+    limit, a lost local observer
+    (:class:`~vq.scheduler_dispatch.SchedulerRemoteOutcomeUnknown`). Cleared by
+    the next poll that does reach the host, which includes one that reaches it
+    and fails: a rejected key, a missing ``qstat`` or an unparseable table is a
+    standing fault that pacing cannot fix and that must stay visible, so it
+    ends the run.
+
+    It defers *observation only*: the jobs on the host keep the lifecycle state
+    and the ``poll_failed`` scheduler state their last real attempt left them,
+    and a deferred pass writes nothing, claims no observation and can never make
+    a job terminal.
+
+    ``consecutive`` counts attempts since the last one that reached the host,
+    and only sets the next interval; it is not a give-up counter. There is no
+    state in which vq stops polling a host.
+
+    ``last_attempt`` is when the record was last armed, on
+    ``Daemon._scheduler_poll_clock``. It is what lets the record outlive the
+    host's last running job: the escalation is a fact about the host, not about
+    any job it happens to be carrying, so job churn must not reset it. See
+    :meth:`Daemon._prune_scheduler_poll_backoff`.
+    """
+
+    until: float
+    interval: float
+    last_attempt: float
+    consecutive: int = 1
+
+
+class _SchedulerPollAnswer(Enum):
+    """What one poll proved about the scheduler host itself (#51).
+
+    The cooldown keys off this rather than off how severe the failure was, or
+    off whether it was a refusal. What paces vq is whether the host answered:
+    an attempt that got no answer is worth no more, repeated immediately, than
+    the one before it.
+    """
+
+    ANSWERED = auto()
+    """The host answered — with a result, or with a standing fault of its own.
+
+    A rejected key, a missing ``qstat``, an unparseable table: sshd or the
+    scheduler client replied, so pacing cannot help and would only make the
+    fault slower to see. A run of unanswered attempts ends here.
+    """
+
+    REFUSED = auto()
+    """ssh reported a connection that never completed."""
+
+    UNDETERMINED = auto()
+    """vq never learned this attempt's outcome.
+
+    Its own poll timeout, an output-capture limit, a lost local observer. This
+    is emphatically not evidence of a healthy host: a login node that accepts
+    the connection and then hangs before the banner produces exactly this
+    shape, and it is as load-dependent as an outright refusal.
+    """
+
+
+def _scheduler_poll_answer(poll_error: BaseException | None) -> _SchedulerPollAnswer:
+    """Classify one live poll's outcome for the cooldown (#51).
+
+    A locally raised ``OSError`` or ``subprocess`` failure is undetermined for
+    the same reason a timeout is: it is the observer's account of itself, and
+    says nothing about whether the host answered.
+    """
+    if poll_error is None:
+        return _SchedulerPollAnswer.ANSWERED
+    if isinstance(poll_error, SchedulerHostUnreachable):
+        return _SchedulerPollAnswer.REFUSED
+    if isinstance(
+        poll_error,
+        SchedulerRemoteOutcomeUnknown | OSError | subprocess.SubprocessError,
+    ):
+        return _SchedulerPollAnswer.UNDETERMINED
+    return _SchedulerPollAnswer.ANSWERED
+
+
+# Two roles, and the whole of #51's follow-up is telling them apart.
+#
+# A host's running jobs can hold more than one dispatcher generation:
+# ``_config_fingerprint()`` rebuilds a target's dispatcher on ANY config edit,
+# while in-flight jobs keep the one they were submitted with. Those generations
+# are NOT interchangeable — they can differ in ``ssh``, ``scheduler_dialect``
+# and ``submit_extra`` — so "the batch's dispatcher" is only ever the right
+# answer for work that belongs to the batch.
+#
+#   * THE OBSERVER (:meth:`Daemon._scheduler_observation_dispatcher`) issues
+#     the one batched ``qstat``/``squeue`` per host per pass and therefore owns
+#     everything that reads the rows it came back with:
+#     ``accounting_required_for_absent``, ``phase_from_detail`` and
+#     ``abnormal_termination_from_detail``. Those are dialect questions about
+#     this observation, so they must be asked of the dialect that produced it.
+#
+#   * THE JOB'S OWN GENERATION (``sj.dispatcher``) owns everything addressed to
+#     one job: ``cancel`` (which runs ``qdel``), ``exit_marker_code`` and
+#     ``missing_marker_diagnostics``, alongside ``fetch_results``, which already
+#     worked this way. A job is cancelled and read over the ``ssh`` alias and
+#     the dialect it was submitted under, never over a generation that merely
+#     happened to be first in a dict.
+#
+# Before the per-host pacing change, grouping by dispatcher object kept these
+# apart by accident and cost the host one connection per generation. Keying on
+# the host is right and stays; the split above is what that keying needs.
 
 
 _SCHEDULER_SUBMIT_BINDING_SCHEMA = "vq.scheduler-submit-binding/1"
 _SCHEDULER_SUBMIT_BINDING_MAX_BYTES = MULTI_USER_SPEC_MAX_BYTES + 4096
 _BINDING_JOB_ID_UNSET = object()
+
+# #22: the on-disk identity of a retained row the daemon has already proven to
+# be off the admission path. Four components per file, all out of the one
+# ``stat`` the check already pays for -- ``(st_mtime_ns, st_size, st_ino,
+# st_dev)`` for the spec, then the same four for the private scheduler binding,
+# which is ``_STAT_IDENTITY_ABSENT`` when there is none (always, in single-user
+# mode). Any rewrite of either file changes the tuple, which retires the proof
+# and puts the row back on the scan.
+#
+# The inode and device are what make that claim strong rather than probable.
+# Every spec write goes through ``_storage.atomic_write_text``: a uniquely named
+# temp file is created in the same directory *while the old file is still
+# linked*, then ``os.replace``d onto the target. The temp therefore cannot be
+# holding the inode it is about to replace, so a rewrite always lands on a
+# different ``st_ino`` even when the new bytes are the same length and the clock
+# has not advanced.
+#
+# Residual hazard, stated plainly: a rewrite that reuses the same inode with an
+# identical ``st_mtime_ns`` and ``st_size`` inside one tick would be served from
+# the stale proof. That needs a writer that bypasses ``atomic_write_text`` and
+# edits the file in place, landing on the same byte count and the same
+# nanosecond timestamp. It is acceptable *for this set* because of what the set
+# contains, not because the window is small: a proof is only ever recorded for a
+# row that is terminal and holds no scheduler transaction that could still be
+# open (:meth:`Daemon._spec_is_off_admission_path`, plus the private binding in
+# multi-user mode). Dispatch acts on PENDING rows; every terminal row that could
+# still hold a reservation is excluded before a proof exists. So a stale proof
+# withholds a row this tick would have read and passed over -- and the next
+# identity change, which any ordinary archive, restore, ``vq fetch`` stamp or
+# hand edit produces, puts it back on the scan. That is the same argument the
+# archived-row skip already rested on, made explicit.
+_SettledSpecIdentity = tuple[int, int, int, int, int, int, int, int]
+
+# One file's four identity components, the first half of a
+# ``_SettledSpecIdentity`` and the whole of what the pause-intent sweep's
+# verdict is keyed on (#82).
+_StatIdentity = tuple[int, int, int, int]
+
+# How many of a ``_SettledSpecIdentity``'s components describe the spec file
+# itself. The rest describe the private scheduler binding beside it.
+_SPEC_IDENTITY_COMPONENTS = 4
+
+# Sentinel for "this file is not there" -- distinct from every real stat result,
+# since st_size is never negative.
+_STAT_IDENTITY_ABSENT: _StatIdentity = (-1, -1, -1, -1)
+
+
+def _stat_identity(path: Path | None) -> _StatIdentity:
+    """``(mtime_ns, size, ino, dev)`` for ``path``, else ``_STAT_IDENTITY_ABSENT``.
+
+    One ``stat`` call, so the inode and the device cost nothing beyond the
+    mtime and the size.
+    """
+    if path is None:
+        return _STAT_IDENTITY_ABSENT
+    try:
+        metadata = path.stat()
+    except OSError:
+        return _STAT_IDENTITY_ABSENT
+    return (
+        metadata.st_mtime_ns,
+        metadata.st_size,
+        metadata.st_ino,
+        metadata.st_dev,
+    )
 
 
 @dataclass(frozen=True)
@@ -987,6 +1228,9 @@ class _OrphanJob:
     mem_mb: int | None
     uid: str | None = None
     spec_path: Path | None = None
+    # Armed when a kill is first observed after reattachment. The orphan
+    # keeps its resource reservation until exit or SIGKILL escalation.
+    term_deadline: float | None = None
 
 
 def _pgroup_alive(pgid: int) -> bool:
@@ -1007,6 +1251,16 @@ _VERSION_RE = re.compile(r'__version__\s*=\s*["\']([^"\']+)["\']')
 
 _UNSET = object()
 """Sentinel for "this cached dispatcher was not built from config"."""
+
+_PINNED_SCRATCH_ROOT_RECHECK_SECONDS = 60.0
+"""How often a pinned scheduler ``scratch_root`` re-reads the queue (#63).
+
+While a host is pinned to its previous root the daemon must notice when the
+last unbound job binds or drains, because that is when the operator's change
+may finally be adopted. Binding publishes the change immediately (see
+:meth:`Daemon._bind_scheduler_workspace`); this bounds the other case --
+draining -- without re-globbing every spec on every dispatch pass.
+"""
 
 
 def _config_fingerprint() -> str | None:
@@ -1733,6 +1987,35 @@ class Daemon:
         # Never rebuild a root-daemon write target from a user-controlled inner
         # id; active runtime records retain this path after the next scan.
         self._job_spec_paths: dict[str, Path] = {}
+        # #22: retained rows proven to be off the admission path — settled,
+        # meaning terminal and holding no scheduler transaction that could still
+        # be open. The value is the on-disk identity that proved it, so an
+        # archive, a `--restore`, a `vq fetch` read stamp, a hand edit or a new
+        # binding invalidates the proof and the row is read again. A per-tick
+        # pass then costs a stat per settled row instead of an open + JSON parse
+        # + model validation.
+        self._settled_spec_identity: dict[Path, _SettledSpecIdentity] = {}
+        # jobid -> path for the rows skipped by the most recent scan. Lets a
+        # dispatch tick read back exactly the settled predecessors a live spec
+        # names, without putting the whole retained history back on the path.
+        self._settled_spec_paths: dict[str, Path] = {}
+        # #82: the verdict this daemon hands to the per-tick pause-intent
+        # sweep, which does its own glob and is the one per-tick pass that does
+        # not go through `_iter_specs`. An entry `path -> identity` means
+        # exactly this: at that on-disk identity, a full read of that path
+        # showed a settled row (`_spec_is_off_admission_path`) carrying no
+        # durable pause intent. Being settled is not on its own enough -- a
+        # `vq pause` killed before SIGSTOP while its job was exiting leaves a
+        # terminal row with a live intent, and finishing that is real work the
+        # sweep must not skip.
+        #
+        # The value is the *spec's* four identity components only. A pause
+        # intent is a field of the row itself, so arming one rewrites this
+        # file; the private scheduler binding's four components govern
+        # admission, not pause. Any content change therefore retires the entry
+        # by making it stop matching, which is what keeps a stale entry
+        # harmless rather than merely unlikely.
+        self._settled_spec_without_pause_intent: dict[Path, _StatIdentity] = {}
         # cgroup detection is at-init: probe systemd-run --user once and
         # remember. If available, the kernel handles memory + CPU
         # enforcement; the watchdog runs in telemetry-only mode for memory.
@@ -1810,6 +2093,14 @@ class Daemon:
         # target host, built lazily from this daemon's config on first dispatch.
         self._scheduler_running: dict[str, _SchedulerJob] = {}
         self._scheduler_dispatchers: dict[str, SchedulerDispatcher] = {}
+        # #63: hosts currently served their PREVIOUS scratch_root because a
+        # non-terminal job on them still has no recorded workspace, and the
+        # monotonic stamp of the last time that was re-checked. The pin is
+        # in-memory; what survives a restart is the remembered root itself,
+        # in ``paths.scheduler_scratch_roots_path``.
+        self._scheduler_pinned_roots: dict[str, str] = {}
+        self._scheduler_pin_checked_at: dict[str, float] = {}
+        self._scheduler_root_memory: dict[str, RememberedScratchRoot] | None = None
         self._scheduler_reattach_retry_last: dict[str, float] = {}
         # Active scheduler rows hidden from normal iteration by the multi-user
         # duplicate-id quarantine.  They are never dispatched or reconciled
@@ -1838,13 +2129,25 @@ class Daemon:
         # before entering the production loop so slow SSH/scheduler observation
         # cannot hold local dispatch or another scheduler host hostage.
         self._background_scheduler_polling = False
-        self._scheduler_poll_flights: dict[
-            SchedulerDispatcher, _SchedulerPollFlight
-        ] = {}
+        # Keyed by configured scheduler target, never by dispatcher object: a
+        # config reload rebuilds a target's dispatcher while its in-flight jobs
+        # keep the generation they were submitted with, and two generations of
+        # one host must still share one observation (#51).
+        self._scheduler_poll_flights: dict[str, _SchedulerPollFlight] = {}
+        # Per scheduler host, not per job and not per dispatcher generation: a
+        # host that did not answer did not answer for any job it carries, so the
+        # whole host's next observation is what waits — across a config reload,
+        # and across its jobs coming and going. See _SchedulerPollBackoff.
+        self._scheduler_poll_backoff: dict[str, _SchedulerPollBackoff] = {}
+        # The monotonic clock the cooldown above is measured on. Production
+        # never replaces it; a test advances it instead of sleeping through a
+        # five-minute ceiling.
+        self._scheduler_poll_clock: Callable[[], float] = time.monotonic
         self._scheduler_fetch_flights: dict[str, _SchedulerFetchFlight] = {}
-        # Main-loop service order: actual admissions move a dispatcher behind
-        # waiting groups. New arrivals cannot continually overtake a waiter.
-        self._scheduler_fetch_order: dict[SchedulerDispatcher, None] = {}
+        # Main-loop service order: actual admissions move a host behind waiting
+        # groups. New arrivals cannot continually overtake a waiter. Keyed by
+        # target for the same reason the poll registries are (#51).
+        self._scheduler_fetch_order: dict[str, None] = {}
         self._scheduler_fetch_admissions_left: int | None = None
         # v0.5.35: webhook URL for terminal-state notifications. None
         # (default) = notifications disabled; daemon-side callers
@@ -1992,7 +2295,52 @@ class Daemon:
             self.default_job_mem_mb,
             multi_user=self._multi_user,
         )
+        # #53: install the stop handlers BEFORE the startup walk, not after
+        # it. The walk reads every queued spec, which on a driver-sized queue
+        # takes minutes -- a reported 21,683-spec queue needed more than 242 s
+        # cold. Until v0.26.8 the handlers went on afterwards, so for that
+        # whole window SIGTERM kept its default disposition and killed the
+        # process outright: `vq daemon stop`, `systemctl --user stop` and
+        # `launchctl bootout` all ended in an instant death, with no shutdown
+        # and no line in the daemon log. That is the ungraceful removal a
+        # self-update rollback recorded, and the window that most needs a
+        # handler was the one window that had none.
+        self._install_stop_handlers()
+        # #67: publish the RPC socket BEFORE the startup reattachment pass,
+        # not after it. The pass reads every queued spec and probes every
+        # live scheduler job over SSH, one job at a time: a driver
+        # supervising 175 scheduler jobs on an 18,013-spec queue took 9 min
+        # 51 s from `daemon starting` to `RPC server listening`. While that
+        # ran, nothing answered the socket, so every local `vq` call failed
+        # and -- the reason this moved -- `vq admin update`'s post-restart
+        # readiness window expired on a daemon that was perfectly healthy and
+        # simply busy, and rolled a valid install back. Readiness and
+        # provenance need none of the pass: the source SHA and tree digest
+        # are captured from the installed package, not from the queue. Anchor
+        # them to process start instead of to fleet size, so a legitimately
+        # busy driver cannot become permanently unupdatable.
+        #
+        # Serving during the pass is deliberate: state-file RPCs
+        # (admin-status, drain, throttle, capacity) read and write files this
+        # pass does not own, and `set_config_reload` only raises a flag the
+        # main loop reads. The one method that needs the loop --
+        # `get_scheduler_status_refresh` -- blocks until its caller's own
+        # timeout, as it already does whenever a tick is slow.
+        self._start_rpc_server(advertised_capacity)
         self._reattach_or_interrupt_at_startup()
+        if self._stop:
+            # Stopped during the pass. Nothing below is worth doing for a
+            # daemon that is leaving, and its socket must go with it: a
+            # reader that reaches the socket must be talking to a daemon that
+            # came up and was not asked to leave, or an updater polling for
+            # readiness would take the answer as proof this daemon stayed.
+            log.info(
+                "daemon stopped during startup reattachment; "
+                "withdrawing the RPC socket before exit",
+            )
+            self._stop_rpc_server()
+            self._close_running_logs()
+            return
         self._reseed_host_pressure_pauses_at_startup()  # HP-1
         # v0.11.0: reap a stale admin-update marker left by a prior
         # daemon life — a killed `vq admin update`, or one whose host
@@ -2003,17 +2351,60 @@ class Daemon:
         # as live and correctly keeps holding dispatch. Cheap: one file
         # read + an os.kill probe, once at startup.
         self._poll_admin_update_marker()
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-        # SIGHUP = reload config, the POSIX convention. Guarded: SIGHUP does not
-        # exist on Windows, and signal.signal raises off the main thread.
-        with contextlib.suppress(ValueError, AttributeError, OSError):
-            signal.signal(signal.SIGHUP, self._handle_reload_signal)
-        # v0.8.0 *Dahl's Simula*: start the RPC server so CLI
-        # clients can read/write admin-status through the
-        # daemon's canonical view. Failure to start is logged
-        # but not fatal — the daemon's primary job (dispatch) is
-        # unaffected; CLIs fall back to direct file access.
+        self._background_scheduler_polling = True
+        try:
+            while not self._stop:
+                # Clear before the pass. A request published during the pass
+                # remains set and makes the following wait return immediately;
+                # a request racing the next clear is already in the monotonic
+                # request sequence and is observed by that next pass.
+                self._scheduler_refresh_wakeup.clear()
+                try:
+                    self.iterate()
+                    if self._loop_hook is not None:
+                        self._loop_hook()
+                except Exception:
+                    log.exception("error in main loop iteration; continuing")
+                self._scheduler_refresh_wakeup.wait(self.poll_interval)
+        finally:
+            self._background_scheduler_polling = False
+            # Poll workers are daemon threads and mutate only their private
+            # flight record. Dropping the registry prevents any late result
+            # from being applied after shutdown; transport timeouts bound the
+            # remaining read-only command.
+            self._scheduler_poll_flights.clear()
+            # A cooldown is a pacing decision about a live loop, not durable
+            # state: a restarted daemon re-measures the host from scratch.
+            self._scheduler_poll_backoff.clear()
+            # No late transfer outcome may publish a lifecycle transition.
+            # A detached transport can finish its unique scratch archive, but
+            # a restarted daemon uses another archive and re-proves the job's
+            # terminal evidence. Neither process removes the other's archive.
+            self._scheduler_fetch_flights.clear()
+            self._scheduler_fetch_order.clear()
+            self._scheduler_fetch_admissions_left = None
+            with self._scheduler_refresh_condition:
+                self._scheduler_refresh_condition.notify_all()
+            self._stop_rpc_server()
+            self._close_running_logs()
+        log.info("daemon stopped")
+
+    def _start_rpc_server(
+        self,
+        advertised_capacity: capacity.DaemonCapacity,
+    ) -> None:
+        """Publish the daemon RPC socket and register its methods.
+
+        v0.8.0 *Dahl's Simula*: CLI clients read and write admin-status
+        through the daemon's canonical view. Failure to start is logged
+        but not fatal -- the daemon's primary job (dispatch) is
+        unaffected; CLIs fall back to direct file access.
+
+        Called before the startup reattachment pass (#67), so readiness
+        and provenance are answerable from process start rather than
+        after a pass whose cost grows with the queue and with the number
+        of live scheduler jobs.
+        """
         self._rpc_server: _rpc_module.RPCServer | None = None
         try:
             from vq import rpc as _rpc_module
@@ -2144,44 +2535,25 @@ class Daemon:
                 "file access (multi-user mode: stale view risk).",
             )
             self._rpc_server = None
-        self._background_scheduler_polling = True
+
+    def _stop_rpc_server(self) -> None:
+        """Withdraw the RPC socket, if one was published.
+
+        Idempotent, and never raises: a failed teardown must not keep the
+        daemon from finishing its shutdown. Used both by the ordinary
+        shutdown path and by the stop-during-startup path, which must
+        unpublish the socket it opened before the reattachment pass (#67).
+        """
+        # getattr: a Daemon whose run() never reached _start_rpc_server (a
+        # test driving one phase, a construction that failed early) has no
+        # attribute yet, and shutdown must not turn that into an error.
+        server = getattr(self, "_rpc_server", None)
+        if server is None:
+            return
         try:
-            while not self._stop:
-                # Clear before the pass. A request published during the pass
-                # remains set and makes the following wait return immediately;
-                # a request racing the next clear is already in the monotonic
-                # request sequence and is observed by that next pass.
-                self._scheduler_refresh_wakeup.clear()
-                try:
-                    self.iterate()
-                    if self._loop_hook is not None:
-                        self._loop_hook()
-                except Exception:
-                    log.exception("error in main loop iteration; continuing")
-                self._scheduler_refresh_wakeup.wait(self.poll_interval)
-        finally:
-            self._background_scheduler_polling = False
-            # Poll workers are daemon threads and mutate only their private
-            # flight record. Dropping the registry prevents any late result
-            # from being applied after shutdown; transport timeouts bound the
-            # remaining read-only command.
-            self._scheduler_poll_flights.clear()
-            # No late transfer outcome may publish a lifecycle transition.
-            # A detached transport can finish its unique scratch archive, but
-            # a restarted daemon uses another archive and re-proves the job's
-            # terminal evidence. Neither process removes the other's archive.
-            self._scheduler_fetch_flights.clear()
-            self._scheduler_fetch_order.clear()
-            self._scheduler_fetch_admissions_left = None
-            with self._scheduler_refresh_condition:
-                self._scheduler_refresh_condition.notify_all()
-            if self._rpc_server is not None:
-                try:
-                    self._rpc_server.stop()
-                except Exception:
-                    log.exception("RPC server stop failed")
-            self._close_running_logs()
-        log.info("daemon stopped")
+            server.stop()
+        except Exception:
+            log.exception("RPC server stop failed")
 
     def _admin_group_gid_for_rpc(self) -> int | None:
         """Resolve the admin-group GID for the RPC socket's chown.
@@ -2270,6 +2642,26 @@ class Daemon:
             "localhost",
             queue_dir=self.queue_dir,
             multi_user=self._multi_user,
+            # This runs every tick over every retained job, so it reads each
+            # row before locking it and skips the ones with no intent to
+            # finish (#22). A tick is a repeated sweep, not a proof: an intent
+            # armed between that read and the lock is picked up next tick.
+            omit_rows_without_intent=True,
+            # #82: and it need not even read a row whose bytes an earlier pass
+            # already read and found settled and intent-free. The sweep stays
+            # *first* in the tick -- the crash window below has to be closed
+            # before polling and the watchdog decide anything about a
+            # possibly-stopped child -- so this verdict is the previous tick's
+            # (or, on the first tick, the startup walk's, which reads every
+            # row). The consequence is bounded at one extra full read per row,
+            # once in its life: a row this tick's scan proves settled is
+            # skipped by the next tick's sweep, and a row that settles only
+            # after this tick's scan has passed it is read once more by the
+            # next sweep and skipped from the one after. Reordering the sweep
+            # behind `_dispatch_pending` would buy that single read back and
+            # cost the ordering guarantee, which is not a trade this loop
+            # should make.
+            rows_proven_without_intent=self._pause_intent_sweep_may_skip,
         )
         for jobid, detail in pause_intents.errors:
             log.error(
@@ -2367,7 +2759,7 @@ class Daemon:
             spec,
             job_id=spec.scheduler_job_id or spec.id,
         )
-        dispatcher.cleanup_remote_workspace(handle)
+        dispatcher.cleanup_remote_workspace(handle, vq_job_id=spec.id)
 
     def _maybe_check_version_drift(self) -> None:
         """v0.6.2: every ``_VERSION_DRIFT_CHECK_INTERVAL_SECONDS``,
@@ -2532,7 +2924,27 @@ class Daemon:
         # paused those, and un-pausing via a resubmit contradicts that
         # intent.
         just_aborted_running: list[JobSpec] = []
-        for spec in self._iter_specs():
+        # #22: the one pass that still sees every retained row. A terminal job
+        # whose process group outlived the daemon is reaped here -- being
+        # terminal, or archived on top of that, says nothing about whether its
+        # children are gone, and this walk must not assume otherwise. It runs
+        # once per daemon life, and it records the identities that let the
+        # per-tick passes behind it skip the same rows.
+        for spec in self._iter_specs(include_settled=True):
+            # #53: a stop that lands mid-walk is honoured at the next spec
+            # boundary. `vq daemon stop` waits 10 s, launchd and systemd
+            # escalate to SIGKILL on their own timeouts, so a daemon that
+            # merely noted the signal and then finished a several-minute
+            # scan would still be killed ungracefully. Each spec is
+            # reconciled and persisted independently, and the walk exists
+            # precisely to reconcile whatever is on disk at startup, so an
+            # unvisited spec is simply reconciled by the next daemon life.
+            if self._stop:
+                log.info(
+                    "stop requested during startup reattach; "
+                    "leaving the remaining specs for the next daemon start",
+                )
+                break
             binding_fence = self._scheduler_binding_requires_fence(spec)
             transaction_may_exist = (
                 self._scheduler_transaction_may_exist(spec)
@@ -2767,6 +3179,11 @@ class Daemon:
         # with --auto-resume, gets a sibling resubmit. Runs after the
         # main loop so the just-written sibling specs don't perturb the
         # iteration.
+        # #53: this pass still runs after an interrupted walk. It covers only
+        # the specs THIS pass aborted, and a sibling is a durable PENDING spec
+        # that the next daemon dispatches. Skipping it would lose those resumes
+        # for good: their parents are ABORTED_BY_QUEUE now, so a later startup
+        # no longer sees them enter from RUNNING.
         for spec in just_aborted_running:
             if spec.recover_on_reboot:
                 self._auto_resume(spec)
@@ -3127,7 +3544,7 @@ class Daemon:
             )
 
     def _reconcile_orphans(self) -> None:
-        """Poll orphan pgids; classify each one when its pgid disappears.
+        """Poll orphan pgids; finish exited groups and escalate killed ones.
 
         v0.4 always marked exiting orphans ABORTED_BY_QUEUE because init
         reaped them and the rc was unrecoverable. v0.5.9's command wrapper
@@ -3145,12 +3562,19 @@ class Daemon:
           state alone but stash the rc for forensics (mirrors
           :meth:`_record_finish`).
 
+        A live group whose spec becomes terminal keeps its reservation until
+        exit or the kill grace expires. Escalation releases it even if zombie
+        members still answer the group probe.
+
         The submitter should still consult stdout.log / stderr.log to
         see what the inner command actually printed before exiting.
         """
         gone: list[str] = []
         for jobid, orphan in list(self._orphans.items()):
-            if not _pgroup_alive(orphan.pgid):
+            if (
+                not _pgroup_alive(orphan.pgid)
+                or self._escalate_orphan_if_killed(jobid, orphan)
+            ):
                 gone.append(jobid)
         for jobid in gone:
             orphan = self._orphans[jobid]
@@ -3180,6 +3604,45 @@ class Daemon:
                     )
             del self._orphans[jobid]
             self.watchdog.unregister(jobid)
+
+    def _escalate_orphan_if_killed(self, jobid: str, orphan: _OrphanJob) -> bool:
+        """Bound a killed orphan's grace without waiting for zombies to vanish.
+
+        Reattached jobs have no Popen handle, so the running-child escalation
+        never sees them. Keep the orphan charged through its grace, then use
+        its captured process group rather than a mutable spec's pgid.
+        """
+        try:
+            spec, _ = self._read_active_spec(jobid, orphan)
+        except (OSError, ValueError):
+            return False
+        if not spec.is_terminal:
+            orphan.term_deadline = None
+            return False
+        if orphan.pgid == os.getpgrp():
+            return False
+        now = time.monotonic()
+        if orphan.term_deadline is None:
+            orphan.term_deadline = now + KILL_ESCALATION_GRACE_SECONDS
+            return False
+        if now < orphan.term_deadline:
+            return False
+        log.warning(
+            "job %s: terminal orphan (%s) pgid %s outlived the kill grace; "
+            "escalating to SIGKILL",
+            jobid, spec.state.value, orphan.pgid,
+        )
+        with contextlib.suppress(ProcessLookupError):
+            killpg(orphan.pgid, signal.SIGCONT)
+        with contextlib.suppress(ProcessLookupError):
+            killpg(orphan.pgid, signal.SIGKILL)
+        self._reap_scope(jobid)
+        events.state_transition(
+            Path(spec.cwd), jobid,
+            from_state=spec.state.value, to_state=spec.state.value,
+            reason="reattached orphan outlived the kill grace; SIGKILLed",
+        )
+        return True
 
     def _record_orphan_finish(
         self,
@@ -3449,7 +3912,15 @@ class Daemon:
 
         Cleanup runs after the terminal-state write and outside its lock. Re-read
         under the per-spec lock so this diagnostic cannot restore a stale state
-        or replace a failure reason written by another terminal actor.
+        or replace a note written by another terminal actor.
+
+        It lands in ``workdir_cleanup_note``, not ``failure_reason``: the job
+        may well have COMPLETED, and ``failure_reason`` is reserved for
+        non-COMPLETED terminal transitions -- ``vq status`` prints it as
+        ``failure:`` and ``--json`` reports it as the terminal ``reason``.
+        Leaving a workdir behind is neither. Before this, a host whose
+        scratch root had moved stamped a "failure" on every ``--clean-tmp``
+        job that succeeded.
         """
         diagnostic = f"workdir cleanup skipped: {reason}"
         log.warning("job %s: %s", spec.id, diagnostic)
@@ -3468,12 +3939,14 @@ class Daemon:
                         fresh.state.value,
                     )
                     return
-                if diagnostic in (fresh.failure_reason or ""):
+                if diagnostic in (fresh.workdir_cleanup_note or ""):
                     return
-                if fresh.failure_reason:
-                    fresh.failure_reason = f"{fresh.failure_reason}; {diagnostic}"
+                if fresh.workdir_cleanup_note:
+                    fresh.workdir_cleanup_note = (
+                        f"{fresh.workdir_cleanup_note}; {diagnostic}"
+                    )
                 else:
-                    fresh.failure_reason = diagnostic
+                    fresh.workdir_cleanup_note = diagnostic
                 fresh.write(spec_path)
         except (OSError, ValueError) as exc:
             log.warning(
@@ -3508,22 +3981,27 @@ class Daemon:
         if not spec.workdir:
             return
         if not self._multi_user:
-            wd = Path(spec.workdir)
-            try:
-                if wd.exists():
-                    shutil.rmtree(wd)
-                    log.info(
-                        "job %s: workdir cleaned "
-                        "(clean_workdir_on_terminal): %s",
-                        spec.id,
-                        wd,
-                    )
-            except OSError as exc:
-                log.warning(
-                    "job %s: failed to clean workdir %s: %s",
+            # #63: the same guarded removal the multi-user path uses. The
+            # workdir root is configurable now, so "rmtree whatever the spec
+            # recorded" would let a stale or hand-edited record aim the
+            # deletion outside every root vq manages.
+            reason = paths.remove_managed_scratch_dir(
+                spec.workdir,
+                spec.id,
+                roots=paths.managed_workdir_roots(),
+                expected_uid=os.geteuid(),
+            )
+            if reason is None:
+                log.info(
+                    "job %s: workdir cleaned (clean_workdir_on_terminal): %s",
                     spec.id,
-                    wd,
-                    exc,
+                    spec.workdir,
+                )
+            else:
+                self._record_workdir_cleanup_skip(
+                    spec,
+                    spec_path or self._spec_path(spec.id),
+                    reason,
                 )
             return
 
@@ -3576,70 +4054,24 @@ class Daemon:
             spec_path = getattr(runtime, "spec_path", None)
         if spec_path is None:
             spec_path = paths.user_spec_path(owner, spec.id)
-        workdir_root = paths.user_workdir_root(owner_uid)
-        managed_workdir = paths.user_workdir(owner_uid, spec.id)
-        if spec.workdir != str(managed_workdir):
-            self._record_workdir_cleanup_skip(
-                spec,
-                spec_path,
-                "recorded path does not match the managed owner/job path",
-            )
+        # #63: both managed roots, so a job dispatched before the scratch
+        # split is still cleaned at its recorded path. The trusted owner uid
+        # (not the spec) still decides which user's trees are eligible, and
+        # the removal is still relative to an O_NOFOLLOW descriptor on the
+        # root itself.
+        reason = paths.remove_managed_scratch_dir(
+            spec.workdir,
+            spec.id,
+            roots=paths.managed_user_workdir_roots(owner_uid),
+            expected_uid=owner_uid,
+        )
+        if reason is not None:
+            self._record_workdir_cleanup_skip(spec, spec_path, reason)
             return
-
-        open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        try:
-            root_fd = os.open(workdir_root, open_flags)
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError) as exc:
-            self._record_workdir_cleanup_skip(
-                spec,
-                spec_path,
-                f"managed workdir root could not be opened safely: {exc}",
-            )
-            return
-        try:
-            try:
-                entry = os.stat(spec.id, dir_fd=root_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                return
-            except (OSError, ValueError) as exc:
-                self._record_workdir_cleanup_skip(
-                    spec,
-                    spec_path,
-                    f"managed owner/job path metadata could not be read: {exc}",
-                )
-                return
-            if stat.S_ISLNK(entry.st_mode):
-                self._record_workdir_cleanup_skip(
-                    spec,
-                    spec_path,
-                    "managed owner/job path is a symlink",
-                )
-                return
-            if not stat.S_ISDIR(entry.st_mode):
-                self._record_workdir_cleanup_skip(
-                    spec,
-                    spec_path,
-                    "managed owner/job path is not a directory",
-                )
-                return
-            try:
-                shutil.rmtree(spec.id, dir_fd=root_fd)
-            except (OSError, ValueError) as exc:
-                self._record_workdir_cleanup_skip(
-                    spec,
-                    spec_path,
-                    f"managed owner/job path could not be removed: {exc}",
-                )
-                return
-        finally:
-            with contextlib.suppress(OSError):
-                os.close(root_fd)
         log.info(
             "job %s: workdir cleaned (clean_workdir_on_terminal): %s",
             spec.id,
-            managed_workdir,
+            spec.workdir,
         )
 
     def _reconcile_running(self) -> None:
@@ -5139,6 +5571,12 @@ class Daemon:
         #   conservatively as "still waiting" so an accidental
         #   `vq cleanup --delete` doesn't silently fail the dependent.
         specs_by_id: dict[str, JobSpec] = {s.id: s for s in all_specs}
+        # #22: a settled predecessor is off the admission scan, but the gate
+        # above reads a missing predecessor as "still waiting" -- which would
+        # park a dependent forever the moment its predecessor finished. Read
+        # back exactly the settled rows a live spec names (normally none), not
+        # the retained history they sit in.
+        self._resolve_settled_dependencies(all_specs, specs_by_id)
         for spec in list(all_specs):
             self._maybe_cascade_dependency_failure(spec, specs_by_id)
 
@@ -5773,23 +6211,47 @@ class Daemon:
                 f"submitter={claimed} does not match the owning state "
                 f"directory uid={trusted_uid} — forged or misplaced spec"
             )
-        # 2. cwd must resolve inside the submitter's own jobs tree.
-        jobs_root_path = paths.user_jobs_dir(trusted_uid)
-        try:
-            jobs_root_stat = jobs_root_path.lstat()
-        except OSError as e:
-            return f"jobs root {jobs_root_path} could not be inspected: {e}"
-        if not stat.S_ISDIR(jobs_root_stat.st_mode):
-            return f"jobs root {jobs_root_path} is not a real directory"
-        jobs_root = jobs_root_path.resolve()
+        # 2. cwd must resolve inside one of the submitter's own jobs trees.
+        #    #63 made that a set rather than a single path: a job dispatched
+        #    before the scratch split recorded its workspace under the state
+        #    root and keeps it, so gating on the current root alone would
+        #    refuse every pre-existing job (the #69 failure shape, from the
+        #    other side). Both roots are daemon-provisioned and owner-checked,
+        #    so accepting either widens nothing.
+        jobs_roots: list[Path] = []
+        problems: list[str] = []
+        for jobs_root_path in paths.managed_user_jobs_roots(trusted_uid):
+            try:
+                jobs_root_stat = jobs_root_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                problems.append(
+                    f"jobs root {jobs_root_path} could not be inspected: {e}"
+                )
+                continue
+            if not stat.S_ISDIR(jobs_root_stat.st_mode):
+                problems.append(
+                    f"jobs root {jobs_root_path} is not a real directory"
+                )
+                continue
+            jobs_roots.append(jobs_root_path.resolve())
+        if not jobs_roots:
+            return problems[0] if problems else (
+                f"no managed jobs root exists for uid {trusted_uid}"
+            )
         try:
             cwd = Path(spec.cwd).resolve()
         except (OSError, RuntimeError, ValueError) as e:
             return f"cwd={spec.cwd!r} could not be resolved: {e}"
-        if cwd != jobs_root and jobs_root not in cwd.parents:
+        if not any(
+            cwd == jobs_root or jobs_root in cwd.parents
+            for jobs_root in jobs_roots
+        ):
             return (
-                f"cwd={spec.cwd!r} is outside the submitter's jobs tree "
-                f"{jobs_root} — refusing to chown/run there as root"
+                f"cwd={spec.cwd!r} is outside the submitter's jobs trees "
+                f"{[str(root) for root in jobs_roots]} — refusing to "
+                "chown/run there as root"
             )
         # 3. stdout/stderr targets must stay inside the workspace
         #    (an absolute or ``../`` path would escape the join).
@@ -6620,6 +7082,18 @@ class Daemon:
         host, so a daemon that never sees a scheduler job loads no extra state.
         Propagates ConfigError (unknown host) / SchedulerError / DialectError,
         which the caller turns into a dispatch failure.
+
+        #63's refusal to adopt a changed ``scratch_root`` while a host still
+        carries an unbound non-terminal job lives here. It used to be gated
+        on there being a *cached* dispatcher to compare against, which is the
+        one thing that is never true on the two paths that matter: the cache
+        is empty at construction and cleared wholesale by a config reload,
+        and "set the key, restart the daemon" is the documented procedure
+        (``docs/fleet_layout.md`` phase 5). The comparison is therefore made
+        against the root this daemon *remembers* serving for the host --
+        durable, so a restart is not amnesia -- and the refusal now builds a
+        dispatcher pinned to that previous root rather than merely returning
+        a cache entry that may not exist.
         """
         current = _config_fingerprint()
         cached = self._scheduler_dispatchers.get(target)
@@ -6628,18 +7102,405 @@ class Daemon:
             # `_UNSET` = the entry was injected rather than built from config
             # (the test seam, and any future programmatic override). Those are
             # pinned: a config change must not silently swap them out.
-            if built_at is _UNSET or built_at == current:
+            if built_at is _UNSET:
                 return cached
-            log.info(
-                "config changed on disk; rebuilding scheduler dispatcher for "
-                "%s so new job scripts use the current config",
-                target,
-            )
+            if built_at == current:
+                # A host held at its previous root re-reads the queue from
+                # time to time: the jobs holding it there may have bound or
+                # drained, and adopting the operator's change is then overdue.
+                # A host serving an unconfirmed root is held in the same
+                # sense -- it is withholding bindings -- and re-reads on the
+                # same cadence, so the doubt clears when those jobs drain
+                # rather than waiting for the next restart.
+                held = (
+                    target in self._scheduler_pinned_roots
+                    or not self._scheduler_root_is_confirmed(target)
+                )
+                if not held:
+                    return cached
+                if not self._pinned_root_recheck_due(target):
+                    return cached
+            else:
+                log.info(
+                    "config changed on disk; rebuilding scheduler dispatcher "
+                    "for %s so new job scripts use the current config",
+                    target,
+                )
         host_cfg = load_config().host(target)  # ConfigError if the host is unknown
+        configured = (host_cfg.scratch_root or "").rstrip("/")
+        previous = (
+            cached.scratch_root
+            if cached is not None
+            else self._remembered_scheduler_root(target)
+        )
+        # Whether the root being served for this host is one vq can stand
+        # behind. It is not, in exactly one case, and that case is written
+        # below. Carried through both branches so the memory keeps its answer.
+        confirmed = self._scheduler_root_is_confirmed(target)
+        if previous is not None and configured != previous and confirmed:
+            # #63: a scratch_root change is safe for every job that recorded
+            # its workspace before submitting, and unsafe for one that did
+            # not -- the only thing that can still locate that job's
+            # workspace is the derivation from the *old* value. Keep serving
+            # the previous root until they bind (which their next
+            # observation does) or drain. The consequence is explicit: the
+            # new root does not take effect on this host, for any job, until
+            # then.
+            #
+            # Only a job that could actually have been staged holds the host
+            # back (:func:`unbound_staged_job_ids`). A first attempt still
+            # PENDING has nothing on the host to strand; counting it meant a
+            # queue that kept being fed held its host at the previous root
+            # indefinitely and the operator's change never landed at all.
+            #
+            # And only a *confirmed* root is defended. An unconfirmed one is
+            # a root vq is serving without knowing it is the staged one, so
+            # there is nothing there to defend -- and refusing to move off it
+            # would block the very repair the unconfirmed warning asks the
+            # operator for. That case falls to the branch below.
+            strandable = self._strandable_scheduler_workspaces(target)
+            if strandable:
+                if target not in self._scheduler_pinned_roots:
+                    log.warning(
+                        "host %s: scratch_root changed to %r while %d job(s) "
+                        "that may already be staged on it carry no recorded "
+                        "workspace (%s%s); keeping the previous root %r until "
+                        "they bind or drain, so the directories they were "
+                        "staged into stay locatable. The new root does not "
+                        "take effect on this host, for any job, until then; "
+                        "`vq doctor %s` reports the host as held.",
+                        target,
+                        host_cfg.scratch_root,
+                        len(strandable),
+                        ", ".join(strandable[:5]),
+                        ", ..." if len(strandable) > 5 else "",
+                        previous,
+                        target,
+                    )
+                self._scheduler_pinned_roots[target] = previous
+                if cached is not None and cached.scratch_root == previous:
+                    # Reuse the instance. A dispatcher carries per-host state
+                    # a rebuild would throw away -- whether the remote job
+                    # root has been created, and the incremental readers'
+                    # tail cursors -- and this branch is re-entered on every
+                    # lookup while the host is held.
+                    self._scheduler_dispatcher_fingerprints[target] = current
+                    return cached
+                pinned = scheduler_dispatcher_for(
+                    host_cfg.model_copy(update={"scratch_root": previous})
+                )
+                self._scheduler_dispatchers[target] = pinned
+                self._scheduler_dispatcher_fingerprints[target] = current
+                return pinned
+            log.info(
+                "host %s: adopting scratch_root %r (previously %r); no job on "
+                "it that could have been staged is missing a recorded "
+                "workspace",
+                target,
+                host_cfg.scratch_root,
+                previous,
+            )
+            # Nothing on the host can be stranded, so whatever doubt an
+            # earlier start recorded about this key is settled.
+            confirmed = True
+        elif previous is None or not confirmed:
+            # #63, the case the guard was built for and could not see: the
+            # first start after an upgrade. The memory is written by this
+            # method, so a vq from before it leaves none -- and the runbook's
+            # own procedure is to set the key and restart, which puts the
+            # upgrade and the change inside one maintenance window. With
+            # nothing to compare against, vq cannot tell whether the
+            # configured root is the one these jobs were staged under.
+            #
+            # It serves the configured root, because no other root is known.
+            # What it will not do is make the guess durable: the root is
+            # recorded unconfirmed and :meth:`_bind_scheduler_workspace`
+            # withholds the binding while it is. A wrong derivation that
+            # nothing wrote down is undone by putting the key back; a wrong
+            # workspace written onto a pre-upgrade spec is not.
+            #
+            # An unconfirmed host therefore follows the key rather than
+            # holding it: restoring the previous value is the repair the
+            # warning asks for, and vq cannot tell that from an ordinary
+            # migration. Nothing is lost by following either, because nothing
+            # was written down.
+            strandable = self._strandable_scheduler_workspaces(target)
+            if strandable:
+                if confirmed:
+                    log.warning(
+                        "host %s: serving scratch_root %r with no memory of a "
+                        "previous one, while %d job(s) that may already be "
+                        "staged on it carry no recorded workspace (%s%s). vq "
+                        "cannot tell whether that is the root they were "
+                        "staged under, so it will not bind them to it. If the "
+                        "key was changed in the same window as the upgrade, "
+                        "put the previous value back; `vq doctor %s` reports "
+                        "the host until those jobs drain.",
+                        target,
+                        host_cfg.scratch_root,
+                        len(strandable),
+                        ", ".join(strandable[:5]),
+                        ", ..." if len(strandable) > 5 else "",
+                        target,
+                    )
+                elif previous is not None and configured != previous:
+                    log.warning(
+                        "host %s: scratch_root moved from %r to %r while the "
+                        "root in force was still unconfirmed; serving the new "
+                        "value. %d job(s) on this host that may already be "
+                        "staged still carry no recorded workspace (%s%s) and "
+                        "are still not bound to anything",
+                        target,
+                        previous,
+                        host_cfg.scratch_root,
+                        len(strandable),
+                        ", ".join(strandable[:5]),
+                        ", ..." if len(strandable) > 5 else "",
+                    )
+                confirmed = False
+                if cached is not None and cached.scratch_root == configured:
+                    # Reuse the instance, for the reason the pin branch above
+                    # reuses it: this branch is re-entered on the periodic
+                    # re-check, and a rebuild would discard per-host state.
+                    self._scheduler_dispatcher_fingerprints[target] = current
+                    self._remember_scheduler_root(
+                        target, configured, confirmed=False
+                    )
+                    return cached
+            else:
+                if not confirmed:
+                    log.info(
+                        "host %s: scratch_root %r is confirmed; no job on it "
+                        "that could have been staged is missing a recorded "
+                        "workspace, so new observations bind normally",
+                        target,
+                        host_cfg.scratch_root,
+                    )
+                confirmed = True
         dispatcher = scheduler_dispatcher_for(host_cfg)
         self._scheduler_dispatchers[target] = dispatcher
         self._scheduler_dispatcher_fingerprints[target] = current
+        self._scheduler_pinned_roots.pop(target, None)
+        self._scheduler_pin_checked_at.pop(target, None)
+        self._remember_scheduler_root(target, configured, confirmed=confirmed)
         return dispatcher
+
+    def _pinned_root_recheck_due(self, target: str) -> bool:
+        """Is it time to re-ask whether a pinned host can adopt its change?"""
+        now = self._scheduler_poll_clock()
+        last = self._scheduler_pin_checked_at.get(target)
+        if (
+            last is not None
+            and now - last < _PINNED_SCRATCH_ROOT_RECHECK_SECONDS
+        ):
+            return False
+        self._scheduler_pin_checked_at[target] = now
+        return True
+
+    def _scheduler_root_memory_map(self) -> dict[str, RememberedScratchRoot]:
+        """The remembered ``scratch_root`` per scheduler host, read once.
+
+        Unreadable or malformed content is treated as no memory at all: a
+        guard that cannot read its own note must not invent one.
+
+        Both entry shapes of
+        :data:`~vq.scheduler_dispatch.SCHEDULER_SCRATCH_ROOTS_SCHEMA` are
+        accepted. A bare string is a root this daemon adopted, and therefore
+        confirmed; an object carries its own ``confirmed`` flag, which is
+        ``False`` for a root that was served without vq being able to tell
+        whether the jobs already on the host were staged under it.
+        """
+        if self._scheduler_root_memory is not None:
+            return self._scheduler_root_memory
+        memory: dict[str, RememberedScratchRoot] = {}
+        path = paths.scheduler_scratch_roots_path(multi_user=self._multi_user)
+        try:
+            memory = parse_scheduler_scratch_roots(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "could not read remembered scheduler scratch roots from %s: "
+                "%s; treating every host as unremembered",
+                path,
+                exc,
+            )
+        self._scheduler_root_memory = memory
+        return memory
+
+    def _remembered_scheduler_root(self, target: str) -> str | None:
+        """The ``scratch_root`` this daemon last served for ``target``."""
+        entry = self._scheduler_root_memory_map().get(target)
+        return None if entry is None else entry.root
+
+    def _scheduler_root_is_confirmed(self, target: str) -> bool:
+        """Whether the root being served for ``target`` is known to be right.
+
+        ``False`` only in the one case #63's guard could not see: a daemon
+        that served a host its configured root while that host still carried
+        jobs from a vq that recorded no workspace, with no memory of its own
+        to compare against. Everything else -- an adopted root, a host with no
+        such jobs, a host with no memory and nothing to strand -- is
+        confirmed, because there is then nothing the root could be wrong
+        about.
+        """
+        entry = self._scheduler_root_memory_map().get(target)
+        return entry is None or entry.confirmed
+
+    def _remember_scheduler_root(
+        self, target: str, root: str, *, confirmed: bool = True
+    ) -> None:
+        """Record the root now in force for ``target``, if it moved.
+
+        Best-effort: a daemon that cannot write this file still dispatches.
+        What it loses is the ability to hold a later change back across a
+        restart, which is logged rather than fatal.
+
+        ``confirmed=False`` records a root vq is serving without being able to
+        prove it is the one this host's unbound jobs were staged under. The
+        entry still holds a later change back -- that is the guard's job, and
+        it works across the restart -- while
+        :meth:`_bind_scheduler_workspace` refuses to make the derivation
+        durable until the doubt is gone.
+        """
+        if not root:
+            return
+        memory = self._scheduler_root_memory_map()
+        entry = RememberedScratchRoot(root=root, confirmed=confirmed)
+        if memory.get(target) == entry:
+            return
+        memory[target] = entry
+        path = paths.scheduler_scratch_roots_path(multi_user=self._multi_user)
+        payload = scheduler_scratch_roots_payload(memory)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            paths.atomic_write_text(
+                path, json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            )
+        except OSError as exc:
+            log.warning(
+                "could not record scheduler scratch root %r for host %s in "
+                "%s: %s; a later change to that key cannot be held back "
+                "across a restart",
+                root,
+                target,
+                path,
+                exc,
+            )
+
+    def _queue_dirs(self) -> list[Path]:
+        """Every queue directory this daemon owns, single- or multi-user."""
+        if not self._multi_user:
+            return [self.queue_dir]
+        return [
+            paths.user_queue_dir(user_dir.name)
+            for user_dir in paths._all_user_dirs()
+        ]
+
+    def _strandable_scheduler_workspaces(self, target: str) -> list[str]:
+        """#63: jobs on ``target`` that may hold an unrecorded workspace.
+
+        A deliberately plain read of the queue rather than a pass through
+        :meth:`_iter_specs`, which clears and rebuilds per-tick scan state;
+        this runs only when a host's ``scratch_root`` is in question, and
+        must not disturb a dispatch tick that is mid-flight.
+
+        A row that cannot be read is skipped, because it names no target and
+        so cannot be attributed to this host -- counting every unreadable row
+        for every host would let one corrupt spec hold the whole fleet. The
+        row is not lost: it is still unreadable at the next start, and the
+        reattachment pass reports it there.
+        """
+        specs: list[JobSpec] = []
+        for queue_dir in self._queue_dirs():
+            try:
+                spec_paths = sorted(queue_dir.glob("*.json"))
+            except OSError:
+                continue
+            for path in spec_paths:
+                try:
+                    specs.append(JobSpec.read(path))
+                except (OSError, ValueError):
+                    continue
+        return unbound_staged_job_ids(specs, target)
+
+    def _bind_scheduler_workspace(
+        self,
+        spec: JobSpec,
+        dispatcher: SchedulerDispatcher,
+        *,
+        spec_path: Path,
+    ) -> str:
+        """Record this job's remote workspace if it has none yet (#63).
+
+        The transition for records that predate the binding: bind on the next
+        observation, from the derivation that was in force when they were
+        staged. :meth:`_scheduler_dispatcher_for` refuses to adopt a changed
+        ``scratch_root`` while any such record exists -- across a restart and
+        a reload as well, since #63's follow-up -- so the derivation this
+        reads is still the one those jobs were staged under.
+
+        "The next observation" is reattachment, which is a daemon start (and
+        the retries that follow a failed one), not a poll tick: this method
+        has exactly one caller, :meth:`_reattach_scheduler_job`.
+
+        The exception, and the whole of what a first start after the upgrade
+        can do: while the host's root is unconfirmed -- vq is serving it with
+        no memory of a previous one, which is exactly the window in which the
+        operator's own runbook changes the key -- the derivation is returned
+        for this job's remote reads but is NOT written down. The job then
+        behaves as it did under the vq that dispatched it, and putting the
+        previous value back in config repairs it. Writing the guess onto the
+        spec is what could not be undone.
+
+        Best-effort on the write -- a job whose binding could not be persisted
+        keeps working off the derivation and is bound at the next observation
+        instead.
+        """
+        recorded = spec.scheduler_remote_workspace
+        if recorded:
+            return recorded
+        workspace = dispatcher.remote_workspace(spec.id)
+        target = spec.scheduler_target
+        if target is not None and not self._scheduler_root_is_confirmed(target):
+            log.warning(
+                "job %s: using scheduler workspace %s without recording it; "
+                "host %s is being served a scratch_root vq cannot confirm is "
+                "the one this job was staged under. Binding waits until the "
+                "host's unbound jobs drain or the previous root is restored",
+                spec.id,
+                workspace,
+                target,
+            )
+            return workspace
+        try:
+            with paths.spec_lock(spec_path):
+                fresh = JobSpec.read(spec_path)
+                if fresh.id != spec.id or fresh.scheduler_remote_workspace:
+                    return fresh.scheduler_remote_workspace or workspace
+                fresh.scheduler_remote_workspace = workspace
+                fresh.write(spec_path)
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "job %s: could not record its scheduler workspace %s: %s",
+                spec.id,
+                workspace,
+                exc,
+            )
+        spec.scheduler_remote_workspace = workspace
+        # This may have been the last job holding its host at a previous
+        # scratch_root, so let the next dispatcher lookup re-ask rather than
+        # wait out the periodic re-check.
+        if spec.scheduler_target is not None:
+            self._scheduler_pin_checked_at.pop(spec.scheduler_target, None)
+        log.info(
+            "job %s: bound to scheduler workspace %s on first observation",
+            spec.id,
+            workspace,
+        )
+        return workspace
 
     def _start_scheduler_job(self, spec: JobSpec) -> bool:
         """Dispatch a scheduler-target job to its cluster via SSH+qsub (§17).
@@ -6712,8 +7573,15 @@ class Daemon:
                         != retry_latest.model_dump(mode="json")
                     ):
                         return False
+                # #63: rotate the evidence in the workspace this job was
+                # actually staged into, which a scratch_root change since the
+                # first attempt would otherwise move out from under it.
+                retry_workspace = retry_latest.scheduler_remote_workspace
             try:
-                dispatcher.prepare_retry_attempt(job_id)
+                dispatcher.prepare_retry_attempt(
+                    job_id,
+                    remote_workspace=retry_workspace,
+                )
             except (SchedulerError, DialectError) as exc:
                 log.warning(
                     "job %s: could not rotate proven-terminal scheduler "
@@ -6814,6 +7682,17 @@ class Daemon:
             spec.started_at = utcnow_iso()
             spec.scheduler_job_id = None
             spec.scheduler_state = "submitting"
+            # #63: record WHERE this job is being staged before anything
+            # reaches the scheduler, in the same durable write that closes
+            # the PENDING -> SUBMITTING transition. Everything afterwards
+            # reads this field, so a later scratch_root change cannot move
+            # the job out from under its own workspace. A retry keeps the
+            # binding it already has: it reuses that exact directory.
+            if not spec.scheduler_remote_workspace:
+                spec.scheduler_remote_workspace = dispatcher.remote_workspace(
+                    spec.id
+                )
+            bound_workspace = spec.scheduler_remote_workspace
             if self._multi_user:
                 assert owner_uid is not None
                 try:
@@ -6878,7 +7757,7 @@ class Daemon:
                     return False
             spec.write(spec_path)
         # Stage + qsub OUTSIDE the lock (never hold a spec lock across SSH).
-        env = _vq_job_env(spec, workdir=dispatcher.remote_workspace(spec.id))
+        env = _vq_job_env(spec, workdir=bound_workspace)
         # Program registry paths belong to the driver host. Scheduler runtimes
         # are selected by scheduler_program_hooks and may use an unrelated
         # filesystem layout, so only portable program identity is exported.
@@ -6895,6 +7774,7 @@ class Daemon:
                 env=env,
                 local_workspace=Path(spec.cwd),
                 program=spec.program,
+                remote_workspace=bound_workspace,
                 retry_attempt=spec.retry_count > 0,
             )
         except SchedulerSubmitOutcomeUnknown as exc:
@@ -6961,6 +7841,7 @@ class Daemon:
         self._scheduler_running[job_id] = _SchedulerJob(
             handle=handle,
             dispatcher=dispatcher,
+            scheduler_target=target,
             cpus=spec.cpus,
             mem_mb=spec.mem_mb,
             owner_uid=owner_uid,
@@ -7325,8 +8206,8 @@ class Daemon:
                         raise
                     if self._scheduler_fetch_admissions_left is not None:
                         self._scheduler_fetch_admissions_left -= 1
-                    self._scheduler_fetch_order.pop(dispatcher, None)
-                    self._scheduler_fetch_order[dispatcher] = None
+                    self._scheduler_fetch_order.pop(sj.scheduler_target, None)
+                    self._scheduler_fetch_order[sj.scheduler_target] = None
                     return _SchedulerFetchOutcome.RETRY
                 if not flight.done.is_set():
                     return _SchedulerFetchOutcome.RETRY
@@ -7390,6 +8271,7 @@ class Daemon:
         attempted_at = utcnow_iso()
         phases: dict[str, SchedulerPhase] = {}
         explicitly_absent_job_ids: frozenset[str] = frozenset()
+        queued_reasons: dict[str, str] = {}
         poll_error: (
             SchedulerError
             | DialectError
@@ -7405,6 +8287,7 @@ class Daemon:
                 explicitly_absent_job_ids = frozenset(
                     evidence.explicitly_absent_job_ids
                 )
+                queued_reasons = dict(getattr(evidence, "queued_reasons", {}))
             else:
                 phases = dispatcher.poll(handles)
         except (
@@ -7422,47 +8305,225 @@ class Daemon:
             | subprocess.SubprocessError
             | None
         ) = None
-        try:
-            details = dispatcher.poll_detail(handles)
-        except (
-            SchedulerError,
-            DialectError,
-            OSError,
-            subprocess.SubprocessError,
-        ) as exc:
-            accounting_error = exc
-            details = {}
+        details: dict[str, QstatDetail] = {}
+        # A failed live poll already decides this host's pass: every item is
+        # stamped poll_failed and the detail result is discarded unread. Issuing
+        # it anyway can only spend a second batch of remote commands against a
+        # host whose transport has just failed, which is the last moment to add
+        # load to it. The next pass polls both again.
+        if poll_error is None:
+            try:
+                details = dispatcher.poll_detail(handles)
+            except (
+                SchedulerError,
+                DialectError,
+                OSError,
+                subprocess.SubprocessError,
+            ) as exc:
+                accounting_error = exc
+                details = {}
         return _SchedulerPollObservation(
             attempted_at=attempted_at,
             refresh_sequence=refresh_sequence,
             phases=phases,
             explicitly_absent_job_ids=explicitly_absent_job_ids,
             details=details,
+            queued_reasons=queued_reasons,
             poll_error=poll_error,
             accounting_error=accounting_error,
         )
 
+    def _scheduler_poll_is_deferred(self, target: str) -> bool:
+        """Whether this host's cooldown has not elapsed yet (#51).
+
+        The one thing it changes is the cooldown record's deadline: an elapsed
+        ``until`` is zeroed so no later read can defer on it again. The record
+        is *not* dropped, and neither ``consecutive`` nor ``last_attempt``
+        moves — an attempt that again fails to reach the host has to escalate
+        from where the run left off rather than restart at the first interval,
+        and the staleness prune measures ``last_attempt``. Nothing outside the
+        record is touched: the decision is only ever "poll now or leave the
+        host alone", never a change to any job.
+
+        :meth:`_scheduler_poll_deferral_remaining` is the side-effect-free read,
+        for a caller that only wants to report the wait.
+        """
+        backoff = self._scheduler_poll_backoff.get(target)
+        if backoff is None:
+            return False
+        if self._scheduler_poll_clock() < backoff.until:
+            return True
+        # Elapsed. The deadline is zeroed so no later read can defer on it
+        # again, while `consecutive` is kept so that an attempt that again does
+        # not reach the host escalates from where the run left off rather than
+        # restarting at the first interval. `last_attempt` is kept for the same
+        # reason: it is what the staleness prune measures.
+        self._scheduler_poll_backoff[target] = _SchedulerPollBackoff(
+            until=0.0,
+            interval=backoff.interval,
+            last_attempt=backoff.last_attempt,
+            consecutive=backoff.consecutive,
+        )
+        return False
+
+    def _scheduler_poll_deferral_remaining(self, jobid: str) -> float | None:
+        """Seconds left on this job's host's poll cooldown, or ``None`` (#51).
+
+        Side-effect free, unlike :meth:`_scheduler_poll_is_deferred`: an RPC
+        acknowledgement reports the wait and must not consume a deadline the
+        poll loop owns. ``None`` for a job that is not on a scheduler host this
+        daemon is running, and for a host that is not waiting.
+        """
+        runtime = self._scheduler_running.get(jobid)
+        if runtime is None:
+            return None
+        record = self._scheduler_poll_backoff.get(runtime.scheduler_target)
+        if record is None:
+            return None
+        remaining = record.until - self._scheduler_poll_clock()
+        return remaining if remaining > 0 else None
+
+    def _prune_scheduler_poll_backoff(self, live_targets: frozenset[str]) -> None:
+        """Forget a host's cooldown only once that host has gone quiet (#51).
+
+        A record is *not* dropped because the host's last running job finished.
+        The escalation is a fact about the host, so a campaign that keeps
+        submitting would otherwise hand a host that is turning vq away a fresh
+        30-second run every time its queue emptied for a tick. It is dropped
+        once the host has no running job *and* has had no attempt for a whole
+        :data:`SCHEDULER_POLL_BACKOFF_MAX_SECONDS` — longer than any cooldown a
+        record can arm, so a live host's record can never be dropped out from
+        under it, and long enough that starting the next run at the first
+        interval is an honest measurement rather than a reset.
+        """
+        if not self._scheduler_poll_backoff:
+            return
+        now = self._scheduler_poll_clock()
+        for target in set(self._scheduler_poll_backoff) - live_targets:
+            record = self._scheduler_poll_backoff[target]
+            if now - record.last_attempt > SCHEDULER_POLL_BACKOFF_MAX_SECONDS:
+                del self._scheduler_poll_backoff[target]
+
+    def _note_scheduler_poll_outcome(
+        self,
+        target: str,
+        poll_error: BaseException | None,
+    ) -> None:
+        """Arm or clear this host's poll cooldown from one observation (#51).
+
+        The question is whether the host *answered*, not how bad the failure
+        was. An answer — a result, or a standing fault the host itself
+        reported — ends the run and returns the host to the normal cadence,
+        because pacing cannot fix a rejected key, a missing ``qstat`` or an
+        unparseable table and would only make it slower to see. An attempt that
+        got no answer continues the run, whether ssh reported the connection
+        refused or vq simply never learned the outcome: neither is evidence of
+        a healthy host, and a login node that accepts the connection and then
+        hangs before the banner produces the second shape rather than the first.
+        See :func:`_scheduler_poll_answer`.
+
+        ``poll_error`` is the *live* poll's outcome and only that. A detail poll
+        is issued only after a live poll succeeded, so the host answered on this
+        pass whatever the detail call then did, and telemetry alone never paces
+        the observation the lifecycle depends on.
+        """
+        answer = _scheduler_poll_answer(poll_error)
+        if answer is _SchedulerPollAnswer.ANSWERED:
+            cleared = self._scheduler_poll_backoff.pop(target, None)
+            if cleared is not None and poll_error is None:
+                log.info(
+                    "scheduler host %s answered a poll again after %d attempt(s) "
+                    "that did not reach it; polling resumes at the normal cadence",
+                    target,
+                    cleared.consecutive,
+                )
+            return
+        now = self._scheduler_poll_clock()
+        previous = self._scheduler_poll_backoff.get(target)
+        consecutive = previous.consecutive + 1 if previous is not None else 1
+        interval = min(
+            SCHEDULER_POLL_BACKOFF_SECONDS * (2 ** (consecutive - 1)),
+            SCHEDULER_POLL_BACKOFF_MAX_SECONDS,
+        )
+        self._scheduler_poll_backoff[target] = _SchedulerPollBackoff(
+            until=now + interval,
+            interval=interval,
+            last_attempt=now,
+            consecutive=consecutive,
+        )
+        log.warning(
+            "scheduler poll to %s %s (%d attempt(s) in a row without an answer "
+            "from the host); deferring its next observation by %.0fs. Jobs there "
+            "keep their last known state and are never terminalized by a failed "
+            "poll.",
+            target,
+            "did not complete its connection"
+            if answer is _SchedulerPollAnswer.REFUSED
+            else "did not come back with an outcome vq could read",
+            consecutive,
+            interval,
+        )
+
+    def _scheduler_observation_dispatcher(
+        self,
+        target: str,
+        items: Sequence[tuple[str, _SchedulerJob]],
+    ) -> SchedulerDispatcher:
+        """The one generation that carries this host's batched observation.
+
+        One connection per host per pass is what makes the cooldown and the
+        "at most one observation in flight per host" bound true of the host
+        rather than of an object (#51), so a batch that spans several
+        dispatcher generations still gets exactly one observer. Which one is
+        not arbitrary: it is the generation this daemon currently serves for
+        the target -- the one a new dispatch would use, and so the one that
+        reflects the operator's current ``ssh`` alias and
+        ``scheduler_dialect``. An edit to either is an assertion about how the
+        host is reached now; an in-flight job's older generation is a record
+        of how it was reached then, which is the right authority for that
+        job's own ``qdel`` and marker reads and the wrong one for addressing
+        the host today.
+
+        Falls back to the first job's generation when the daemon holds no
+        dispatcher for the target -- a config reload clears the cache, and a
+        host deleted from config never gets a new one. Every generation in the
+        batch is then equally stale, and polling on with one of them keeps the
+        jobs observable instead of stranding them on a missing config entry.
+
+        Note what this does NOT do: it never builds a dispatcher. Reaching
+        :meth:`_scheduler_dispatcher_for` here would load config, re-run the
+        ``scratch_root`` guard and raise ``ConfigError`` on the poll path,
+        which is a mutation and a new failure mode inside a read-only
+        observation.
+        """
+        current = self._scheduler_dispatchers.get(target)
+        if current is not None:
+            return current
+        return items[0][1].dispatcher
+
     def _start_scheduler_poll_flight(
         self,
-        dispatcher: SchedulerDispatcher,
+        target: str,
         items: list[tuple[str, _SchedulerJob]],
     ) -> None:
         """Start at most one bounded, read-only observation for one host."""
-        if dispatcher in self._scheduler_poll_flights:
+        if target in self._scheduler_poll_flights:
             return
+        observer = self._scheduler_observation_dispatcher(target, items)
         with self._scheduler_refresh_condition:
             refresh_sequence = self._scheduler_refresh_requested
         flight = _SchedulerPollFlight(
             items=tuple(items),
             refresh_sequence=refresh_sequence,
             done=threading.Event(),
+            observer=observer,
         )
-        self._scheduler_poll_flights[dispatcher] = flight
+        self._scheduler_poll_flights[target] = flight
 
         def observe() -> None:
             try:
                 flight.observation = self._observe_scheduler_dispatcher(
-                    dispatcher,
+                    observer,
                     flight.items,
                     refresh_sequence=flight.refresh_sequence,
                 )
@@ -7479,7 +8540,7 @@ class Daemon:
                 daemon=True,
             ).start()
         except BaseException:
-            self._scheduler_poll_flights.pop(dispatcher, None)
+            self._scheduler_poll_flights.pop(target, None)
             raise
 
     def _reconcile_scheduler(self) -> None:
@@ -7517,8 +8578,18 @@ class Daemon:
                             observation is not None
                             and observation[1] >= request_id
                         )
+                        # A host inside its poll cooldown will not be contacted
+                        # by the next flight either, so waiting out the RPC
+                        # deadline would report "timeout" for a wait vq chose
+                        # (#51). Answer now, and say which wait it was.
+                        deferred = (
+                            not observation_is_fresh
+                            and self._scheduler_poll_deferral_remaining(jobid)
+                            is not None
+                        )
                         if (
                             not observation_is_fresh
+                            and not deferred
                             and self._background_scheduler_polling
                             and jobid in self._scheduler_running
                         ):
@@ -7532,7 +8603,11 @@ class Daemon:
                                 "schema": "vq.scheduler.status_refresh/1",
                                 "completed": False,
                                 "observed_at": None,
-                                "reason": "job_not_observed",
+                                "reason": (
+                                    SCHEDULER_REFRESH_HOST_DEFERRED_REASON
+                                    if deferred
+                                    else "job_not_observed"
+                                ),
                             }
                         else:
                             assert observation is not None
@@ -7566,59 +8641,90 @@ class Daemon:
                 self._scheduler_fetch_flights.pop(jobid, None)
         if not self._scheduler_running:
             self._scheduler_fetch_order.clear()
-            for dispatcher, flight in list(self._scheduler_poll_flights.items()):
+            self._prune_scheduler_poll_backoff(frozenset())
+            for target, flight in list(self._scheduler_poll_flights.items()):
                 if flight.done.is_set():
-                    self._scheduler_poll_flights.pop(dispatcher, None)
+                    self._scheduler_poll_flights.pop(target, None)
             return observed_jobs
-        by_dispatcher: dict[SchedulerDispatcher, list[tuple[str, _SchedulerJob]]] = {}
+        # Grouped by configured target, never by dispatcher object. Two
+        # generations of one host's dispatcher are two objects and one host;
+        # grouping on the object gave that host two observations per pass, each
+        # with its own unescalated cooldown, which is the storm #51 exists to
+        # prevent. One observer carries the batch and one generation per job
+        # carries that job's own remote work -- see the comment above
+        # _SCHEDULER_SUBMIT_BINDING_SCHEMA and
+        # Daemon._scheduler_observation_dispatcher.
+        by_target: dict[str, list[tuple[str, _SchedulerJob]]] = {}
         for jobid, sj in self._scheduler_running.items():
-            by_dispatcher.setdefault(sj.dispatcher, []).append((jobid, sj))
+            by_target.setdefault(sj.scheduler_target, []).append((jobid, sj))
         finished: list[str] = []
-        for dispatcher in set(self._scheduler_poll_flights) - set(by_dispatcher):
-            flight = self._scheduler_poll_flights[dispatcher]
+        self._prune_scheduler_poll_backoff(frozenset(by_target))
+        for target in set(self._scheduler_poll_flights) - set(by_target):
+            flight = self._scheduler_poll_flights[target]
             if flight.done.is_set():
-                self._scheduler_poll_flights.pop(dispatcher, None)
+                self._scheduler_poll_flights.pop(target, None)
         if self._background_scheduler_polling:
             self._scheduler_fetch_order = {
-                dispatcher: None for dispatcher in self._scheduler_fetch_order
-                if dispatcher in by_dispatcher
+                target: None for target in self._scheduler_fetch_order
+                if target in by_target
             }
-            for dispatcher in by_dispatcher:
-                self._scheduler_fetch_order.setdefault(dispatcher, None)
-            dispatchers = list(self._scheduler_fetch_order)
+            for target in by_target:
+                self._scheduler_fetch_order.setdefault(target, None)
+            targets = list(self._scheduler_fetch_order)
         else:
-            dispatchers = list(by_dispatcher)
-        for dispatcher in dispatchers:
-            current_items = by_dispatcher[dispatcher]
+            targets = list(by_target)
+        for target in targets:
+            current_items = by_target[target]
             if self._background_scheduler_polling:
-                flight = self._scheduler_poll_flights.get(dispatcher)
+                flight = self._scheduler_poll_flights.get(target)
                 if flight is None:
-                    self._start_scheduler_poll_flight(dispatcher, current_items)
+                    # A host whose last attempt did not reach it is left alone
+                    # for its cooldown rather than handed the next pass's
+                    # attempts (#51). An observation already in flight is still
+                    # reaped below; only starting a new one waits.
+                    if self._scheduler_poll_is_deferred(target):
+                        continue
+                    self._start_scheduler_poll_flight(target, current_items)
                     continue
                 if not flight.done.is_set():
                     continue
-                self._scheduler_poll_flights.pop(dispatcher, None)
+                self._scheduler_poll_flights.pop(target, None)
                 if flight.error is not None:
                     raise flight.error
                 if flight.observation is None:
                     raise RuntimeError("scheduler poll flight completed without a result")
                 observation = flight.observation
                 items = list(flight.items)
+                assert flight.observer is not None
+                observer = flight.observer
             else:
+                if self._scheduler_poll_is_deferred(target):
+                    continue
                 with self._scheduler_refresh_condition:
                     refresh_sequence = self._scheduler_refresh_requested
                 items = current_items
+                observer = self._scheduler_observation_dispatcher(target, items)
                 observation = self._observe_scheduler_dispatcher(
-                    dispatcher,
+                    observer,
                     tuple(items),
                     refresh_sequence=refresh_sequence,
                 )
+            # `observer` is the generation that carried this host's batch, and
+            # therefore the only one whose dialect may read the rows it came
+            # back with. Anything addressed to ONE job below uses that job's
+            # own generation instead.
             attempted_at = observation.attempted_at
             phases = observation.phases
             explicitly_absent_job_ids = observation.explicitly_absent_job_ids
             details = observation.details
+            queued_reasons = observation.queued_reasons
             poll_error = observation.poll_error
             accounting_error = observation.accounting_error
+            # One real attempt has now been made against this host, so this is
+            # where its cooldown is armed or cleared (#51). Never per job, and
+            # never per dispatcher generation: the connection this host did not
+            # answer was the one connection its whole batch rides on.
+            self._note_scheduler_poll_outcome(target, poll_error)
             if poll_error is not None:
                 poll_reason = _safe_scheduler_poll_diagnostic(poll_error)
                 log.warning(
@@ -7633,8 +8739,8 @@ class Daemon:
                 log.debug("scheduler detail poll failed: %s", accounting_reason)
             # A failed live poll is an unknown observation even if accounting
             # happens to have a terminal row: without squeue, liveness has not
-            # been disproved. Both batched calls still run so host telemetry is
-            # prompt and consistent.
+            # been disproved. The detail poll is therefore not issued at all
+            # after a failed live poll — its result could not be used here.
             if poll_error is not None:
                 for jobid, sj in items:
                     self._stamp_scheduler_poll_failed(
@@ -7645,7 +8751,7 @@ class Daemon:
                     )
                 continue
             accounting_required = bool(
-                getattr(dispatcher, "accounting_required_for_absent", False)
+                getattr(observer, "accounting_required_for_absent", False)
             )
             for jobid, sj in items:
                 try:
@@ -7684,7 +8790,11 @@ class Daemon:
                         sj.handle.job_id,
                     )
                     try:
-                        dispatcher.cancel(sj.handle)
+                        # The generation this job was submitted under, not the
+                        # one that happened to carry the batch: a qdel over
+                        # another generation's ssh alias or dialect addresses
+                        # a host, or a scheduler, this allocation is not on.
+                        sj.dispatcher.cancel(sj.handle)
                     except (SchedulerError, DialectError):
                         log.exception(
                             "job %s: scheduler cancellation is not yet "
@@ -7734,7 +8844,7 @@ class Daemon:
                         continue
                     else:
                         try:
-                            detail_phase = dispatcher.phase_from_detail(detail)
+                            detail_phase = observer.phase_from_detail(detail)
                         except (SchedulerError, DialectError) as exc:
                             log.warning(
                                 "job %s: scheduler detail state %r could not be "
@@ -7775,7 +8885,7 @@ class Daemon:
                     # Torque compatibility: qstat absence remains terminal, but
                     # a surviving qstat -f live record wins when available.
                     try:
-                        detail_phase = dispatcher.phase_from_detail(detail)
+                        detail_phase = observer.phase_from_detail(detail)
                     except (SchedulerError, DialectError) as exc:
                         log.warning(
                             "job %s: scheduler detail state %r could not be "
@@ -7805,7 +8915,12 @@ class Daemon:
                     sj.finished_without_marker_since = None
                     sj.finished_without_marker_misses = 0
                     self._stamp_scheduler_status(
-                        jobid, sj, spec, phase, detail
+                        jobid,
+                        sj,
+                        spec,
+                        phase,
+                        detail,
+                        queued_reason=queued_reasons.get(sj.handle.job_id),
                     )
                     continue
                 # Scheduler termination is known even when both artifact
@@ -7845,12 +8960,14 @@ class Daemon:
                 # the incident jobs were OOM-killed with a marker that read 0
                 # and were reaped completed/exit-0.
                 abnormal_state = (
-                    dispatcher.abnormal_termination_from_detail(detail)
+                    observer.abnormal_termination_from_detail(detail)
                     if detail is not None
                     else None
                 )
                 try:
-                    rc = dispatcher.exit_marker_code(
+                    # Addressed to this job's own workspace, so it reads over
+                    # the generation the job was submitted under.
+                    rc = sj.dispatcher.exit_marker_code(
                         sj.handle, array_index=artifact_index
                     )
                 except SchedulerError as exc:
@@ -7955,7 +9072,7 @@ class Daemon:
                         evidence["scheduler_accounting_exit_code"] = accounting_rc
                     try:
                         evidence.update(
-                            dispatcher.missing_marker_diagnostics(
+                            sj.dispatcher.missing_marker_diagnostics(
                                 sj.handle, array_index=artifact_index
                             )
                         )
@@ -8199,6 +9316,14 @@ class Daemon:
                 "job %s: cannot reattach to scheduler %s: %s", spec.id, target, exc
             )
             return False
+        # #63: reattachment is "the next observation" for a record that
+        # predates the workspace binding. Bind before reading any remote
+        # evidence, so the receipt and marker are read from the directory
+        # this job was actually staged into rather than from wherever the
+        # current config would put a new one.
+        bound_workspace = self._bind_scheduler_workspace(
+            spec, dispatcher, spec_path=spec_path
+        )
         scheduler_job_id = spec.scheduler_job_id
         if self._multi_user:
             assert owner_uid is not None
@@ -8227,13 +9352,19 @@ class Daemon:
                 scheduler_job_id = None
         if scheduler_job_id is None:
             receipt_reader = getattr(dispatcher, "submit_receipt", None)
-            receipt = receipt_reader(spec.id) if callable(receipt_reader) else None
+            receipt = (
+                receipt_reader(spec.id, remote_workspace=bound_workspace)
+                if callable(receipt_reader)
+                else None
+            )
             receipt_job_id = (
                 receipt.scheduler_job_id
                 if receipt is not None and receipt.status == "accepted"
                 else None
             )
-            recorded_job_id = dispatcher.recorded_job_id(spec.id)
+            recorded_job_id = dispatcher.recorded_job_id(
+                spec.id, remote_workspace=bound_workspace
+            )
             if (
                 receipt_job_id is not None
                 and recorded_job_id is not None
@@ -8280,6 +9411,7 @@ class Daemon:
         self._scheduler_running[spec.id] = _SchedulerJob(
             handle=handle,
             dispatcher=dispatcher,
+            scheduler_target=target,
             cpus=spec.cpus,
             mem_mb=spec.mem_mb,
             owner_uid=owner_uid,
@@ -8512,8 +9644,15 @@ class Daemon:
                     expected_target=expected_target,
                 )
                 return False
+        # #63: read both kinds of evidence from the workspace this job
+        # recorded before it was submitted, not from the current derivation.
+        reconcile_workspace = bound_remote_workspace(dispatcher, spec)
         receipt_reader = getattr(dispatcher, "submit_receipt", None)
-        receipt = receipt_reader(spec.id) if callable(receipt_reader) else None
+        receipt = (
+            receipt_reader(spec.id, remote_workspace=reconcile_workspace)
+            if callable(receipt_reader)
+            else None
+        )
         receipt_job_id = (
             receipt.scheduler_job_id
             if receipt is not None and receipt.status == "accepted"
@@ -8522,7 +9661,9 @@ class Daemon:
         # Always read the job-authored marker.  It is the closest evidence to
         # what actually started, and must never be silently shadowed by an
         # accepted receipt naming a different scheduler allocation.
-        recorded_job_id = dispatcher.recorded_job_id(spec.id)
+        recorded_job_id = dispatcher.recorded_job_id(
+            spec.id, remote_workspace=reconcile_workspace
+        )
         acceptance_ids = {
             candidate
             for candidate in (
@@ -8794,6 +9935,7 @@ class Daemon:
         self._scheduler_running[spec.id] = _SchedulerJob(
             handle=handle,
             dispatcher=dispatcher,
+            scheduler_target=target,
             cpus=self._scheduler_reservation_cpus(owner_uid, fresh),
             mem_mb=fresh.mem_mb,
             owner_uid=owner_uid,
@@ -8861,6 +10003,7 @@ class Daemon:
         runtime = _SchedulerJob(
             handle=handle,
             dispatcher=dispatcher,
+            scheduler_target=expected_target,
             cpus=self._scheduler_reservation_cpus(owner_uid, fresh),
             mem_mb=fresh.mem_mb,
             owner_uid=owner_uid,
@@ -9407,6 +10550,8 @@ class Daemon:
         spec: JobSpec,
         phase: SchedulerPhase,
         detail: QstatDetail | None,
+        *,
+        queued_reason: str | None = None,
     ) -> None:
         """Record the cluster-side status + qstat detail on a live job (§18).
 
@@ -9426,8 +10571,24 @@ class Daemon:
             cluster_state = "running"
         else:
             cluster_state = "queued"
+        # Why the cluster has not started this job, in the scheduler's own
+        # words: Slurm reports it on the coarse poll, Torque on the detail
+        # record, so take whichever arrived. A job that is no longer pending
+        # has no such answer, and keeping the last one would leave a running
+        # job explaining why it is waiting.
+        observed_reason = (
+            (queued_reason or (detail.queued_reason if detail is not None else None))
+            if phase is SchedulerPhase.PENDING
+            else None
+        )
         transitioned = spec.scheduler_state != cluster_state
         now = time.monotonic()
+        # The reason deliberately does not force a write of its own: some
+        # schedulers rewrite a queued job's comment on every cycle (an
+        # estimated start time, a queue position), and honouring that would
+        # cost one spec write per poll per job. It rides the same refresh
+        # budget as the walltime below. Clearing is unaffected, because
+        # leaving PENDING is itself a transition.
         if not transitioned and (now - sj.last_status_write) < SCHEDULER_STATUS_REFRESH_SECONDS:
             return  # unchanged + refreshed recently -> skip the write (low churn)
         spec_path = self._active_spec_path(jobid, sj)
@@ -9444,6 +10605,10 @@ class Daemon:
                 return  # a racing kill won the spec; don't stamp over it
             fresh.scheduler_state = cluster_state
             fresh.last_heartbeat_at = utcnow_iso()
+            # Unlike the fields below, this one is assigned rather than merged:
+            # a stale explanation is worse than none, so an absent reason
+            # clears it.
+            fresh.scheduler_queued_reason = observed_reason
             if detail is not None:
                 # Only overwrite with non-empty values (a queued job has no
                 # exec_host / resources_used yet -- keep any prior reading).
@@ -9456,8 +10621,157 @@ class Daemon:
             fresh.write(spec_path)
         sj.last_status_write = now
 
-    def _iter_specs(self) -> Iterator[JobSpec]:
-        """Iterate over all specs in the queue(s).
+    @staticmethod
+    def _spec_is_off_admission_path(spec: JobSpec) -> bool:
+        """Whether a settled row can be left out of the daemon's own scan.
+
+        True for a row that has reached a terminal state and carries no
+        scheduler transaction that could still be open behind it.
+
+        * **Terminal** -- a dispatch tick has nothing left to do with it.
+          Dispatch acts on PENDING rows; reconciliation, the watchdog and the
+          orphan sweep act on in-memory runtime handles, not on the scan. The
+          per-tick passes read a terminal row only in order to pass over it.
+          Its predecessor role survives: :meth:`_resolve_settled_dependencies`
+          reads back exactly the settled rows a live spec names.
+        * **No open scheduler transaction** -- an ambiguous submit
+          (``submit_outcome_unknown_after_terminal`` and friends,
+          ``reattach_failed``, anything
+          :meth:`_scheduler_transaction_may_exist` accepts, and in multi-user
+          mode a private binding that is open or unreadable) keeps reserving
+          its slot at any age, because the remote job it may have created is
+          still out there. Those rows stay on the scan however old they are.
+
+        The first #22 admission fix also required ``spec.is_archived``. That
+        was conservatism, not a load-bearing part of the safety argument, and
+        it left the saving behind an opt-in verb (``vq cleanup --auto-enable``):
+        a driver that keeps its history without ever archiving paid the full
+        open + JSON parse + model validation for every job it had ever run, on
+        every pass. Archived rows are now the subset of settled ones whose
+        workspace has also been tarred away.
+
+        This governs the daemon's hot scan only. Operator surfaces -- ``vq
+        queue``, ``vq status``, ``vq cleanup``, ``vq fetch`` -- resolve a spec
+        by id or run their own listing pass and are untouched.
+        """
+        return spec.is_terminal and not Daemon._scheduler_transaction_may_exist(spec)
+
+    def _settled_binding_path(self, uid: str | None, jobid: str) -> Path | None:
+        """Private binding path for ``jobid``, or None when there can be none."""
+        if not self._multi_user or uid is None:
+            return None
+        try:
+            directory = _scheduler_submit_binding_directory()
+            return directory / _scheduler_submit_binding_name(uid, jobid)
+        except (OSError, ValueError):
+            return None
+
+    def _settled_spec_identity_now(
+        self, path: Path, uid: str | None
+    ) -> _SettledSpecIdentity | None:
+        """On-disk identity of ``path`` (+ its binding), or None if unreadable.
+
+        Read *before* the spec is parsed, so a rewrite that races the parse
+        leaves the older identity recorded and the row is re-read next pass.
+        """
+        spec_identity = _stat_identity(path)
+        if spec_identity == _STAT_IDENTITY_ABSENT:
+            return None
+        binding_identity = _stat_identity(
+            self._settled_binding_path(uid, path.stem)
+        )
+        return (*spec_identity, *binding_identity)
+
+    def _pause_intent_sweep_may_skip(self, spec_path: Path) -> bool:
+        """Whether the per-tick pause sweep may pass over ``spec_path`` unread.
+
+        The repeating sweep in :meth:`iterate` globs the queue directory
+        itself, so #22's admission skip never reached it and it still opened,
+        parsed and validated every retained row on every tick just to learn
+        that a finished job carries no pause intent -- at 16,000 retained rows
+        the largest single term in a tick (#82). This hands it the verdict the
+        daemon's own passes already recorded.
+
+        True only when a full read of *these exact bytes* showed a settled row
+        (:meth:`_spec_is_off_admission_path`) carrying no durable pause intent,
+        which is the invariant ``_settled_spec_without_pause_intent`` holds.
+        Everything else answers False and is swept exactly as before:
+
+        * a path no pass has read in full, or one read before this daemon
+          started;
+        * a settled row that *does* carry an intent -- a ``vq pause`` killed
+          before SIGSTOP while its job was exiting leaves one, and finishing it
+          is the sweep's whole purpose;
+        * a row whose bytes have changed since, including one that armed an
+          intent: every spec write is an atomic replace onto a freshly
+          allocated inode, so arming an intent always changes the identity and
+          puts the row back on the next sweep;
+        * a row that cannot be stat'ed at all, which no more counts as proven
+          here than an unreadable row counts as terminal anywhere else.
+
+        A row that became unreadable **without its bytes changing** -- a
+        ``chmod`` on a settled spec -- still answers True, because the verdict
+        is about content this daemon has read and the content has not moved.
+        That is correct for pause, and it is a deliberate loss of a log line:
+        the sweep used to report "reconciliation failed: Permission denied"
+        once per tick for such a row, and now reports nothing, exactly as the
+        admission scan has been silent about it since #22. Restoring the
+        message would cost an access check per settled row per tick to say
+        something about a row with nothing left to do.
+
+        This is a negative hint about work to do, never authorization to signal
+        a process: a row it declines still goes through the sweep's locked and
+        authorized path unchanged. It is consulted only by the sweep that
+        repeats forever. The exact proofs
+        (:func:`vq.pause_resume.pause_token_scope_with_proof`,
+        :func:`vq.pause_resume._prove_pause_token_absent`) take the default and
+        keep scanning every row under its lock, including terminal ones.
+        """
+        proven = self._settled_spec_without_pause_intent.get(spec_path)
+        if proven is None:
+            return False
+        return _stat_identity(spec_path) == proven
+
+    def _resolve_settled_dependencies(
+        self,
+        all_specs: list[JobSpec],
+        specs_by_id: dict[str, JobSpec],
+    ) -> None:
+        """Add the settled predecessors ``all_specs`` names to ``specs_by_id``.
+
+        ``_iter_specs`` leaves a settled row out of the dispatch tick (#22),
+        but ``depends_on`` / ``depends_on_any`` still have to see it: a missing
+        predecessor is deliberately read as "not finished yet", so a finished
+        predecessor would otherwise park its dependent forever. Only the ids a
+        live spec actually names are read, so the cost is the dependency fan-in
+        of the live queue, not the size of the retained history.
+        """
+        wanted: set[str] = set()
+        for spec in all_specs:
+            for dependency_id in (*(spec.depends_on or ()), *(spec.depends_on_any or ())):
+                if dependency_id not in specs_by_id:
+                    wanted.add(dependency_id)
+        for dependency_id in sorted(wanted):
+            path = self._settled_spec_paths.get(dependency_id)
+            if path is None:
+                continue
+            try:
+                if self._multi_user:
+                    predecessor = _read_untrusted_multi_user_spec(path)
+                else:
+                    predecessor = JobSpec.read(path)
+            except Exception:
+                log.exception(
+                    "failed to read settled dependency %s; treating it as "
+                    "unfinished",
+                    path,
+                )
+                continue
+            if predecessor.id == dependency_id:
+                specs_by_id[dependency_id] = predecessor
+
+    def _iter_specs(self, *, include_settled: bool = False) -> Iterator[JobSpec]:
+        """Iterate over the specs the daemon has to act on.
 
         In multi-user mode, scan every per-user queue before yielding. Bare job
         ids are compatibility identifiers rather than storage identities, so a
@@ -9465,20 +10779,72 @@ class Daemon:
         yielded and neither is entered in ``_job_uid``. Unrelated unique jobs
         continue normally. In single-user mode, iterate over ``self.queue_dir``
         only.
+
+        #22: a row that :meth:`_spec_is_off_admission_path` accepts -- terminal,
+        with no scheduler transaction that could still be open -- is neither
+        yielded nor re-read. The first pass that sees it pays the full open +
+        parse + validate and records its on-disk identity; later passes cost a
+        stat. That is what makes the daemon's per-tick cost a function of the
+        live queue rather than of everything the host has ever run, whether or
+        not the operator archives. Archiving remains what reclaims the disk.
+
+        ``include_settled=True`` restores the pre-#22 behaviour for the one
+        pass that genuinely needs every row: the startup walk, which reaps a
+        terminal job's leaked process group and so cannot assume a terminal row
+        has none. That pass still records identities, so it warms the skip set
+        for the per-tick passes behind it.
+
+        #82: the same reads also record which of those settled rows carry no
+        durable pause intent, in ``_settled_spec_without_pause_intent``. That
+        is the verdict :meth:`_pause_intent_sweep_may_skip` serves to the
+        per-tick pause sweep, which globs the directory itself and so gets
+        nothing from this scan otherwise.
         """
         self._colliding_scheduler_reservations = []
+        self._settled_spec_paths = {}
         if self._multi_user:
             self._job_uid.clear()
             self._job_spec_paths.clear()
             records: list[tuple[str, Path, JobSpec]] = []
             paths_by_jobid: dict[str, list[Path]] = {}
             readable_paths: set[Path] = set()
+            scanned_paths: set[Path] = set()
+            # path -> identity for rows this pass proved to be off the
+            # admission path. Applied after collision detection below, so
+            # duplicate-id quarantine sees exactly what it saw before.
+            skippable: dict[Path, _SettledSpecIdentity] = {}
+            # #82: the subset of those whose full read also showed no durable
+            # pause intent, keyed on the spec's own four components -- the
+            # verdict the per-tick pause sweep consults.
+            without_intent: dict[Path, _StatIdentity] = {}
+            # Paths a full read has just shown to carry an intent. Recording
+            # only the intent-free ones would leave a contradicted verdict in
+            # place, inert solely because the row's identity moved -- see
+            # `_pause_intent_sweep_may_skip`. Retiring it explicitly means the
+            # set never holds a verdict a read has disproved, whatever the
+            # filesystem does with inode numbers.
+            with_intent: set[Path] = set()
             for user_dir in paths._all_user_dirs():
                 uid = user_dir.name
                 qdir = paths.user_queue_dir(uid)
                 if not qdir.is_dir():
                     continue
                 for path in sorted(qdir.glob("*.json")):
+                    scanned_paths.add(path)
+                    identity = self._settled_spec_identity_now(path, uid)
+                    if (
+                        not include_settled
+                        and identity is not None
+                        and self._settled_spec_identity.get(path) == identity
+                    ):
+                        # Proven off the admission path and unchanged since.
+                        # Still counted as a readable path and a candidate for
+                        # the duplicate-id check: the filename/id agreement was
+                        # verified when the identity was recorded.
+                        self._settled_spec_paths[path.stem] = path
+                        readable_paths.add(path)
+                        paths_by_jobid.setdefault(path.stem, []).append(path)
+                        continue
                     try:
                         spec = _read_untrusted_multi_user_spec(path)
                     except Exception:
@@ -9501,8 +10867,16 @@ class Daemon:
                             uid,
                             spec.id,
                         )
+                        binding_unreadable = False
                     except (OSError, ValueError):
                         closed_binding = None
+                        # A binding the daemon cannot read is not a binding
+                        # that is absent. `_scheduler_binding_requires_fence`
+                        # fences on exactly this, so the skip decision below
+                        # has to as well, or a row could leave the scan while
+                        # its private authority still says a submit may be
+                        # open.
+                        binding_unreadable = True
                     if (
                         closed_binding is not None
                         and closed_binding.transaction_state == "closed"
@@ -9515,6 +10889,21 @@ class Daemon:
                     records.append((uid, path, spec))
                     readable_paths.add(path)
                     paths_by_jobid.setdefault(spec.id, []).append(path)
+                    if (
+                        identity is not None
+                        and self._spec_is_off_admission_path(spec)
+                        and not binding_unreadable
+                        and not _scheduler_submit_binding_may_be_open(
+                            closed_binding
+                        )
+                    ):
+                        skippable[path] = identity
+                        if spec.pause_intent_at is None:
+                            without_intent[path] = identity[
+                                :_SPEC_IDENTITY_COMPONENTS
+                            ]
+                        else:
+                            with_intent.add(path)
             # A user may delete or corrupt the mutable queue row while qsub is
             # in flight. The private binding is the durable authority created
             # before scheduler mutation; reconstruct its exact admitted row so
@@ -9584,18 +10973,89 @@ class Daemon:
                     or self._owner_scheduler_binding_requires_fence(uid, spec.id)
                 )
             ]
+            # Retire proofs for rows this pass no longer sees (deleted by
+            # `vq cleanup --delete`, or moved) so the set tracks the queue.
+            self._settled_spec_identity = {
+                p: identity
+                for p, identity in self._settled_spec_identity.items()
+                if p in scanned_paths
+            }
+            self._settled_spec_identity.update(skippable)
+            self._settled_spec_without_pause_intent = {
+                p: identity
+                for p, identity in (
+                    self._settled_spec_without_pause_intent.items()
+                )
+                if p in scanned_paths
+            }
+            self._settled_spec_without_pause_intent.update(without_intent)
+            for path in with_intent:
+                self._settled_spec_without_pause_intent.pop(path, None)
+            # A duplicate bare id is quarantined in full, and that has to hold
+            # for a skipped row too: an ambiguous record must not become the
+            # predecessor a dependency gate accepts.
+            for jobid in colliding:
+                self._settled_spec_paths.pop(jobid, None)
             for uid, path, spec in records:
                 if spec.id in colliding:
+                    continue
+                if not include_settled and path in skippable:
+                    self._settled_spec_paths[spec.id] = path
                     continue
                 self._job_uid[spec.id] = uid
                 self._job_spec_paths[spec.id] = path
                 yield spec
         else:
-            for path in sorted(self.queue_dir.glob("*.json")):
+            spec_paths = sorted(self.queue_dir.glob("*.json"))
+            scanned = set(spec_paths)
+            self._settled_spec_identity = {
+                p: identity
+                for p, identity in self._settled_spec_identity.items()
+                if p in scanned
+            }
+            self._settled_spec_without_pause_intent = {
+                p: identity
+                for p, identity in (
+                    self._settled_spec_without_pause_intent.items()
+                )
+                if p in scanned
+            }
+            for path in spec_paths:
+                identity = self._settled_spec_identity_now(path, None)
+                if (
+                    not include_settled
+                    and identity is not None
+                    and self._settled_spec_identity.get(path) == identity
+                ):
+                    self._settled_spec_paths[path.stem] = path
+                    continue
                 try:
-                    yield JobSpec.read(path)
+                    spec = JobSpec.read(path)
                 except Exception:
                     log.exception("failed to read %s; skipping", path)
+                    continue
+                # The filename is the storage identity here, so only record a
+                # proof the next pass can act on without re-reading when the
+                # filename and the inner id agree.
+                if (
+                    identity is not None
+                    and path.name == f"{spec.id}.json"
+                    and self._spec_is_off_admission_path(spec)
+                ):
+                    self._settled_spec_identity[path] = identity
+                    if spec.pause_intent_at is None:
+                        self._settled_spec_without_pause_intent[path] = (
+                            identity[:_SPEC_IDENTITY_COMPONENTS]
+                        )
+                    else:
+                        # A read that disproves the verdict retires it, rather
+                        # than leaving a contradicted entry that is harmless
+                        # only while the row's identity never repeats.
+                        self._settled_spec_without_pause_intent.pop(path, None)
+                    if not include_settled:
+                        self._settled_spec_paths[spec.id] = path
+                        continue
+                yield spec
 
     def _spec_path(self, jobid: str) -> Path:
         """Resolve the spec path for ``jobid``.
@@ -9705,6 +11165,22 @@ class Daemon:
     def _close_running_logs(self) -> None:
         for rj in self._running.values():
             rj.close_logs()
+
+    def _install_stop_handlers(self) -> None:
+        """Take over SIGTERM/SIGINT (and SIGHUP) before any long startup work.
+
+        Called at the top of :meth:`run`, ahead of the startup walk, so that
+        a stop arriving while the daemon is still scanning specs is recorded
+        and logged instead of killing the process at its default disposition
+        (#53). The handler only sets a flag; the walk and the main loop are
+        what act on it.
+        """
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+        # SIGHUP = reload config, the POSIX convention. Guarded: SIGHUP does not
+        # exist on Windows, and signal.signal raises off the main thread.
+        with contextlib.suppress(ValueError, AttributeError, OSError):
+            signal.signal(signal.SIGHUP, self._handle_reload_signal)
 
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:
         log.info("received signal %d; stopping after current iteration", signum)
@@ -9817,9 +11293,17 @@ class Daemon:
             )
         self._scheduler_dispatchers.clear()
         self._scheduler_dispatcher_fingerprints.clear()
+        # The pins go with the cache they qualified; the remembered roots do
+        # NOT. #63's refusal is evaluated against what this daemon last
+        # served for a host, and clearing that here would make a reload the
+        # second way (after a restart) to walk past the guard.
+        self._scheduler_pinned_roots.clear()
+        self._scheduler_pin_checked_at.clear()
         self._config_fingerprint = _config_fingerprint()
         self._config_error_logged = None
         log.info(
             "config reloaded; scheduler dispatcher cache cleared (in-flight "
-            "jobs keep the dispatcher they were submitted with)"
+            "jobs keep the dispatcher they were submitted with; a host's poll "
+            "cooldown and its single in-flight observation are keyed on the "
+            "target and survive the rebuild)"
         )

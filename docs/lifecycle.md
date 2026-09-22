@@ -43,7 +43,20 @@ An older vq environment without the marker is not adopted automatically. Pass
 `--adopt-legacy` explicitly (`install.sh` also requires `--force`) for a
 one-time migration. Adoption uses an isolated Python outside the target to
 read the environment's regular PEP 610 `direct_url.json`; it succeeds only
-when the recorded local source path exactly matches this checkout. The target
+when the recorded local source path exactly matches this checkout.
+
+The distribution was renamed from `vq` to `vibe-queue`, and pip does not know
+the two names are one project, so a record may sit under either
+`.dist-info` prefix. Both are read and **neither outranks the other**. A venv
+holding one record under each name is two independent installs recording two
+origins — a hand-run `pip install -e .` over a pre-rename environment, since
+every venv vq installs drops the old record first — and adoption refuses it,
+naming the two `.dist-info` directories so the stale one can be removed. An
+unreadable `.dist-info` refuses for the same reason rather than falling back to
+the other name: answering from a record the venv no longer installs reports the
+wrong checkout and the wrong install mode. `scripts/update.sh` reads the same
+way when it preserves the installed mode, and reports the mode as unknown
+rather than guessing. The target
 environment's Python and `vq` commands are never executed to establish trust.
 After that proof, a non-dry-run command commits the one-time adoption by
 writing the marker while it holds the lifecycle lock, before any daemon or
@@ -70,16 +83,71 @@ rebuild by whatever the program declares:
 extras = ["web"]
 ```
 
-The declaration is applied by the managed transaction, which is the one path
-that has proved the updater is vq's own `scripts/update.sh`; an ordinary
-`vq admin update` on some other program runs that program's own script and
-says that it left the declaration alone rather than passing over it silently.
+The declaration is applied wherever vq itself builds the venv: the managed
+transaction, a fresh `vq admin install`, and an ordinary `vq admin update` on
+any other program. All three rest on the same proof — the script vq is about
+to name a profile on is vq's own `scripts/install.sh` or `scripts/update.sh`,
+resolved inside the checkout the program points at. The proof is the only
+thing that decides, so a program whose scripts are its own is built and
+rebuilt exactly as it always was.
+
+An ordinary update resolves the floor over whatever `update.sh` would have
+installed without vq's help, in that script's own order of precedence: an
+operator's `--update-script-arg --extras PROFILE`, else the profile
+`.vq-install-metadata` records, else `core`. It appends no `--recreate-venv` —
+reinstalling into the existing environment is what puts the declared runtime
+in it, and a direct `--recreate-venv` is refused outside a managed transaction
+anyway. A newly raised floor also outranks `--expected-sha` idempotence: a
+checkout already at the target commit says nothing about what its venv carries.
+
+What a failed proof means differs, because the verbs stand at different points
+in an environment's life:
+
+* an **update** has a built, possibly serving environment to leave alone, so
+  an update of a program whose `update_script` is its own script runs that
+  script unchanged and says that it left the declaration alone rather than
+  passing over it silently. It does not offer the managed transaction as a way
+  round, because that path requires the same canonical script and refuses
+  without one; what it names is the config change that gives the program a
+  route;
+* an **install** is about to create the venv, so it **refuses** rather than
+  building one without the runtime the program declares, and names the remedy:
+  point `install_script` at the checkout's own `scripts/install.sh`, or drop
+  the declaration, provision, and apply the profile with `vq admin update
+  ENV`, which needs no flags because an ordinary update applies the floor by
+  itself. When the configured `install_script` does not name one of vq's own
+  scripts at all, that refusal comes before the clone.
+
+Both of those depend on the program's `update_script` being one of vq's own
+scripts, because that is what lets an ordinary update apply the floor. A
+program configuring only `install_script`, or a foreign updater, is a
+supported shape — the provision applies the floor once — but vq can never
+rebuild that environment afterwards: an update pulls the checkout, reports
+success and rebuilds nothing. So the refusal names pointing `install_script` at
+vq's own installer as the *only* route it has, and adding
+`update_script = "scripts/update.sh"` as what makes the other one real; the
+note an ordinary update prints says that this update rebuilds nothing rather
+than describing a rebuild that is not happening. Neither offers a fresh
+`vq admin install`: the checkout exists, and a provision refuses to build over
+one. `vq web install`’s runtime remedy follows the same rule.
+
+`vq doctor` reports which of those routes each declaring program actually has,
+on the host whose checkout can answer, so the situation is visible before a
+unit starts failing rather than after. It says nothing at all where no program
+declares `extras`, fails only where a declaration has no route at all, and
+reports that it could not answer where the checkout is absent or unreadable.
+
+At install the floor is resolved over whatever profile the configured
+`install_script` already asks for — `--extras dev` plus `extras = ["web"]`
+installs `all` — and appended only when it raises that profile. The same rule
+applies on an update, over the profile that run was going to install. A
+program that declares no extras is installed and updated exactly as before.
 
 Use the per-update flags to fix a host now; use the declaration to say what
-the venv is *for*. The declaration survives a venv rebuilt outside the managed
-path — a fresh provision, `install.sh`, `reinstall.sh` — where the metadata
-sidecar dies with the venv it described, and an operator request that does not
-cover it is refused rather than silently widened.
+the venv is *for*. The declaration survives a venv rebuilt by a script run
+directly — `install.sh`, `reinstall.sh` — where the metadata sidecar dies with
+the venv it described, and an operator request that does not cover it is
+refused rather than silently widened.
 
 This is how a host whose one venv serves both the daemon and the web console
 keeps uvicorn across a rebuild — the only supported way, since pip inside a

@@ -39,7 +39,10 @@ from pathlib import Path, PurePosixPath
 from vq import capacity, config, drain, events, paths, spec_access, transport
 from vq.config import HostConfig, VenvProgram
 from vq.host import is_local_host
-from vq.scheduler_dialect import enforce_scheduler_wall_time_limit
+from vq.scheduler_dialect import (
+    enforce_scheduler_wall_time_limit,
+    scheduler_width_warning,
+)
 from vq.spec import (
     JOB_NAME_MAX_LEN,
     JOB_NAME_PATTERN,
@@ -2428,6 +2431,40 @@ def new_array_group_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _scheduler_width_warnings(
+    *,
+    cpus: int,
+    jobid: str,
+    scheduler_target: str,
+) -> tuple[str, ...]:
+    """Warn when a request is wider than its scheduler lane can ever run.
+
+    vibe-qc#148: five ``ppn=128`` jobs were accepted onto a lane whose only
+    nodes that wide were one busy and one offline, and queued for six days.
+    The scheduler accepts such a request without complaint, and until now so
+    did vq -- this path returned nothing at all for a scheduler target, so
+    the one moment a human was watching passed in silence.
+
+    Advisory and best effort in both directions: an unreadable config costs
+    the warning and never the submission, and an exceeded limit warns rather
+    than refuses, because a declared lane width goes stale as nodes return
+    to service.
+    """
+    try:
+        host_cfg = config.load_config().host(scheduler_target)
+    except Exception:
+        return ()
+    lane = host_cfg.scheduler_lane_metadata()
+    partition = lane.get("partition") if lane is not None else None
+    message = scheduler_width_warning(
+        cpus,
+        host_cfg.scheduler_max_cpus,
+        scheduler_host=scheduler_target,
+        partition=partition if isinstance(partition, str) else None,
+    )
+    return () if message is None else (f"job {jobid}: {message}",)
+
+
 def _impossible_capacity_warnings(
     *,
     cpus: int,
@@ -2436,9 +2473,13 @@ def _impossible_capacity_warnings(
     multi_user: bool,
     scheduler_target: str | None,
 ) -> tuple[str, ...]:
-    """Describe requests that can never fit this local daemon."""
+    """Describe requests this host can never run as asked."""
     if scheduler_target is not None:
-        return ()
+        return _scheduler_width_warnings(
+            cpus=cpus,
+            jobid=jobid,
+            scheduler_target=scheduler_target,
+        )
     try:
         caps = capacity.read_daemon_capacity(multi_user=multi_user)
     except Exception:

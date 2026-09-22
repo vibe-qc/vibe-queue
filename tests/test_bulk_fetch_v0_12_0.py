@@ -67,9 +67,9 @@ class TestBulkFetch:
         )
         assert [r.jobid for r in results] == ["aaaaaaaaaaaa"]
 
-    def test_file_exists_becomes_skipped(self) -> None:
+    def test_positive_same_job_signal_becomes_skipped(self) -> None:
         def fake(jid: str) -> Path:
-            raise FileExistsError("destination already exists")
+            raise fetch.AlreadyFetched("destination already fetched")
 
         results = fetch.bulk_fetch(
             [_spec("aaaaaaaaaaaa", JobState.COMPLETED)], states=None, fetch_one=fake

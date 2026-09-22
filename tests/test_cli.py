@@ -3185,7 +3185,7 @@ class TestFetchCLI:
         assert workdir_result.exit_code == 0, workdir_result.output
         assert (cli_state / "out" / f"{jobid}-workdir" / "result.json").is_file()
 
-    def test_fetch_legacy_remote_requires_explicit_workspace(
+    def test_fetch_remote_without_mark_fetched_requires_explicit_workspace(
         self, cli_state: Path, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -3198,8 +3198,11 @@ class TestFetchCLI:
             "submitted_at": "2026-08-20T10:11:12+00:00", "state": "completed",
             "scheduler_target": None,
         }
+        # Fetch provenance and mark-back are separate capability contracts.
+        monkeypatch.setattr(fetch_module, "_new_fetch_protocol_token", lambda: "0" * 32)
         buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as tf:
+        with tarfile.open(fileobj=buffer, mode="w",
+                          pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in {
                 "input.py": "# submitted input\n",
                 fetch_module.TERMINAL_DIAGNOSIS_SIDECAR: json.dumps(diagnosis),
@@ -4074,6 +4077,7 @@ class TestAllHostsAggregation:
         assert payload["scheduler_lane"] == {
             "partition": "compute",
             "max_wall_time_seconds": 28_800,
+            "max_cpus": None,
             "source": "host-config",
         }
 
@@ -4109,6 +4113,7 @@ class TestAllHostsAggregation:
                 "scheduler_lane": {
                     "partition": "compute",
                     "max_wall_time_seconds": 28_800,
+                    "max_cpus": None,
                     "source": "host-config",
                 },
             }
