@@ -24,6 +24,24 @@ from vq.daemon import Daemon
 from vq.spec import JobSpec, JobState, ProgramRuntimePin
 from vq.submit import submit_local
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a teardown reap of whatever the daemon fixture left running.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 1 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# Nothing to bound it against here: these tests run `true` and `echo hi`,
+# which exit on their own in milliseconds, and the one site using this
+# budget is a fixture teardown that asserts nothing (it even swallows the
+# timeout), so a generous value removes no coverage. Ten seconds matches
+# tests/test_transport.py and tests/test_pause_resume.py.
+_LIVENESS_SECONDS = 10.0
+
+
 # ----------------------------------------------------------------------
 # JobSpec fields
 # ----------------------------------------------------------------------
@@ -153,7 +171,7 @@ def daemon(tmp_path: Path) -> Iterator[Daemon]:
     for rj in d._running.values():
         try:
             rj.popen.kill()
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         except Exception:
             pass
         rj.close_logs()

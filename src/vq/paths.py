@@ -1,14 +1,39 @@
-"""Filesystem layout for vq daemon state, job workspaces, and config.
+"""Filesystem layout for vq daemon state, job scratch, and config.
+
+Two roots, sorted by lifecycle rather than by content type (#63,
+``docs/fleet_layout.md``). The **state root** is durable and never pruned;
+the **scratch root** holds disposable per-job trees and is swept by age.
 
 State root contains:
 
   queue/<jobid>.json   -- one spec file per job, regardless of state
-  jobs/<jobid>/        -- per-job workspace (inputs unpacked, outputs written)
+  archive/<jobid>.tar.bz2 -- `vq cleanup --archive` tarballs (see archive_dir)
   daemon.pid           -- pidfile while the daemon is running
   daemon.log           -- daemon's own log
 
+Scratch root contains:
+
+  jobs/<jobid>/        -- per-job workspace (inputs unpacked, outputs written)
+  workdirs/<jobid>/    -- per-job scratch ($VQ_WORKDIR)
+
 Override the state root with $VQ_STATE_DIR; otherwise XDG_DATA_HOME/vq, falling
 back to ~/.local/share/vq. Likewise $VQ_CONFIG_DIR for the config root.
+
+The scratch root defaults to a **sibling of the state root** named so it is
+obviously scratch -- ``<state_root>-scratch``, so
+``~/.local/share/vq-scratch`` out of the box and ``$VQ_STATE_DIR``-relative
+when that is set. Precedence, first match wins: ``$VQ_SCRATCH_DIR``, the
+``scratch_root`` config key, that default. ``jobs_root`` and ``workdir_root``
+split the two trees onto different volumes when a site wants results on
+durable storage; unset, they default together under the scratch root.
+
+**Before v0.26.10 both trees lived under the state root.** Nothing moves on
+upgrade: a job keeps the ``cwd``/``workdir`` it recorded (#69), only new
+dispatches select the new root, and cleanup and accounting reach a job at the
+path it recorded -- under the current root, the pre-#63 root under the state
+root, or a root this host has since been configured away from. See
+:func:`managed_workdir_roots` for what the host manages now and
+:func:`workdir_roots_for_job` for what may hold one job's workdir.
 
 --- Multi-user mode (v0.6.x+) ---
 
@@ -19,15 +44,21 @@ a system-wide root (default ``/var/lib/vq``) with per-user subdirectories:
     users/
       <uid>/           -- one directory per Unix user
         queue/         -- that user's job specs
-        jobs/          -- that user's workspaces
         archive/       -- that user's archives
         daemon.log     -- per-user daemon log (symlink or separate)
     daemon.pid         -- system-level pidfile
     daemon.log         -- system-level daemon log
+  /var/lib/vq-scratch/
+    users/
+      <uid>/
+        jobs/          -- that user's workspaces
+        workdirs/      -- that user's per-job scratch
 
 Env vars: ``$VQ_MULTI_USER_ROOT`` overrides the system root (default
-``/var/lib/vq``). The single-user ``$VQ_STATE_DIR`` env var is ignored in
-multi-user mode (the daemon's state is always the multi-user root).
+``/var/lib/vq``) and ``$VQ_MULTI_USER_SCRATCH_ROOT`` the scratch root
+(default: the same sibling rule, ``/var/lib/vq-scratch``). The single-user
+``$VQ_STATE_DIR`` / ``$VQ_SCRATCH_DIR`` env vars are ignored in multi-user
+mode (the daemon's roots are always the multi-user ones).
 """
 
 from __future__ import annotations
@@ -36,9 +67,11 @@ import contextlib
 import fcntl
 import os
 import re
+import shutil
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 from vq._storage import atomic_write_text as atomic_write_text
@@ -56,6 +89,20 @@ auto-cleanup pass)."""
 ENV_MULTI_USER_ROOT = "VQ_MULTI_USER_ROOT"
 """v0.6.x: override the multi-user system root (default ``/var/lib/vq``).
 Ignored in single-user mode."""
+ENV_SCRATCH_DIR = "VQ_SCRATCH_DIR"
+"""#63: override the per-user scratch root that holds ``jobs/`` and
+``workdirs/``.
+
+Highest-precedence setting for the root, above the ``scratch_root`` config
+key and above the default (a ``-scratch`` sibling of the state root). It has
+the same whole-host discipline as ``$VQ_STATE_DIR``: give it to the daemon
+**and** every CLI caller at once, or the CLI reads one scratch tree while the
+daemon writes another. The config key is the safer way to move the root for
+that reason; the env var exists for one-off and test invocations."""
+ENV_MULTI_USER_SCRATCH_ROOT = "VQ_MULTI_USER_SCRATCH_ROOT"
+"""#63: override the multi-user scratch root (default: the ``-scratch``
+sibling of the multi-user root, i.e. ``/var/lib/vq-scratch``). Ignored in
+single-user mode."""
 ENV_TEST_SANDBOX_ROOT = "VQ_TEST_SANDBOX_ROOT"
 """Internal pytest capability: every persistent root must resolve below it.
 
@@ -66,6 +113,16 @@ conftest-less child cannot inherit an operator's live path overrides.
 
 # Default system-level root for multi-user deployments.
 _DEFAULT_MULTI_USER_ROOT = "/var/lib/vq"
+
+SCRATCH_ROOT_SUFFIX = "-scratch"
+"""How the default scratch root is named: appended to the state root's own
+final component.
+
+Derived rather than written out as a home-relative literal so it follows
+whatever the state root followed -- XDG when XDG is in play, ``$VQ_STATE_DIR``
+when that is set, ``/var/lib/vq`` in multi-user mode. A sibling, not a child:
+a child would put disposable bytes back inside the tree this separation
+exists to keep small, which is the whole defect in #63."""
 _CANONICAL_UID_DIR_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)$")
 
 
@@ -167,6 +224,48 @@ def users_root() -> Path:
     return multi_user_root() / "users"
 
 
+def multi_user_scratch_root() -> Path:
+    """System-level scratch root for multi-user deployments (#63).
+
+    Resolution: ``$VQ_MULTI_USER_SCRATCH_ROOT``, else the ``-scratch``
+    sibling of :func:`multi_user_root` (``/var/lib/vq-scratch`` for the
+    default system root).
+
+    Distinct from :func:`multi_user_root` for the same reason as in
+    single-user mode: the state root carries the queue database, leases and
+    the audit trail and is never pruned, while ``jobs/`` and ``workdirs/``
+    are swept by age and were over 99 % of the measured footprint.
+
+    **The ``scratch_root`` config key does not apply here**, exactly as it
+    does not apply to :func:`multi_user_root`. A config key is read from the
+    *calling process's* config file: the root daemon reads ``/etc/vq`` while
+    a user's CLI reads ``~/.config/vq/config.toml``, and ``vq submit``
+    resolves the submitter's jobs directory in the user's own process. Honour
+    it and the two disagree -- the user stages into one tree while the
+    daemon's cwd gate expects another, and the spec is refused as "outside
+    the submitter's jobs trees". A system-wide root is a deployment-wide
+    decision, so it is made once, in the environment both sides inherit.
+    :meth:`vq.config.Config._validate_scratch_roots` refuses the key in a
+    config that enables multi-user mode rather than ignore it silently.
+    """
+    if env := os.environ.get(ENV_MULTI_USER_SCRATCH_ROOT):
+        require_explicit_test_path(
+            ENV_MULTI_USER_SCRATCH_ROOT, "vq multi-user scratch root"
+        )
+        return Path(env).expanduser()
+    return _scratch_sibling_of(multi_user_root())
+
+
+def users_scratch_root() -> Path:
+    """Top-level directory holding per-user scratch dirs (#63)."""
+    return multi_user_scratch_root() / "users"
+
+
+def user_scratch_dir(uid: int | str) -> Path:
+    """Per-user scratch directory: ``<users_scratch_root>/<uid>/``."""
+    return users_scratch_root() / str(uid)
+
+
 def user_dir(uid: int | str) -> Path:
     """Per-user state directory: ``<users_root>/<uid>/``."""
     return users_root() / str(uid)
@@ -183,7 +282,22 @@ def user_queue_dir(uid: int | str) -> Path:
 
 
 def user_jobs_dir(uid: int | str) -> Path:
-    """Jobs dir for a specific user in multi-user mode."""
+    """Jobs dir for a specific user in multi-user mode.
+
+    #63: under the per-user **scratch** dir, not the per-user state dir.
+    :func:`user_state_jobs_dir` is where it used to be; a job that recorded
+    the old path keeps it, and both roots are swept.
+    """
+    return user_scratch_dir(uid) / "jobs"
+
+
+def user_state_jobs_dir(uid: int | str) -> Path:
+    """Where a user's workspaces lived before #63 (``<uid>/jobs``).
+
+    Kept as a *read* target: cleanup, accounting and the multi-user spec gate
+    accept a workspace recorded under it, so separating the roots strands no
+    existing job. Nothing new is ever created here.
+    """
     return user_dir(uid) / "jobs"
 
 
@@ -204,12 +318,20 @@ def user_workspace_dir(uid: int | str, jobid: str) -> Path:
 
 def user_workdir_root(uid: int | str) -> Path:
     """v0.6.54: per-job scratch workdir root for a user in multi-user
-    mode (``<users_root>/<uid>/workdirs/``).
+    mode (#63: ``<users_scratch_root>/<uid>/workdirs/``).
 
     Distinct from ``user_jobs_dir`` (which holds the submitted
     workspace = ``cwd``). Workdirs are operator-visible scratch:
     long-lived enough that the chat can read results back, but
     swept by the v0.6.54 cleanup pass after a configurable max-age."""
+    return user_scratch_dir(uid) / "workdirs"
+
+
+def user_state_workdir_root(uid: int | str) -> Path:
+    """Where a user's workdirs lived before #63 (``<uid>/workdirs``).
+
+    A read target only, for the same reason as :func:`user_state_jobs_dir`.
+    """
     return user_dir(uid) / "workdirs"
 
 
@@ -286,10 +408,63 @@ def ensure_users_root() -> Path:
     return root
 
 
+def _ensure_managed_root(root: Path, *, label: str, strip: int) -> os.stat_result:
+    """Create or adopt one managed root, failing closed on a bad final node.
+
+    Shared by the state and scratch roots so the scratch tree cannot end up
+    with weaker structural guarantees than the tree it was split out of: a
+    real daemon-owned directory at the managed final component, never a
+    symlink, with ``strip`` permission bits removed.
+    """
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError:
+        root.mkdir(parents=True, exist_ok=False)
+        info = os.lstat(root)
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnsafeMultiUserStateError(
+            f"unsafe {label} {root}: expected a real directory"
+        )
+    if info.st_uid != os.geteuid():
+        raise UnsafeMultiUserStateError(
+            f"unsafe {label} {root}: owner uid {info.st_uid} does not match "
+            f"provisioning uid {os.geteuid()}"
+        )
+    mode = stat.S_IMODE(info.st_mode)
+    hardened = mode & ~strip
+    if hardened != mode:
+        os.chmod(root, hardened)
+    return info
+
+
+def ensure_multi_user_scratch_root() -> Path:
+    """Create or validate the multi-user scratch root (#63).
+
+    Same structural contract as :func:`ensure_multi_user_root`: a real
+    daemon-owned directory with no world write. It holds no control-plane
+    record, so it is not group-writable for admins the way the state root is.
+    """
+    root = multi_user_scratch_root()
+    _ensure_managed_root(root, label="multi-user scratch root", strip=0o022)
+    return root
+
+
+def ensure_users_scratch_root() -> Path:
+    """Create or validate the trusted root of every per-user scratch tree."""
+    ensure_multi_user_scratch_root()
+    root = users_scratch_root()
+    _ensure_managed_root(
+        root, label="multi-user users scratch root", strip=0o022
+    )
+    return root
+
+
 def provision_user_state(uid: int, gid: int) -> None:
     """v0.6.x: create a user's multi-user state tree
-    (``<users_root>/<uid>/`` plus ``queue/`` ``jobs/`` ``archive/``).
-    The structural ``<uid>/`` parent stays owned by the provisioning process
+    (``<users_root>/<uid>/`` plus ``queue/`` ``archive/``) and, since #63,
+    their per-user scratch tree (``<users_scratch_root>/<uid>/`` plus
+    ``jobs/`` ``workdirs/``).
+    Each structural ``<uid>/`` parent stays owned by the provisioning process
     (root in production) with the target user's primary group, while its
     writable children belong to ``uid:gid``.
 
@@ -328,10 +503,29 @@ def provision_user_state(uid: int, gid: int) -> None:
     # the structural parent without exposing the numeric tree to other users.
     os.chmod(structural, 0o750)
 
+    # #63: jobs/ and workdirs/ live under the per-user *scratch* dir, whose
+    # structural parent needs the same root-owned, search-only treatment as
+    # the state one -- otherwise the user could swap a checked child between
+    # the lstat and the chown below.
+    ensure_users_scratch_root()
+    scratch_structural = user_scratch_dir(uid)
+    try:
+        scratch_stat = os.lstat(scratch_structural)
+    except FileNotFoundError:
+        scratch_structural.mkdir(exist_ok=False)
+        scratch_stat = os.lstat(scratch_structural)
+    if not stat.S_ISDIR(scratch_stat.st_mode):
+        raise UnsafeMultiUserStateError(
+            f"unsafe multi-user scratch root {scratch_structural}: "
+            "expected a real directory"
+        )
+    os.chown(scratch_structural, os.geteuid(), gid, follow_symlinks=False)
+    os.chmod(scratch_structural, 0o750)
+
     writable_children = [
         user_queue_dir(uid),
-        user_jobs_dir(uid),
         user_archive_dir(uid),
+        user_jobs_dir(uid),
         user_workdir_root(uid),  # v0.6.54
     ]
     for child in writable_children:
@@ -386,22 +580,305 @@ def config_dir() -> Path:
     return Path(xdg).expanduser() / "vq"
 
 
+def _scratch_sibling_of(root: Path) -> Path:
+    """``<root>-scratch``: the default scratch root beside a state root."""
+    return root.parent / f"{root.name}{SCRATCH_ROOT_SUFFIX}"
+
+
+@lru_cache(maxsize=8)
+def _scratch_config_roots(
+    _config_file: str, _fingerprint: tuple[int, int, int]
+) -> tuple[str | None, str | None, str | None]:
+    """Read ``scratch_root`` / ``jobs_root`` / ``workdir_root`` from config.
+
+    Cached on the config file's identity (path, mtime_ns, size, inode) so
+    resolving a path costs one ``stat`` rather than a TOML parse and a full
+    pydantic validation. An edit changes the fingerprint and the next call
+    re-reads.
+
+    A malformed config propagates :class:`~vq.config.ConfigError` rather than
+    falling back to the default root: silently resolving a *different* scratch
+    root than the operator configured is how a sweep ends up in the wrong tree.
+    """
+    from vq.config import load_config  # noqa: PLC0415 - lazy: config imports us
+
+    cfg = load_config()
+    return (cfg.scratch_root, cfg.jobs_root, cfg.workdir_root)
+
+
+def _configured_root(key: str) -> Path | None:
+    """The configured value of one scratch path key, or ``None`` if unset."""
+    try:
+        config_file = config_dir() / "config.toml"
+        info = config_file.stat()
+    except (OSError, UnsafeImplicitTestPathError):
+        return None
+    values = dict(
+        zip(
+            ("scratch_root", "jobs_root", "workdir_root"),
+            _scratch_config_roots(
+                str(config_file),
+                (info.st_mtime_ns, info.st_size, info.st_ino),
+            ),
+            strict=True,
+        )
+    )
+    value = values[key]
+    return Path(value).expanduser() if value else None
+
+
+def scratch_root() -> Path:
+    """#63: the per-user root holding ``jobs/`` and ``workdirs/``.
+
+    Resolution, first match wins:
+
+      1. ``$VQ_SCRATCH_DIR``
+      2. the ``scratch_root`` config key
+      3. ``<state_root>-scratch`` (so ``$XDG_DATA_HOME/vq-scratch``, falling
+         back to ``~/.local/share/vq-scratch``)
+
+    Separate from :func:`state_root` **by default** since v0.26.10: on two
+    measured daemon hosts job workdirs were over 99 % of the state root's
+    footprint (132 GB of 138, 81 GB of 84), so a root documented as "never
+    pruned" was in fact almost entirely disposable bytes.
+    """
+    if env := os.environ.get(ENV_SCRATCH_DIR):
+        require_explicit_test_path(ENV_SCRATCH_DIR, "per-user vq scratch root")
+        return Path(env).expanduser()
+    if configured := _configured_root("scratch_root"):
+        require_test_path_within_sandbox(configured, "per-user vq scratch root")
+        return configured
+    return _scratch_sibling_of(state_root())
+
+
 def queue_dir() -> Path:
     return state_root() / "queue"
 
 
 def jobs_dir() -> Path:
+    """Where a new job's workspace (its ``cwd``) is created.
+
+    ``<scratch_root>/jobs`` unless the ``jobs_root`` config key names another
+    directory. The key exists on its own so a site can keep results on
+    durable storage while workdirs churn on a scratch volume; unset, the two
+    trees default together (#63 decision 2).
+    """
+    if configured := _configured_root("jobs_root"):
+        require_test_path_within_sandbox(configured, "vq jobs root")
+        return configured
+    return scratch_root() / "jobs"
+
+
+def state_jobs_dir() -> Path:
+    """Where workspaces lived before #63 (``<state_root>/jobs``).
+
+    A *read* target: cleanup, accounting and restore accept a workspace
+    recorded under it so nothing has to move on upgrade. Never written to for
+    a new job.
+    """
     return state_root() / "jobs"
 
 
+def managed_jobs_roots() -> tuple[Path, ...]:
+    """Every jobs root vq manages, current first, de-duplicated.
+
+    Cleanup and accounting iterate this rather than the current root alone:
+    the whole point of #63's "nothing moves on upgrade" is that the old root
+    keeps existing until it is empty, and a verb that only looks at the new
+    root is the #61/#63 defect again -- a cleanup that cannot see where the
+    bytes are.
+    """
+    return _dedupe_roots(jobs_dir(), state_jobs_dir())
+
+
 def workdir_root() -> Path:
-    """v0.6.54: single-user workdir root (``<state_root>/workdirs/``)."""
+    """v0.6.54: single-user workdir root.
+
+    ``<scratch_root>/workdirs`` unless the ``workdir_root`` config key names
+    another directory (#63). The daemon opens **this** directory with
+    ``O_NOFOLLOW`` before removing anything beneath it, so the configured root
+    may be anywhere -- including a different volume -- while nothing below it
+    may be a symlink escape. Before #63 the root was hard-wired under the
+    state root, which meant a symlinked ``workdirs`` did not relocate scratch:
+    it silently switched vq's own workdir cleanup off.
+    """
+    if configured := _configured_root("workdir_root"):
+        require_test_path_within_sandbox(configured, "vq workdir root")
+        return configured
+    return scratch_root() / "workdirs"
+
+
+def state_workdir_root() -> Path:
+    """Where workdirs lived before #63 (``<state_root>/workdirs``).
+
+    A read target only, for the same reason as :func:`state_jobs_dir`.
+    """
     return state_root() / "workdirs"
+
+
+def managed_workdir_roots() -> tuple[Path, ...]:
+    """Every workdir root vq manages, current first, de-duplicated."""
+    return _dedupe_roots(workdir_root(), state_workdir_root())
+
+
+def workdir_roots_for_job(
+    recorded: str | Path | None, job_id: str
+) -> tuple[Path, ...]:
+    """Every root that may legitimately hold **this job's** workdir.
+
+    :func:`managed_workdir_roots` answers "which roots does this host manage
+    *now*", which is the right question for a sweep that enumerates
+    directories and the wrong one for a job that already recorded where its
+    own scratch went. ``workdir_root`` and ``scratch_root`` are operator
+    configuration, so a host can be pointed at a third root after a job was
+    dispatched; the job's record still names the second one, which is in
+    neither :func:`workdir_root` nor :func:`state_workdir_root`. Accounting
+    then reported 0 bytes for a directory that is plainly on disk and
+    ``--delete`` left it there -- exactly the bytes #63 was opened about,
+    one configuration change later.
+
+    So the record's own parent is added, and only when the record names this
+    job (``<parent>/<job id>``). ``spec.workdir`` is written by exactly one
+    place, the daemon's dispatch, from :func:`workdir_for` -- never by a
+    submitter and never by a CLI flag -- so in single-user mode it is vq's
+    own note of a directory vq created, held to the same standard as
+    ``spec.cwd``, which cleanup has always removed at its recorded path. The
+    structural guards in :func:`remove_managed_scratch_dir` do not move: the
+    parent is opened ``O_NOFOLLOW``, the entry must be a real directory that
+    is not a symlink, and ownership must match.
+
+    **Single-user only.** In root multi-user mode the queued spec is
+    user-writable, so the record is evidence and never authority; those
+    callers keep passing :func:`managed_user_workdir_roots`.
+    """
+    roots = managed_workdir_roots()
+    if not recorded:
+        return roots
+    try:
+        safe_id = validate_job_id(job_id)
+    except ValueError:
+        return roots
+    recorded_path = Path(recorded)
+    if recorded_path.name != safe_id or not recorded_path.is_absolute():
+        return roots
+    return _dedupe_roots(*roots, recorded_path.parent)
+
+
+def managed_user_jobs_roots(uid: int | str) -> tuple[Path, ...]:
+    """Every jobs root vq manages for one multi-user uid, current first."""
+    return _dedupe_roots(user_jobs_dir(uid), user_state_jobs_dir(uid))
+
+
+def managed_user_workdir_roots(uid: int | str) -> tuple[Path, ...]:
+    """Every workdir root vq manages for one multi-user uid, current first."""
+    return _dedupe_roots(user_workdir_root(uid), user_state_workdir_root(uid))
+
+
+def _dedupe_roots(*roots: Path) -> tuple[Path, ...]:
+    """Preserve order, drop repeats.
+
+    The two roots coincide whenever an operator points a scratch key back at
+    the state root, and a duplicate would make a sweep visit the same tree
+    twice and double-count its bytes.
+    """
+    seen: list[Path] = []
+    for root in roots:
+        if root not in seen:
+            seen.append(root)
+    return tuple(seen)
 
 
 def workdir_for(jobid: str) -> Path:
     """v0.6.54: per-job workdir (single-user)."""
     return workdir_root() / _safe_job_id(jobid)
+
+
+def remove_managed_scratch_dir(
+    recorded: str | Path,
+    job_id: str,
+    *,
+    roots: Sequence[Path],
+    expected_uid: int | None = None,
+) -> str | None:
+    """Remove one job's managed scratch directory, or say why it was refused.
+
+    Returns ``None`` when the directory was removed or was already gone, and
+    a short human-readable reason otherwise. Never raises for an ordinary
+    filesystem condition: a refusal is a diagnostic, not a crash, because the
+    caller is finishing a job or running a sweep.
+
+    The authority is deliberately narrow, and #63 widened *where* a root may
+    be without widening *what* may be deleted:
+
+    * the recorded path must name **this job** directly under one of the
+      ``roots`` the caller passes -- the configured ones, the pre-#63 one
+      under the state root, and for a single-user caller any further root
+      this host's own records still name. A recorded path anywhere else is
+      refused, so an operator who points ``workdir`` at their own directory
+      keeps it. Note what this does and does not bound: it stops a record
+      aiming the removal *outside* the roots it is given, and it is the
+      caller's business which roots those are. The age sweep is where that
+      matters, and it deliberately declines to remove anything unrecorded
+      under a root the host merely used to write into;
+    * the matching root is opened ``O_RDONLY | O_DIRECTORY | O_NOFOLLOW``, so
+      the configured root may live on any volume but may not itself be a
+      symlink -- a redirected root fails closed instead of granting deletion
+      rights somewhere else;
+    * the entry is then ``lstat``-ed and removed **relative to that
+      descriptor**, so it must be a real directory and no component can be
+      swapped for a symlink between the check and the removal;
+    * ``expected_uid``, when given, refuses an entry owned by anyone else.
+      Ambiguous ownership is a refusal, never a best-effort removal.
+    """
+    try:
+        safe_id = _safe_job_id(job_id)
+    except ValueError as exc:
+        return f"job id is not usable as a managed path component: {exc}"
+    recorded_path = Path(recorded)
+    matched: Path | None = None
+    for root in roots:
+        candidates = {root / safe_id}
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            candidates.add(root.resolve(strict=False) / safe_id)
+        if recorded_path in candidates:
+            matched = root
+            break
+    if matched is None:
+        return (
+            "recorded path does not name this job under a managed scratch "
+            "root"
+        )
+    open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(matched, open_flags)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        return f"managed scratch root could not be opened safely: {exc}"
+    try:
+        try:
+            entry = os.stat(safe_id, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            return f"managed job path metadata could not be read: {exc}"
+        if stat.S_ISLNK(entry.st_mode):
+            return "managed job path is a symlink"
+        if not stat.S_ISDIR(entry.st_mode):
+            return "managed job path is not a directory"
+        if expected_uid is not None and entry.st_uid != expected_uid:
+            return (
+                f"managed job path is owned by uid {entry.st_uid}, not the "
+                f"expected uid {expected_uid}"
+            )
+        try:
+            shutil.rmtree(safe_id, dir_fd=root_fd)
+        except (OSError, ValueError) as exc:
+            return f"managed job path could not be removed: {exc}"
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(root_fd)
+    return None
 
 
 def archive_dir() -> Path:
@@ -543,6 +1020,32 @@ def daemon_logfile(*, multi_user: bool = False) -> Path:
     if multi_user:
         return multi_user_root() / "daemon.log"
     return state_root() / "daemon.log"
+
+
+def scheduler_scratch_roots_path(*, multi_user: bool = False) -> Path:
+    """Where the daemon remembers each scheduler host's ``scratch_root``.
+
+    Daemon-written. It exists because the #63 refusal -- "do not adopt a
+    changed ``scratch_root`` for a host that still has a job that may already
+    be staged under the old one" -- needs to know what the previous root
+    *was*, and the only in-memory answer (the dispatcher cache) is empty at
+    startup and cleared by a config reload. Those are precisely the two
+    moments an operator changes the key and restarts, so without something
+    durable the guard was silent exactly when it mattered.
+
+    ``vq doctor`` reads it, and nothing else does: the refusal has to be
+    visible to whoever wrote the config, and this file plus ``config.toml``
+    is the whole of that answer, with no daemon round trip.
+
+    A missing or unreadable file means "no memory yet", which is also the
+    honest answer on the first start after an upgrade -- a start that then
+    serves the configured root without binding any pre-upgrade job to it. The
+    entry shapes are
+    :data:`~vq.scheduler_dispatch.SCHEDULER_SCRATCH_ROOTS_SCHEMA`.
+    """
+    if multi_user:
+        return multi_user_root() / "scheduler-scratch-roots.json"
+    return state_root() / "scheduler-scratch-roots.json"
 
 
 ADMIN_UPDATE_LOG_DIRNAME = "admin-updates"

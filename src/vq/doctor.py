@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from typing import cast
 
 from vq import admin as admin_module
-from vq import config, host_status, ssh_probe, transport
+from vq import config, host_status, paths, ssh_probe, transport
 from vq import drain as drain_module
 from vq.host import is_local_host
 from vq.scheduler_dispatch import (
     RemoteResult,
     RemoteRunner,
     SchedulerError,
+    read_scheduler_scratch_roots,
     wrapper_already_applied,
 )
 
@@ -698,6 +699,122 @@ def console_runtime_checks(
             "console_runtime",
             True,
             f"web console runtime not determined: {detail or 'no verdict'}",
+        )
+    ]
+
+
+def declared_extras_route_checks(
+    cfg: config.Config,
+) -> list[dict[str, object]]:
+    """Whether a declared ``extras`` floor has a route into its venv (#84).
+
+    A venv program declares ``extras`` to say what its environment is *for*,
+    and that floor reaches pip only through vq's own ``scripts/install.sh`` or
+    ``scripts/update.sh``, resolved inside the checkout the program points at.
+    Config load cannot check which script the configured commands *point* at,
+    because at load time there may be no checkout to read; the provision
+    refuses where the evidence is, but only once someone runs it. So a program
+    whose installer is a site command loads clean, provisions never, updates
+    quietly, and produces the symptom the key exists to prevent: a console
+    venv declaring ``extras = ["web"]``, built without uvicorn, whose unit
+    fails on every start while the doctor reports nothing unusual.
+
+    This is the check that says it out loud, on the one host that can answer:
+    the scripts are files in a checkout, so the question is only answerable
+    where that checkout is. ``vq doctor REMOTE`` therefore leaves it out
+    rather than guessing from the local config, which describes local
+    programs.
+
+    Three things it deliberately does not do. It says nothing at all when no
+    program declares ``extras``, which is every host that only runs the daemon
+    -- there is no situation to report. It **fails** only for a program where
+    both scripts were resolved and neither is vq's own, which is the state
+    with no route at all. And where the checkout does not exist yet or cannot
+    be read it reports that it could not answer and stays OK: a doctor run
+    that goes red on a host mid-provision is a doctor run operators learn to
+    ignore.
+    """
+    declaring = [
+        (name, prog)
+        for name, prog in sorted(cfg.programs.items())
+        if isinstance(prog, config.VenvProgram) and prog.extras
+    ]
+    if not declaring:
+        return []
+    lines: list[str] = []
+    records: list[dict[str, object]] = []
+    unroutable: list[str] = []
+    for name, prog in declaring:
+        routes = admin_module.declared_extras_routes(prog)
+        declared = list(prog.extras)
+        records.append(
+            {
+                "program": name,
+                "extras": declared,
+                "install_script": prog.install_script,
+                "update_script": prog.update_script,
+                "install_route": routes.install,
+                "update_route": routes.update,
+                "install_detail": routes.install_detail,
+                "update_detail": routes.update_detail,
+                "applied_at_install": routes.applied_at_install,
+                "applied_on_update": routes.applied_on_update,
+            }
+        )
+        if routes.applied_on_update:
+            lines.append(
+                f"{name}: extras {declared} are re-applied by every "
+                f"`vq admin update {name}` (update_script resolves to "
+                f"{routes.update_detail})"
+            )
+        elif routes.applied_at_install:
+            lines.append(
+                f"{name}: extras {declared} were applied once, by the "
+                "provision, and nothing re-applies them: update_script is "
+                + (
+                    "not configured"
+                    if routes.update == admin_module.ExtrasRoute.ABSENT
+                    else f"{routes.update_detail}"
+                )
+                + ". Point it at the checkout's own scripts/update.sh to keep "
+                "the declaration true across rebuilds"
+            )
+        elif routes.undetermined:
+            lines.append(
+                f"{name}: cannot tell whether extras {declared} have a route "
+                "into this venv: "
+                + "; ".join(
+                    detail
+                    for route, detail in (
+                        (routes.install, routes.install_detail),
+                        (routes.update, routes.update_detail),
+                    )
+                    if route == admin_module.ExtrasRoute.UNKNOWN and detail
+                )
+            )
+        else:
+            unroutable.append(name)
+            lines.append(
+                f"{name}: extras {declared} have no route into this venv. "
+                f"install_script is {prog.install_script!r} and update_script "
+                f"is {prog.update_script!r}; neither is the checkout's own "
+                "scripts/install.sh or scripts/update.sh, so a provision "
+                "refuses and an update rebuilds without them. Point one of "
+                "them at the checkout's own script, or drop the declaration"
+            )
+    ok = not unroutable
+    headline = (
+        f"{len(declaring)} program(s) declare extras"
+        if ok
+        else "declared extras with no route into the venv: "
+        + ", ".join(unroutable)
+    )
+    return [
+        check(
+            "declared_extras_routes",
+            ok,
+            "\n".join([headline, *lines]),
+            programs=records,
         )
     ]
 
@@ -1876,6 +1993,77 @@ def scheduler_runtime_deployments_check(
     )
 
 
+def scheduler_scratch_root_check(
+    host: str,
+    host_cfg: config.HostConfig,
+) -> dict[str, object]:
+    """Report whether the configured ``scratch_root`` is the one in force (#63).
+
+    The driver refuses to adopt a changed ``scratch_root`` for a host while a
+    job on it may already be staged somewhere only the previous root can
+    locate, and it refuses to *bind* jobs to a root it has no memory to check
+    against. Both are correct and both mean the same thing to an operator:
+    the value in ``config.toml`` is not the value this host is running on, and
+    no other command said so -- the refusal was one log line per daemon
+    lifetime and appeared in no output at all.
+
+    Answered from the driver's own record of what it last served
+    (:func:`vq.paths.scheduler_scratch_roots_path`) against what config now
+    says, so it costs no SSH and no daemon RPC. Read where the driver keeps
+    its state: run on another machine it reports "no record", never a wrong
+    verdict, because a host with no record is exactly a host this vq has never
+    driven.
+    """
+    name = "scheduler_scratch_root"
+    configured = (host_cfg.scratch_root or "").rstrip("/")
+    remembered = read_scheduler_scratch_roots(
+        paths.scheduler_scratch_roots_path(multi_user=paths.is_multi_user())
+    ).get(host)
+    if remembered is None:
+        return check(
+            name,
+            True,
+            f"no record of a driver serving {host} from this state root"
+            + (f"; config says {configured!r}" if configured else ""),
+        )
+    if remembered.root != configured:
+        return check(
+            name,
+            False,
+            f"held at {remembered.root!r}; config says {configured!r}. The "
+            "driver keeps serving the root it last adopted while a job on "
+            "this host may already be staged under it and carries no "
+            "recorded workspace. Those jobs bind when the driver next starts "
+            "and reattaches to them, or they drain; the change lands on the "
+            "restart after that. A host still held then has a job that did "
+            "not reattach, and that job is the real problem",
+            scratch_root_configured=configured,
+            scratch_root_in_force=remembered.root,
+        )
+    if not remembered.confirmed:
+        return check(
+            name,
+            False,
+            f"serving {remembered.root!r} unconfirmed. The driver first saw "
+            "this host with jobs that carry no recorded workspace and no "
+            "record of a previous root to check the configured one against, "
+            "so it cannot tell whether those jobs were staged under it. It "
+            "is not binding them to it, and it will not hold this key back "
+            "either -- there is nothing proven to hold. If the key was "
+            "changed in the same window as the upgrade, restore the previous "
+            "value; otherwise this clears when those jobs drain",
+            scratch_root_configured=configured,
+            scratch_root_in_force=remembered.root,
+            scratch_root_confirmed=False,
+        )
+    return check(
+        name,
+        True,
+        f"{remembered.root!r} is configured and in force",
+        scratch_root_in_force=remembered.root,
+    )
+
+
 def diagnose_host(
     cfg: config.Config,
     host: str,
@@ -1977,6 +2165,7 @@ def diagnose_host(
         )
         checks.append(scheduler_program_hooks_check(cfg, host_cfg))
         checks.append(scheduler_command_wrapper_check(host_cfg))
+        checks.append(scheduler_scratch_root_check(host, host_cfg))
         # This check crosses the scheduler host's own SSH route. Driver-side
         # failures below belong to the driver's separate route and diagnosis.
         own_ssh_checks.append(
@@ -2050,6 +2239,13 @@ def diagnose_host(
             checks.extend(
                 console_runtime_checks(cfg, host, check_timeout=check_timeout)
             )
+
+    # A program's scripts are files in a checkout, so only the host holding
+    # that checkout can say whether a declared extras floor has a route into
+    # its venv. `cfg.programs` describes this machine's programs, so asking it
+    # about a remote host would answer from the wrong config (#84).
+    if is_local_host(host):
+        checks.extend(declared_extras_route_checks(cfg))
 
     # If the first hop answered but SSH later failed at the transport layer,
     # spend one verbose probe to classify the broken link. RemoteError checks

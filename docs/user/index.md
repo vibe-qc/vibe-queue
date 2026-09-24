@@ -74,6 +74,13 @@ vq fetch --workdir <jobid>         # the per-job scratch directory
 vq fetch-all HOST -o results/      # every terminal job on a host
 ```
 
+A file vq cannot read, or a symlink it must not follow, costs that entry and
+not the job: the rest of the workspace still arrives, the fetch prints
+`PARTIAL`, and the tree's `_vq/fetch-exclusions.json` names what is missing.
+`vq fetch-all` also writes `<output_dir>/_vq/fetch-all-report.json` listing
+every job it swept and how each one went, so you can check the coverage of a
+batch without re-reading the command's output.
+
 ## When something goes wrong
 
 * A job that will not start: `vq status` names the gate it is waiting on.
