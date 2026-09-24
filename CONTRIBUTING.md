@@ -6,7 +6,7 @@ other command-line workload, onto a local machine, a remote host over SSH, or
 a cluster scheduler backend. It is useful on its own and does not build or
 install vibe-qc.
 
-The distribution is named `vq`; the repository is named `vibe-queue`.
+The distribution, like the repository, is named `vibe-queue`; the command and the import package are `vq`.
 
 ## Where to report what
 
@@ -193,11 +193,36 @@ why in the commit message.
 - Do not tag `vX.Y.Z` and do not push to `release`; releases are cut
   separately.
 
+## Changelog fragments
+
+`CHANGELOG.md` is written by the release cut, not by the change. For anything
+a user or an operator would notice, add one file under `changelog.d/`:
+
+```
+changelog.d/<issues>-<topic>.<kind>.md
+```
+
+`<issues>` is the tracker issue number (several joined with `-`, as in
+`77-79-readiness-uncertainty`), `<topic>` a short kebab-case name, and
+`<kind>` the Keep a Changelog section in lower case: `added`, `changed`,
+`deprecated`, `removed`, `fixed` or `security`. The file holds **one** entry
+as it will read under `[Unreleased]`: a bold lead sentence, the body, and the
+issue number at the end. Write it as prose, with no list marker and no
+heading; the fold adds the `- ` and indents the rest, so a nested list inside
+the entry is written flush left and comes out nested. A change that needs an
+entry in two sections writes two files.
+
+A fragment is a file of its own, so two changes landing at once never
+conflict on the ledger. `python scripts/fold_changelog.py --check` validates
+the names, and the test suite runs it; the release cut folds the fragments
+into `CHANGELOG.md` with the same script.
+
 ## Before you open a merge request
 
 - Run the affected lanes locally and name them.
 - Keep `main` release-ready: no half-finished code paths, docs in parity,
-  `CHANGELOG.md` `[Unreleased]` reflecting what you actually landed.
+  and a changelog fragment for anything a user or an operator would notice
+  (see "Changelog fragments").
 - **vq versions are load-bearing for the fleet.** Private operations storage
   holds fleet release reports and runtime pins reference them by version. A change to the
   version scheme, the report schema, or `vq --version` output is a

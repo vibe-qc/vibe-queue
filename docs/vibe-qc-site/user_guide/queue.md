@@ -306,8 +306,12 @@ the server:
 vq fetch compute <jobid> --name job.qvf -o results/
 ```
 
-That publishes `results/job.qvf` atomically. Retrying is idempotent only when
-the existing file is byte-identical: vq will not overwrite a different result.
+That publishes `results/job.qvf` atomically: the transfer is staged and then
+renamed into place, so a reader never sees a half-written container. Fetching
+again refreshes it. An existing copy is replaced with the newly fetched bytes,
+and an identical one is left where it is. vq refuses only a destination it
+cannot safely replace, such as a symlink, or a directory where the artifact is
+a file.
 
 (vq-core-preflight)=
 
@@ -323,8 +327,9 @@ on the job spec. The queue then knows what the job will write before it writes
 it, so fetch can be selective and progress can be reported per declared
 artefact instead of by tarring the whole workspace.
 
-It costs a second or two at submit time, and it executes your Python file, so
-it is opt-in. Three limits worth knowing:
+It executes your Python file at submit time, so it is opt-in. The dry run is
+bounded rather than cheap by assumption: vq abandons it after ten seconds and
+queues the job anyway. Three limits worth knowing:
 
 * It is meaningful only for scripts that go through `vibeqc.run_job`. Other
   scripts are a no-op, and a preflight failure is non-fatal.
@@ -364,22 +369,24 @@ instead reads a file literally named `INPUT` in the working directory. The
 wrapper hides both conventions and restores the workspace on exit.
 
 ```sh
-# Parallel CRYSTAL14, 14 MPI ranks by default.
+# Parallel CRYSTAL14. The rank count is explicit; there is no default.
 vq submit compute -d ./calc --cpus 14 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh INPUT.d12
+    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 14 INPUT.d12
 
 # Serial, no mpirun startup cost.
 vq submit compute -d ./calc --cpus 1 \
     -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --serial INPUT.d12
 
-# A specific rank count.
-vq submit compute -d ./calc --cpus 8 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 8 INPUT.d12
-
 # PROPERTIES post-processing rather than an SCF.
-vq submit compute -d ./prop --cpus 14 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --properties prop.d3
+vq submit compute -d ./prop --cpus 8 \
+    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 8 \
+       --properties prop.d3
 ```
+
+A parallel run needs `--np N`; the wrapper refuses to guess one and exits
+rather than picking a rank count for you. Use `--serial` for a single core.
+Keep `--np` and `--cpus` in agreement, as with ORCA below: the first is what
+the wrapper launches, the second is what the queue reserves.
 
 `--demo` selects the CRYSTAL23 demo binaries. It is serial only, so combining
 it with `--np` is rejected, and it is capped at ten atoms per primitive cell.
@@ -490,4 +497,4 @@ Everything below is vq's own documentation, not vibe-qc's:
 * [Install and maintain the vibe toolset](../toolset_lifecycle.md).
 * [Jupyter Lab integration](jupyter.md), for interactive work, which is the
   shape vq is deliberately bad at.
-* [vibe-queue on GitLab](https://github.com/vibe-qc/vibe-queue).
+* [vibe-queue on GitHub](https://github.com/vibe-qc/vibe-queue).

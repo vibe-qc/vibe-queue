@@ -1957,10 +1957,21 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
     initial = _plan(report, [_action(action_id="driver", decision="skip")])
     final = _plan(report, [_action(action_id="driver", decision="skip")])
     _patch_discovery(monkeypatch, report=report, plans=[initial, final])
+    config.load_config().fleet_report_repo = "/private-reports"
+    monkeypatch.setattr(
+        "vq.cli.admin_module._canonical_lifecycle_checkout", lambda path: path,
+    )
     events: list[str] = []
     rollout_active = False
     lifecycle_depth = 0
-    resources = (("checkout", "/repo"), ("target", "/repo/.venv"))
+    resources = (("checkout", "/private-reports"), ("checkout", "/repo"),
+                 ("target", "/repo/.venv"))
+    @contextmanager
+    def adopt(**kwargs: Any):
+        assert kwargs["expected_lifecycle_resources"] == resources
+        yield None
+
+    monkeypatch.setattr("vq.cli.fleet_rollout.adopt_rollout_reentry_handoff", adopt)
     handoff = json.dumps(
         {
             "schema": "vq.toolset.lifecycle_handoff/1",
@@ -1971,7 +1982,7 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
                     "fd": fd,
                     "path": f"/tmp/test-controller-{scope}.lock",
                 }
-                for fd, (scope, resource) in zip((91, 92), resources, strict=True)
+                for fd, (scope, resource) in zip((91, 92, 93), resources, strict=True)
             ],
         },
         separators=(",", ":"),
@@ -1995,9 +2006,10 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
     @contextmanager
     def lifecycle_lock(*args: Any, **kwargs: Any):
         nonlocal lifecycle_depth
-        del args, kwargs
+        del args
         assert rollout_active
         if lifecycle_depth == 0:
+            assert kwargs["extra_resources"] == (("checkout", "/private-reports"),)
             events.append("lifecycle-enter")
         lifecycle_depth += 1
         try:
@@ -2009,7 +2021,7 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
 
     def active_handoff() -> tuple[str, tuple[int, ...]]:
         assert lifecycle_depth > 0
-        return handoff, (91, 92)
+        return handoff, (91, 92, 93)
 
     def active_resources() -> tuple[tuple[str, str], ...]:
         assert lifecycle_depth > 0
@@ -2090,10 +2102,21 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
             report_digest_sha256=report.digest_sha256,
         ),
     )
+    config.load_config().fleet_report_repo = "/private-reports"
+    monkeypatch.setattr(
+        "vq.cli.admin_module._canonical_lifecycle_checkout", lambda path: path,
+    )
     events: list[str] = []
     rollout_active = False
     lifecycle_depth = 0
-    resources = (("checkout", "/repo"), ("target", "/repo/.venv"))
+    resources = (("checkout", "/private-reports"), ("checkout", "/repo"),
+                 ("target", "/repo/.venv"))
+    @contextmanager
+    def adopt(**kwargs: Any):
+        assert kwargs["expected_lifecycle_resources"] == resources
+        yield None
+
+    monkeypatch.setattr("vq.cli.fleet_rollout.adopt_rollout_reentry_handoff", adopt)
     handoff = json.dumps(
         {
             "schema": "vq.toolset.lifecycle_handoff/1",
@@ -2104,7 +2127,7 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
                     "fd": fd,
                     "path": f"/tmp/test-controller-{scope}.lock",
                 }
-                for fd, (scope, resource) in zip((91, 92), resources, strict=True)
+                for fd, (scope, resource) in zip((91, 92, 93), resources, strict=True)
             ],
         },
         separators=(",", ":"),
@@ -2127,9 +2150,10 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
     @contextmanager
     def lifecycle_lock(*args: Any, **kwargs: Any):
         nonlocal lifecycle_depth
-        del args, kwargs
+        del args
         assert rollout_active
         if lifecycle_depth == 0:
+            assert kwargs["extra_resources"] == (("checkout", "/private-reports"),)
             events.append("lifecycle-enter")
         lifecycle_depth += 1
         try:
@@ -2143,7 +2167,7 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
     monkeypatch.setattr("vq.cli.admin_module.toolset_lifecycle_lock", lifecycle_lock)
     monkeypatch.setattr(
         "vq.cli.admin_module._active_toolset_lifecycle_handoff",
-        lambda: (handoff, (91, 92)),
+        lambda: (handoff, (91, 92, 93)),
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._active_toolset_lifecycle_resources",

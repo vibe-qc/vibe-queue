@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import shutil
 import tarfile
@@ -34,7 +35,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field
 
 from vq import paths, spec_access, submit
-from vq.spec import JobSpec, JobState, utcnow_iso
+from vq.spec import JobSpec, JobState, utcnow_iso, validate_job_id
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +155,34 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _workdir_size_bytes(spec: JobSpec, uid: str | None) -> int:
+    """Bytes under a job's recorded workdir, if vq manages that path.
+
+    Sized only when the record names a per-job directory under a root vq may
+    remove it from, so accounting reports exactly the bytes ``--delete``
+    would remove -- never bytes under an operator's own directory that vq
+    happens to have been pointed at. Single-user mode includes the root the
+    record itself names (:func:`vq.paths.workdir_roots_for_job`), so a
+    workdir under a root the host has since been configured away from is
+    reported rather than silently counted as zero.
+    """
+    if not spec.workdir:
+        return 0
+    roots = (
+        paths.managed_user_workdir_roots(uid)
+        if uid is not None
+        else paths.workdir_roots_for_job(spec.workdir, spec.id)
+    )
+    recorded = Path(spec.workdir)
+    for root in roots:
+        candidates = {root / spec.id}
+        with contextlib.suppress(OSError, RuntimeError, ValueError):
+            candidates.add(root.resolve(strict=False) / spec.id)
+        if recorded in candidates:
+            return _dir_size_bytes(recorded)
+    return 0
+
+
 def _file_size_bytes(path: Path) -> int:
     try:
         return path.stat().st_size
@@ -185,11 +214,17 @@ class Candidate:
     # single-user mode. Lets the caller archive/delete with that
     # user's own queue + archive dirs.
     uid: str | None = None
+    # #63: bytes under the job's recorded workdir ($VQ_WORKDIR). Measured
+    # from the *recorded* path, so it covers both the scratch root and the
+    # pre-#63 root under the state root. It was missing entirely until #63,
+    # which is why `vq cleanup` reported about 1 GB on a host whose workdirs
+    # held 81 GB.
+    workdir_size: int = 0
 
     @property
     def reclaimable(self) -> int:
         """Bytes that would be freed by deleting this job entirely."""
-        return self.workspace_size + self.archive_size
+        return self.workspace_size + self.archive_size + self.workdir_size
 
 
 def find_candidates_by_jobid(
@@ -259,6 +294,7 @@ def find_candidates_by_jobid(
                 workspace_size=_dir_size_bytes(ws),
                 archive_size=_file_size_bytes(archive) if archive else 0,
                 uid=owner_uid,
+                workdir_size=_workdir_size_bytes(spec, owner_uid),
             )
         )
     return candidates, errors
@@ -331,6 +367,7 @@ def find_candidates(
                 workspace_size=_dir_size_bytes(ws),
                 archive_size=_file_size_bytes(archive) if archive else 0,
                 uid=owner_uid,
+                workdir_size=_workdir_size_bytes(spec, owner_uid),
             )
         )
     out.sort(key=lambda c: c.spec.finished_at or "")
@@ -506,13 +543,37 @@ def delete_job(
     spec: JobSpec,
     *,
     queue_dir: Path | None = None,
+    owner_uid: str | None = None,
 ) -> None:
-    """Remove spec + workspace + archive (whichever exist).
+    """Remove spec + workspace + workdir + archive (whichever exist).
 
     Refuses to act on non-terminal jobs (the daemon could still be
     writing to the workspace). Idempotent: missing workspace /
     archive / spec file is silently OK — the goal is "after this call,
     the job is gone."
+
+    #63: the job's ``$VQ_WORKDIR`` goes too, which it did not before. On the
+    two hosts that prompted the issue that is where over 99 % of the bytes
+    were, so a delete that left it behind reclaimed about 1 % of what it
+    reported. The removal is guarded by
+    :func:`vq.paths.remove_managed_scratch_dir`: the recorded path must name
+    this job (``<root>/<job id>``), the root is opened ``O_NOFOLLOW``, the
+    entry must be a real directory rather than a symlink, and ownership must
+    match. Anything else is left in place rather than deleted -- a workdir vq
+    did not create is not vq's to remove.
+
+    Which roots count is the one asymmetry worth naming. The workspace is
+    removed at the path the spec records, unconditionally, because ``cwd``
+    is only ever written by vq's own submit. ``workdir`` is only ever
+    written by vq's own dispatch, so single-user mode now holds it to the
+    same standard via :func:`vq.paths.workdir_roots_for_job` -- otherwise a
+    host configured onto a third scratch root deleted the small workspace
+    and left the large workdir, while reporting both as reclaimed. In
+    multi-user mode the queued spec is user-writable, so the record stays
+    evidence and the managed per-uid roots stay the authority.
+
+    ``owner_uid`` names the multi-user owner whose trees are eligible; None
+    means single-user.
     """
     if not spec.is_terminal:
         raise ValueError(
@@ -555,6 +616,26 @@ def delete_job(
         workspace = Path(fresh.cwd)
         if workspace.is_dir():
             shutil.rmtree(workspace, ignore_errors=True)
+        if fresh.workdir:
+            refusal = paths.remove_managed_scratch_dir(
+                fresh.workdir,
+                fresh.id,
+                roots=(
+                    paths.managed_user_workdir_roots(owner_uid)
+                    if owner_uid is not None
+                    else paths.workdir_roots_for_job(fresh.workdir, fresh.id)
+                ),
+                expected_uid=(
+                    int(owner_uid) if owner_uid is not None else os.geteuid()
+                ),
+            )
+            if refusal is not None:
+                log.info(
+                    "cleanup: left job %s workdir %s in place: %s",
+                    fresh.id,
+                    fresh.workdir,
+                    refusal,
+                )
         if fresh.archive_path:
             archive = Path(fresh.archive_path)
             with contextlib.suppress(FileNotFoundError):
@@ -642,8 +723,11 @@ def format_table(
     """
     if not candidates:
         return f"({action}: no eligible jobs)"
-    header = ("ID", "STATE", "FINISHED (UTC)", "WORKSPACE", "ARCHIVE")
-    rows: list[tuple[str, str, str, str, str]] = [header]
+    # #63: WORKDIR is its own column. Folding it into WORKSPACE would hide
+    # the one number this table was missing -- the scratch tree is routinely
+    # two orders of magnitude larger than the workspace beside it.
+    header = ("ID", "STATE", "FINISHED (UTC)", "WORKSPACE", "WORKDIR", "ARCHIVE")
+    rows: list[tuple[str, str, str, str, str, str]] = [header]
     total = 0
     for c in candidates:
         finished = (c.spec.finished_at or "")[:19].replace("T", " ")
@@ -651,8 +735,18 @@ def format_table(
             "(archived)" if c.workspace_size == 0 and c.spec.is_archived
             else (_human_bytes(c.workspace_size) if c.workspace_size else "-")
         )
+        wd_label = _human_bytes(c.workdir_size) if c.workdir_size else "-"
         ar_label = _human_bytes(c.archive_size) if c.archive_size else "-"
-        rows.append((c.spec.id, c.spec.state.value, finished, ws_label, ar_label))
+        rows.append(
+            (
+                c.spec.id,
+                c.spec.state.value,
+                finished,
+                ws_label,
+                wd_label,
+                ar_label,
+            )
+        )
         total += c.reclaimable
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     lines = [
@@ -661,11 +755,22 @@ def format_table(
     ]
     if action in ("archive", "delete", "restore"):
         verb = "would " + action if dry_run else action + "d"
+        workdir_total = sum(c.workdir_size for c in candidates)
         lines.append("")
         lines.append(
             f"{verb}: {len(candidates)} job(s); "
-            f"reclaimable: {_human_bytes(total)}"
+            f"reclaimable: {_human_bytes(total)} "
+            f"(workdirs: {_human_bytes(workdir_total)})"
         )
+        if action == "archive" and workdir_total:
+            # --archive only tars the workspace; the workdir stays until the
+            # job is deleted or the age sweep takes it. Saying so keeps the
+            # "reclaimable" figure from reading as a promise this verb makes.
+            lines.append(
+                "note: --archive does not remove workdirs; "
+                "--delete does, and `--auto-enable --workdir-max-age` "
+                "sweeps them by age."
+            )
     return "\n".join(lines)
 
 
@@ -959,6 +1064,7 @@ def _archive_and_delete_pass(
     now: datetime,
     counts: dict[str, int],
     scheduler_workspace_reaper: SchedulerWorkspaceReaper | None = None,
+    owner_uid: str | None = None,
 ) -> None:
     """v0.6.39: one archive+delete sweep over a single (queue dir,
     archive dir) pair. Factored out of :func:`run_auto_cleanup_pass`
@@ -1000,7 +1106,7 @@ def _archive_and_delete_pass(
                     )
                 ):
                     counts["scheduler_workspaces_swept"] += 1
-                delete_job(c.spec, queue_dir=qd)
+                delete_job(c.spec, queue_dir=qd, owner_uid=owner_uid)
                 counts["deleted"] += 1
             except Exception as e:
                 log.warning(
@@ -1074,6 +1180,7 @@ def run_auto_cleanup_pass(
                 now,
                 counts,
                 scheduler_workspace_reaper,
+                owner_uid=uid,
             )
     else:
         qd = queue_dir or paths.queue_dir()
@@ -1127,6 +1234,49 @@ def _stamp_workdir_swept(spec_path: Path) -> None:
         fresh.write(spec_path)
 
 
+def _single_user_sweep_roots(
+    queue_dir: Path | None = None,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The workdir roots the age sweep walks: ``(configured, derived)``.
+
+    The configured roots (:func:`vq.paths.managed_workdir_roots`) come first.
+    Then every *other* root this host's own job records still name:
+    ``workdir_root`` and ``scratch_root`` are operator configuration, so point
+    a host at a third root and the second is in neither the current nor the
+    pre-#63 pair, and a root-driven sweep stopped seeing the very directories
+    it exists to remove while ``workdirs_swept`` reported 0.
+
+    **The two are not swept with the same authority, and that is the point.**
+    A configured root is one the operator is pointing this host at now, so
+    enumerating it and removing what looks like a spent workdir is what they
+    asked for -- including an *orphan*, a directory whose owning spec is gone,
+    which is aged by its own mtime because there is no job left to endanger. A
+    derived root is a directory this host merely *used to* write into. It may
+    since have been repurposed, and an operator's own directory under it is
+    indistinguishable from an orphan: ``validate_job_id`` accepts ``notes``,
+    ``README`` and ``my-data``, and the mtime of a directory nobody has added
+    to in a month is old. So under a derived root the sweep removes only what
+    a spec still records, and never an orphan. The residue -- an orphan under
+    a root nothing configures any more -- is an operator's to remove, and
+    ``docs/operations.md`` says so rather than implying a sweep that cannot
+    safely happen.
+
+    Single-user only: a multi-user spec is user-writable, so a root named by
+    one is not authority for anything.
+    """
+    configured = list(paths.managed_workdir_roots())
+    known = set(configured)
+    derived: list[Path] = []
+    for spec in _iter_specs(queue_dir or paths.queue_dir()):
+        if not spec.workdir:
+            continue
+        for root in paths.workdir_roots_for_job(spec.workdir, spec.id):
+            if root not in known:
+                known.add(root)
+                derived.append(root)
+    return tuple(configured), tuple(derived)
+
+
 def _sweep_stale_workdirs(
     max_age_seconds: int,
     now: datetime,
@@ -1136,10 +1286,30 @@ def _sweep_stale_workdirs(
 ) -> None:
     """v0.6.54: rmtree per-job workdirs older than ``max_age_seconds``.
 
-    Iterates every workdir root the daemon manages (single-user:
-    ``paths.workdir_root()``; multi-user: every
-    ``users/<uid>/workdirs/``), checks each per-job workdir's mtime
-    against ``now - max_age_seconds``, and rmtrees the stale ones.
+    Iterates every workdir root the daemon manages (#63: the current
+    scratch one *and* the pre-#63 one under the state root; single-user also
+    every root this host's own job records still name, see
+    :func:`_single_user_sweep_roots`; multi-user: the managed pair per uid),
+    checks each per-job workdir's mtime against ``now - max_age_seconds``,
+    and removes the stale ones.
+
+    More than the current root, because nothing moves when the root does: an
+    operator who splits scratch out of the state root -- or who moves it
+    again afterwards -- still has every existing job's workdir under the
+    previous one, and a sweep that only looked at the new root would leave
+    exactly the bytes #63 was opened about.
+
+    A directory whose name is not a job id is not ours: it is skipped, not
+    swept and not an error. That guard is weak on its own -- ``validate_job_id``
+    accepts ``notes`` and ``README`` -- so it is not what keeps an operator's
+    directory safe. What does is where the sweep is willing to remove an
+    orphan at all: under a root the operator configures now, and never under
+    one this host merely used to write into. See
+    :func:`_single_user_sweep_roots`.
+
+    Removal goes through :func:`vq.paths.remove_managed_scratch_dir`, so a
+    symlinked root, a symlinked or non-directory entry, or an entry owned by
+    another uid is refused rather than followed.
 
     Terminal-gated (v0.8.9, CLEAN-1): a workdir is swept only if its
     owning job's spec is in a TERMINAL state AND that spec's
@@ -1169,13 +1339,49 @@ def _sweep_stale_workdirs(
         except (OSError, ValueError):
             return None
 
-    def _sweep_one_root(root: Path, spec_path_for: Callable[[str], Path]) -> None:
-        if not root.exists():
+    def _sweep_one_root(
+        root: Path,
+        spec_path_for: Callable[[str], Path],
+        *,
+        expected_uid: int,
+        allow_orphans: bool = True,
+    ) -> None:
+        try:
+            entries = sorted(root.iterdir())
+        except FileNotFoundError:
             return
-        for entry in root.iterdir():
-            if not entry.is_dir():
+        except OSError as e:
+            log.warning(
+                "auto-cleanup workdir-sweep: %s could not be listed: %s",
+                root, e,
+            )
+            counts["workdir_errors"] += 1
+            return
+        for entry in entries:
+            # follow_symlinks=False: a symlinked entry is not a managed
+            # workdir, and resolving it here would let a planted link decide
+            # which job's age gate applies to a directory elsewhere.
+            try:
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+            except OSError:
                 continue
             jobid = entry.name
+            try:
+                validate_job_id(jobid)
+            except ValueError:
+                # Not a job id, so not a workdir of ours. #63 made this root
+                # operator-configurable, which means it may be a shared
+                # scratch volume that holds other people's directories. This
+                # used to raise out of the whole pass -- and the daemon still
+                # stamped ``last_run_at``, so archive, delete and the sweep
+                # all stopped until a human removed the directory.
+                log.debug(
+                    "auto-cleanup workdir-sweep: %s is not a job directory; "
+                    "leaving it alone",
+                    entry,
+                )
+                continue
             spec = _read_spec_or_none(spec_path_for(jobid))
             if spec is not None:
                 # Owned by a known job: never touch a non-terminal job's
@@ -1184,6 +1390,20 @@ def _sweep_stale_workdirs(
                     continue
                 if not _spec_older_than(spec, cutoff, now):
                     continue
+            elif not allow_orphans:
+                # A derived root: somewhere this host used to write, which
+                # the operator may since have repurposed. Without a spec
+                # there is nothing saying vq created this directory, and an
+                # operator's own is indistinguishable from an orphan --
+                # `validate_job_id` accepts `notes` and `README`, and an
+                # untouched directory's mtime is old. Authority here comes
+                # from the record, not from the listing.
+                log.debug(
+                    "auto-cleanup workdir-sweep: %s under the former root %s "
+                    "has no spec; leaving it to the operator",
+                    entry, root,
+                )
+                continue
             else:
                 # Orphan workdir (no spec — owning job already cleaned
                 # up): no live job to endanger; fall back to dir mtime.
@@ -1198,35 +1418,58 @@ def _sweep_stale_workdirs(
                     continue
                 if mtime > cutoff_ts:
                     continue  # too young
-            try:
-                shutil.rmtree(entry)
-                counts["workdirs_swept"] += 1
-                log.info(
-                    "auto-cleanup workdir-sweep: removed %s (older than %ds)",
-                    entry, max_age_seconds,
-                )
-                # CLEAN-3: leave a breadcrumb on the owning spec (if any —
-                # orphan workdirs have none) so a later `vq fetch --workdir`
-                # explains the workdir was age-swept, not removed by
-                # --clean-tmp. Best-effort + lock-safe.
-                if spec is not None:
-                    _stamp_workdir_swept(spec_path_for(jobid))
-            except OSError as e:
+            refusal = paths.remove_managed_scratch_dir(
+                entry,
+                jobid,
+                roots=(root,),
+                expected_uid=expected_uid,
+            )
+            if refusal is not None:
                 log.warning(
-                    "auto-cleanup workdir-sweep: rmtree failed for %s: %s",
-                    entry, e,
+                    "auto-cleanup workdir-sweep: refused %s: %s",
+                    entry, refusal,
                 )
                 counts["workdir_errors"] += 1
+                continue
+            counts["workdirs_swept"] += 1
+            log.info(
+                "auto-cleanup workdir-sweep: removed %s (older than %ds)",
+                entry, max_age_seconds,
+            )
+            # CLEAN-3: leave a breadcrumb on the owning spec (if any —
+            # orphan workdirs have none) so a later `vq fetch --workdir`
+            # explains the workdir was age-swept, not removed by
+            # --clean-tmp. Best-effort + lock-safe.
+            if spec is not None:
+                _stamp_workdir_swept(spec_path_for(jobid))
 
     if multi_user:
         for user_dir in paths._all_user_dirs():
             uid = user_dir.name
-            _sweep_one_root(
-                paths.user_workdir_root(uid),
-                lambda jid, uid=uid: paths.user_spec_path(uid, jid),
-            )
+            try:
+                expected_uid = int(uid)
+            except ValueError:
+                # _all_user_dirs only yields canonical numeric names, so this
+                # is unreachable; refusing rather than guessing an owner keeps
+                # it that way if that ever changes.
+                continue
+            for root in paths.managed_user_workdir_roots(uid):
+                _sweep_one_root(
+                    root,
+                    lambda jid, uid=uid: paths.user_spec_path(uid, jid),
+                    expected_uid=expected_uid,
+                )
     else:
-        _sweep_one_root(paths.workdir_root(), paths.spec_path)
+        configured, derived = _single_user_sweep_roots()
+        for root in configured:
+            _sweep_one_root(
+                root, paths.spec_path, expected_uid=os.geteuid()
+            )
+        for root in derived:
+            _sweep_one_root(
+                root, paths.spec_path, expected_uid=os.geteuid(),
+                allow_orphans=False,
+            )
 
 
 def format_auto_cleanup_status() -> str:

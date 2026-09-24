@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vq import config, resource_receipt
+from vq import config, paths, resource_receipt
 from vq.cli import _program_runtime_pin_for_submit
 from vq.daemon import (
     EXIT_MARKER_RELPATH,
@@ -28,6 +28,36 @@ from vq.daemon import (
     _read_vq_version_from_source,
 )
 from vq.spec import JobSpec, JobState, ProgramRuntimePin, utcnow_iso
+
+# Budget for a wait that only has to tell "it exited" from "it is stuck":
+# every `proc.kill()` / `os.killpg(...)` reap in this file, whether it runs in
+# a test body or in a fixture teardown. A liveness guard. It exists so a
+# genuine hang fails the test instead of blocking the suite, and its value
+# carries no meaning beyond "longer than this is certainly broken" -- a
+# healthy run clears every one of them in milliseconds. At 1-2 s they were
+# sized like performance claims, which a host starved of CPU for seconds at a
+# time can miss; that is the shape #5 fixed in tests/test_transport.py with
+# this same constant (b6de2b5) and #41 audits across the suite.
+#
+# **It has a ceiling here, exactly as it does in tests/test_transport.py and
+# tests/test_pause_resume.py.** Six of this file's reaps can still catch a
+# defect, and every one of them kills a `sleep 30`: the five in the
+# orphan-reconciliation tests, which clear the zombie in the test body before
+# `_reconcile_orphans` probes the pgid, and the `finally` in
+# `test_running_with_alive_pgid_stays_running_and_tracked`. A budget at or
+# above 30 s would let those waits return because the sleep ended rather than
+# because the kill landed, so a kill that never worked would report success.
+# Ten seconds is five times the longest budget it replaces (2 s) and a third
+# of the self-exit, so it stays generous and keeps discriminating. Raising it
+# means raising those sleeps first.
+#
+# The rest cannot catch anything at any budget and are converted only so the
+# file reads uniformly: nine sit under `except Exception: pass`, and the six
+# capacity / max-jobs / memory / wall-time cleanups iterate a `d._running`
+# their test has already asserted empty. Five of those six reap `sleep 0.4` /
+# `sleep 0.5` children besides, already past self-exit before the old 1 s
+# budget started, so they never discriminated anything either.
+_LIVENESS_SECONDS = 10.0
 
 _THREAD_CAP_ENV_VARS = (
     "OMP_NUM_THREADS",
@@ -128,7 +158,7 @@ def daemon(tmp_path: Path) -> Iterator[Daemon]:
     for rj in d._running.values():
         try:
             rj.popen.kill()
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         except Exception:
             pass
         rj.close_logs()
@@ -754,7 +784,7 @@ class TestCapacity:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
 
@@ -790,7 +820,7 @@ class TestMaxJobs:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
     def test_max_jobs_one_dispatches_oversized_cpu_jobs(
@@ -839,7 +869,7 @@ class TestMaxJobs:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
     def test_max_jobs_two_caps_at_two(self, tmp_path: Path) -> None:
@@ -865,7 +895,7 @@ class TestMaxJobs:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
     def test_max_jobs_zero_rejected(self, tmp_path: Path) -> None:
@@ -913,7 +943,7 @@ class TestMemoryBudget:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
     def test_undeclared_job_bypasses_dispatch_memory_gate(
@@ -1066,7 +1096,7 @@ class TestWatchdogIntegration:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
     @pytest.mark.skipif(
@@ -1137,7 +1167,7 @@ class TestWatchdogIntegration:
                         os.killpg(os.getpgid(rj.popen.pid), signal.SIGCONT)
                     try:
                         rj.popen.kill()
-                        rj.popen.wait(timeout=2)
+                        rj.popen.wait(timeout=_LIVENESS_SECONDS)
                     except Exception:
                         pass
                 rj.close_logs()
@@ -1225,7 +1255,7 @@ class TestOrphanReset:
             assert daemon._orphans["alive-orphan"].pgid == pgid
         finally:
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
     def test_orphan_exit_marked_aborted_by_queue_on_next_iterate(
         self, daemon: Daemon
@@ -1254,7 +1284,7 @@ class TestOrphanReset:
 
             # Kill the process and wait for it to be reaped (init does this).
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
             # Give the kernel a moment to clean up the pgid mapping.
             deadline = time.monotonic() + 3.0
@@ -1272,7 +1302,7 @@ class TestOrphanReset:
         finally:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
 
@@ -1579,7 +1609,7 @@ class TestOrphanRecoveryViaMarker:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("0")
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
@@ -1597,7 +1627,7 @@ class TestOrphanRecoveryViaMarker:
         finally:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
 
@@ -1627,7 +1657,7 @@ class TestOrphanRecoveryViaMarker:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("1")
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
@@ -1642,7 +1672,7 @@ class TestOrphanRecoveryViaMarker:
         finally:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
 
@@ -1672,7 +1702,7 @@ class TestOrphanRecoveryViaMarker:
 
             # Deliberately do NOT write a marker.
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
@@ -1686,7 +1716,7 @@ class TestOrphanRecoveryViaMarker:
         finally:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
 
@@ -1752,7 +1782,7 @@ class TestOrphanRecoveryViaMarker:
             (ws / EXIT_MARKER_RELPATH).parent.mkdir(parents=True, exist_ok=True)
             (ws / EXIT_MARKER_RELPATH).write_text("143")  # SIGTERM
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline:
@@ -1768,7 +1798,7 @@ class TestOrphanRecoveryViaMarker:
         finally:
             try:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
 
@@ -2015,7 +2045,7 @@ class TestAdminUpdateMarkerEnforcement:
                 # a group mid-teardown answers EPERM on macOS (#27, #29).
                 with contextlib.suppress(OSError):
                     os.killpg(rj.popen.pid, signal.SIGKILL)
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
             except Exception:
                 pass
             rj.close_logs()
@@ -2624,7 +2654,7 @@ class TestScopeCollisionDetection:
             for rj in d._running.values():
                 try:
                     rj.popen.kill()
-                    rj.popen.wait(timeout=2)
+                    rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 except Exception:
                     pass
                 rj.close_logs()
@@ -3001,7 +3031,8 @@ class TestAbortedByQueueWorkdirCleanup:
         d.jobs_dir.mkdir(parents=True, exist_ok=True)
         ws = d.jobs_dir / "abrtwd000001"
         ws.mkdir(parents=True)
-        workdir = tmp_path / "workdirs" / "abrtwd000001"
+        # #63: the workdir a real dispatch creates, under the managed root.
+        workdir = paths.workdir_for("abrtwd000001")
         workdir.mkdir(parents=True)
         (workdir / "scratch.bin").write_text("x")
 
@@ -3029,6 +3060,97 @@ class TestAbortedByQueueWorkdirCleanup:
         assert not workdir.exists(), (
             "CLEAN-4: the --clean-tmp workdir must be removed on a queue-abort"
         )
+
+    def test_clean_tmp_refuses_a_workdir_outside_every_managed_root(
+        self, tmp_path: Path
+    ) -> None:
+        """#63: --clean-tmp is not a licence to remove an arbitrary path.
+
+        The workdir root is configurable now, so "delete whatever the spec
+        recorded" would let a stale or hand-edited record aim the removal at
+        a directory vq never created. This automatic, unattended removal
+        keeps the narrow authority its follow-up left it -- a refusal here
+        only defers, because the record survives for the age sweep and
+        ``--delete`` -- and the refusal is recorded on the spec, not only in
+        the daemon log.
+        """
+        d = Daemon(
+            max_cpus=4, poll_interval=0.05,
+            queue_dir=tmp_path / "q", jobs_dir=tmp_path / "j",
+        )
+        d.queue_dir.mkdir(parents=True, exist_ok=True)
+        d.jobs_dir.mkdir(parents=True, exist_ok=True)
+        ws = d.jobs_dir / "abrtwd000002"
+        ws.mkdir(parents=True)
+        foreign = tmp_path / "not-a-vq-root" / "abrtwd000002"
+        foreign.mkdir(parents=True)
+        (foreign / "precious.bin").write_text("x")
+
+        spec = JobSpec(
+            id="abrtwd000002",
+            command=["sleep", "1"],
+            cwd=str(ws),
+            cpus=1,
+            state=JobState.RUNNING,
+            pid=999,
+            pgid=4242,
+            workdir=str(foreign),
+            clean_workdir_on_terminal=True,
+        )
+        spec.write(d._spec_path("abrtwd000002"))
+
+        d._mark_aborted_by_queue(
+            spec,
+            reason="test: pgid gone at startup",
+            process_exit_confirmed=True,
+        )
+
+        assert (foreign / "precious.bin").exists()
+        recovered = JobSpec.read(d._spec_path("abrtwd000002"))
+        assert recovered.state == JobState.ABORTED_BY_QUEUE
+        assert "workdir cleanup skipped" in (recovered.workdir_cleanup_note or "")
+        assert recovered.failure_reason == "test: pgid gone at startup", (
+            "the abort's own reason is not the queue's to append to: a "
+            "cleanup refusal has its own field"
+        )
+
+    def test_clean_tmp_removes_a_workdir_under_the_pre_63_state_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#63: a job that recorded <state_root>/workdirs/<id> is still cleaned."""
+        d = Daemon(
+            max_cpus=4, poll_interval=0.05,
+            queue_dir=tmp_path / "q", jobs_dir=tmp_path / "j",
+        )
+        d.queue_dir.mkdir(parents=True, exist_ok=True)
+        d.jobs_dir.mkdir(parents=True, exist_ok=True)
+        ws = d.jobs_dir / "abrtwd000003"
+        ws.mkdir(parents=True)
+        legacy = paths.state_workdir_root() / "abrtwd000003"
+        legacy.mkdir(parents=True)
+        (legacy / "scratch.bin").write_text("x")
+        assert paths.state_workdir_root() != paths.workdir_root()
+
+        spec = JobSpec(
+            id="abrtwd000003",
+            command=["sleep", "1"],
+            cwd=str(ws),
+            cpus=1,
+            state=JobState.RUNNING,
+            pid=999,
+            pgid=4242,
+            workdir=str(legacy),
+            clean_workdir_on_terminal=True,
+        )
+        spec.write(d._spec_path("abrtwd000003"))
+
+        d._mark_aborted_by_queue(
+            spec,
+            reason="test: pgid gone at startup",
+            process_exit_confirmed=True,
+        )
+
+        assert not legacy.exists()
 
     def test_workdir_kept_without_clean_tmp(self, tmp_path: Path) -> None:
         """Without --clean-tmp the workdir is preserved (the opt-in gate)."""

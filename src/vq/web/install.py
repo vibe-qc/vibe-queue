@@ -347,10 +347,27 @@ def console_runtime_import_error() -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _ManagedProgram:
+    """The configured venv program an interpreter belongs to, as a remedy needs it.
+
+    ``rebuildable`` is whether vq has any route to rebuild the environment
+    that already exists, which is exactly whether the program configures an
+    ``update_script``: an ordinary ``vq admin update`` runs that script and
+    nothing else, and a provision cannot step in because
+    :func:`vq.admin._refuse_occupied_git_dir` refuses to build over the
+    checkout this program already has.
+    """
+
+    name: str
+    extras: list[str]
+    rebuildable: bool
+
+
 def _managed_program_serving_this_vq(
     python: str | None = None,
-) -> tuple[str, list[str]] | None:
-    """The configured venv program an interpreter belongs to, and its extras.
+) -> _ManagedProgram | None:
+    """The configured venv program an interpreter belongs to.
 
     ``python`` defaults to this interpreter; ``vq web status`` passes the
     one recorded in the console's install marker instead.
@@ -359,7 +376,9 @@ def _managed_program_serving_this_vq(
     key plus ``vq admin update``; on a laptop checkout it is ``pip``. Telling
     an operator to run pip inside a vq-managed checkout is telling them to do
     the one thing the fleet rules forbid, so the message has to know which
-    host it is on.
+    host it is on. For the same reason it carries whether vq could rebuild
+    this program at all: a remedy naming a command that exits 0 and changes
+    nothing is worse than no remedy, because the operator believes it.
     """
     try:
         cfg = config.load_config()
@@ -380,8 +399,28 @@ def _managed_program_serving_this_vq(
                 continue
         except OSError:
             continue
-        return name, list(getattr(program, "extras", []))
+        return _ManagedProgram(
+            name=name,
+            extras=list(getattr(program, "extras", [])),
+            rebuildable=bool(getattr(program, "update_script", None)),
+        )
     return None
+
+
+_NO_REBUILD_ROUTE = (
+    "but it configures no update_script, so `vq admin update` would pull its "
+    "checkout and rebuild nothing. Point one at the checkout's own script, "
+    "then rebuild"
+)
+"""Why ``vq admin update PROGRAM`` is not the remedy for this program.
+
+A program may declare ``extras`` with ``install_script`` alone (#47): a
+provision applies the floor once, which is a real route, so the config model
+admits that shape. Nothing rebuilds the venv afterwards, and this guard runs
+when the console is already pointed at a venv that is wrong -- so the remedy
+it prints has to be the one that ends with uvicorn on disk, not the one that
+exits 0.
+"""
 
 
 def _console_runtime_remedy(python: str | None = None) -> str:
@@ -392,16 +431,36 @@ def _console_runtime_remedy(python: str | None = None) -> str:
             "Install the extra into this environment and re-run:\n"
             "    pip install -e '.[web]'"
         )
-    program, extras = managed
-    if "web" in extras:
+    program = managed.name
+    if "web" in managed.extras:
         # Declared but not yet built: the config is already right and the
-        # venv has not caught up. Do not send the operator back to edit it.
+        # venv has not caught up. Do not send the operator back to edit it --
+        # unless what the config is missing is the key that makes a rebuild
+        # possible at all.
+        if not managed.rebuildable:
+            return (
+                f"The managed program {program!r} already declares the web "
+                f"extra, {_NO_REBUILD_ROUTE}:\n"
+                f"    [programs.{program}]\n"
+                '    update_script = "scripts/update.sh"\n'
+                f"    $ vq admin update {program}"
+            )
         return (
             f"The managed program {program!r} already declares the web extra; "
             "its environment has not been rebuilt since. Rebuild it:\n"
             f"    $ vq admin update {program}"
         )
-    wanted = ", ".join(f'"{name}"' for name in [*extras, "web"])
+    wanted = ", ".join(f'"{name}"' for name in [*managed.extras, "web"])
+    if not managed.rebuildable:
+        return (
+            f"This interpreter is the managed program {program!r}. Declaring "
+            "the extra is what the next rebuild will preserve, "
+            f"{_NO_REBUILD_ROUTE}:\n"
+            f"    [programs.{program}]\n"
+            f"    extras = [{wanted}]\n"
+            '    update_script = "scripts/update.sh"\n'
+            f"    $ vq admin update {program}"
+        )
     return (
         f"This interpreter is the managed program {program!r}, so install the "
         "extra the way the next rebuild will preserve — declare it, then "
