@@ -195,5 +195,17 @@ failure refuses execution. A missing outcome after a crash or append failure
 means the result needs investigation, not that replay is safe. These records
 do not identify a person or provide the future tamper-evident audit chain.
 
+### Console calculation previews
+
+`/api/v1/fleet/jobs/<id>/preview` (#65) returns a structured summary of a
+job's calculation: formula, method and basis, SCF convergence, headline
+energies. It is derived only from the stdout tail that the job drill-down
+already shows the same identity, fetched through the same `vq status --json`
+path. It is bounded to 2000 lines and 256 KiB, and parsed as text. It opens no
+other file, walks no workdir and deserialises no result container. It sits
+behind the same login or bearer gate as the rest of the fleet API. Structures
+and energies of unpublished work are sensitive: no preview field belongs in
+any anonymous or public view (#66).
+
 If you are unsure whether a finding is in scope, email it to the address above
 and we will triage together.

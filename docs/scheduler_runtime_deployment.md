@@ -36,6 +36,41 @@ Verification runs on the scheduler login host so it sees the runtime paths
 used by submitted jobs. Consult the configuration reference for the complete
 profile schema and the arguments passed to provider commands.
 
+## Feeding a push-fed source mirror
+
+A build node that cannot reach the source repository may instead be served by
+a bare mirror on the login host, fed by push. A profile that sets
+`feed_source_mirror` has vq perform that feed before preparation.
+
+**The feed does not force anything, and it is not a mirror-sync.** It is one
+unforced, atomic push of the immutable per-pin ref `refs/vq/pins/<sha>`, this
+lane's branch pair, and the tags that name this pin in the driver's checkout.
+Refs and tags outside that set are never named and so stay byte-identical,
+including tags the driver's checkout holds at another commit.
+
+An update that would need a force is refused before the push, naming what the
+mirror holds and what was requested. A mirror branch that has advanced past
+an accepted pin therefore fails visibly: the operator either deploys the
+commit the mirror carries, or the mirror's owner moves that branch back
+deliberately. A feed must never resolve the disagreement by picking up a
+newer tree than the one that was accepted, and it must never rewind the
+mirror to make an older pin fit. The immutable per-pin ref is what keeps the
+accepted pin addressable regardless of where the mutable branches sit.
+
+The site preparers read the lane branch pair today; `refs/vq/pins/<sha>` is
+fed for every deployment so the exact accepted tree is anchored in the mirror
+under a name that cannot be forced. **The intended contract is for a preparer
+to read that ref, not the branch pair.** The pin ref names exactly the
+accepted commit and can never move, so a mirror whose lane branch has drifted
+cannot make a preparer build the wrong tree and need not be reconciled before
+that pin deploys; the branch pair stays fed for the preparers that still read
+it. Which ref a preparer reads is a provider-side contract change, made
+deliberately and recorded with the profile, and until a site's preparer has
+moved, a drifted lane branch is refused as described above (#81).
+
+See `docs/operations.md`, "Feeding the source mirror", for the operator view
+and the exact refusal text.
+
 ## Source identity and activation
 
 Stage an exact source revision and verify its archive and source-tree identity

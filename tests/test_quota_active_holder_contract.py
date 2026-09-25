@@ -113,6 +113,7 @@ def _scheduler_holder(spec: JobSpec) -> _SchedulerJob:
             remote_workspace=f"/remote/{spec.id}",
         ),
         dispatcher=object(),  # type: ignore[arg-type]
+        scheduler_target=spec.scheduler_target or "host_f",
         cpus=spec.cpus,
         mem_mb=spec.mem_mb,
     )

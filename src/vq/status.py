@@ -23,7 +23,10 @@ from vq.listing import (
 )
 from vq.logs import read_system_progress
 from vq.logs import tail_file as _tail_file
-from vq.scheduler_dispatch import scheduler_dispatcher_for
+from vq.scheduler_dispatch import (
+    bound_remote_workspace,
+    scheduler_dispatcher_for,
+)
 from vq.spec import (
     JobSpec,
     JobState,
@@ -392,6 +395,12 @@ def show_status(
         lines.append(f"scheduler:    {' '.join(scheduler_bits)}")
         lines.append(f"sched_state:  {_scheduler_state_label(spec)}")
         lines.append(f"fetch_state:  {_scheduler_fetch_state_label(spec)}")
+        # The scheduler's own answer to "why has this not started yet", shown
+        # next to the queued state it explains. Without it a job that can
+        # never be scheduled is indistinguishable from one that is merely
+        # next in line.
+        if spec.scheduler_queued_reason:
+            lines.append(f"queued_why:   {spec.scheduler_queued_reason}")
         if spec.scheduler_exec_host:
             lines.append(f"exec_host:    {spec.scheduler_exec_host}")
         walltime = _format_scheduler_walltime(
@@ -464,6 +473,11 @@ def show_status(
     # exit-code-says-it-all case stays uncluttered.
     if spec.failure_reason:
         lines.append(f"failure:      {spec.failure_reason}")
+    # #63 follow-up: an opt-in workdir cleanup that was refused is operator
+    # news, but it is not a failure of the job -- a COMPLETED job says so
+    # here rather than under ``failure:``.
+    if spec.workdir_cleanup_note:
+        lines.append(f"workdir:      {spec.workdir_cleanup_note}")
     # v0.12.0: crash feedback. The captured stderr tail tells the operator
     # WHY a calculation died (traceback / CRYSTAL or ORCA error) inline,
     # no fetch-and-grep. Indented so it reads as the cause of the failure.
@@ -1250,9 +1264,22 @@ def _runtime_workdir(spec: JobSpec) -> str | None:
 
 
 def _scheduler_runtime_workdir(spec: JobSpec) -> str | None:
+    """The scheduler workspace this job is bound to, not a fresh derivation.
+
+    #63 records the workspace on the spec before the submission boundary
+    precisely so a later ``scratch_root`` change cannot move a live job.
+    Recomputing it here published the *new* root as ``runtime_workdir`` --
+    the agent contract's name for ``$VQ_WORKDIR`` -- and
+    ``checkpoint_qvf_path`` is derived from it, so a polling agent watched a
+    checkpoint path nothing would ever write. The derivation stays as the
+    fallback for a job dispatched before the binding existed, which is what
+    :func:`~vq.scheduler_dispatch.bound_remote_workspace` means.
+    """
+    if spec.scheduler_remote_workspace:
+        return spec.scheduler_remote_workspace
     with contextlib.suppress(Exception):
         host_cfg = config.load_config().host(spec.scheduler_target or "")
-        return scheduler_dispatcher_for(host_cfg).remote_workspace(spec.id)
+        return bound_remote_workspace(scheduler_dispatcher_for(host_cfg), spec)
     return None
 
 

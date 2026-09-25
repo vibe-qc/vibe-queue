@@ -5221,7 +5221,7 @@ def _release_rollout_hold_group(
 
 
 def release_rollout_hold(
-    plan: RolloutPlan,
+    plan: RolloutPlan | None,
     run: RolloutRun,
     *,
     hold: Mapping[str, Any],
@@ -5244,7 +5244,7 @@ def release_rollout_hold(
         control_host = _journaled_hold_control_host(
             host,
             hold,
-            legacy_default=plan.driver,
+            legacy_default=plan.driver if plan is not None else None,
         )
         if hold.get("acquire_unconfirmed") is True:
             # The mutation may have committed even though its response never
@@ -6124,6 +6124,49 @@ def _is_accepted_report_path(value: object) -> bool:
     return _accepted_report_version(value) is not None
 
 
+_PIN_VERSION = re.compile(
+    r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[.-]?(dev|a|b|rc)([0-9]+))?"
+)
+_PIN_PHASE_RANK = {"dev": 0, "a": 1, "b": 2, "rc": 3, None: 4}
+
+
+def _pin_version_key(value: object) -> tuple[int, ...] | None:
+    """Order ``X.Y.Z`` with an optional devN/aN/bN/rcN suffix, else None."""
+    match = _PIN_VERSION.fullmatch(value.strip()) if isinstance(value, str) else None
+    if match is None:
+        return None
+    major, minor, patch, phase, number = match.groups()
+    return (int(major), int(minor), int(patch), _PIN_PHASE_RANK[phase],
+            int(number) if number is not None else 0)
+
+
+def _report_is_pinwise_newer(
+    older: fleet_release.FleetReleaseReport,
+    newer: fleet_release.FleetReleaseReport,
+) -> bool:
+    """Whether a same-filename re-pin is strictly newer (#93).
+
+    A re-pin keeps the report file name, so the name cannot order the two.
+    It is newer only when both pin the same products, every pin is either
+    identical or a strictly higher version of that product, and at least one
+    is higher. An unparseable version, a changed pin set or any downgrade is
+    not newer.
+    """
+    if set(older.pins) != set(newer.pins):
+        return False
+    higher = False
+    for name, old_pin in older.pins.items():
+        new_pin = newer.pins[name]
+        if (new_pin.sha, new_pin.version) == (old_pin.sha, old_pin.version):
+            continue
+        old_key = _pin_version_key(old_pin.version)
+        new_key = _pin_version_key(new_pin.version)
+        if old_key is None or new_key is None or new_key <= old_key:
+            return False
+        higher = True
+    return higher
+
+
 @dataclass(frozen=True)
 class _ValidatedLegacyRetention:
     """Strict durable receipts that replace a fleet-global legacy block."""
@@ -6192,7 +6235,10 @@ def _validate_plan_bound_hold_supersede_receipt(
         or raw.get("hold_record_sha256") != _legacy_subtree_sha256(hold)
         or historical_version is None
         or current_version is None
-        or current_version <= historical_version
+        or current_version < historical_version
+        # A same-filename re-pin (#93) must at least change the digest; its
+        # pin-wise ordering was proven when the receipt was written.
+        or current_digest == run.report_digest_sha256
         or not isinstance(current_digest, str)
         or _SOURCE_TREE_SHA256.fullmatch(current_digest) is None
         or raw.get("current_rollout_id")
@@ -6434,6 +6480,26 @@ def _validate_legacy_retention_receipts(
     identity_mismatch_hosts: set[str] = set()
     receipt_contexts: set[tuple[str, str, str]] = set()
 
+    def _receipt_report_is_repinned_older(raw: Mapping[str, Any]) -> bool:
+        if report_repo is None or current_report_source_path is None:
+            return False
+        try:
+            receipt_report = fleet_release.discover_historical_report_by_digest(
+                str(raw["current_report_path"]),
+                str(raw["current_report_digest_sha256"]),
+                report_repo,
+                fetch=False,
+            )
+            present = fleet_release.discover_historical_report_by_digest(
+                current_report_source_path,
+                current_report_digest_sha256,
+                report_repo,
+                fetch=False,
+            )
+        except fleet_release.FleetReleaseError:
+            return False
+        return _report_is_pinwise_newer(receipt_report, present)
+
     def record_identity_mismatch(
         raw: Mapping[str, Any],
         *,
@@ -6447,6 +6513,17 @@ def _validate_legacy_retention_receipts(
             raw["current_report_digest_sha256"]
             != current_report_digest_sha256
         )
+        if digest_changed and not path_changed:
+            # A same-filename re-pin (#93): the name cannot order the two
+            # reports, so authenticate both and require the present one to be
+            # pin-wise newer than the receipt's.
+            if not _receipt_report_is_repinned_older(raw):
+                raise FleetRolloutError(
+                    f"rollout {run.rollout_id} retained legacy {receipt_kind} "
+                    f"receipt has incoherent current report identity for {host!r}"
+                )
+            identity_mismatch_hosts.add(host)
+            return
         if path_changed != digest_changed:
             raise FleetRolloutError(
                 f"rollout {run.rollout_id} retained legacy {receipt_kind} "
@@ -9375,7 +9452,7 @@ def supersede_obsolete_plan_bound_hold(
             run.report_digest_sha256 == accepted_report.digest_sha256
             or historical_version is None
             or current_version is None
-            or current_version <= historical_version
+            or current_version < historical_version
         ):
             raise FleetRolloutError(
                 f"rollout {rollout_id_value} is not strictly older than the "
@@ -9393,6 +9470,14 @@ def supersede_obsolete_plan_bound_hold(
                 f"obsolete rollout {rollout_id_value} historical report "
                 f"could not be authenticated: {exc}"
             ) from exc
+        if current_version == historical_version and not _report_is_pinwise_newer(
+            historical, accepted_report,
+        ):
+            # A same-filename re-pin (#93) is newer only pin by pin.
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} is not strictly older than the "
+                "current accepted report"
+            )
         if not _historical_report_binds_run(historical, run):
             raise FleetRolloutError(
                 f"obsolete rollout {rollout_id_value} does not bind its "
@@ -9496,6 +9581,158 @@ def supersede_obsolete_plan_bound_hold(
             current_rollout_id=current_rollout_id,
             replayed=False,
         )
+
+
+@dataclass(frozen=True)
+class AbandonedHost:
+    rollout_id: str
+    host: str
+    actions: tuple[str, ...]
+    replayed: bool
+
+
+def _observe_abandonable_target(
+    run: RolloutRun,
+    *,
+    host: str,
+    hold: Mapping[str, Any],
+    control_host: str,
+    runner: Runner,
+) -> str:
+    """Prove from a supported read-only snapshot that only this hold claims ``host``.
+
+    Returns the snapshot's ``observed_at``. Acceptable: no drain policy on the
+    target, or owner-scoped leases on it that all belong to this hold's exact
+    lease owner (the release that follows removes them). A legacy claim, any
+    other owner, incomplete coverage or a fail-closed snapshot refuses.
+    """
+    argv = ["drain", "--status", "--json", "--read-only-snapshot", control_host]
+    try:
+        proc = _run_control(argv, runner=runner,
+                            timeout=_DRAIN_LIVENESS_CONTROL_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FleetRolloutError(
+            f"supported read-only drain snapshot for {host} unavailable: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "(no output)").strip()
+        raise FleetRolloutError(
+            f"supported read-only drain snapshot for {host} unavailable: "
+            f"exit {proc.returncode}: {detail}"
+        )
+    try:
+        snapshot = _validate_final_drain_status(_strict_liveness_json(proc.stdout))
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise FleetRolloutError(
+            f"malformed supported read-only drain snapshot for {host}: {exc}"
+        ) from exc
+    if not all(snapshot["coverage"].values()) or snapshot["safety_fail_closed"] is True:
+        raise FleetRolloutError(
+            f"read-only drain snapshot coverage for {host} is incomplete"
+        )
+    observed_at = str(snapshot["observed_at"])
+    policy = snapshot["policy"]
+    if policy is None or host not in set(policy["scheduler_hosts"]):
+        return observed_at
+    if host in set(policy["legacy_scheduler_hosts"]):
+        raise FleetRolloutError(
+            f"{host} carries a legacy drain claim; reconcile it before abandoning"
+        )
+    owners = {
+        str(lease["owner"]) for lease in snapshot["scheduler_leases"]
+        if lease["scheduler_host"] == host
+    }
+    if owners and owners == {str(hold.get("lease_owner"))}:
+        return observed_at
+    raise FleetRolloutError(
+        f"{host} is claimed by another owner ({', '.join(sorted(owners)) or 'unknown'}); "
+        f"rollout {run.rollout_id} can only abandon its own hold"
+    )
+
+
+def abandon_deferred_host(
+    *,
+    rollout_id_value: str,
+    host: str,
+    control_runner: Runner = subprocess.run,
+) -> AbandonedHost:
+    """Release a finished rollout's owned hold on a host it never started (#96).
+
+    A rollout that deferred a host keeps its owned plan-bound hold there, and
+    every later plan refuses while it exists; superseding it needs health
+    evidence only a rollout of that host can produce. The owner may instead
+    abandon the deferred child: every action for the host must be ``not-run``
+    with no operation attempt, the hold must carry its exact control binding,
+    and a supported read-only drain snapshot must prove the target inactive.
+    The journal then records the abandonment on the hold and those actions,
+    and the hold is released through :func:`release_rollout_hold`. Nothing is
+    executed on the host; the next rollout plans it normally.
+    """
+    if (
+        not isinstance(rollout_id_value, str) or not rollout_id_value
+        or rollout_id_value != rollout_id_value.strip()
+        or not isinstance(host, str) or not host or host != host.strip()
+    ):
+        raise FleetRolloutError("abandoning a host requires exact rollout and host identities")
+    with _rollout_execution_lock(rollout_id_value):
+        run, journal_digest = _load_run_with_digest(rollout_id_value)
+        if run is None or journal_digest is None:
+            raise FleetRolloutError(f"rollout journal {rollout_id_value!r} does not exist")
+        _validate_journal_records(run)
+        hold = run.holds.get(host)
+        if not isinstance(hold, Mapping) or hold.get("owned") is not True:
+            raise FleetRolloutError(f"rollout {rollout_id_value} owns no hold on {host!r}")
+        if hold.get("status") == "released" and hold.get("abandoned_at"):
+            return AbandonedHost(rollout_id_value, host,
+                                 tuple(hold.get("abandoned_actions") or ()), True)
+        if hold.get("status") not in {"active", "cleanup-failed"}:
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} hold on {host!r} is "
+                f"{hold.get('status')!r}, not an active owned hold"
+            )
+        if hold.get("control_host") is None:
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} hold on {host!r} has no exact control "
+                "binding; reconcile it through the legacy path instead"
+            )
+        control_host = _journaled_hold_control_host(host, hold)
+        action_host = hold.get("action_host") or host
+        actions: list[str] = []
+        for action_id, record in sorted(run.actions.items()):
+            try:
+                _phase, lane_host, _program = _legacy_action_parts(action_id)
+            except FleetRolloutError:
+                continue
+            if lane_host not in {host, action_host}:
+                continue
+            if record.get("status") != "not-run" or _operation_attempts(record):
+                raise FleetRolloutError(
+                    f"rollout {rollout_id_value} already started {action_id}; "
+                    "only a never-started deferred host can be abandoned"
+                )
+            actions.append(action_id)
+        observed_at = _observe_abandonable_target(
+            run, host=host, hold=hold, control_host=control_host, runner=control_runner,
+        )
+        current, current_digest = _load_run_with_digest(rollout_id_value)
+        if current is None or current_digest != journal_digest:
+            raise FleetRolloutError(
+                f"rollout journal {rollout_id_value} changed during abandonment"
+            )
+        stamp = utcnow_iso()
+        for action_id in actions:
+            current.actions[action_id] = {
+                **current.actions[action_id], "abandoned_at": stamp,
+            }
+        record = {
+            **current.holds[host], "abandoned_at": stamp,
+            "abandoned_observed_at": observed_at,
+            "abandoned_actions": actions,
+        }
+        current.holds[host] = record
+        save_run(current)
+        release_rollout_hold(None, current, hold=record, runner=control_runner)
+        return AbandonedHost(rollout_id_value, host, tuple(actions), False)
 
 
 def _failure_report_ref(

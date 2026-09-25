@@ -93,6 +93,28 @@ origin is resolved against the live checkout before use from the slot. Missing
 or unreachable source remains a failure before activation; the updater never
 asks an operator to fetch manually inside the live managed checkout.
 
+Fresh generation clones retain the input's configured origin even when the
+requested commit is already available locally. Borrowed Git alternate objects
+are copied into the new repository; ordinary local objects may remain safe
+content-addressed hardlinks. A subsequent generation can therefore use that
+upstream without depending on the original checkout or its borrowed object store.
+This does not establish that an operator-configured origin is durable: an input
+without an origin remains local-only, and an origin naming a legacy directory
+still needs migration review. Existing generations are not rewritten by this
+change. Registry, bootstrap and remote-consumer rebinding remain separate #72
+requirements; no legacy directory is retired by source preparation.
+
+Updater entry points must also belong to the selected generation. An absolute
+`update_script` or `post_update_script` under the configured legacy `git_dir`
+is converted to the same source-relative path in the slot, preserving its
+arguments. External or traversing entry points refuse before preparing the
+generation; an in-tree symlink that resolves outside the materialized source
+refuses immediately before script execution. Use relative script paths when
+the registration uses a different symlink spelling for the source root.
+This binds the script entry point, not arbitrary paths inside its arguments or
+body: site-specific build targets and custom venv arguments still need a
+reviewed slot-aware adapter before migration (#72).
+
 What this costs: a new slot pays a real venv creation plus an extension build.
 What it does not cost is the native dependency tree — `third_party/` install
 prefixes are consumed at build time rather than imported at run time, so they can
@@ -100,6 +122,25 @@ still be shared or copied between slots, and ccache still covers the compile.
 The §1c question (does the build replace artifacts or rewrite them in place?)
 therefore no longer gates this design; it remains worth answering for its own
 sake.
+
+### Source-local virtualenv profiles
+
+Slot preparation preserves a registered `SOURCE/VENV/bin/python` path when
+`VENV` is a single directory under the source root, including custom names
+such as `.venv-viewer`. It keeps the updater's arguments and dependency
+profile unchanged. The builder must create that environment at its final
+generation path; no environment is copied, renamed or redirected through
+`current`. External or nested environments require a reviewed build adapter
+and are refused by this source-local path.
+
+Default `.venv` generations retain their existing marker format. Custom
+environments use runtime-slot marker schema 2, which records the venv directory
+in both build receipts and the verified generation. Older vq versions refuse
+these generations; update every launcher/maintenance reader before preparing
+one. Reusing or retrying a SHA with a different venv binding refuses, even if
+both environments happen to exist. Sealing, launch, lifecycle locking and
+recovery use the same recorded path. This prepares custom-venv support for
+#72; it does not migrate program aliases, driver bindings or services.
 
 ### Shared launcher (issue #577)
 
@@ -131,6 +172,97 @@ and `git_dir`. Host migration must still bind registration, runtime provenance
 and job retention to the exact slot, prove the old and new launch paths, and
 preserve existing legacy jobs. No host migration is implied by this command's
 availability.
+
+### Explicit local execution binding
+
+`runtime_slot_execution = true` explicitly binds a local venv registration to
+its verified `runtime_slot_root`. The default is false: setting the store root
+alone still changes only update preparation. Prepare and verify the first
+generation before enabling execution, and update all readers before adding the
+new configuration field. A missing or invalid current generation refuses;
+there is no fallback to the legacy environment.
+
+The stored `python` and `git_dir` remain the legacy build inputs and compatible
+paths. `vq programs --json` reports the selected generation's execution paths
+and identity, alongside `build_python` and `build_git_dir`; `vq admin status`
+reports the same selected generation. For any registration with
+`runtime_slot_root`, `vq admin update` idempotence asks whether the active
+verified generation is the requested SHA and healthy. The build checkout's
+HEAD is not consulted, because slot updates never move it. An admin update
+continues to build out of place from the original source input. It checks both
+legacy and selected execution identities when identifying a serving daemon;
+this flag does not bypass managed serving-daemon ownership and restart verification.
+See the serving-daemon transaction below.
+
+At local dispatch, vq resolves one generation and records its exact source,
+interpreter and source SHA on the job under the same spec lock. The payload's
+`VQ_PROGRAM_PYTHON`, `VQ_PROGRAM_GIT_DIR` and `VQ_PROGRAM_BIN` use that selection,
+even if activation changes before process launch. Generated QVF commands use
+the same interpreter. Fixed-SHA requirements still refuse a mismatching
+generation. Arbitrary user commands are not rewritten: legacy paths remain
+usable, and wrappers should consume the managed-program environment when they
+intend to use the current registration.
+
+Retries and resubmissions clear the prior execution selection, retain the
+original pin requirements and QVF payload type, and select again at dispatch.
+A running process retains its exact generation. Rolling a registration back
+to legacy execution also rebinds its next generated QVF command; it never
+removes either generation. Scheduler target selection remains the driver's
+existing immutable-wrapper contract. Grouping aliases, coordinating all driver
+bindings and applying a recoverable host migration remain #72 transaction work;
+this execution switch alone does not establish fleet migration completion.
+
+### Build input: retiring the registered checkout
+
+`runtime_slot_build_input = "current"` (default `"legacy"`) makes the next
+generation clone from the active verified generation instead of the registered
+`git_dir`. That generation's `origin` is the configured upstream, so a later
+commit is fetched exactly into the unpublished slot; a commit it already holds
+needs no network. The registered `git_dir` and `python` are then compatibility
+paths: the virtualenv name and updater entry points are still derived from
+them by path arithmetic, but neither needs to exist. The update gate requires
+an active verified generation instead of a checkout, declared-extras routes
+read that generation's scripts, and lifecycle locks keep the registered
+checkout's keys only while it exists, beside the stable runtime-root key. The
+option requires `runtime_slot_execution`; a registration still executing its
+legacy interpreter cannot give that interpreter up. A registration serving the
+vq daemon refuses it until the serving-daemon transaction (#73) no longer
+binds its receipts to the registered checkout.
+
+Setting the option retires nothing. Deleting a legacy checkout stays an
+operator decision, made through a reviewed plan:
+
+```sh
+vq admin retire-checkout ENV                       # read-only plan
+vq admin retire-checkout ENV --apply-plan PLAN_ID  # delete, with a receipt
+```
+
+The plan blocks deletion while any of these holds:
+
+- a registration sharing the checkout or its interpreter still builds from it;
+- a service definition or the running daemon uses it;
+- a live job names it, or a started job of the program has no recorded
+  runtime selection;
+- an admin marker is unresolved;
+- the checkout has uncommitted or unignored changes, stashes, or commits that
+  no remote-tracking ref contains.
+
+Apply re-plans under the admin and lifecycle ownership, refuses on any
+change, removes the tree (with `munlink` on Lustre), and records the exact
+HEAD and upstream under `<state root>/checkout-retirement/`. Finish or roll
+back every `migrate-runtime` transaction for the program first: a rollback
+restores execution from this checkout. Rolling back to `"legacy"` afterwards
+means cloning the checkout again at the recorded HEAD.
+
+Unattended updates follow the same rule for every registration with
+`runtime_slot_root`, whatever its build input: nothing is fetched into a
+published generation or into the build checkout to decide them. `vq admin
+auto-update` takes "current" to be the active generation's SHA and exact tags,
+and asks the remote read-only (`ls-remote`) through the build source. A branch
+policy's queued `vq build-env` job checks its baseline against the active
+generation and its target against `ls-remote`. The build then refuses unless
+the target provably descends from that baseline; the proof runs in the new,
+unpublished generation, which may fetch a missing baseline from its origin.
 
 ## 0b. Origin
 
@@ -585,3 +717,185 @@ that gate a continuously-rolling fleet can ever satisfy. Keep the
 stale-marker-needs-acknowledgement contract for the *owning* host, since that is
 what makes an interrupted update safe, but scope it so an unrelated host's marker
 cannot wedge the loop.
+
+## Local registration migration transaction (#72, 0.26.11)
+
+`vq admin migrate-runtime` supports one local component, including all aliases
+sharing its checkout or interpreter. It handles local registry authorities and
+new stable launchers. It leaves every legacy path and both runtime generations
+in place. It does not reconfigure a service, contact another driver, invoke a
+private packed publisher, or prune anything. A serving daemon or unknown service
+identity blocks this operation; its lifecycle belongs to #73.
+
+Keep the manifest, candidate configs, output and receipts outside product
+checkouts. They contain private deployment paths and may include complete config
+bytes. The caller must own the files and their parent directories; symlinked
+parents, symlinked configs, shared-writable files and hard-linked configs refuse.
+Use canonical absolute paths. All authority files must be local and available.
+The manifest is an explicit inventory declaration, not automatic fleet discovery:
+list every known remote driver, packed publisher or other unhandled consumer in
+`external_consumers`. Any entry blocks preparation and apply until its reviewed
+participant integration exists. Do not clear this list to bypass a dependency.
+
+An external manifest has this shape (replace the reserved example paths):
+
+```json
+{
+  "schema_version": "vq.runtime-migration/1",
+  "component": "chemistry",
+  "program": "chemistry",
+  "source_sha": "0123456789abcdef0123456789abcdef01234567",
+  "runtime_root": "/opt/example/runtimes/chemistry",
+  "registries": [
+    {
+      "path": "/opt/example/config/config.toml",
+      "candidate": "/opt/example/review/config.candidate.toml"
+    }
+  ],
+  "launchers": [
+    {
+      "path": "/opt/example/bin/chemistry-python",
+      "bootstrap": "/opt/example/retained-vq/bin/vq",
+      "arguments": []
+    }
+  ],
+  "external_consumers": []
+}
+```
+
+Each candidate must parse as a complete vq config. Its only semantic changes
+are `runtime_slot_root` and `runtime_slot_execution = true` for **every** alias
+sharing the selected program's source or interpreter. Preserve `python`,
+`git_dir`, update arguments, extras, import checks, fixed pins and every unrelated
+field. The candidate may additionally set `runtime_slot_build_input = "current"`,
+but only for every such alias and in every authority; the plan reports the
+resulting `build_input`. Conflicting alias profiles refuse. Different authorities
+must declare the same component profile. Registry permissions remain those of the original file.
+A candidate with different formatting is allowed; rollback restores the exact
+original bytes, including comments.
+
+The bootstrap is an existing independently retained vq executable supporting
+`runtime-python`; its environment and editable source must remain installed.
+The generated shell launcher invokes it with the exact store root and then
+forwards the caller's arguments. `arguments` can contain a fixed Python module
+entry point, for example `["-m", "vq.cli"]` for a **daemonless** source-local vq
+helper. The bootstrap must live outside the target store. Existing launchers are
+not overwritten: choose a new path and keep legacy/fixed-SHA launchers and their
+archives. A scheduler's packed helper requires its private publication and driver
+binding participant; generating this wrapper does not establish that contract.
+
+Run the operation in separate reviewable steps:
+
+```sh
+vq admin migrate-runtime --manifest /opt/example/review/migration.json
+vq admin migrate-runtime --manifest /opt/example/review/migration.json \
+  --prepare-plan REVIEWED_PLAN_SHA256
+vq admin migrate-runtime --manifest /opt/example/review/migration.json \
+  --apply-plan REVIEWED_READY_PLAN_SHA256 \
+  --receipt-dir /opt/example/review/transaction-001
+```
+
+The default plan is read-only JSON. It identifies exact source/generation paths,
+all changed aliases and file identities, current/previous, retained job generation
+references, blockers and a digest over the full plan. Preparation rechecks that
+digest under the existing admin and checkout/venv lifecycle locks, then uses the
+normal slot builder without activating. Review its new `ready` plan before apply.
+A stale config, candidate, pointer, source identity or generation receipt changes
+the digest and refuses. Failed builds retain the slot primitive's own recovery
+receipts; migration never deletes or relabels an incomplete generation itself.
+
+Apply stages new and rollback bytes durably before changing any live binding.
+Each pointer or file replacement checks both content and inode identity. Local
+aliases within one registry switch in one atomic rename. Multiple registries
+switch in journaled sequence; this is recoverable local publication, **not a
+fleet-wide atomic commit**. Original interpreters remain available throughout.
+The current pointer changes only after generation verification. The receipt
+records the exact interpreter/source/SHA used by new dispatch and helper launches.
+
+Recover an interrupted apply or roll it back using the same receipt:
+
+```sh
+vq admin migrate-runtime --receipt-dir /opt/example/review/transaction-001 --resume
+vq admin migrate-runtime --receipt-dir /opt/example/review/transaction-001 --rollback
+```
+
+Resume and rollback are idempotent. Once rollback starts, finish it before making
+a new plan. Recovery recognizes original, prepared and already-renamed inodes;
+it refuses a later operator edit rather than overwriting it. Restore or reconcile
+that edit explicitly before continuing. If receipt initialization was interrupted,
+no live binding was changed: make a new plan and receipt. Its private staged files
+are retained for inspection. Successful operations likewise retain staged rollback
+material; no cleanup is implicit. Rollback verifies old pointer generations,
+restores old registry bytes and pointers, and removes only a new launcher whose
+exact transaction-owned inode still matches. No source, venv, job or archive moves.
+
+Source fixture acceptance does not establish host migration. The operational
+owner must refresh complete consumer discovery, install compatible readers and
+bootstrap, verify representative local dispatch/helper invocation and old-process
+late imports, and obtain all external participant evidence before declaring the
+component migrated. Remote driver bindings and private packed helper publication
+remain explicit #72 dependencies; service lifecycle remains #73 and retention #74.
+
+## Serving-daemon generations (#73)
+
+A single-user serving `vq` registration can use `runtime_slot_root` with
+`vq self-update --expected-sha FULL_SHA` or a single-environment
+`vq admin update ENV localhost --expected-sha FULL_SHA`. The user systemd unit
+or launchd agent must directly name the registered legacy interpreter or the
+verified current generation. Batch serving-slot updates, multi-user services,
+`--no-restart-daemon`, forced marker replacement and post-update hooks refuse before
+preparation. Use `vq admin recover-update` for an interrupted transaction.
+
+First-class `vq self-update` permits the same SHA or a proven descendant of the
+generation actually serving the daemon, even when the legacy build checkout is
+at a different revision. It repeats this proof against the prepared generation
+before pausing jobs or stopping the service. An older, divergent or unprovable
+target refuses; single-environment `vq admin update` retains its explicit exact
+target policy.
+
+The first update prepares the requested generation at its final absolute path
+while the old daemon runs. It preserves the proven install mode and extras,
+including the declared extras floor. The existing canonical updater and its
+source/package checks remain required. An existing generation with a different
+profile cannot be rebuilt in place under the same SHA. Preparation failure
+leaves the old service, registry and pointers unchanged.
+
+After successful preparation, the ordinary managed-update ownership and pause
+scope protect a durable binding transaction. The receipt records exact original
+config and service bytes, file identities, current/previous pointers, and staged
+forward/rollback identities before stopping the daemon. Every matching registry
+alias changes only its `runtime_slot_execution` flag; other parsed TOML values
+are preserved, although formatting and comments may change. Raw build inputs
+remain registered and must remain available. This does not retire the legacy
+checkout, migrate a remote publisher, or satisfy fleet-wide #72 acceptance.
+
+Only the service executable changes. Environment, queue/config paths, daemon
+arguments and manager options remain intact. Systemd requires one owned effective
+user unit with no drop-ins and one canonical `ExecStart`; command expansions and
+compound definitions refuse. Launchd preserves its secure plist, including
+`ProgramArguments`, optional matching `Program`, and environment. The new
+executable names the exact generation, never `current`. Systemd reloads the unit;
+launchd unloads and bootstraps the agent through the existing managed lifecycle.
+Manager identity and exact source SHA/package-tree RPC checks must pass before
+the transaction commits and resumes its scoped jobs.
+
+Both generations remain at their original paths. A failed start or provenance
+check restores the old service/config bytes and pointers, then restarts and
+proves the old daemon. No interpreter directory is renamed or deleted, and no
+job specification is rewritten by the binding transaction. Existing immutable
+job pins continue to select their saved generation.
+
+The durable marker uses `vq-managed-daemon-slots-v1`. Recovery authenticates the
+receipt against the current config authority, registered component, effective
+service definition, queue authority, exact generation paths and owned staged
+inodes under the admin and lifecycle locks. Foreign edits or an unknown manager
+identity leave the marker in place. A nonterminal interruption restores and
+proves the old daemon; only a durable `target_committed` receipt can retain the
+new target, and its service, config and pointers must all agree. Recovery never
+infers commitment from a pointer alone and never blindly retries an update.
+Staged evidence and old generations remain for separately reviewed retention.
+
+These are source-side guarantees with sandboxed manager tests. Real systemd and
+launchd restart, retained-job behaviour and operator recovery evidence remain
+release-coordinator acceptance gates; merging this implementation does not
+perform or authorize a host migration.

@@ -33,11 +33,26 @@ starting -- particularly the security section.
   via `systemd-run --scope --uid=<uid> --gid=<gid>`. The kernel
   enforces that it does not run as root or another uid; access to files
   then follows ordinary Unix owner, group, and mode permissions.
-* Per-user state lives under `/var/lib/vq/users/<uid>/`. The
-  structural `<uid>` directory is `root:<primary-gid>` mode `0750`;
-  the user's writable `queue/`, `jobs/`, `archive/`, and `workdirs/`
-  children stay owned by that uid/gid. Provisioning retains existing
-  read/execute bits but removes group/world write bits from those children.
+* Per-user durable state lives under `/var/lib/vq/users/<uid>/` and per-user
+  disposable scratch under `/var/lib/vq-scratch/users/<uid>/` (#63). Each
+  structural `<uid>` directory is `root:<primary-gid>` mode `0750`; the user's
+  writable `queue/` and `archive/` children in the first, and `jobs/` and
+  `workdirs/` in the second, stay owned by that uid/gid. Provisioning retains
+  existing read/execute bits but removes group/world write bits from those
+  children. `$VQ_MULTI_USER_SCRATCH_ROOT` overrides the scratch root; it
+  defaults to the `-scratch` sibling of `$VQ_MULTI_USER_ROOT`. Jobs that
+  recorded `jobs/` or `workdirs/` under the state tree keep those paths, and
+  cleanup covers both.
+* **The `scratch_root` config key does not apply in multi-user mode**, exactly
+  as `$VQ_MULTI_USER_ROOT` has no config key. A config key is read from the
+  *calling* process's file: the root daemon reads `/etc/vq/config.toml` while a
+  user's CLI reads `~/.config/vq/config.toml`, and `vq submit` resolves the
+  submitter's jobs directory in the user's own process — so the user would
+  stage into one tree while the daemon's cwd gate expected another and refused
+  the spec as "outside the submitter's jobs trees". Set the environment
+  variable in the unit and in the environment users inherit, and a config that
+  enables multi-user mode while setting `scratch_root` is refused at load
+  rather than quietly ignored.
 * `[quotas]` caps each user's pending-job count and concurrent CPUs.
 * `kill` / `fetch` check the caller's uid against the job's
   `submitter`; members of the `admin_group` (and root) bypass the
@@ -308,11 +323,13 @@ default_max_concurrent_cpus = 16
 
 ## Migrating from a single-user install
 
-A single-user deployment keeps state under each user's
-`~/.local/share/vq/` (`queue/`, `jobs/`, `archive/`). Multi-user mode
-reads `/var/lib/vq/users/<uid>/`. The two layouts are not shared -- a
-switch must migrate the old state, or that history disappears from
-`vq queue`.
+A single-user deployment keeps durable state under each user's
+`~/.local/share/vq/` (`queue/`, `archive/`) and disposable scratch under
+`~/.local/share/vq-scratch/` (`jobs/`, `workdirs/`) since v0.26.10 (#63);
+before that, `jobs/` lived under the state root too. Multi-user mode reads
+`/var/lib/vq/users/<uid>/` and `/var/lib/vq-scratch/users/<uid>/`. The layouts
+are not shared -- a switch must migrate the old state, or that history
+disappears from `vq queue`.
 
 **Migrate per user. Do this with the single-user daemon stopped.**
 
@@ -337,14 +354,21 @@ copy below when that history must remain visible after the switch.
    ```sh
    UID_N=$(id -u alice)
    GID_N=$(id -g alice)
-   sudo mkdir -p /var/lib/vq/users/$UID_N
+   sudo mkdir -p /var/lib/vq/users/$UID_N /var/lib/vq-scratch/users/$UID_N
    sudo cp -a ~alice/.local/share/vq/queue   /var/lib/vq/users/$UID_N/
-   sudo cp -a ~alice/.local/share/vq/jobs    /var/lib/vq/users/$UID_N/
    sudo cp -a ~alice/.local/share/vq/archive /var/lib/vq/users/$UID_N/ 2>/dev/null || true
-   sudo chown -R "$UID_N:$GID_N" /var/lib/vq/users/$UID_N
-   sudo chown root:"$GID_N" /var/lib/vq/users/$UID_N
-   sudo chmod 0750 /var/lib/vq/users/$UID_N
+   # Workspaces: from the scratch root on v0.26.10+, from the state root on
+   # anything older. Copy whichever that user actually has (#63).
+   sudo cp -a ~alice/.local/share/vq-scratch/jobs /var/lib/vq-scratch/users/$UID_N/ 2>/dev/null || \
+     sudo cp -a ~alice/.local/share/vq/jobs /var/lib/vq-scratch/users/$UID_N/ 2>/dev/null || true
+   sudo chown -R "$UID_N:$GID_N" /var/lib/vq/users/$UID_N /var/lib/vq-scratch/users/$UID_N
+   sudo chown root:"$GID_N" /var/lib/vq/users/$UID_N /var/lib/vq-scratch/users/$UID_N
+   sudo chmod 0750 /var/lib/vq/users/$UID_N /var/lib/vq-scratch/users/$UID_N
    ```
+
+   A copied spec still records the path it ran under, so `vq fetch` keeps
+   working for the old location until those jobs age out; the copy is what
+   makes them visible to the multi-user daemon's queue.
 
 4. **Disable the old user-level unit** so it cannot race the
    system daemon:
@@ -385,10 +409,13 @@ un-provisioned user's first `vq submit` fails with `PermissionError`.
   sudo /opt/vq/venv/bin/vq admin provision-user ALICE
   ```
 
-  `ALICE` is a username or a numeric uid. It creates
-  a root-owned `/var/lib/vq/users/<uid>` structural directory plus
-  user-owned `{queue,jobs,archive,workdirs}` children; their `vq
-  submit` works thereafter. Idempotent -- safe to re-run.
+  `ALICE` is a username or a numeric uid. It creates root-owned
+  `/var/lib/vq/users/<uid>` and `/var/lib/vq-scratch/users/<uid>` structural
+  directories plus user-owned `{queue,archive}` and `{jobs,workdirs}` children
+  respectively; their `vq submit` works thereafter. Idempotent -- safe to
+  re-run, and re-running it is how an existing deployment gains the scratch
+  tree after an upgrade (the daemon also does it at startup for every
+  admin-group member).
 
 Each user also needs the **vq CLI** available (the client
 auto-detects multi-user mode from `/etc/vq/config.toml` since

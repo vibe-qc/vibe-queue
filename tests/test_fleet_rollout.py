@@ -9720,6 +9720,40 @@ def test_reconciliation_recovers_pre_exact_local_hold_before_release(
     assert ["--status" in args for args in controls] == [True, False]
 
 
+# A liveness bound, not a timing claim.  After authorization a real operation
+# starts two cold interpreters (the recorder, then ``python -m vq`` importing
+# the whole CLI), which takes seconds on an idle machine and more than ten
+# under load.  A dead operation is caught at once by its free lease instead.
+_OPERATION_LIVENESS_SECONDS = 120.0
+
+
+def _wait_for_completed_operation(
+    operation_id: str,
+) -> fleet_operation.OperationObservation:
+    deadline = time.monotonic() + _OPERATION_LIVENESS_SECONDS
+    while True:
+        observed = fleet_operation.observe_operation(operation_id)
+        if observed.state == "completed":
+            return observed
+        if not observed.lease_busy:
+            # The result is read before the lease, so a recorder that exits
+            # between the two reads looks dead once; look again to be sure.
+            observed = fleet_operation.observe_operation(operation_id)
+            if observed.state == "completed":
+                return observed
+            if not observed.lease_busy:
+                pytest.fail(
+                    f"operation {operation_id} stopped in {observed.state} "
+                    "without a result"
+                )
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"operation {operation_id} still {observed.state} after "
+                f"{_OPERATION_LIVENESS_SECONDS:.0f} s"
+            )
+        time.sleep(0.01)
+
+
 def _safe_durable_action(*, phase: fleet_rollout.Phase = "local-runtime"):
     return fleet_rollout.RolloutAction(
         id=f"{phase}:localhost:vibeqc-queue",
@@ -9852,15 +9886,14 @@ def test_driver_reentry_requires_exact_receipt_and_mutating_resume(
     )
     supervisor = fleet_operation.launch_supervisor(handle.operation_id)
     del supervisor
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,
     )
-    deadline = time.monotonic() + 10
-    while fleet_operation.observe_operation(handle.operation_id).state != "completed":
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    _wait_for_completed_operation(handle.operation_id)
 
     harvested = fleet_rollout.reconcile_durable_operations(
         current_report_digest_sha256=digest,
@@ -10711,7 +10744,9 @@ def test_controller_death_after_authorization_is_adopted_and_harvested_once(
         handle.operation_id,
         lifecycle_handoff=operation_handoff,
     )
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=report_digest,
@@ -10824,7 +10859,9 @@ def test_controller_death_nonzero_harvest_stays_host_local_without_replay(
 
     supervisor = threading.Thread(target=forced_failure_supervisor)
     supervisor.start()
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,
@@ -11005,17 +11042,14 @@ def test_harvested_failure_after_driver_reentry_is_not_replayed(
     for handle in handles:
         supervisor = fleet_operation.launch_supervisor(handle.operation_id)
         del supervisor
-        fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+        fleet_operation.wait_for_ready(
+            handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+        )
         fleet_operation.authorize_operation(
             handle.operation_id,
             expected_report_digest_sha256=digest,
         )
-        deadline = time.monotonic() + 10
-        while fleet_operation.observe_operation(handle.operation_id).state != (
-            "completed"
-        ):
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
+        _wait_for_completed_operation(handle.operation_id)
 
     first = fleet_rollout.reconcile_durable_operations(
         current_report_digest_sha256=digest,
@@ -16737,7 +16771,10 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
     source_path = fleet_rollout.rollout_state_path(host_e.rollout_id)
     paths = (source_path, current_path, scheduler_path)
     before = {path: path.read_bytes() for path in paths}
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             name: config.HostConfig(ssh=name, fleet_role="managed")
             for name in ("localhost", "host_a", "host_e", "host_c")
@@ -16760,17 +16797,18 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -17021,7 +17059,10 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
     assert current is not None
     assert current.legacy_failure_update_intent is not None
 
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             "localhost": config.HostConfig(ssh="localhost", fleet_role="managed"),
             "host_e": config.HostConfig(ssh="host_e", fleet_role="managed"),
@@ -17044,17 +17085,18 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -19748,7 +19790,9 @@ def test_current_pre_authorized_attempt_is_adopted_without_a_second_launch(
     fleet_rollout.save_run(run)
     launched = fleet_operation.launch_supervisor(handle.operation_id)
     del launched
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     plan = fleet_rollout.RolloutPlan(
         driver="localhost",
         report={"digest_sha256": digest, "source_path": "report.json"},
@@ -19803,13 +19847,7 @@ def test_stale_report_after_ready_aborts_before_authorization(
     run = fleet_rollout.load_run("v0.15.60-stale-after-ready")
     assert run is not None
     operation = run.actions[action.id]["operation_attempts"][0]["operation_id"]
-    deadline = time.monotonic() + 10
-    while True:
-        observed = fleet_operation.observe_operation(operation)
-        if observed.state == "completed":
-            break
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    observed = _wait_for_completed_operation(operation)
     assert observed.authorization is not None
     assert observed.authorization["decision"] == "abort"
     assert observed.activation is None
@@ -20439,7 +20477,9 @@ def test_activation_without_result_is_outcome_unknown_and_never_replayed(
 
     thread = threading.Thread(target=supervisor)
     thread.start()
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,

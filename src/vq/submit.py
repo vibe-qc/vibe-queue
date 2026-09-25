@@ -39,7 +39,10 @@ from pathlib import Path, PurePosixPath
 from vq import capacity, config, drain, events, paths, spec_access, transport
 from vq.config import HostConfig, VenvProgram
 from vq.host import is_local_host
-from vq.scheduler_dialect import enforce_scheduler_wall_time_limit
+from vq.scheduler_dialect import (
+    enforce_scheduler_wall_time_limit,
+    scheduler_width_warning,
+)
 from vq.spec import (
     JOB_NAME_MAX_LEN,
     JOB_NAME_PATTERN,
@@ -1664,6 +1667,7 @@ def _resolve_submit_plan(
     # A direct local request owns registry validation before any hidden
     # scheduler target is consulted.
     if directly_requested_local:
+        _validate_program_execution_target(cfg, request.program, target.scheduler_target)
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1742,6 +1746,9 @@ def _resolve_submit_plan(
     if is_local_host(execution_target.execution_host) and not directly_requested_local:
         # A local scheduler driver contributes only an observational fallback
         # when the target did not require an authoritative runtime lookup.
+        _validate_program_execution_target(
+            cfg, request.program, execution_target.scheduler_target,
+        )
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1886,6 +1893,21 @@ def _execute_submit_plan(
     )
 
 
+def _validate_program_execution_target(
+    cfg: config.Config, program_name: str | None, scheduler_target: str | None,
+) -> None:
+    """A scheduler-only registration must never authorize local execution."""
+    if (
+        program_name is not None
+        and isinstance(cfg.programs.get(program_name), config.SchedulerProgram)
+        and scheduler_target is None
+    ):
+        raise ValueError(
+            f"--program {program_name!r} is scheduler-only; submit to a "
+            "configured scheduler host or register a local installation"
+        )
+
+
 def _validate_program_for_submit(
     cfg: config.Config,
     program_name: str | None,
@@ -1909,12 +1931,20 @@ def _validate_program_for_submit(
     if local_spec:
         prog = cfg.programs[program_name]
         if isinstance(prog, VenvProgram):
+            prog = _execution_program_for_submit(prog)
             mismatches = prog.runtime_pin_mismatches()
             if mismatches:
                 raise ValueError(
                     f"--program {program_name!r} runtime pin mismatch: "
                     + "; ".join(mismatches)
                 )
+
+
+def _execution_program_for_submit(prog: VenvProgram) -> VenvProgram:
+    try:
+        return prog.execution_program()
+    except config.ConfigError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _git_sha_matches(actual: str, expected: str) -> bool:
@@ -1967,6 +1997,7 @@ def _validate_expected_sha_for_submit(
             f"--expected-sha requires --program {program_name!r} to be a "
             "venv program with a git_dir"
         )
+    prog = _execution_program_for_submit(prog)
     actual_sha = prog.current_git_sha(full=len(expected_sha) == 40)
     if actual_sha is None:
         raise ValueError(
@@ -2228,6 +2259,7 @@ def _program_runtime_pin_for_submit(
     prog = cfg.programs.get(program_name)
     if not isinstance(prog, VenvProgram):
         return None
+    prog = _execution_program_for_submit(prog)
     # An explicit or configured SHA is enforced. A discovered SHA without
     # either requirement is observational and must survive runtime rollovers.
     expected_git_sha = expected_sha or prog.expected_git_sha
@@ -2319,6 +2351,7 @@ def _qvf_command(
                 f"single-QVF submit requires --program {program!r} to be a "
                 f"managed venv program; known programs: {known}"
             )
+        prog = _execution_program_for_submit(prog)
         command = [prog.python, "-m", "vibeqc._cli", "run", artifact_name]
     if force:
         command.append("--force")
@@ -2428,6 +2461,40 @@ def new_array_group_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _scheduler_width_warnings(
+    *,
+    cpus: int,
+    jobid: str,
+    scheduler_target: str,
+) -> tuple[str, ...]:
+    """Warn when a request is wider than its scheduler lane can ever run.
+
+    vibe-qc#148: five ``ppn=128`` jobs were accepted onto a lane whose only
+    nodes that wide were one busy and one offline, and queued for six days.
+    The scheduler accepts such a request without complaint, and until now so
+    did vq -- this path returned nothing at all for a scheduler target, so
+    the one moment a human was watching passed in silence.
+
+    Advisory and best effort in both directions: an unreadable config costs
+    the warning and never the submission, and an exceeded limit warns rather
+    than refuses, because a declared lane width goes stale as nodes return
+    to service.
+    """
+    try:
+        host_cfg = config.load_config().host(scheduler_target)
+    except Exception:
+        return ()
+    lane = host_cfg.scheduler_lane_metadata()
+    partition = lane.get("partition") if lane is not None else None
+    message = scheduler_width_warning(
+        cpus,
+        host_cfg.scheduler_max_cpus,
+        scheduler_host=scheduler_target,
+        partition=partition if isinstance(partition, str) else None,
+    )
+    return () if message is None else (f"job {jobid}: {message}",)
+
+
 def _impossible_capacity_warnings(
     *,
     cpus: int,
@@ -2436,9 +2503,13 @@ def _impossible_capacity_warnings(
     multi_user: bool,
     scheduler_target: str | None,
 ) -> tuple[str, ...]:
-    """Describe requests that can never fit this local daemon."""
+    """Describe requests this host can never run as asked."""
     if scheduler_target is not None:
-        return ()
+        return _scheduler_width_warnings(
+            cpus=cpus,
+            jobid=jobid,
+            scheduler_target=scheduler_target,
+        )
     try:
         caps = capacity.read_daemon_capacity(multi_user=multi_user)
     except Exception:
@@ -3088,7 +3159,10 @@ def _submission_intent_digest(
     runtime_pin = (
         spec.program_runtime_pin.model_dump(
             mode="json",
-            exclude={"resolved_git_sha"},
+            # Dispatch receipts are observations, not submission intent. Omit
+            # even absent additive fields to preserve pre-upgrade claim hashes.
+            exclude={"resolved_git_sha", "resolved_runtime_root",
+                     "resolved_runtime_source", "resolved_runtime_python"},
         )
         if spec.program_runtime_pin is not None
         else None

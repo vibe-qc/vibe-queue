@@ -526,6 +526,60 @@ def resolve_owner_host(cfg: config.Config, queue_host: str) -> str | None:
     return queue_host
 
 
+PREVIEW_TAIL_LINES = 2000
+"""Stdout lines a preview reads: the same status tail the drill-down shows, deeper."""
+
+
+def fetch_job_preview(
+    cfg: config.Config,
+    queue_host: str,
+    jobid: str,
+    *,
+    multi_user: bool = False,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Calculation preview for one job (#65, V1); ``(payload, error)``.
+
+    Reads only what the drill-down already reads, ``vq status --json`` with a
+    stdout tail, on the owning host, and parses it with :mod:`vq.previews`.
+    It opens no other file and walks no workdir. ``preview`` is ``None`` when
+    no parser knows the job's program.
+    """
+    from vq import previews
+    from vq.status import show_status_json
+
+    owner = resolve_owner_host(cfg, queue_host)
+    if owner is None:
+        return None, f"scheduler host {queue_host!r} has no scheduler_driver configured"
+    try:
+        if is_local_host(owner):
+            status_payload = json.loads(show_status_json(
+                owner, jobid, tail=PREVIEW_TAIL_LINES, multi_user=multi_user,
+            ))
+        else:
+            proc = transport.run_remote_vq(
+                cfg.host(owner), "status", "localhost", jobid, "--json",
+                "-n", str(PREVIEW_TAIL_LINES),
+            )
+            status_payload = json.loads(proc.stdout)
+    except FileNotFoundError as e:
+        return None, str(e)
+    except transport.RemoteError as e:
+        return None, str(e)
+    except (config.ConfigError, json.JSONDecodeError, ValueError, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    program = status_payload.get("program")
+    stdout = status_payload.get("stdout")
+    text = stdout[-previews.MAX_TAIL_BYTES:] if isinstance(stdout, str) else ""
+    return {
+        "jobid": jobid,
+        "queue_host": queue_host,
+        "owner_host": owner,
+        "state": status_payload.get("state"),
+        "program": program if isinstance(program, str) else None,
+        "preview": previews.preview(program if isinstance(program, str) else None, text),
+    }, None
+
+
 def fetch_job_detail(
     cfg: config.Config,
     queue_host: str,
