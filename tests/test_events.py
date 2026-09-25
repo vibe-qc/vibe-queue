@@ -9,6 +9,23 @@ import pytest
 from vq import events
 from vq.events import EventKind
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a teardown reap of whatever the daemon left running.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 1 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# Nothing to bound it against here: the job this test runs is a `print` that
+# exits on its own in milliseconds, and the one site using this budget is a
+# `finally` reap that asserts nothing, so a generous value removes no
+# coverage. Ten seconds matches tests/test_transport.py and
+# tests/test_pause_resume.py.
+_LIVENESS_SECONDS = 10.0
+
 
 class TestAppendAndRead:
     def test_first_append_creates_dir_and_file(self, tmp_path: Path) -> None:
@@ -148,7 +165,7 @@ class TestEventLogE2E:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=1)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
         log = events.read_events(ws)

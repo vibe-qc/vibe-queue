@@ -32,6 +32,9 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1785,6 +1788,177 @@ class TestAllRegisteredTogether:
         assert rpc.call("get_throttle_state")["weight"] == 25
 
 
+# One phase covers arrival and the checks made while a callback is held. These
+# are liveness guards, not response-time claims. The hold cannot expire inside
+# that phase; the client also has room for the subsequent publication phase.
+_REFRESH_PHASE_SECONDS = 10.0
+_REFRESH_HOLD_SECONDS = 2 * _REFRESH_PHASE_SECONDS
+_REFRESH_CLIENT_SECONDS = 3 * _REFRESH_PHASE_SECONDS
+assert _REFRESH_HOLD_SECONDS <= rpc.SCHEDULER_STATUS_REFRESH_MAX_SECONDS
+
+
+class _RefreshPhase:
+    def __init__(self) -> None:
+        self.deadline = time.monotonic() + _REFRESH_PHASE_SECONDS
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        assert remaining > 0, "scheduler-refresh test phase did not complete"
+        return remaining
+
+    def call(self, method: str, args: dict | None = None) -> dict:
+        return rpc.call(method, args, timeout=self.remaining())
+
+
+def _unavailable_refresh() -> dict:
+    return {
+        "schema": "vq.scheduler.status_refresh/1",
+        "completed": False,
+        "observed_at": None,
+        "reason": "timeout",
+    }
+
+
+class _RefreshGate:
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.arrivals = threading.Condition()
+        self.count = 0
+        self.expired = False
+
+    def callback(self, jobid: str, timeout: float) -> dict:
+        with self.arrivals:
+            self.count += 1
+            self.arrivals.notify_all()
+        if not self.release.wait(_REFRESH_HOLD_SECONDS):
+            self.expired = True
+            raise AssertionError("scheduler-refresh test release gate expired")
+        return _unavailable_refresh()
+
+    def wait_for(self, count: int, phase: _RefreshPhase) -> None:
+        with self.arrivals:
+            assert self.arrivals.wait_for(
+                lambda: self.count >= count, timeout=phase.remaining(),
+            ), "scheduler-refresh callback did not arrive"
+
+    def assert_held(self) -> None:
+        assert not self.release.is_set()
+        assert not self.expired, "natural gate expiry cannot establish isolation"
+
+
+class _RefreshProtocol:
+    def __init__(self, server: rpc.RPCServer) -> None:
+        self.servers = [server]
+        self.threads: list[threading.Thread] = []
+        if server._thread is not None:
+            self.threads.append(server._thread)
+        self.gates: list[_RefreshGate] = []
+        self.sockets: list[socket.socket] = []
+        self.lock = threading.Lock()
+
+    def record(self, thread: threading.Thread) -> None:
+        with self.lock:
+            self.threads.append(thread)
+
+    def held_callback(self, server: rpc.RPCServer) -> _RefreshGate:
+        gate = _RefreshGate()
+        self.gates.append(gate)
+        rpc.register_get_scheduler_status_refresh_method(server, gate.callback)
+        return gate
+
+    def submit(self, call: Callable[[], dict]) -> Future:
+        result: Future = Future()
+
+        def run() -> None:
+            try:
+                result.set_result(call())
+            except BaseException as exc:
+                result.set_exception(exc)
+
+        thread = threading.Thread(target=run, name="test-refresh-client", daemon=True)
+        self.record(thread)
+        thread.start()
+        return result
+
+    def raw_client(self, phase: _RefreshPhase) -> socket.socket:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sockets.append(client)
+        client.settimeout(phase.remaining())
+        client.connect(str(rpc.socket_path()))
+        client.sendall((json.dumps({
+            "method": rpc.SCHEDULER_STATUS_REFRESH_RPC_METHOD,
+            "args": {"jobid": "95cfbc03cf3e", "timeout_seconds": _REFRESH_HOLD_SECONDS},
+        }) + "\n").encode())
+        return client
+
+    def drain(self) -> None:
+        """Join actual workers, including response publication and disposal."""
+        phase = _RefreshPhase()
+        with self.lock:
+            workers = [t for t in self.threads if t.name == "vq-rpc-scheduler-refresh"]
+        for thread in workers:
+            if thread.ident is not None:
+                thread.join(timeout=phase.remaining())
+                assert not thread.is_alive(), "scheduler-refresh worker did not finish"
+        for server in self.servers:
+            with server._refresh_lock:
+                assert not server._refresh_connections
+
+    def close(self) -> None:
+        for gate in self.gates:
+            gate.release.set()
+        for client in self.sockets:
+            client.close()
+        # An old server must never unlink a replacement's still-live endpoint.
+        stop_errors = []
+        for server in reversed(self.servers):
+            try:
+                server.stop()
+            except Exception as exc:
+                stop_errors.append(exc)
+        phase = _RefreshPhase()
+        # Join accept loops first: no new refresh worker can appear afterwards.
+        with self.lock:
+            acceptors = [t for t in self.threads if t.name == "vq-rpc-server"]
+        for thread in acceptors:
+            if thread.ident is not None:
+                thread.join(timeout=max(0, phase.deadline - time.monotonic()))
+        with self.lock:
+            owned = list(self.threads)
+        for thread in owned:
+            if thread.ident is not None:
+                thread.join(timeout=max(0, phase.deadline - time.monotonic()))
+        alive = [thread.name for thread in owned if thread.is_alive()]
+        assert not alive, f"owned threads survived cleanup: {alive}"
+        assert not stop_errors, f"RPC server cleanup failed: {stop_errors}"
+        for server in self.servers:
+            with server._refresh_lock:
+                assert not server._refresh_connections
+        assert not any(gate.expired for gate in self.gates)
+
+
+@contextmanager
+def _refresh_protocol(
+    server: rpc.RPCServer, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[_RefreshProtocol]:
+    protocol = _RefreshProtocol(server)
+    original_start = threading.Thread.start
+
+    def observe_start(thread: threading.Thread) -> None:
+        if thread.name in {"vq-rpc-scheduler-refresh", "vq-rpc-server"}:
+            # Record before start, not inside the callback: delayed entry and
+            # failed test bodies must still leave an owned thread to reap.
+            protocol.record(thread)
+        original_start(thread)
+
+    with monkeypatch.context() as observer:
+        observer.setattr(threading.Thread, "start", observe_start)
+        try:
+            yield protocol
+        finally:
+            protocol.close()
+
+
 class TestSchedulerRefreshIsolation:
     """#766: actual sockets stay responsive while scheduler observations wait."""
 
@@ -1792,165 +1966,125 @@ class TestSchedulerRefreshIsolation:
     def refresh() -> dict:
         return rpc.call(
             rpc.SCHEDULER_STATUS_REFRESH_RPC_METHOD,
-            {"jobid": "95cfbc03cf3e", "timeout_seconds": 5.0},
-            timeout=6.0,
+            {"jobid": "95cfbc03cf3e", "timeout_seconds": _REFRESH_HOLD_SECONDS},
+            timeout=_REFRESH_CLIENT_SECONDS,
         )
 
     @staticmethod
     def unavailable() -> dict:
-        return {
-            "schema": "vq.scheduler.status_refresh/1",
-            "completed": False,
-            "observed_at": None,
-            "reason": "timeout",
-        }
+        return _unavailable_refresh()
 
-    def test_wait_does_not_block_health_or_admin(self, running_server):
-        from concurrent.futures import ThreadPoolExecutor
+    def test_wait_does_not_block_health_or_admin(self, running_server, monkeypatch):
+        with _refresh_protocol(running_server, monkeypatch) as protocol:
+            gate = protocol.held_callback(running_server)
+            phase = _RefreshPhase()
+            pending = protocol.submit(self.refresh)
+            gate.wait_for(1, phase)
+            assert phase.call("ping")["version"]
+            assert "ping" in phase.call("get_methods")["methods"]
+            phase.call("set_drain_state", {"state": {"enabled": True}})
+            assert phase.call("get_drain_state")["enabled"]
+            gate.assert_held()
+            assert not pending.done()
+            gate.release.set()
+            assert pending.result(timeout=_RefreshPhase().remaining()) == self.unavailable()
+            protocol.drain()
 
-        entered, release = threading.Event(), threading.Event()
-
-        def refresh(jobid, timeout):
-            entered.set()
-            assert release.wait(5)
-            return self.unavailable()
-
-        rpc.register_get_scheduler_status_refresh_method(running_server, refresh)
-        with ThreadPoolExecutor(max_workers=1) as clients:
-            pending = clients.submit(self.refresh)
-            try:
-                assert entered.wait(2)
-                assert rpc.call("ping", timeout=0.5)["version"]
-                assert "ping" in rpc.call("get_methods", timeout=0.5)["methods"]
-                rpc.call("set_drain_state", {"state": {"enabled": True}}, timeout=0.5)
-                assert rpc.call("get_drain_state", timeout=0.5)["enabled"]
-                assert not pending.done()
-            finally:
-                release.set()
-            assert pending.result(timeout=2) == self.unavailable()
-
-    def test_saturation_refuses_without_blocking_health(self, running_server):
-        from concurrent.futures import ThreadPoolExecutor
-
-        release = threading.Event()
-        entered = [threading.Event() for _ in range(4)]
-        count = 0
-        lock = threading.Lock()
-
-        def refresh(jobid, timeout):
-            nonlocal count
-            with lock:
-                position = count
-                count += 1
-            if position < 4:
-                entered[position].set()
-            assert release.wait(5)
-            return self.unavailable()
-
-        rpc.register_get_scheduler_status_refresh_method(running_server, refresh)
-        with ThreadPoolExecutor(max_workers=4) as clients:
-            pending = [clients.submit(self.refresh) for _ in range(4)]
-            try:
-                assert all(event.wait(2) for event in entered)
-                with pytest.raises(rpc.RPCError, match="scheduler refresh busy"):
-                    rpc.call(
-                        rpc.SCHEDULER_STATUS_REFRESH_RPC_METHOD,
-                        {"jobid": "95cfbc03cf3e", "timeout_seconds": 1.0},
-                        timeout=0.5,
-                    )
-                assert count == 4
-                assert rpc.call("ping", timeout=0.5)["version"]
-            finally:
-                release.set()
-            assert all(p.result(timeout=2) == self.unavailable() for p in pending)
+    def _assert_saturation(self, server, protocol):
+        gate = protocol.held_callback(server)
+        phase = _RefreshPhase()
+        pending = [protocol.submit(self.refresh) for _ in range(4)]
+        gate.wait_for(4, phase)
+        with pytest.raises(rpc.RPCError, match="scheduler refresh busy"):
+            phase.call(
+                rpc.SCHEDULER_STATUS_REFRESH_RPC_METHOD,
+                {"jobid": "95cfbc03cf3e", "timeout_seconds": _REFRESH_HOLD_SECONDS},
+            )
+        with gate.arrivals:
+            assert gate.count == 4
+        with server._refresh_lock:
+            assert len(server._refresh_connections) == 4
+        assert phase.call("ping")["version"]
+        gate.assert_held()
+        gate.release.set()
+        completion = _RefreshPhase()
+        assert all(p.result(timeout=completion.remaining()) == self.unavailable() for p in pending)
+        protocol.drain()
         assert self.refresh() == self.unavailable()
+        protocol.drain()
 
-    def test_handler_errors_release_capacity(self, running_server):
+    def test_saturation_refuses_without_blocking_health(self, running_server, monkeypatch):
+        with _refresh_protocol(running_server, monkeypatch) as protocol:
+            self._assert_saturation(running_server, protocol)
+
+    def test_handler_errors_release_capacity(self, running_server, monkeypatch):
         def broken(jobid, timeout):
             raise ValueError("observation refused")
 
-        rpc.register_get_scheduler_status_refresh_method(running_server, broken)
-        for _ in range(8):
-            with pytest.raises(rpc.RPCError, match="observation refused"):
-                self.refresh()
-        assert rpc.call("ping", timeout=0.5)["version"]
+        with _refresh_protocol(running_server, monkeypatch) as protocol:
+            rpc.register_get_scheduler_status_refresh_method(running_server, broken)
+            for _ in range(8):
+                with pytest.raises(rpc.RPCError, match="observation refused"):
+                    self.refresh()
+                protocol.drain()
+            assert _RefreshPhase().call("ping")["version"]
 
-    def test_disconnect_releases_wait_capacity(self, running_server):
-        entered, release = threading.Event(), threading.Event()
-
-        def refresh(jobid, timeout):
-            entered.set()
-            assert release.wait(5)
-            return self.unavailable()
-
-        rpc.register_get_scheduler_status_refresh_method(running_server, refresh)
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            client.connect(str(rpc.socket_path()))
-            client.sendall((json.dumps({
-                "method": rpc.SCHEDULER_STATUS_REFRESH_RPC_METHOD,
-                "args": {"jobid": "95cfbc03cf3e", "timeout_seconds": 5.0},
-            }) + "\n").encode())
-            assert entered.wait(2)
+    def test_disconnect_releases_wait_capacity(self, running_server, monkeypatch):
+        with _refresh_protocol(running_server, monkeypatch) as protocol:
+            gate = protocol.held_callback(running_server)
+            phase = _RefreshPhase()
+            client = protocol.raw_client(phase)
+            gate.wait_for(1, phase)
             client.close()
-            assert rpc.call("ping", timeout=0.5)["version"]
-        finally:
-            release.set()
-            client.close()
-        # A disconnected callback may finish only after its bounded wait. A
-        # second full four-reader wave proves that it eventually returns capacity.
-        deadline = time.monotonic() + 2
-        with running_server._refresh_lock:
-            active = bool(running_server._refresh_connections)
-        while active and time.monotonic() < deadline:
-            time.sleep(0.01)
-            with running_server._refresh_lock:
-                active = bool(running_server._refresh_connections)
-        assert not active
-        self.test_saturation_refuses_without_blocking_health(running_server)
+            assert phase.call("ping")["version"]
+            gate.assert_held()
+            gate.release.set()
+            protocol.drain()
+            # A second full wave proves disposal returned all four slots.
+            self._assert_saturation(running_server, protocol)
 
-    def test_stop_disconnects_waiter_before_replacement(self, state_dir):
-        from concurrent.futures import ThreadPoolExecutor
-
-        entered, release = threading.Event(), threading.Event()
+    def test_stop_disconnects_waiter_before_replacement(self, state_dir, monkeypatch):
         server, replacement = rpc.RPCServer(), rpc.RPCServer()
-
-        def refresh(jobid, timeout):
-            entered.set()
-            assert release.wait(5)
-            return self.unavailable()
-
-        rpc.register_get_scheduler_status_refresh_method(server, refresh)
-        server.start()
-        with ThreadPoolExecutor(max_workers=1) as clients:
-            pending = clients.submit(self.refresh)
-            try:
-                assert entered.wait(2)
-                server.stop()
-                with pytest.raises(rpc.RPCError):
-                    pending.result(timeout=1)
-                replacement.start()
-                assert rpc.call("ping", timeout=0.5)["version"]
-                assert not release.is_set()
-            finally:
-                release.set()
-                replacement.stop()
-                server.stop()
+        with _refresh_protocol(server, monkeypatch) as protocol:
+            protocol.servers.append(replacement)
+            gate = protocol.held_callback(server)
+            server.start()
+            acceptor = server._thread
+            phase = _RefreshPhase()
+            pending = protocol.submit(self.refresh)
+            gate.wait_for(1, phase)
+            server.stop()
+            assert acceptor is not None
+            acceptor.join(timeout=phase.remaining())
+            assert not acceptor.is_alive()
+            with pytest.raises(rpc.RPCError):
+                pending.result(timeout=phase.remaining())
+            replacement.register("replacement_identity")(lambda: {"replacement": True})
+            replacement.start()
+            assert phase.call("replacement_identity") == {"replacement": True}
+            gate.assert_held()
+            gate.release.set()
+            protocol.drain()
+            assert _RefreshPhase().call("replacement_identity") == {"replacement": True}
 
     def test_worker_start_failure_returns_capacity(self, running_server, monkeypatch):
-        original = threading.Thread.start
+        with _refresh_protocol(running_server, monkeypatch) as protocol:
+            original = threading.Thread.start
 
-        def refuse(thread):
-            if thread.name == "vq-rpc-scheduler-refresh":
-                raise RuntimeError("cannot start refresh worker")
-            return original(thread)
+            def refuse(thread):
+                if thread.name == "vq-rpc-scheduler-refresh":
+                    raise RuntimeError("cannot start refresh worker")
+                return original(thread)
 
-        rpc.register_get_scheduler_status_refresh_method(
-            running_server, lambda jobid, timeout: self.unavailable(),
-        )
-        monkeypatch.setattr(threading.Thread, "start", refuse)
-        for _ in range(5):
-            with pytest.raises(rpc.RPCError):
-                self.refresh()
-        monkeypatch.setattr(threading.Thread, "start", original)
-        assert self.refresh() == self.unavailable()
+            rpc.register_get_scheduler_status_refresh_method(
+                running_server, lambda jobid, timeout: self.unavailable(),
+            )
+            with monkeypatch.context() as failure:
+                failure.setattr(threading.Thread, "start", refuse)
+                for _ in range(5):
+                    with pytest.raises(rpc.RPCError):
+                        self.refresh()
+                    with running_server._refresh_lock:
+                        assert not running_server._refresh_connections
+            assert self.refresh() == self.unavailable()
+            protocol.drain()

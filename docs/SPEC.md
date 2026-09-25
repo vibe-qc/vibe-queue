@@ -90,6 +90,25 @@ proposal is retired: external schedulers use a current parallel execution path.
    * `--auto-resume` is an explicit policy for a local RUNNING job lost across
      reboot. When eligible, it emits a sibling spec in the same workspace with
      lineage recorded; it is never an implicit default.
+   * **The reattachment pass is interruptible.** The daemon installs its stop
+     handlers before the pass, not after it, and the pass gives up at the next
+     spec boundary once a stop is requested. On a large queue the pass runs for
+     minutes, and a stop that had to wait for it would be escalated to
+     `SIGKILL` by the service manager. A spec the pass never reached keeps its
+     entry state and is reconciled by the next daemon start; a spec it did
+     reach is reconciled and persisted, including any `--auto-resume` sibling
+     it earned.
+   * **Readiness does not wait for the reattachment pass.** The daemon
+     publishes its RPC socket before the pass, so health and provenance are
+     answerable from process start rather than after a pass whose cost grows
+     with the queue and with the number of live scheduler jobs it must probe
+     one at a time. A supervised host that is legitimately busy therefore
+     stays reachable, and its post-restart readiness window cannot expire on
+     a daemon that is merely slow to finish reattaching. Dispatch still waits
+     for the pass: nothing is scheduled until every surviving job has been
+     reconciled. A daemon stopped inside the pass withdraws that socket
+     before exiting and never enters its main loop, so no reader mistakes it
+     for a daemon that came up and stayed.
 3. **Durable record before execution.** The workspace and JobSpec exist before
    local process launch or remote scheduler submission. A crash in an
    acknowledgement window can leave an unowned process or scheduler job, but
@@ -273,15 +292,76 @@ parse; there is no database index. The append-only JSONL file at
 `<workspace>/_vq/events.jsonl` is best-effort observability history rather than
 a transactional journal or alternate source of truth.
 
+Because there is no index, the daemon's own per-tick scan would otherwise grow
+with every job a host has ever run. The bound is neither archival nor deletion,
+and it needs no operator action: a **settled** row — one that has reached a
+terminal state and carries no scheduler transaction that could still be open —
+is left out of the per-tick scan, so a retained history costs one `stat` per
+row per pass rather than a read and a validation — one in single-user mode,
+and in multi-user mode the private scheduler binding is checked beside it, so
+the saving is smaller there than the single-user benchmarks report. The pass
+that first sees a row reads it in full and records its on-disk identity
+(`st_mtime_ns`, `st_size`, `st_ino`, `st_dev`, and in multi-user mode the same
+for the private scheduler binding); any rewrite changes that identity and the
+row is read again.
+
+Every spec write is an atomic rename, so a rewrite never edits the row in
+place and cannot leave the identity unchanged while the content moves. It is
+**not** guaranteed to land on an inode number never used before: `os.replace`
+frees the old one, and a filesystem is free to hand it back to a later write.
+A repeat would need that reused inode together with an identical size and an
+identical `st_mtime_ns`, which is why this is a residual hazard and not a
+correctness argument — the daemon does not rely on it alone. A verdict that a
+full read contradicts is retired at that read rather than left to be made
+inert by a moving identity. Two exceptions stay on the scan at any age — a row
+whose scheduler submit is still unresolved, which must keep reserving its slot,
+and every row during the startup walk, which reaps a terminal job's leaked
+process group. Dependency gates are unaffected: a dispatch tick reads back
+exactly the settled predecessors a live spec names. The per-tick pause-intent
+sweep, which globs the directory itself rather than sharing that scan, takes
+the same verdict narrowed to the settled rows whose full read also showed no
+durable pause intent — reaching a terminal state is not on its own a statement
+about intents — so all three of a tick's walks follow the live queue. The exact
+pause admission and token-clearance proofs never take it and still scan every
+row under its lock. The skip is the daemon's
+alone: operator surfaces resolve a job by id or run their own listing pass, so
+a retained job stays exactly as visible and as retrievable as before, and
+`vq cleanup --archive` is a way to reclaim disk rather than a way to bound
+admission cost.
+
 Single-user state resolves from `VQ_STATE_DIR`, otherwise
 `XDG_DATA_HOME/vq` with `~/.local/share/vq` as the default. Multi-user mode
-uses `VQ_MULTI_USER_ROOT` or `/var/lib/vq`, puts user-owned queue/workspace/
-archive/workdir trees under `users/<uid>/`, and keeps daemon-wide control files
-at the system root. Configuration is separate: `VQ_CONFIG_DIR` or the XDG
-config root for ordinary use, and `/etc/vq/config.toml` for the standard system
+uses `VQ_MULTI_USER_ROOT` or `/var/lib/vq`, puts the user-owned queue and
+archive trees under `users/<uid>/`, and keeps daemon-wide control files at the
+system root. Configuration is separate: `VQ_CONFIG_DIR` or the XDG config root
+for ordinary use, and `/etc/vq/config.toml` for the standard system
 deployment. Moving from a single-user tree to multi-user mode is an explicit
 stopped-daemon filesystem migration; vq does not move or reinterpret the old
 tree automatically.
+
+**There are two roots, sorted by lifecycle (#63).** The **state root** above is
+durable and never pruned. The **scratch root** holds what is disposable —
+`jobs/` (the submitted workspace, a job's `cwd`) and `workdirs/` (`$VQ_WORKDIR`)
+— and is swept by age. They are separate by default: `VQ_SCRATCH_DIR`, else the
+`scratch_root` config key, else `<state-root>-scratch`, which is a derived
+sibling so it follows whatever the state root follows (`$XDG_DATA_HOME/vq-scratch`
+on a stock install, `/var/lib/vq-scratch` in multi-user mode, and
+`$VQ_STATE_DIR`-relative when that is set). `jobs_root` and `workdir_root` move
+the two trees independently for a site that wants results on durable storage;
+unset, they default together under the scratch root and are single-user only.
+
+The separation exists because the classification was wrong in practice, not in
+theory: on two measured daemon hosts job workdirs were **over 99 % of the state
+root's footprint** (132 GB of 138, 81 GB of 84) under a root documented as
+never pruned, and `vq cleanup` — which accounted for `jobs/` and not
+`workdirs/` — reported about 1 GB on the second of them.
+
+Separating the roots moves nothing. A job keeps the `cwd`, `workdir` and
+`archive_path` it recorded (below), only new dispatches select the new root,
+and cleanup, accounting and the multi-user workspace gate iterate **both** roots
+until the old one is empty. Relocating existing data is an operator runbook
+step ([the fleet layout](fleet_layout.md), phase 5), never something an upgrade
+does on its own.
 
 **Retired proposal.** The May 2026 plan for `index.sqlite`, a global event-log
 mirror, `vq reindex`, and a system-wide SQLite view never shipped. Current code
@@ -322,6 +402,12 @@ The default single-user layout is:
     <jobid>.json               # authoritative JobSpec
     <jobid>.json.lock          # advisory writer lock, created as needed
     .vq-daemon.lock            # one-daemon lock for this queue
+  archive/<dest-dirname>.tar.bz2  # jobid, or job-name-jobid when named
+  daemon.pid
+  daemon.log
+  daemon.sock
+
+<scratch-root>/                # default: <state-root>-scratch
   jobs/<jobid>/                # submitted workspace and results
     stdout.log                 # default captured-output path; spec-configurable
     stderr.log                 # default captured-output path; spec-configurable
@@ -333,11 +419,24 @@ The default single-user layout is:
       resource-usage.json      # direct or scheduler terminal resource receipt
     <submitted files and results>
   workdirs/<jobid>/            # local-job VQ_WORKDIR scratch
-  archive/<dest-dirname>.tar.bz2  # jobid, or job-name-jobid when named
-  daemon.pid
-  daemon.log
-  daemon.sock
 ```
+
+Before v0.26.10 both scratch trees were children of the state root. They still
+resolve there for every job that recorded them there, and a host that has not
+been migrated keeps its bytes exactly where they are.
+
+A spec's `cwd`, `workdir` and `archive_path` — and, for a scheduler job,
+`scheduler_remote_workspace` — are **absolute paths recorded at submit,
+dispatch and archive time**, and no read path recomputes them from the
+current roots: where a job ran is a durable fact about that job, not a
+function of the daemon's present configuration. The consequence is that moving
+a host's state to a new root relocates the bytes and not the references, and
+fetch then fails on terminal records whose artifacts are present under the new
+root. Rewriting those references is an explicit, reviewable operator action
+(`vq admin repair-state-paths`, preserving current artifact identity and digest
+through an explicitly approved old-root alias and gated behind a reviewed plan
+id), never a silent read-time fallback. An absent old root does not prove
+correspondence and blocks apply; see [the repair contract](state_path_repair.md).
 
 `VQ_ARCHIVE_DIR` and cleanup policy can move archives without moving the rest
 of the state root. The CLI's `client.log` and files such as `drain.json`,
@@ -357,9 +456,12 @@ The default multi-user layout is:
   users/<uid>/                 # provisioned and owned by that uid/gid
     queue/<jobid>.json
     queue/<jobid>.json.lock
-    jobs/<jobid>/              # same workspace shape as above
-    workdirs/<jobid>/
     archive/<dest-dirname>.tar.bz2
+
+<multi-user-scratch-root>/     # default: <system-root>-scratch
+  users/<uid>/                 # same structural policy as the state tree:
+    jobs/<jobid>/              #   root-owned <uid>/ parent, mode 0750,
+    workdirs/<jobid>/          #   uid-owned children with no group/world write
 ```
 
 Configuration and web authentication live outside those trees. Ordinary use
@@ -440,8 +542,15 @@ repeating its Pydantic type declaration.
 - **Scheduler execution:** `scheduler_target`, `scheduler_job_id`,
   `scheduler_state`, `scheduler_remote_workspace_cleaned_at`,
   `scheduler_exec_host`, `scheduler_walltime_used`,
-  `scheduler_walltime_limit`. These remain `None` or inapplicable for local
-  execution; scheduler jobs do not populate the local PID fields.
+  `scheduler_walltime_limit`, `scheduler_queued_reason`. These remain `None`
+  or inapplicable for local execution; scheduler jobs do not populate the
+  local PID fields. `scheduler_queued_reason` is the batch scheduler's own
+  verbatim explanation for a job it has not started (Torque's `qstat -f`
+  `comment`, Slurm's `squeue` `Reason`). It is set only while the cluster job
+  is queued and cleared as soon as it is not, so a consumer may read a
+  present value as "this is why the job is still waiting" without checking
+  how fresh it is. A queued job whose scheduler offers no explanation keeps
+  `None`; absence therefore means "not reported", never "no reason".
 - **Dependencies, retries, and grouping:** `depends_on`, `depends_on_any`,
   `retry_max`, `retry_count`, `array_index`, `array_total`, `array_group_id`,
   `chain_index`, `chain_total`, `chain_group_id`,
@@ -523,7 +632,7 @@ preflight, and artifact boundaries are described first. The original adapter
 and plugin design is explicitly retired below.
 
 **Current architecture: registry and launch.** Each vq configuration may define
-a strict `[programs.NAME]` registry. A program has one of three concrete kinds:
+a strict `[programs.NAME]` registry. A program has one of four concrete kinds:
 
 - `binary`: an executable path, with existence and executable-bit probes;
   recognized serial CRYSTAL frontends also receive a bounded no-input startup
@@ -550,7 +659,10 @@ a strict `[programs.NAME]` registry. A program has one of three concrete kinds:
   the same identity/freshness gate before activation, require the core to stay
   inside the slot generation, and revalidate legacy verified slots before
   reuse;
-- `import`: a Python interpreter plus a module and optional required symbols.
+- `import`: a Python interpreter plus a module and optional required symbols;
+- `scheduler`: a driver-side name without a local installation. It reports
+  `SCHEDULER_ONLY`, not local readiness, and is refused for local execution.
+  Scheduler hooks and target runtime identity retain their existing authority.
 
 `vq programs` probes and reports those entries. `vq doctor` also checks that
 scheduler program-hook and managed-runtime keys refer to registered names.
@@ -926,6 +1038,13 @@ liveness probe and a container's PID 1 need not reap them: the `SIGKILL` is
 the last thing vq does for the job, and the budget is released with it. Across
 a daemon restart the equivalent reap is the startup scan of Section 4.7.
 
+A job reattached while still running can also be killed after the restart.
+When reconciliation first observes its terminal spec, it starts the same
+10-second grace and keeps the orphan's resource reservation. At expiry it
+sends `SIGCONT` and `SIGKILL` to the process group captured at reattachment,
+stops any job scope, and releases the reservation without waiting for zombie
+members to disappear. An observed group exit releases the reservation sooner.
+
 A separate host-pressure pass reads Linux memory pressure. At the current
 internal defaults it pauses local running jobs at 85 percent pressure, holds
 new dispatch, and resumes only the jobs it paused after pressure falls below
@@ -1028,6 +1147,71 @@ and stamps `stale: true` with the failure onto the existing tree. A consumer
 can therefore age-check a fetched tree without trusting the CLI's exit code.
 Artifact-only fetches (`vq fetch --name`) write no sidecars by contract and so
 carry no manifest.
+
+Fetched workspaces and workdirs also receive `_vq/fetch-exclusions.json`
+(`vq.fetch-exclusions.v1`). A fetch is not all-or-nothing: an entry vq cannot
+read on the source host, and an archive member the extraction filter refuses on
+the receiving side, are each skipped and recorded here rather than failing the
+whole job. Each record names the path relative to the fetched tree, the stage
+(`archive` on the side holding the workspace, `extract` on the side unpacking
+it), a stable reason token, and a human detail. The emitting side ships its own
+list as a tar member and the receiving side merges it with its own, so one tree
+carries one manifest. An empty list is a positive statement that the tree is
+complete; an absent sidecar means the tree was fetched by a vq that predates
+this contract and says nothing either way. `fetch-manifest.json` carries the
+matching `partial` and `excluded_count` fields; `partial` is orthogonal to
+`stale`, since a partial tree is current but incomplete.
+
+`excluded_count` is the true total even when the list of records is capped,
+and it stays true across the merge: the emitting side's list may be capped
+before it reaches the receiver, so the receiver carries the difference forward
+rather than publishing the cap as the total. A partial tree is also a
+structurally valid one: an entry that is a hard link to something the emitting
+side could not archive has no content to resolve to, so it is excluded and
+listed in its own right rather than shipped as a link to a member that is not
+there.
+
+The extraction filter is not relaxed to accommodate this. An absolute symlink
+is a path-traversal primitive and is never extracted. The emitting side rewrites
+an absolute symlink as an equivalent relative one only when its target resolves
+inside the workspace being archived; every other refused member is skipped and
+listed.
+
+A partial fetch reports success. The bytes that arrived are the result, and
+discarding a mostly-complete workspace over one unreadable file loses more than
+it protects — but it is never silent: `vq fetch` prints a `PARTIAL` line,
+`vq fetch-all` tags the job's row and counts partials in its summary, and both
+name the sidecar. `vq fetch-all` additionally writes a run report
+(`vq.fetch-all-report.v1`, at `<output_dir>/_vq/fetch-all-report.json` unless
+`--report` moves or declines it) naming every selected job, its outcome, and
+each partial tree's exclusions, so a consumer of the corpus can state its own
+coverage without parsing the command's output.
+
+The three generated fetch sidecar paths are reserved control metadata. A raw
+workspace or archive occupying any of them, or a `_vq` entry that is not a real
+directory, fails explicitly before promotion; it is neither excluded as a
+partial entry nor overwritten. Other `_vq` lifecycle records are valid payload.
+Local copies are checked at the source and again in staging. Remote whole-tree fetch negotiates a fresh 128-bit token through the hidden
+`--fetch-protocol-token` option. The emitter returns it in the versioned
+`VQ.fetch-protocol.v1` global PAX header. The receiver checks the stream and
+control-member response against this request; missing, malformed or replayed
+responses fail before promotion. An older remote that rejects the option must
+be updated; there is no compatibility fallback that infers provenance from
+JSON schema or path. Known option rejection preserves the previous destination
+without changing its manifest. This binds a response to the cooperating emitter,
+not to arbitrary metadata replayed from a raw archive. Existing sidecar content
+validation and extraction filters remain in force. Remote protocol sidecars
+are held separately until extraction finishes: each emitter sidecar
+must be a unique canonical regular member, and payload may not populate its
+reserved path through an alias. Collision refusal preserves source bytes and
+the previous destination, including its previous manifest. Fetch does not
+remove or rename source artifacts to resolve a collision.
+
+Bulk fetch distinguishes a positive same-job idempotence signal from ordinary
+`FileExistsError`. Only the former becomes `skipped`; ordinary destination or
+metadata collisions, `OSError`, and `TarError` are per-job error rows. Later
+jobs continue. Programming errors and cancellation still propagate. The CLI's
+existing archived-job selection rule is unchanged.
 
 **Retired proposal.** vq does not capture `siginfo`, a 256 KB stdout window,
 `dmesg`, `kernel.core_pattern`, or a discovered core-file path. It does not
@@ -1384,16 +1568,34 @@ scheduler backend uses the same local systemd mechanism.
 
 **Classification: current managed workdirs and scheduler scratch plus retired
 proposal.** A local dispatch receives one deterministic workdir at
-`<state-root>/workdirs/<jobid>` in single-user mode or
-`<system-root>/users/<uid>/workdirs/<jobid>` in multi-user mode. vq exports
-that absolute path as `VQ_WORKDIR`; it is separate from the submitted workspace
-used as the command's current directory.
+`<scratch-root>/workdirs/<jobid>` in single-user mode or
+`<multi-user-scratch-root>/users/<uid>/workdirs/<jobid>` in multi-user mode. vq
+exports that absolute path as `VQ_WORKDIR`; it is separate from the submitted
+workspace used as the command's current directory. Both roots were children of
+the state root before v0.26.10 (#63) and a job that recorded a path there keeps it.
 
 Immediate terminal cleanup is opt-in through the job's clean-workdir setting.
-In multi-user mode the root daemon never deletes the mutable `spec.workdir`
-target. It retains the trusted owner and owner-qualified spec path at admission,
-derives the sole permissible managed owner/job workdir, requires the recorded
-path to match it exactly, and performs descriptor-relative no-follow checks.
+**Neither mode deletes the mutable `spec.workdir` target as given.** The
+recorded path is evidence, not the deletion target: it must name *this* job
+directly under one of the workdir roots vq manages — the current one or the
+pre-#63 one — or the removal is refused and the refusal is recorded on the spec
+for `vq status`. The matching root is then opened
+`O_RDONLY | O_DIRECTORY | O_NOFOLLOW`, so the configured root may be on any
+volume and may not itself be a symlink; the entry is `lstat`-ed and removed
+relative to that descriptor, so no component can be swapped between the check
+and the removal; and an entry owned by another uid is refused rather than
+removed. Making the root configurable therefore widened *where* scratch may
+live without widening *what* may be deleted. The same primitive backs the
+age sweep and `vq cleanup --delete`.
+
+`vq cleanup` accounts for and removes workdir bytes at the path each job
+recorded — the current root, the pre-#63 root under the state root, or a root
+the host has since been configured away from. It did not account for them at
+all before #63, which is why it reported about 1 GB on a host whose workdirs
+held 81 GB, and it accounted for none of them outside the current pair until
+the follow-up. The age sweep enumerates the configured roots plus every root
+the queue's own records name; a workdir with no record, under a root no record
+names, is an operator's to remove.
 Path mismatch, traversal, symlink, non-directory, and metadata failures skip
 deletion and append an operator-visible diagnostic without changing the
 terminal state. Cleanup occurs only after the local child or reattached orphan
@@ -1705,8 +1907,9 @@ execution boundary. The old semi-trusted web-user privacy model is retired.
   spec as untrusted. The numeric state-directory name is the authoritative uid;
   the spec's submitter must match it. Job ids are safe path components and the
   inner id must match the queue filename. The daemon owns each structural
-  `users/<uid>` directory as `root:<primary-gid>` mode `0750`; its writable
-  `queue`, `jobs`, `archive`, and `workdirs` children remain owned by the target
+  `users/<uid>` directory as `root:<primary-gid>` mode `0750` — in the state
+  tree and, since #63, in the scratch tree, under the same policy; the writable
+  `queue`, `archive`, `jobs`, and `workdirs` children remain owned by the target
   uid/gid, retain existing read/execute bits, and lose group/world write bits.
   The state/control root is real and daemon-owned; its documented
   `root:vq-admins` mode `2775` makes the trusted admin group part of this
@@ -1988,7 +2191,42 @@ Torque and Slurm are implemented as dialects over the same
   path. The dispatcher stages a remote working copy over SSH, renders a
   scheduler script, and submits with `qsub` or `sbatch`.
 - Reconciliation batches `qstat` or `squeue` by scheduler host. `qstat -f` or
-  `sacct` adds scheduler state, execution-host, and walltime detail. The vq
+  `sacct` adds scheduler state, execution-host, and walltime detail. A batch
+  is never one handle per command, and never one command of unbounded size
+  either: a host's handles are split into the fewest invocations that keep
+  each rendered remote command within a fixed byte cap, issued in order, and
+  the first that fails aborts the rest of the observation. A pass whose live
+  poll failed does not issue the detail poll, whose result it would discard.
+  When a poll does not come back with an answer from the host, that host's next
+  observation is deferred, and the deferral lengthens with each further
+  unanswered attempt, up to a fixed ceiling. Two outcomes count as unanswered:
+  the host *refused the connection itself* — ssh reporting a banner exchange
+  that timed out, or a peer that closed, reset or did not route the connection
+  — and an attempt whose outcome vq never learned, such as its own poll timeout
+  or a lost local observer. Neither establishes that the host answered, and a
+  login node that accepts the connection and then hangs before the banner
+  produces the second rather than the first. The deferral is cleared by the
+  next poll that does reach the host, which includes one that reaches it and
+  fails: a rejected key, a missing scheduler binary or an unparseable table is
+  a standing fault that waiting cannot help and that must stay visible, so it
+  ends the run and returns the host to the ordinary cadence.
+
+  The deferral is per scheduler host, and never per job, per dispatcher object
+  or per the host's current queue. The connection a host did not answer is the
+  one connection its whole batch rides on, so a newly submitted job cannot
+  reopen a host that is turning vq away. It is keyed on the configured target
+  name, so a config reload — which rebuilds a target's dispatcher while its
+  in-flight jobs keep the generation they were submitted with — leaves one host
+  with one cooldown, one batched observation and one fetch turn rather than one
+  of each per generation. It outlives the host's last running job, because the
+  escalation is a fact about the host and a campaign that keeps submitting must
+  not restart it; a host with no running job is forgotten only after a whole
+  ceiling with no attempt. A deferred pass performs no observation and
+  therefore claims none: it writes nothing, and a job's lifecycle and
+  `scheduler_state` stay exactly as its last real attempt left them. An
+  operator-requested status refresh does not break the deferral — vq's own
+  connections are part of what the host is turning away — and is answered with
+  the deferral named as its reason rather than left to time out. The vq
   lifecycle remains RUNNING after submission while `scheduler_state` carries
   queued, running, held, or retry detail. Production keeps at most one bounded,
   read-only observation in flight per scheduler host; completed observations
@@ -2011,8 +2249,36 @@ Torque and Slurm are implemented as dialects over the same
 - Terminal workspaces are fetched back to the driver when available; bounded
   retrieval failure is recorded without hiding an authoritative return code.
   The state root does not move to a scheduler-side shared filesystem.
-- `scheduler_job_id` and the deterministic remote workspace let the driver
+- `scheduler_job_id` and the **recorded** remote workspace let the driver
   reattach after restart; cancellation routes through `qdel` or `scancel`.
+  `spec.scheduler_remote_workspace` is written in the same durable
+  PENDING → SUBMITTING transition that precedes `qsub`/`sbatch`, so the record
+  exists before anything reaches the scheduler, and every later step —
+  reattachment, uncertain-submit reconciliation, retry-evidence rotation,
+  polling, log reads, fetch and remote cleanup — addresses that path instead
+  of recomputing it from the host's current `scratch_root`. Remote cleanup
+  checks the recorded path's *shape* (absolute, normalised, final component
+  equal to the vq job id, parent ending in the configured `job_root`) rather
+  than equality with the current jobs root, so changing `scratch_root` neither
+  strands a staged workspace nor makes it permanently un-reapable. A record
+  that predates the binding is bound when the driver *reattaches* to it, which
+  is a driver start and not a poll tick, and the driver refuses to adopt a
+  changed `scratch_root` for a host while any job on it that **may already
+  have been staged** carries no such record — it keeps serving the previous
+  root until those jobs bind or drain, because nothing but the old derivation
+  can locate their workspaces. "May already have been staged" is the test
+  because dispatch is the only thing that stages: a job still PENDING on its
+  first attempt has nothing on the host, and counting it held a continuously
+  fed host at its previous root indefinitely.
+
+  The driver defends only a root it *knows* was in force, which is the one it
+  recorded when it adopted it. On a first start with no such record — the one
+  case the refusal could not see, because the record is written by the code
+  that added it — a host whose jobs may already be staged is served its
+  configured root **without those jobs being bound to it**, and the root is
+  recorded unconfirmed rather than adopted: an unproven derivation is undone
+  by putting the key back, and a workspace written onto a pre-upgrade spec is
+  not. `vq doctor HOST` reports a host that is held or unconfirmed, and why.
 
 `pbspro` and `sge` remain accepted `scheduler_dialect` vocabulary but have no
 implementation; selecting either dialect fails closed instead of guessing flags.
@@ -2026,6 +2292,8 @@ site portability comes from explicit host configuration:
 
 - `scheduler = "local"` is the default; a scheduler host must declare its
   dialect, absolute scratch root, SSH target, and always-on `scheduler_driver`.
+- The single-user scratch root comes from `VQ_SCRATCH_DIR`, otherwise the
+  `scratch_root` config key, otherwise `<state-root>-scratch`.
 - The single-user state root comes from `VQ_STATE_DIR`, otherwise the XDG/default
   layout; multi-user mode has its separate system root. It is not a TOML host
   setting, and only fields that need stable host-wide locations are validated
@@ -2040,6 +2308,18 @@ The original draft's Python entry-point adapter system, `disabled_adapters`,
 and web-brand settings are not implemented scheduler requirements. Plugin-based
 adapter discovery is a retired proposal for this workstream; site branding is a
 future consideration, not part of the scheduler contract.
+
+**Invariant: vq never force-pushes into a site's source mirror.** A profile
+with `feed_source_mirror` feeds an offline build node's push-fed mirror before
+preparation. That feed is additive only: an unforced, atomic push of the
+immutable per-pin ref `refs/vq/pins/<sha>`, the lane's branch pair, and the
+tags naming that pin. Refs the feed does not name stay byte-identical, and no
+option makes the feed force, rewind or mirror a whole namespace. A ref update
+that would need a force is refused before the push and leaves the mirror, the
+active runtime and the canonical LAST OK record unchanged. In particular, an
+accepted pin older than the mirror's lane branch fails visibly and is resolved
+by a human deliberately; vq does not silently build a newer tree than the one
+that was accepted, and does not rewind the mirror to make an older pin fit.
 
 ---
 
@@ -2287,7 +2567,8 @@ These are stated explicitly so they do not get re-litigated every six months.
 - **Event log:** Per-job append-only JSONL of state transitions and notable events. Source of truth for "what happened."
 - **JobSpec:** Declarative description of a job, on disk as JSON. Backend-agnostic.
 - **Profile:** Named bundle of adapter + resource defaults + adapter config, invoked by name at submit.
-- **State root:** The directory holding all vq state for a daemon. Defaults to `~/.local/share/vq/`, override via `$VQ_STATE_DIR`.
+- **State root:** The directory holding a daemon's durable vq state — the queue, its locks, archives and the daemon's own control files. Defaults to `~/.local/share/vq/`, override via `$VQ_STATE_DIR`. Never pruned.
+- **Scratch root:** The directory holding a daemon's disposable per-job trees, `jobs/` and `workdirs/`. Defaults to `<state-root>-scratch`, override via `$VQ_SCRATCH_DIR` or the `scratch_root` config key. Swept by age; separate from the state root by default since v0.26.10 (#63).
 - **Watchdog:** The supervision component that samples running jobs and enforces resource limits.
 - **Workspace:** Per-job directory holding inputs, outputs, and `_vq/` metadata.
 

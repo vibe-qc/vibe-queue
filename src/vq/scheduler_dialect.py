@@ -72,6 +72,46 @@ def enforce_scheduler_wall_time_limit(
     )
 
 
+def scheduler_width_warning(
+    requested_cpus: int | None,
+    maximum_cpus: int | None,
+    *,
+    scheduler_host: str | None = None,
+    partition: str | None = None,
+) -> str | None:
+    """Warn about an ask wider than the lane can ever run, or ``None``.
+
+    Deliberately a *warning*, unlike
+    :func:`enforce_scheduler_wall_time_limit`. A width limit is a capacity
+    observation and capacity changes: a node comes back, a partition is
+    resized, the declared figure goes stale. Refusing on a stale number would
+    reject work the cluster can now run, so the operator is told and the
+    submission proceeds.
+
+    An unknown maximum warns about nothing -- ``None`` means "not declared",
+    never "unlimited".
+    """
+    if (
+        requested_cpus is None
+        or maximum_cpus is None
+        or requested_cpus <= maximum_cpus
+    ):
+        return None
+    lane = (
+        f"scheduler lane {scheduler_host!r}"
+        if scheduler_host is not None
+        else "scheduler lane"
+    )
+    if partition is not None:
+        lane += f" (partition {partition!r})"
+    return (
+        f"{lane} declares at most {maximum_cpus} cpu(s) per job; "
+        f"this asks for {requested_cpus}. The scheduler will accept it and "
+        "may never start it. Check `vq scheduler-probe` and resize, or "
+        "update scheduler_max_cpus if the lane has grown."
+    )
+
+
 class SchedulerPhase(Enum):
     """Coarse, scheduler-agnostic phase derived from scheduler status output.
 
@@ -101,6 +141,12 @@ class QstatDetail:
     landed on and how much of its walltime budget it has used. The execution
     host and used walltime may be absent while queued, and every detail field is
     optional except ``raw_state``.
+
+    ``queued_reason`` is the scheduler's own verbatim explanation for a job
+    that has not started -- Torque's ``comment`` and Slurm's ``Reason``. It is
+    set only while the job is PENDING, because those strings answer "why is
+    this not running yet" and mean nothing once it is. A queued job whose
+    scheduler offers no explanation keeps ``None``.
     """
 
     raw_state: str
@@ -108,6 +154,7 @@ class QstatDetail:
     walltime_used: str | None = None
     walltime_limit: str | None = None
     exit_code: int | None = None
+    queued_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -213,6 +260,16 @@ class SchedulerDialect(Protocol):
 
         Jobs absent from the output have left the queue; the dispatcher (which
         knows which ids it asked about) treats an absent id as FINISHED.
+        """
+        ...
+
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        """``{job_id: reason}`` from the *same* poll stdout, pending jobs only.
+
+        The scheduler's verbatim answer to "why has this not started", for the
+        dialects whose coarse poll carries one. A dialect that reports the
+        reason elsewhere (Torque, in the detail poll's ``comment``) returns an
+        empty mapping here.
         """
         ...
 
@@ -489,6 +546,13 @@ class TorqueDialect:
             result[fields[0]] = self.phase_for_state(fields[-2])
         return result
 
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        # Torque's coarse qstat table has no reason column. The queued
+        # explanation arrives with the detail poll instead, as `comment` in
+        # the `qstat -f` block, and is carried on QstatDetail.queued_reason.
+        del stdout
+        return {}
+
     def detail_command(self, job_id: str) -> list[str]:
         return ["qstat", "-f", job_id]
 
@@ -504,9 +568,47 @@ class TorqueDialect:
         return ["qstat", "-f", *job_ids]
 
     # A `qstat -f` record opens with "Job Id: <id>"; the body is `key = value`
-    # lines (some wrapped onto indented continuation lines, which we ignore --
-    # the fields we read fit one line on a single-node job).
+    # lines. Torque wraps a long value by inserting a newline and a tab, so
+    # continuation lines are rejoined before the fields are read: a queued
+    # job's `comment` -- the scheduler's own explanation for why it has not
+    # started -- is routinely long enough to wrap, and so is the `exec_host`
+    # list of a multi-node job.
     _DETAIL_FIELD = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(.*?)\s*$")
+
+    @staticmethod
+    def _unwrap_detail_lines(lines: Sequence[str]) -> list[str]:
+        """Rejoin Torque's tab-continued value lines into whole fields.
+
+        Torque breaks a long attribute value with a newline and a tab, so
+        dropping the leading tab and concatenating restores the original string
+        (the space either side of the break is part of the value). A site whose
+        qstat wraps some other way simply leaves the value as it arrived, which
+        is the pre-existing truncated-but-harmless behaviour rather than a
+        mangled one.
+        """
+        joined: list[str] = []
+        for line in lines:
+            if line.startswith("\t") and joined:
+                joined[-1] += line[1:]
+                continue
+            joined.append(line)
+        return joined
+
+    def _pending_comment(self, raw_state: str, comment: str | None) -> str | None:
+        """A queued job's ``comment``, or ``None`` once it is not queued.
+
+        Torque reuses ``comment`` for run-time annotations, so it is only the
+        "why is this not running" answer while the job is PENDING. An
+        unrecognized state yields ``None`` rather than raising: a parse of
+        live telemetry must not fail the whole poll over one odd record.
+        """
+        if not comment:
+            return None
+        try:
+            phase = self.phase_for_state(raw_state)
+        except DialectError:
+            return None
+        return comment if phase is SchedulerPhase.PENDING else None
 
     def parse_qstat_detail(self, stdout: str) -> dict[str, QstatDetail]:
         result: dict[str, QstatDetail] = {}
@@ -514,7 +616,7 @@ class TorqueDialect:
         # preamble before the first header.
         blocks = re.split(r"(?im)^Job Id:\s*", stdout)
         for block in blocks[1:]:
-            lines = block.splitlines()
+            lines = self._unwrap_detail_lines(block.splitlines())
             job_id = lines[0].strip()
             if not job_id:
                 continue
@@ -523,11 +625,15 @@ class TorqueDialect:
                 m = self._DETAIL_FIELD.match(line)
                 if m:
                     fields[m.group(1)] = m.group(2)
+            raw_state = fields.get("job_state", "")
             result[job_id] = QstatDetail(
-                raw_state=fields.get("job_state", ""),
+                raw_state=raw_state,
                 exec_host=fields.get("exec_host"),
                 walltime_used=fields.get("resources_used.walltime"),
                 walltime_limit=fields.get("Resource_List.walltime"),
+                queued_reason=self._pending_comment(
+                    raw_state, fields.get("comment")
+                ),
             )
         return result
 
@@ -678,22 +784,59 @@ class SlurmDialect:
         return match.group(1)
 
     def poll_command(self, job_ids: Sequence[str]) -> list[str]:
+        # %r (the pending reason) rides along on the coarse poll: Slurm reports
+        # why a job has not started in squeue and nowhere in sacct, so reading
+        # it here costs no extra round trip on the poll path.
         return [
             "squeue",
             "--noheader",
-            "--format=%i|%T|%M|%l|%N",
+            "--format=%i|%T|%M|%l|%N|%r",
             "--jobs",
             ",".join(job_ids),
         ]
+
+    # The trailing %r is free text ("Resources", "Priority",
+    # "ReqNodeNotAvail, UnavailableNodes:node[1-4]"), so a row is split with a
+    # bounded maxsplit: a delimiter inside the reason lands in the reason
+    # rather than making an otherwise sound row look malformed and failing the
+    # whole host's poll. Too *few* fields is still a hard parse error.
+    _POLL_FIELD_COUNT = 6
+
+    def _split_poll_row(self, line: str) -> list[str]:
+        fields = line.split("|", self._POLL_FIELD_COUNT - 1)
+        if (
+            len(fields) < self._POLL_FIELD_COUNT
+            or not fields[0].strip()
+            or not fields[1].strip()
+        ):
+            raise DialectError("malformed squeue row in scheduler poll output")
+        return fields
+
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        """``{job_id: reason}`` for the pending jobs in one squeue poll.
+
+        Only PENDING rows carry an explanation; squeue prints the placeholder
+        ``None`` for a job that is already running, which is dropped here so a
+        caller never records "None" as a reason.
+        """
+        reasons: dict[str, str] = {}
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = self._split_poll_row(line)
+            if self.phase_for_state(fields[1].strip()) is not SchedulerPhase.PENDING:
+                continue
+            reason = fields[self._POLL_FIELD_COUNT - 1].strip()
+            if reason and reason.lower() != "none":
+                reasons[fields[0].strip()] = reason
+        return reasons
 
     def parse_poll(self, stdout: str) -> dict[str, SchedulerPhase]:
         result: dict[str, SchedulerPhase] = {}
         for line in stdout.splitlines():
             if not line.strip():
                 continue
-            fields = line.split("|")
-            if len(fields) != 5 or not fields[0].strip() or not fields[1].strip():
-                raise DialectError("malformed squeue row in scheduler poll output")
+            fields = self._split_poll_row(line)
             job_id = fields[0].strip()
             if job_id in result:
                 raise DialectError(

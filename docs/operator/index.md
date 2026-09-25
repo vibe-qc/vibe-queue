@@ -58,8 +58,13 @@ mode, not what you get by using `sudo`.
 * [Multi-user deployment](../multi_user_deployment.md) — privileged shared
   installation under `/opt/vq`, ownership checks, admin group.
 * [Retiring a multi-user deployment](../multi_user_retirement.md).
+* [One directory layout for every host](../fleet_layout.md) — homes sorted by
+  lifecycle, the reviewed-plan migration tool, and the steps that need the
+  maintainer first.
 * [Scheduler runtime deployment](../scheduler_runtime_deployment.md) — hosts
   where PBS or SLURM, not a vq daemon, owns dispatch.
+* [Repair recorded state paths](../state_path_repair.md) — plan and preserve
+  terminal records after an explicitly mapped state-root move.
 * [Operations](../operations.md) — the long-form operational reference.
 
 ## When a host stops answering
@@ -96,6 +101,8 @@ the moment you need a second way in is the moment you cannot set one up.
 ../fleet_console
 ../multi_user_deployment
 ../multi_user_retirement
+../state_path_repair
+../fleet_layout
 ../scheduler_runtime_deployment
 ../operations
 ../host_recovery_channels

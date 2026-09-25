@@ -141,6 +141,17 @@ regular file at mode 0600. Both are created automatically. All workers of one
 console must use the same local configuration directory. Separate replicas
 with separate disks do not share revocation or login budgets.
 
+SQLite serializes writers, so on a busy console the workers contend for the
+store: they are separate processes, and the most contended moment is several of
+them racing to create the store's tables on first use. A statement waits up to
+**15 seconds** for another worker before giving up with `database is locked`.
+That budget was 2 seconds, which a loaded CI runner exceeded, failing a request
+that would have succeeded a moment later. Raising it costs latency only while
+the lock is actually held, and the work runs in a worker thread rather than on
+the event loop. A store that is genuinely wedged still surfaces an error rather
+than hanging. `scripts/measure_session_lock_budget.py` measures what a given
+host needs if the default ever has to be revisited.
+
 Upgrading from stateless sessions signs every browser out once. Log in again;
 the existing account format remains valid. Login and account creation limit
 usernames to 128 characters and passwords to 1024 characters; an existing

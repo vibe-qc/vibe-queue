@@ -54,7 +54,6 @@ falls back to "localhost" with no extra metadata, preserving v0.1 behavior.
 
 from __future__ import annotations
 
-import copy
 import math
 import os
 import re
@@ -63,7 +62,7 @@ import tomllib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -461,17 +460,39 @@ class SchedulerRuntimeDeployment(BaseModel):
     feed_source_mirror: str | None = None
     """Path (login-host-relative or absolute) of a PUSH-FED bare source
     mirror to feed with the exact ``--expected-sha`` before preparation.
-    pbs-cluster's compute build node is offline and the online login node is not
-    provisioned with private GitLab credentials, so its mirror at
-    ``.local/share/vq-pbs-cluster/vibeqc.git`` is authoritative only for what has
-    been pushed into it. When set, ``vq admin update PROGRAM HOST`` pushes
-    the exact SHA into the two refs for that profile -- ``refs/heads/release``
-    plus ``refs/remotes/origin/release`` for ``vibeqc-release``, or the
-    corresponding ``main`` refs for branch-tip programs -- together with all
-    tags from the driver's :attr:`Config.scheduler_runtime_source_repo`
-    (which is therefore required) over the host's ssh alias. Keeping the ref
-    pairs separate prevents a release feed from replacing the dev identity and
-    replaces the manual per-release feed step from the fleet runbook.
+    An offline compute build node with a login node that carries no source
+    credentials makes its mirror authoritative only for what has been pushed
+    into it. When set, ``vq admin update PROGRAM HOST`` feeds that mirror from
+    the driver's :attr:`Config.scheduler_runtime_source_repo` (which is
+    therefore required) over the host's ssh alias, and replaces the manual
+    per-release feed step from the fleet runbook.
+
+    **The feed never forces anything** (#81). One unforced, ``--atomic``
+    ``git push`` carries exactly four kinds of ref:
+
+    * ``refs/vq/pins/<sha>`` -- the immutable per-pin ref. Its name is the
+      commit it names, so feeding it is a creation or an exact no-op, and the
+      accepted pin stays addressable however the branches later move.
+    * ``refs/heads/release`` and ``refs/remotes/origin/release`` for
+      ``vibeqc-release``, or the corresponding ``main`` pair for branch-tip
+      programs. Keeping the pairs separate stops a release feed from replacing
+      the dev identity; feeding them atomically stops a half-fed lane, which
+      is what every preparer fails closed on.
+    * the tags that name this pin in the driver's clone -- the requested
+      release identity, not the whole tag namespace.
+
+    Anything that would need a force is refused **before** the push, with the
+    mirror's own values in the message, and the mirror is left byte-identical:
+    a lane branch that has moved past the accepted pin, a diverged branch, a
+    mirror commit the driver's clone does not contain, or a tag the mirror
+    already holds at another object. A legitimate but *older* accepted pin is
+    therefore a visible refusal an operator resolves deliberately, never a
+    silent pick-up of whatever newer tree the mirror drifted to. Refs and tags
+    the feed does not name are never touched at all.
+
+    ``--atomic`` needs git >= 2.4 on the receiving end; an older one refuses
+    the push, which is the correct failure for a feed that must be
+    all-or-nothing.
 
     **The mirror must already exist and be push-fed**: a bare repository whose
     ``origin`` names its own path, which is how the preparer tells a push-fed
@@ -684,7 +705,21 @@ class HostConfig(BaseModel):
     """Absolute directory on the scheduler host under which staged
     workspaces and ``$VQ_WORKDIR``-equivalent scratch live (e.g.
     ``/home/USER`` when the cluster has no dedicated ``/scratch``). Required
-    when ``scheduler`` is not ``local``."""
+    when ``scheduler`` is not ``local``.
+
+    The scheduler-host half of one concept; the top-level
+    :attr:`Config.scratch_root` says the same thing for the host this config
+    belongs to (#63).
+
+    Changing it is safe under jobs in flight since #63: a job records the
+    workspace it was staged into (``spec.scheduler_remote_workspace``)
+    **before** the submission boundary, and every later step -- reattachment,
+    uncertain-submit reconciliation, retry, polling, log reads, fetch and
+    remote cleanup -- uses that recorded path rather than recomputing it from
+    the current value. A pre-#63 non-terminal job carries no such record; the
+    daemon binds it on its next observation and refuses to adopt a changed
+    ``scratch_root`` for this host until every non-terminal job on it is
+    bound."""
 
     node_scratch_dir: str | None = None
     """Optional node-local scratch directory **template** on the compute node
@@ -732,6 +767,28 @@ class HostConfig(BaseModel):
     This is a pre-admission safety boundary, not a capacity observation.
     ``None`` means the limit is unknown, not that the scheduler is unlimited.
     Scheduler-host-only; local hosts must leave it unset.
+    """
+
+    scheduler_max_cpus: Annotated[
+        int,
+        Field(strict=True, gt=0),
+    ] | None = None
+    """Operator-declared widest request this scheduler lane can ever run.
+
+    The companion to ``scheduler_max_wall_time_seconds``, and read the same
+    way: a pre-admission boundary, not a live capacity observation. ``None``
+    means unknown, not unlimited.
+
+    Unlike wall time, exceeding this does **not** refuse the submission. A
+    node census goes stale -- a node returns to service, a partition is
+    resized -- and refusing on a stale number would reject work the cluster
+    can now run. ``vq submit`` warns instead, which is what the vibe-qc#148
+    starvation needed: the request was admitted and then never started, with
+    nothing anywhere saying it could not.
+
+    `vq scheduler-probe HOST` reports the figure to put here as
+    ``capacity.max_cpus_when_free``. Scheduler-host-only; local hosts must
+    leave it unset.
     """
 
     scheduler_prologue: list[str] = Field(default_factory=list)
@@ -937,6 +994,10 @@ class HostConfig(BaseModel):
                     "scheduler_max_wall_time_seconds must be unset when "
                     "scheduler = 'local'"
                 )
+            if self.scheduler_max_cpus is not None:
+                raise ValueError(
+                    "scheduler_max_cpus must be unset when scheduler = 'local'"
+                )
             if self.scheduler_dialect is not None:
                 raise ValueError(
                     "scheduler_dialect must be unset when scheduler = 'local'"
@@ -1099,6 +1160,7 @@ class HostConfig(BaseModel):
         return {
             "partition": partition,
             "max_wall_time_seconds": self.scheduler_max_wall_time_seconds,
+            "max_cpus": self.scheduler_max_cpus,
             "source": "host-config",
         }
 
@@ -1124,7 +1186,8 @@ class ProgramAvailability:
 
     ``status`` is ``OK``, ``MISSING`` (work dispatched here will fail) or
     ``UNHEALTHY`` (the runtime loads; its configured healthcheck does not
-    pass). ``healthcheck_status`` is one of the ``_program_probe.HEALTHCHECK_*``
+    pass), or ``SCHEDULER_ONLY`` (no local installation; target not probed).
+    ``healthcheck_status`` is one of the ``_program_probe.HEALTHCHECK_*``
     values for a venv program and ``None`` for kinds without a healthcheck.
     """
 
@@ -1244,12 +1307,29 @@ class VenvProgram(_ProgramBase):
     Distinct from :attr:`update_script` because the two are genuinely
     different operations: one builds an environment that does not exist, the
     other refreshes one that does. ``vq admin install`` never runs the update
-    script, and ``vq admin update`` never runs this one."""
+    script, and ``vq admin update`` never runs this one.
+
+    When this program declares :attr:`extras`, the floor is appended to this
+    command as ``--extras PROFILE`` -- last, so it decides, and resolved over
+    whatever profile is configured here. That happens only when this is vq's
+    own ``scripts/install.sh`` or ``scripts/update.sh``, the same proof the
+    managed update requires before it names an install target; a declaration
+    any other installer would have to apply refuses the install instead."""
 
     update_script: str | None = None
     """Relative path under ``git_dir`` of the script to run after
-    ``git pull``. None means "no script, just the pull." Reserved for
-    v0.6.0's ``vq admin update``; ``vq programs`` doesn't run it."""
+    ``git pull``. None means "no script, just the pull." ``vq programs``
+    doesn't run it.
+
+    When this program declares :attr:`extras` **and** this command is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh`` inside this program's
+    checkout, the floor is appended to it as ``--extras PROFILE`` -- last, so
+    it decides, and resolved over the profile the run would otherwise install:
+    an operator's ``--update-script-arg --extras PROFILE``, else what
+    ``.vq-install-metadata`` records, else ``core``. With any other command,
+    the update runs exactly as it always has and says that the declaration was
+    not its to apply. Unlike the managed daemon transaction, this appends no
+    ``--recreate-venv``: it reinstalls into the existing environment."""
 
     runtime_slot_root: str | None = None
     """Opt this venv program into per-SHA runtime slots, rooted here.
@@ -1279,6 +1359,29 @@ class VenvProgram(_ProgramBase):
     is a hand-edited file, where rejecting a typo is worth having.)
     """
 
+    runtime_slot_execution: bool = False
+    """Explicitly select verified slots for this program's local execution.
+
+    The stored source/interpreter remain the legacy build inputs and compatible
+    paths. Execution consumers resolve one verified generation and retain its
+    exact paths; admin preparation still uses the stored inputs. Migration must
+    enable every alias together, after preparing the first verified generation.
+    Merely setting runtime_slot_root continues to opt in only to slot builds.
+    """
+
+    runtime_slot_build_input: Literal["legacy", "current"] = "legacy"
+    """Where the next runtime generation is cloned from.
+
+    ``"legacy"`` (the default) clones from the registered ``git_dir``, which
+    must therefore remain on disk. ``"current"`` clones from the active
+    verified generation, whose ``origin`` is the configured upstream, so the
+    registered ``git_dir``/``python`` become compatibility paths that may be
+    retired. Requires ``runtime_slot_execution``. The updater entry points and
+    virtualenv name are still derived from the registered paths, which are
+    only read as path arithmetic. Same reader-first rollout rule as
+    ``runtime_slot_root``: update every vq that reads this config first (#72).
+    """
+
     extras: list[str] = Field(default_factory=list)
     """Optional dependency groups this program's virtualenv **requires**.
 
@@ -1299,11 +1402,11 @@ class VenvProgram(_ProgramBase):
     --update-script-arg --extras --update-script-arg PROFILE`` of #11, which
     changes one environment once. That is the right tool for "fix this host
     now"; this is the right one for "this venv is *for* serving the console",
-    because it is re-applied on every managed rebuild and it survives a venv
-    rebuilt outside that path -- a fresh provision, ``install.sh``,
-    ``reinstall.sh`` -- where ``.vq-install-metadata`` dies with the venv it
-    described. An operator request that does not cover this declaration is
-    refused rather than silently widened.
+    because it is re-applied on every rebuild vq performs and it survives a
+    venv rebuilt by a script run directly -- ``install.sh``, ``reinstall.sh``
+    -- where ``.vq-install-metadata`` dies with the venv it described. An
+    operator request that does not cover this declaration is refused rather
+    than silently widened.
 
     Concretely (coordinator, 2026-09-09): one venv served ``vq-daemon`` and
     ``vq-web``; its recorded profile was ``core``; ``vq web install`` had
@@ -1318,14 +1421,36 @@ class VenvProgram(_ProgramBase):
     ``all`` rather than dropping its test tooling. See
     :func:`vq.admin._resolve_extras_profile`.
 
-    **Where it takes effect:** the managed daemon transaction -- ``vq admin
-    update`` / ``vq self-update`` on the env serving this host's daemon. That
-    is the one path that has proved the updater is vq's own
-    ``scripts/update.sh`` before naming an install target on it; an ordinary
-    update runs whatever ``update_script`` says, which for a vibe-qc or
-    vibe-view program is a script that has never heard of ``--extras``. An
-    update that cannot apply a declaration says so rather than passing over it
-    (:func:`vq.admin._warn_if_declared_extras_are_inert`).
+    **Where it takes effect:** wherever vq itself builds the venv, which is
+    every build vq performs and no other. That is the managed daemon
+    transaction (``vq admin update`` / ``vq self-update`` on the env serving
+    this host's daemon), a fresh ``vq admin install``, and an ordinary ``vq
+    admin update`` on any other program. All three rest on one proof: the
+    command vq is about to name an install target on is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh``, resolved inside the
+    checkout this program points at (:func:`vq.admin._vq_own_script_proof`).
+    The proof is what makes naming the target safe, and it is the only thing
+    that decides: a program whose scripts are its own is built exactly as it
+    always was.
+
+    What a *failed* proof means differs, because the verbs stand at different
+    points in an environment's life. An update has a built, possibly serving
+    environment to leave alone, so it leaves it alone and says that it did
+    (:func:`vq.admin._warn_if_declared_extras_are_inert`). An install has
+    nothing to leave alone: it is about to create the venv, and creating it
+    without the runtime the program declares is precisely the failure this key
+    exists to prevent, so it is **refused** and names the remedy
+    (:func:`vq.admin._declared_extras_install_args`). A program that declares
+    nothing is unaffected by any of them.
+
+    A program carrying :attr:`install_script` and no :attr:`update_script` has
+    exactly one of those routes, and it fires once. There is nothing for ``vq
+    admin update`` to run afterwards, so that environment is never rebuilt: the
+    update pulls the checkout and reports success. Every message about this key
+    is worded for that shape separately, because the remedies that end in ``vq
+    admin update`` would otherwise name a command that changes nothing.
+    ``vq doctor`` reports which of the two routes a declaring program actually
+    has, on the host whose checkout can answer.
 
     **Deployment ordering matters**, for the same reason it does on
     :attr:`runtime_slot_root`: ``_ProgramBase`` sets ``extra="forbid"``, so a
@@ -1516,25 +1641,50 @@ class VenvProgram(_ProgramBase):
 
     @model_validator(mode="after")
     def _declared_extras_have_a_route_into_the_venv(self) -> VenvProgram:
-        """``extras`` is inert without the updater that applies it.
+        """``extras`` is inert unless vq itself builds the environment.
 
-        The declaration is read on the way to ``scripts/update.sh``, so a
-        program vq cannot rebuild would accept the key, change nothing, and
-        leave an operator believing the capability was declared -- the exact
-        belief that kept coordinator's console down. Refuse instead.
+        A program vq neither provisions nor rebuilds would accept the key,
+        change nothing, and leave an operator believing the capability was
+        declared -- the exact belief that kept a console down. Refuse instead.
+
+        There are two routes, and either one is enough. A fresh provision
+        applies the floor (``vq admin install``, #47) and an update re-applies
+        it (``vq admin update``, managed or ordinary, #85), so a program
+        configuring ``install_script`` or ``update_script`` can carry the
+        declaration. Having one is necessary but not sufficient: every route
+        applies the floor only through vq's own ``scripts/install.sh`` or
+        ``scripts/update.sh``, which the checkout has to exist to prove, so
+        the install refuses at provision time and an ordinary update says it
+        cannot honour the declaration. Neither check belongs here, where there
+        is no checkout to read; ``vq doctor`` makes the same proof on a host
+        that has one, so an operator can see the situation before a unit
+        starts failing (#84).
+
+        The two routes are not interchangeable, and admitting both here made
+        one config shape that several messages had assumed away: with
+        ``install_script`` alone the declaration is applied once, at provision,
+        and nothing rebuilds that venv afterwards. Every remedy that ends in
+        ``vq admin update`` is worded around that (#47).
         """
-        if self.extras and not self.update_script:
+        if self.extras and not (self.install_script or self.update_script):
             raise ValueError(
-                "extras requires update_script; vq applies a declared extra "
-                "when it rebuilds the environment, and a program without an "
-                "update script is never rebuilt by vq. Note that having one "
-                "is necessary but not sufficient: only a managed daemon "
-                "update applies the declaration"
+                "extras requires install_script or update_script; vq applies "
+                "a declared extra when it builds or rebuilds the environment, "
+                "and a program with neither script is never built by vq. Note "
+                "that having one is necessary but not sufficient: the floor "
+                "reaches pip only through vq's own scripts/install.sh or "
+                "scripts/update.sh"
             )
         return self
 
     @model_validator(mode="after")
     def _runtime_probe_settings_are_consistent(self) -> VenvProgram:
+        if self.runtime_slot_execution and self.runtime_slot_root is None:
+            raise ValueError("runtime_slot_execution requires runtime_slot_root")
+        if self.runtime_slot_build_input == "current" and not self.runtime_slot_execution:
+            raise ValueError(
+                'runtime_slot_build_input = "current" requires runtime_slot_execution'
+            )
         if self.import_symbols and not self.import_check:
             raise ValueError("import_symbols requires import_check")
         if self.expected_import_version and not self.import_check:
@@ -1546,6 +1696,22 @@ class VenvProgram(_ProgramBase):
                 "healthcheck_command must be a single shell-style command line"
             )
         return self
+
+    def execution_program(self) -> VenvProgram:
+        """Resolve the local execution binding once, without changing build inputs."""
+        if not self.runtime_slot_execution:
+            return self
+        from vq import runtime_slots
+
+        assert self.runtime_slot_root is not None
+        try:
+            selected = runtime_slots.select_python(self.runtime_slot_root)
+            program = runtime_slots.slot_local_program(self, selected.root, selected.sha)
+        except (runtime_slots.RuntimeSlotError, OSError) as exc:
+            raise ConfigError(f"cannot resolve runtime-slot execution: {exc}") from exc
+        if program.import_check is None and program.vibeqc_source_root() is not None:
+            program = program.model_copy(update={"import_check": "vibeqc"})
+        return program
 
     def current_git_sha(self, *, full: bool = False) -> str | None:
         args = ("HEAD",) if full else ("--short=12", "HEAD")
@@ -1694,6 +1860,11 @@ class VenvProgram(_ProgramBase):
         configured healthcheck failed, which on 2026-09-12 was a Linux-only
         ``xvfb-run`` on a macOS host beside a vibe-view that imported fine.
         """
+        if self.runtime_slot_execution:
+            try:
+                return self.execution_program().availability_status()
+            except ConfigError as exc:
+                return ProgramAvailability(PROGRAM_STATUS_MISSING, str(exc))
         not_run = (
             _program_probe.HEALTHCHECK_NOT_RUN
             if self.healthcheck_command
@@ -1820,8 +1991,25 @@ class ImportProgram(_ProgramBase):
         return True, f"{import_detail} from {self.python} ok"
 
 
+class SchedulerProgram(_ProgramBase):
+    """A driver-side program name with no local executable or installation.
+
+    Target configuration supplies hooks and runtime deployment authority just
+    as it does for other program kinds. Registration alone proves no remote
+    availability and cannot authorize a local job.
+    """
+
+    kind: Literal["scheduler"]
+
+    def availability(self) -> tuple[bool, str]:
+        return False, "scheduler-only registration; target runtime not probed"
+
+    def availability_status(self) -> ProgramAvailability:
+        return ProgramAvailability("SCHEDULER_ONLY", self.availability()[1])
+
+
 ProgramConfig = Annotated[
-    BinaryProgram | VenvProgram | ImportProgram,
+    BinaryProgram | VenvProgram | ImportProgram | SchedulerProgram,
     Field(discriminator="kind"),
 ]
 
@@ -2176,7 +2364,13 @@ class DaemonRunConfig(BaseModel):
 
 
 class Config(BaseModel):
-    """Top-level config. Missing file -> empty Config (all defaults)."""
+    """Top-level config. Missing file -> empty Config (all defaults).
+
+    Top-level keys describe **this** host (its scratch roots, its defaults,
+    its pools); ``[hosts.<name>]`` describes a host this one submits to.
+    :attr:`scratch_root` deliberately carries the same name in both scopes:
+    it is one concept, "where disposable per-job trees live on that host".
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2225,6 +2419,67 @@ class Config(BaseModel):
     """v0.11.0: if set, a bare ``vq submit auto`` (no ``--pool``) scopes to
     this pool instead of every host — e.g. point it at a "compute" pool so
     the daily-driver / gaming boxes are excluded by default."""
+
+    scratch_root: str | None = None
+    """#63: absolute directory on **this** host holding disposable per-job
+    scratch -- ``jobs/`` (the submitted workspace = a job's ``cwd``) and
+    ``workdirs/`` (``$VQ_WORKDIR``).
+
+    The same concept as :attr:`HostConfig.scratch_root`, which says it for a
+    scheduler host this daemon submits *to*. One name, one meaning, scoped to
+    the host the section describes.
+
+    Unset (the default) resolves to ``<state_root>-scratch``, so
+    ``~/.local/share/vq-scratch`` on a stock install. ``$VQ_SCRATCH_DIR``
+    overrides this key; see :func:`vq.paths.scratch_root` for the full
+    precedence.
+
+    **Set :attr:`min_vq_version` when you set this.** A vq that predates the
+    key ignores unrecognized top-level keys by design, so it would keep
+    resolving scratch under the state root while a newer vq on the same host
+    used this one -- a split store, exactly the failure
+    ``docs/fleet_layout.md`` phase 4 warns about for ``$VQ_STATE_DIR``.
+
+    Changing it strands no job: a job keeps the ``cwd``/``workdir`` it
+    recorded, and accounting, ``--delete`` and the age sweep all reach a
+    job's directories at the path that job recorded, under the current root,
+    the pre-#63 root under the state root, or a root you have since
+    configured away from. (The daemon's immediate ``--clean-tmp`` removal
+    keeps the narrower authority deliberately: it is automatic and
+    unattended, and a refusal there only defers, since the record survives
+    for the sweep and ``--delete``.) What a changed root does leave behind is an
+    *orphan* directory -- one whose job record is already gone -- under a root
+    no remaining record names: nothing enumerates it any more, so remove it by
+    hand. See :func:`vq.paths.workdir_roots_for_job`.
+
+    **Single-user only.** In multi-user mode the root is a deployment-wide
+    decision made through ``$VQ_MULTI_USER_SCRATCH_ROOT``, which the daemon
+    and every user's CLI inherit from the same environment; setting this key
+    there is a load error rather than a silently per-caller root (see
+    :func:`vq.paths.multi_user_scratch_root`)."""
+
+    jobs_root: str | None = None
+    """#63: absolute directory holding job workspaces, overriding
+    ``<scratch_root>/jobs``.
+
+    ``jobs/`` and ``workdirs/`` have the same lifecycle and default together
+    under :attr:`scratch_root`; this key and :attr:`workdir_root` exist so a
+    site that judges results slowly can keep ``jobs/`` on durable, backed-up
+    storage while workdirs churn on a scratch volume. Most hosts should leave
+    both unset and move the one root.
+
+    Single-user only: a multi-user host needs a per-uid tree under the
+    per-user scratch dir, which one path cannot express, so setting it there
+    is a load error rather than a silently ignored key."""
+
+    workdir_root: str | None = None
+    """#63: absolute directory holding per-job workdirs, overriding
+    ``<scratch_root>/workdirs``. See :attr:`jobs_root`; single-user only.
+
+    The daemon opens this exact directory with ``O_RDONLY | O_DIRECTORY |
+    O_NOFOLLOW`` before removing a job's workdir beneath it, so it may be
+    anywhere the daemon can reach while nothing below it may be a symlink
+    escape."""
     fleet_rollout_order: list[str] = Field(default_factory=list)
     """Canonical host order for ``vq admin rollout-latest``.
 
@@ -2340,6 +2595,48 @@ class Config(BaseModel):
                 f'"0.26.0" (got {value!r})'
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_scratch_roots(self) -> Config:
+        """#63: the local scratch roots must be absolute, and the two
+        sub-roots must not be set on a multi-user host.
+
+        Absolute because a relative root would resolve against whatever
+        directory the caller happened to be in -- the daemon, ``vq cleanup``
+        and ``vq fetch`` are three different working directories, and a
+        sweep that resolves its root differently from the dispatcher that
+        created the tree is a deletion aimed at the wrong place.
+        """
+        for key in ("scratch_root", "jobs_root", "workdir_root"):
+            value: str | None = getattr(self, key)
+            if value is None:
+                continue
+            if not value.startswith(("/", "~/")):
+                raise ValueError(
+                    f"{key} must be an absolute path on this host, or start "
+                    f"with '~/'; got {value!r}"
+                )
+        if self.multi_user.enabled:
+            for key in ("jobs_root", "workdir_root"):
+                if getattr(self, key) is not None:
+                    raise ValueError(
+                        f"{key} is single-user only: a multi-user host keeps "
+                        "one tree per uid under the per-user scratch dir, "
+                        "which a single path cannot express. Move the whole "
+                        "root with $VQ_MULTI_USER_SCRATCH_ROOT instead."
+                    )
+            if self.scratch_root is not None:
+                raise ValueError(
+                    "scratch_root is single-user only: a config key is read "
+                    "from the calling process's own config file, so the root "
+                    "daemon (/etc/vq) and a user's CLI "
+                    "(~/.config/vq/config.toml) would resolve different "
+                    "scratch trees and `vq submit` would stage outside the "
+                    "tree the daemon accepts. Set "
+                    "$VQ_MULTI_USER_SCRATCH_ROOT for the whole deployment "
+                    "instead."
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_pools(self) -> Config:
@@ -2533,12 +2830,28 @@ def _parse_config_bytes(contents: bytes) -> dict:
     return tomllib.loads(contents.decode("utf-8"))
 
 
+def _copy_toml_value(value: Any) -> Any:
+    """Isolate TOML containers without copying immutable scalar values.
+
+    This accepts only the built-in values returned by ``tomllib.loads`` with
+    its default float parser: dicts and lists are the only mutable types.
+    Strings, numbers, booleans and date/time values can safely be shared.
+    Unlike a general object graph, parsed TOML has no cycles or aliases that
+    require deepcopy's memo table or object reconstruction protocol.
+    """
+    if isinstance(value, dict):
+        return {key: _copy_toml_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_toml_value(item) for item in value]
+    return value
+
+
 def _read_config_data(path: Path) -> dict:
     # Always open/read: mtime, size and inode are not content authorities.
     # Validation receives a private mapping because validators/callers may
     # mutate nested containers. Validation itself is deliberately not cached.
     with path.open("rb") as stream:
-        return copy.deepcopy(_parse_config_bytes(stream.read()))
+        return _copy_toml_value(_parse_config_bytes(stream.read()))
 
 
 def system_multi_user_enabled() -> bool:

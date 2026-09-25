@@ -6124,6 +6124,49 @@ def _is_accepted_report_path(value: object) -> bool:
     return _accepted_report_version(value) is not None
 
 
+_PIN_VERSION = re.compile(
+    r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[.-]?(dev|a|b|rc)([0-9]+))?"
+)
+_PIN_PHASE_RANK = {"dev": 0, "a": 1, "b": 2, "rc": 3, None: 4}
+
+
+def _pin_version_key(value: object) -> tuple[int, ...] | None:
+    """Order ``X.Y.Z`` with an optional devN/aN/bN/rcN suffix, else None."""
+    match = _PIN_VERSION.fullmatch(value.strip()) if isinstance(value, str) else None
+    if match is None:
+        return None
+    major, minor, patch, phase, number = match.groups()
+    return (int(major), int(minor), int(patch), _PIN_PHASE_RANK[phase],
+            int(number) if number is not None else 0)
+
+
+def _report_is_pinwise_newer(
+    older: fleet_release.FleetReleaseReport,
+    newer: fleet_release.FleetReleaseReport,
+) -> bool:
+    """Whether a same-filename re-pin is strictly newer (#93).
+
+    A re-pin keeps the report file name, so the name cannot order the two.
+    It is newer only when both pin the same products, every pin is either
+    identical or a strictly higher version of that product, and at least one
+    is higher. An unparseable version, a changed pin set or any downgrade is
+    not newer.
+    """
+    if set(older.pins) != set(newer.pins):
+        return False
+    higher = False
+    for name, old_pin in older.pins.items():
+        new_pin = newer.pins[name]
+        if (new_pin.sha, new_pin.version) == (old_pin.sha, old_pin.version):
+            continue
+        old_key = _pin_version_key(old_pin.version)
+        new_key = _pin_version_key(new_pin.version)
+        if old_key is None or new_key is None or new_key <= old_key:
+            return False
+        higher = True
+    return higher
+
+
 @dataclass(frozen=True)
 class _ValidatedLegacyRetention:
     """Strict durable receipts that replace a fleet-global legacy block."""
@@ -6192,7 +6235,10 @@ def _validate_plan_bound_hold_supersede_receipt(
         or raw.get("hold_record_sha256") != _legacy_subtree_sha256(hold)
         or historical_version is None
         or current_version is None
-        or current_version <= historical_version
+        or current_version < historical_version
+        # A same-filename re-pin (#93) must at least change the digest; its
+        # pin-wise ordering was proven when the receipt was written.
+        or current_digest == run.report_digest_sha256
         or not isinstance(current_digest, str)
         or _SOURCE_TREE_SHA256.fullmatch(current_digest) is None
         or raw.get("current_rollout_id")
@@ -6434,6 +6480,26 @@ def _validate_legacy_retention_receipts(
     identity_mismatch_hosts: set[str] = set()
     receipt_contexts: set[tuple[str, str, str]] = set()
 
+    def _receipt_report_is_repinned_older(raw: Mapping[str, Any]) -> bool:
+        if report_repo is None or current_report_source_path is None:
+            return False
+        try:
+            receipt_report = fleet_release.discover_historical_report_by_digest(
+                str(raw["current_report_path"]),
+                str(raw["current_report_digest_sha256"]),
+                report_repo,
+                fetch=False,
+            )
+            present = fleet_release.discover_historical_report_by_digest(
+                current_report_source_path,
+                current_report_digest_sha256,
+                report_repo,
+                fetch=False,
+            )
+        except fleet_release.FleetReleaseError:
+            return False
+        return _report_is_pinwise_newer(receipt_report, present)
+
     def record_identity_mismatch(
         raw: Mapping[str, Any],
         *,
@@ -6447,6 +6513,17 @@ def _validate_legacy_retention_receipts(
             raw["current_report_digest_sha256"]
             != current_report_digest_sha256
         )
+        if digest_changed and not path_changed:
+            # A same-filename re-pin (#93): the name cannot order the two
+            # reports, so authenticate both and require the present one to be
+            # pin-wise newer than the receipt's.
+            if not _receipt_report_is_repinned_older(raw):
+                raise FleetRolloutError(
+                    f"rollout {run.rollout_id} retained legacy {receipt_kind} "
+                    f"receipt has incoherent current report identity for {host!r}"
+                )
+            identity_mismatch_hosts.add(host)
+            return
         if path_changed != digest_changed:
             raise FleetRolloutError(
                 f"rollout {run.rollout_id} retained legacy {receipt_kind} "
@@ -9375,7 +9452,7 @@ def supersede_obsolete_plan_bound_hold(
             run.report_digest_sha256 == accepted_report.digest_sha256
             or historical_version is None
             or current_version is None
-            or current_version <= historical_version
+            or current_version < historical_version
         ):
             raise FleetRolloutError(
                 f"rollout {rollout_id_value} is not strictly older than the "
@@ -9393,6 +9470,14 @@ def supersede_obsolete_plan_bound_hold(
                 f"obsolete rollout {rollout_id_value} historical report "
                 f"could not be authenticated: {exc}"
             ) from exc
+        if current_version == historical_version and not _report_is_pinwise_newer(
+            historical, accepted_report,
+        ):
+            # A same-filename re-pin (#93) is newer only pin by pin.
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} is not strictly older than the "
+                "current accepted report"
+            )
         if not _historical_report_binds_run(historical, run):
             raise FleetRolloutError(
                 f"obsolete rollout {rollout_id_value} does not bind its "

@@ -32,6 +32,55 @@
 # Comment out or delete to require explicit hosts on every command.
 default_host = "compute"
 
+# #63 (v0.26.10): where THIS host keeps disposable per-job trees -- `jobs/` (each
+# job's working directory and results) and `workdirs/` ($VQ_WORKDIR).
+#
+# Default: `<state root>-scratch`, i.e. ~/.local/share/vq-scratch on a stock
+# install, /var/lib/vq-scratch in multi-user mode, and `$VQ_STATE_DIR`-relative
+# when that is set. It is a SIBLING of the state root, not a child: the state
+# root holds the queue, its locks, archives and the daemon's own files and is
+# never pruned, while this is swept by age.
+#
+# They were one root before v0.26.10, and the classification was wrong where it
+# mattered: on two measured daemon hosts job workdirs were over 99 % of the
+# state root's footprint (132 GB of 138, 81 GB of 84). Set this when the two
+# belong on different disks -- a small ~ and a big data volume is the usual
+# reason.
+#
+# `$VQ_SCRATCH_DIR` overrides this key. Prefer the key: an env var has to reach
+# the daemon AND every CLI caller or the two read different trees.
+#
+# Changing it strands nothing. Every existing job keeps the path it recorded,
+# only new dispatches use the new root, and cleanup and accounting iterate the
+# old one until it is empty. See docs/fleet_layout.md phase 5 for the runbook.
+#
+# SET min_vq_version WHEN YOU SET THIS. A vq that predates the key ignores
+# unrecognized top-level keys by design, so without the floor an older build on
+# this host would keep resolving scratch under the state root while a newer one
+# uses this key -- a split store.
+#
+# min_vq_version = "0.26.10"
+# scratch_root = "/data/vq-scratch"
+
+# #63: split the two scratch trees onto different volumes.
+#
+# They have the same lifecycle and default together under `scratch_root`.
+# These exist for a site that judges results slowly and wants `jobs/` on
+# durable, backed-up storage while workdirs churn on a fast scratch volume.
+# Most hosts should leave both unset and move the one root.
+#
+# Single-user only: a multi-user host needs one tree per uid under the per-user
+# scratch dir, which a single path cannot express, so setting either there is a
+# load error rather than a silently ignored key. `scratch_root` is single-user
+# only for the same reason and is refused there too -- a config key is read
+# from the calling process's own file, so the root daemon and a user's CLI
+# would resolve different trees. On a multi-user host move the whole root with
+# $VQ_MULTI_USER_SCRATCH_ROOT, which the daemon and every user's CLI inherit
+# from one environment.
+#
+# jobs_root    = "/backed-up/vq-jobs"
+# workdir_root = "/fast-scratch/vq-workdirs"
+
 # v0.26.1: extra absolute directories prepended to PATH for a build this
 # host runs (`update_script` / `post_update_script`).
 #
@@ -217,14 +266,45 @@ latest      = "release"
 # `core` for a plain install -- so a venv that also runs `vq web run` loses
 # uvicorn on the next rebuild and its console unit fails on every start. The
 # declaration is a floor, never a ceiling: it can only add to what the venv
-# already had. `update_script` may NOT carry `--extras`; a serving venv's
-# install target comes from this validated key or from nowhere.
+# already had. For the env serving this host's daemon, `update_script` may NOT
+# carry `--extras`; that venv's install target comes from this validated key
+# or from nowhere.
 # extras = ["web"]                     # names from [project.optional-dependencies]:
-#                                      # web, test, dev. Applied by the managed
-#                                      # daemon transaction (`vq admin update`
-#                                      # on the env serving this host's daemon,
-#                                      # `vq self-update`); an update that
-#                                      # cannot apply it says so.
+#                                      # web, test, dev. Applied wherever vq
+#                                      # builds the venv: the managed daemon
+#                                      # transaction (`vq admin update` on the
+#                                      # env serving this host's daemon,
+#                                      # `vq self-update`), a fresh `vq admin install`,
+#                                      # and an ordinary `vq admin update` on
+#                                      # any other program.
+#
+# All of them rest on the same proof -- the script vq is about to name a
+# profile on is vq's own `scripts/install.sh` or `scripts/update.sh`, resolved
+# inside this program's own checkout -- and they differ in what a failed proof
+# means. An update leaves a built environment alone and says that it did; an
+# install is about to create the venv, so it is REFUSED rather than building
+# one without the runtime declared here, and it names the remedy. A program
+# that declares nothing is unaffected by any of them, which is every program
+# whose scripts are its own.
+#
+# On an ordinary update the floor is resolved over the profile that run was
+# going to install anyway: an operator's `--update-script-arg --extras
+# PROFILE`, else what `.vq-install-metadata` records, else `core`. It is
+# appended last and only when it raises that profile, and it never asks for
+# `--recreate-venv` -- the reinstall goes into the environment that is there.
+#
+# `install_script` alone is enough to carry the declaration, because the
+# provision applies it. Be aware of what that shape does NOT get: without an
+# `update_script` there is nothing for `vq admin update` to run, so the venv is
+# built once and never rebuilt -- the update pulls the checkout and reports
+# success. Set `update_script` too if this environment is expected to follow
+# the checkout.
+#
+# The key therefore needs one of those two scripts configured: a program with
+# neither is never built by vq, so its declaration could not reach pip by any
+# route and the config is refused at load. Either one alone is enough. Which
+# of them is actually a route is a question about the checkout, so it is asked
+# by `vq doctor` on the host that has one, not at config load.
 #
 # Ordering, and it bites: an older vq rejects an unknown program key outright
 # and then fails to load this file at all. Update the host, then add the key.
@@ -238,6 +318,15 @@ latest      = "release"
 # scheduler_dialect = "torque"
 # scheduler_driver = "compute"         # host with the always-on vq daemon
 # scratch_root = "/home/USER"  # absolute path on the scheduler host
+#
+# The scheduler-host half of the same concept as the top-level `scratch_root`
+# above: where disposable per-job trees live on THAT machine. Changing it is
+# safe under jobs in flight since #63 -- each job records the workspace it was
+# staged into before submission and every later step (reattach, retry, poll,
+# fetch, remote cleanup) uses that recorded path. A job dispatched by an older
+# vq carries no such record; the driver binds it on its next observation and
+# refuses to adopt a changed value for this host until every non-terminal job
+# on it is bound.
 # submit_extra = ["-q", "compute"]
 # scheduler_mem_directive = "omit"     # Torque moms turn `-l mem=` into a hard
 #                                      # per-process RLIMIT_DATA that bad_allocs
@@ -309,6 +398,18 @@ latest      = "release"
 # update_host = "cluster-build"
 # detached_build = true
 # verify_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/verify-pbs-cluster-runtime"
+#
+# feed_source_mirror names a PUSH-FED bare mirror (a bare repository whose
+# origin names itself). The feed is one unforced, atomic `git push`: the
+# immutable per-pin ref refs/vq/pins/<sha>, this lane's branch pair
+# (refs/heads/release + refs/remotes/origin/release, or the main pair for a
+# branch-tip program), and the tags that name this pin in the driver's clone.
+# vq never force-pushes: a lane branch that has moved past the requested pin,
+# a diverged branch, or a tag the mirror already holds at another object is
+# refused before the push with the mirror's own values in the message, and
+# the mirror is left byte-identical. Refs the feed does not name, including
+# every other tag, are never touched. Needs git >= 2.4 on the mirror's host
+# for the atomic push. See docs/operations.md, "Feeding the source mirror".
 # feed_source_mirror = ".local/share/vq-pbs-cluster/vibe-qc.git"
 # prepare_command = "/home/USER/.local/libexec/vq-pbs-cluster/bin/prepare-pbs-cluster-runtime-source"
 # prepare_timeout_seconds = 1800
@@ -321,6 +422,9 @@ latest      = "release"
 # timeout_seconds = 3600
 #
 # Each scheduler_program_hooks key must match a configured [programs.NAME].
+# A driver without that program installed locally can use kind = "scheduler"
+# in [programs.NAME]. It reports SCHEDULER_ONLY and refuses local execution;
+# target hooks and managed runtime identity remain authoritative.
 # `vq doctor pbs-cluster` reports unknown hook keys before submit.
 # [hosts.pbs-cluster.scheduler_program_hooks.orca]
 # prologue = ["source /home/USER/orca-env.sh"]
@@ -537,6 +641,11 @@ latest      = "release"
 # git_dir = "/home/USER/vibeqc-dev"
 # branch = "main"
 # update_script = "scripts/update.sh --dev"   # relative to git_dir; v0.5.39 supports args
+# # When the program declares `extras` and this command is the checkout's own
+# # scripts/install.sh or scripts/update.sh, vq appends `--extras PROFILE` to
+# # it, last and resolved over the profile this run was going to install. With
+# # any other command the update runs exactly as it always has, and says which
+# # declaration it did not apply.
 # import_check = "vibeqc"   # runtime core identity/freshness + atomic rollback
 # # v0.26.1: what `vq admin install` needs to bring a host up from nothing.
 # # Without these, git_dir has to be cloned and built by hand before vq can
@@ -547,6 +656,14 @@ latest      = "release"
 # # whatever origin it has and vq never repoints it. `install_script` is the
 # # program's own installer, run once after the clone -- `vq admin install`
 # # never runs update_script, and `vq admin update` never runs this one.
+# #
+# # v0.26.10: when the program declares `extras`, that floor is appended to
+# # this command as `--extras PROFILE`, last and resolved over the profile
+# # configured here (`--extras dev` plus `extras = ["web"]` installs `all`).
+# # It is appended only to vq's own scripts/install.sh or scripts/update.sh;
+# # with any other installer, a program declaring extras is refused rather
+# # than provisioned without them. Without an `update_script` beside it, this
+# # is the only time vq builds this venv, and the refusal says so.
 # upstream = "ssh://git@gitlab.example.invalid:26/mpei/vibe-qc.git"
 # install_script = "scripts/install.sh --editable --extras dev"
 # description = "vibe-qc development (main branch)"
