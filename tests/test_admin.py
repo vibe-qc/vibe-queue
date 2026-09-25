@@ -1578,7 +1578,7 @@ class TestSelfUpdateRestart:
         monkeypatch.setattr(
             admin,
             "_verify_restarted_daemon",
-            lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+            lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
                 verified=True,
                 actual_sha=expected_sha,
                 actual_tree_sha256=None,
@@ -1663,7 +1663,7 @@ class TestSelfUpdateRestart:
         monkeypatch.setattr(
             admin,
             "_verify_restarted_daemon",
-            lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+            lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
                 verified=True,
                 actual_sha=expected_sha,
                 actual_tree_sha256=None,

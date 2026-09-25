@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -524,6 +526,90 @@ def resolve_owner_host(cfg: config.Config, queue_host: str) -> str | None:
     if host_cfg is not None and host_cfg.scheduler != "local":
         return host_cfg.scheduler_driver
     return queue_host
+
+
+PREVIEW_TAIL_LINES = 2000
+"""Stdout lines a preview reads: the same status tail the drill-down shows, deeper."""
+
+
+def fetch_job_preview(
+    cfg: config.Config,
+    queue_host: str,
+    jobid: str,
+    *,
+    multi_user: bool = False,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Calculation preview for one job (#65, V1); ``(payload, error)``.
+
+    Reads only what the drill-down already reads, ``vq status --json`` with a
+    stdout tail, on the owning host, and parses it with :mod:`vq.previews`.
+    It opens no other file and walks no workdir. ``preview`` is ``None`` when
+    no parser knows the job's program.
+    """
+    from vq import previews
+    from vq.status import show_status_json
+
+    owner = resolve_owner_host(cfg, queue_host)
+    if owner is None:
+        return None, f"scheduler host {queue_host!r} has no scheduler_driver configured"
+    try:
+        if is_local_host(owner):
+            status_payload = json.loads(show_status_json(
+                owner, jobid, tail=PREVIEW_TAIL_LINES, multi_user=multi_user,
+            ))
+        else:
+            proc = transport.run_remote_vq(
+                cfg.host(owner), "status", "localhost", jobid, "--json",
+                "-n", str(PREVIEW_TAIL_LINES),
+            )
+            status_payload = json.loads(proc.stdout)
+    except FileNotFoundError as e:
+        return None, str(e)
+    except transport.RemoteError as e:
+        return None, str(e)
+    except (config.ConfigError, json.JSONDecodeError, ValueError, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    program = status_payload.get("program")
+    stdout = status_payload.get("stdout")
+    text = stdout[-previews.MAX_TAIL_BYTES:] if isinstance(stdout, str) else ""
+    source = "stdout"
+    output_name = (
+        previews.orca_output_name(status_payload.get("command"))
+        if previews.parser_for(program if isinstance(program, str) else None) == "orca"
+        else None
+    )
+    if output_name is not None:
+        # Maintainer decision (2026-09-25): an ORCA job run through
+        # run-orca.sh writes to one named output file; read exactly that
+        # file's bounded tail through vq tail, never a directory walk.
+        tail_args = ("tail", queue_host, jobid, "--name", output_name, "--json",
+                     "-n", str(PREVIEW_TAIL_LINES))
+        try:
+            if is_local_host(owner):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "vq.cli", *tail_args],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=60, check=False,
+                )
+                tail_text = proc.stdout if proc.returncode == 0 else ""
+            else:
+                tail_text = transport.run_remote_vq(cfg.host(owner), *tail_args).stdout
+            tailed = json.loads(tail_text).get("text") if tail_text else None
+        except (transport.RemoteError, json.JSONDecodeError, OSError,
+                subprocess.SubprocessError, AttributeError):
+            tailed = None
+        if isinstance(tailed, str):
+            text = tailed[-previews.MAX_TAIL_BYTES:]
+            source = output_name
+    return {
+        "source": source,
+        "jobid": jobid,
+        "queue_host": queue_host,
+        "owner_host": owner,
+        "state": status_payload.get("state"),
+        "program": program if isinstance(program, str) else None,
+        "preview": previews.preview(program if isinstance(program, str) else None, text),
+    }, None
 
 
 def fetch_job_detail(

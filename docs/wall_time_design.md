@@ -135,7 +135,10 @@ Mitigation today:
   compute-d: ≪1 s.
 * The v0.4 orphan-reattach reconciler picks up wall-time
   accounting on next daemon start (started_monotonic is
-  recovered from `started_at` on the spec).
+  recovered from `started_at` on the spec). Until #97 the code
+  anchored a re-attached job at the restart instead, so each
+  restart granted a fresh budget. A missing, unparseable or
+  future `started_at` still falls back to the restart.
 * `--max-jobs=1` makes the blast radius small: at most one
   in-flight job to over-run, and the host can absorb that.
 

@@ -254,6 +254,73 @@ vq admin update --token-file ~/.config/vq/web-token vibeqc-dev --all-hosts
 vq admin update --token "$VQ_TOKEN" vibeqc-dev --all-hosts
 ```
 
+## Public fleet snapshot (#66)
+
+The public face of a fleet is a **static snapshot**, not the console. An
+operator-side process that holds the fleet credentials writes it; a separate
+unprivileged account with no fleet credentials serves the files; the console
+itself stays on loopback behind authentication. vq never serves the public
+page. `SECURITY.md`, "Public fleet snapshot", is the security record.
+
+The snapshot follows the schema `vq.public-fleet/1`
+(`vq.web.public_snapshot.PUBLIC_SNAPSHOT_JSON_SCHEMA`), and that schema is the
+complete list of what it may contain:
+
+```json
+{
+  "schema": "vq.public-fleet/1",
+  "generated_at": "2026-09-25T12:00:00+00:00",
+  "stale_after": "2026-09-25T12:15:00+00:00",
+  "title": "Example fleet",
+  "hosts": [
+    {"name": "Cluster A", "state": "up", "load": "busy"},
+    {"name": "Workstation", "state": "down", "load": "unknown"}
+  ],
+  "calculations": [
+    {"alias": "water-dimer-scan", "state": "running", "host": "Cluster A"}
+  ]
+}
+```
+
+| field | values |
+|---|---|
+| host `state` | `up` (answered the sweep), `down` (administratively down or unreachable), `unknown` (a display name for a key the sweep did not cover) |
+| host `load` | `idle`, `light` (< 50 % of the configured CPU budget running), `busy` (< 90 %), `full`, `active` (work present, budget unknown), `unknown` (host not up) |
+| calculation `state` | `queued`, `running`, `paused`, `finished`, `failed`, `cancelled`, `unknown` |
+| calculation `host` | the host's display name, or `null` when it has none |
+
+**Hosts are named by the operator, and only those appear.** Configure a
+public display name per `[hosts.<key>]` key:
+
+```toml
+[public_snapshot]
+title = "Example fleet"
+stale_after_seconds = 900
+
+[public_snapshot.hosts]
+cluster-a = "Cluster A"
+workstation = "Workstation"
+```
+
+A host with no entry is left out of the snapshot entirely; it is never shown
+under its config key. Display names must be unique, printable and at most 64
+characters. `stale_after_seconds` (at least 60, default 900) sets how long
+after the sweep the page calls itself stale.
+
+**Calculations opt in at submit time, one by one.** Nothing is public by
+default. Add a tag of the form `public.<alias>`:
+
+```bash
+vq submit cluster-a --tag public.water-dimer-scan -- vibe-qc run input.py
+```
+
+The alias is what the page shows, so make it something you are content to
+publish. It uses the tag charset (letters, digits, `.`, `_`, `-`) and is at
+most 43 characters, since a tag is at most 50. The prefix is exact and
+lowercase, and a job with two different `public.` tags stays private. (The
+decision on #66 named a `public=<alias>` form; `=` is not a legal tag
+character, so the separator is `.`.)
+
 ## Public exposure -- caddy reverse proxy + TLS (still not shipped as of v0.6.18)
 
 If you want the dashboard reachable from a domain (e.g.

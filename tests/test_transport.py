@@ -1072,7 +1072,7 @@ class TestOwnedSubprocessTimeout:
                     pytest.fail(f"process-tree fixture exited early: {proc.communicate()}")
                 if time.monotonic() >= deadline:
                     os.killpg(proc.pid, signal.SIGKILL)
-                    proc.communicate(timeout=1.0)
+                    proc.communicate(timeout=_LIVENESS_SECONDS)
                     pytest.fail("process-tree fixture never became ready")
                 time.sleep(0.01)
             ready_at.append(time.monotonic())
@@ -1283,7 +1283,7 @@ class TestOwnedSubprocessTimeout:
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=_LIVENESS_SECONDS)
 
 
 def _process_exists(pid: int) -> bool:

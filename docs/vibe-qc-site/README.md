@@ -10,7 +10,9 @@ vibe-queue. It is not made only in vibe-qc.
 
 Written 2026-09-09 against vq 0.26.0 and vibe-qc `5f95d0870`. Reconciled
 2026-09-13 with vibe-qc `880b1ff`: each page is vibe-qc's published page plus
-the `starved` fix described on vibe-qc#242, and nothing else.
+the `starved` fix described on vibe-qc#242, and nothing else. Audited against
+the vq source again on 2026-09-18, the first re-check since that reconciliation;
+what it changed is under "Corrections from the 2026-09-18 audit" below.
 
 ---
 
@@ -167,6 +169,54 @@ them since the reconciliation on vibe-queue#39:
   `capture --section ID`, and the fetched-file listing no longer promises
   sidecars that depend on output settings.
 
+## Corrections from the 2026-09-18 audit
+
+The reconciliation matched the two copies to each other. It did not re-read
+either against the code, and vq had moved on. This pass walked both pages
+claim by claim against the Click command tree, `src/vq/config.py`, the fetch
+and cleanup modules and the `contrib/` wrappers (vibe-queue#39):
+
+* **The parallel CRYSTAL examples no longer ran.** `contrib/run-crystal.sh`
+  dropped its built-in rank count in `707232b`, two days after the
+  reconciliation: a parallel run with no `--np N` now exits rather than
+  choosing one. Both parallel examples on the page omitted it. They now pass
+  `--np`, and the page says the wrapper will not guess.
+* **A named fetch was described as refusing to overwrite.** The page said
+  re-fetching is "idempotent only when the existing file is byte-identical:
+  vq will not overwrite a different result". `fetch._publish_artifact` does
+  the opposite: an existing file is replaced with the newly fetched bytes, and
+  only an identical one short-circuits. It refuses a destination it cannot
+  safely replace, such as a symlink. Rewritten to what the code does.
+* **`vq pause` was documented as the dispatch gate.** "Holding the queue back"
+  showed `vq pause` for "stop dispatching; running jobs continue" and
+  `vq resume` for "dispatch again". That is `vq drain` and `vq drain
+  --release`. `vq pause` SIGSTOPs one running job's process group into
+  `suspended`, and with no job id and no `--all` it is a usage error. The
+  tutorial's own step 3 already said so, so the page contradicted itself. The
+  section now separates the dispatch gate from the running-job verbs.
+* **The `vq queue` sample output was invented.** It showed columns `JOBID`,
+  `ELAPSED` and `SCRIPT`. `listing.py` renders `ID`, `STATE`, `CPUS`,
+  `SUBMITTED (UTC)` and `COMMAND`, with `NAME` only once a listed job has one,
+  which that job did not. Replaced with the column list, and no fabricated
+  row. This is the same fault the integration removed elsewhere on the page.
+* **The preflight's cost was a number nobody measured.** "It costs a second or
+  two at submit time" is unverifiable and was carried over from the pre-split
+  page. What the code guarantees is a bound: `_DEFAULT_TIMEOUT_S` is ten
+  seconds, after which the preflight is abandoned and the submit proceeds.
+  The page states the bound instead.
+* **A link labelled GitLab pointed at GitHub.** `queue.md`'s See also read
+  "vibe-queue on GitLab" over the GitHub mirror URL. Relabelled.
+
+Everything else both pages claim was checked and is correct as written: every
+verb and flag resolves in the Click tree, every configuration key is a real
+`Config`, `HostConfig`, `VenvProgram` or `BinaryProgram` field, and the
+behaviour claims about `--expected-sha`, `--branch`, `--qvf-force`, the QVF
+command, `--vibeqc-preflight`'s scope, `--array` and `--chain`, cleanup's
+dry-run default, `vq drain --max-jobs`, `vq throttle`, `vq kill`'s escalation,
+`vq resubmit`, the fetch destination layout, `vq status` naming the budget a
+pending job waits on, and the cgroup v2 caps all match the source. The ORCA
+wrapper's flags and kept artefacts match `contrib/run-orca.sh`.
+
 ## Two things the split broke that were not documentation
 
 Both are fixed on vibe-qc `main` (checked at `2e7179e`):
@@ -189,19 +239,77 @@ reason these pages are authored in vq's repository:
 | `[programs.*]` schema, or `--program` / `--expected-sha` | `queue.md` § Point vq at your vibe-qc environments, § Choosing which vibe-qc runs the job |
 | `--branch` routing or `[hosts.X.branches]` | `queue.md`, same two sections |
 | `--vibeqc-preflight` scope, or the QVF submit contract | `queue.md`, the tutorial's steps 1 and 2 |
-| `contrib/run-crystal.sh`, `contrib/run-orca.sh` | `queue.md` § CRYSTAL, ORCA and other external programs |
-| `vq.spec.JobState` | `tutorial/vq_queue_remote_job.md` step 3, and the terminal list in `queue.md`. Enforced by `tests/test_vibeqc_site_job_states.py`, so this row is a pointer rather than the only defence |
+| `contrib/run-crystal.sh`, `contrib/run-orca.sh` | `queue.md` § CRYSTAL, ORCA and other external programs. The flags are checked against the scripts; what the wrapper *does* with them is not |
+| `vq.spec.JobState` | `tutorial/vq_queue_remote_job.md` step 3, and the terminal list in `queue.md`. Checked |
 
 Everything else in vq can move without touching these pages, which is the
 point of linking out rather than copying.
 
-Only the `JobState` row is machine-checked, by
-`tests/test_vibeqc_site_job_states.py`. It asserts three things:
+`tests/test_vibeqc_site_claims.py` is the guard. It reads the two published
+pages, and the code rather than a transcription of it, and asserts:
 
-* every backticked name in a prose sentence about states is a real state;
-* the tutorial's lifecycle block lists exactly `TERMINAL_STATES`;
-* the "are all terminal" note in `queue.md` lists every terminal state
-  except success.
+* **Job states.** Every backticked name in a prose sentence about states is a
+  real state; the tutorial's lifecycle block lists exactly `TERMINAL_STATES`;
+  the "are all terminal" note in `queue.md` lists every terminal state except
+  success; and every state these pages name is covered by at least one of
+  those three, so none is named where nothing would notice it going stale.
+* **Verbs.** Every `vq <verb>` and `vq <verb> <subverb>` the pages show
+  resolves in the Click tree under `vq.cli.main`, by introspection. A verb
+  that exists as a function but is not registered, or is registered under
+  another name, fails.
+* **Flags.** An option on a `vq` command line must be an option of *that*
+  command. The whole-tree version of this check would pass `vq submit
+  --serial`, because `--serial` exists on `vq admin update`. An option named
+  in prose, where no command is named, is held to the whole tree instead.
+* **Wrapper flags.** Options passed after `--` to `contrib/run-crystal.sh` or
+  `contrib/run-orca.sh` are checked against the options those scripts parse.
+  This checks the flags that are present, not whether required flags are
+  missing. It would not have caught the omitted `--np` in the rank-count
+  drift above; that still needs a behaviour review.
+* **Configuration keys.** Every key in a `toml` fence is a field of the model
+  that owns it: `Config`, `HostConfig`, or the `kind`-selected program model.
+
+Three of those are a constraint on how you write, so they are worth stating
+plainly.
+
+**Say "state" in a sentence that names one.** The first check reads only sentences that mention a *state*, and the
+other two read only the lifecycle block and the terminal list. So if you name
+a state in prose, either say "state" in the same sentence, or be naming one
+the block or the list already pins. Writing "the job goes `suspended` while
+the host is under pressure" otherwise leaves that name with nothing watching
+it, and a later rename in `vq.spec.JobState` would go unnoticed. The check
+fails with the states it found and what to do about them.
+
+The narrower alternative was deliberate. This file itself writes
+"`vq kill` produces `killed`, not `cancelled`", and vq does not produce
+`cancelled` at all. A check that read every backticked name on the page would
+need a list of every other identifier the prose uses, twenty of them today,
+and would then fail for reasons that have nothing to do with the enum.
+
+**Put a command in a fence, or in backticks with its verb.** The command
+lines are read out of `sh` fences and out of indented blocks inside a MyST
+directive, and separately out of inline spans that begin `vq `. Unbackticked
+prose is read as English, so "vq delegates over SSH to the remote" is safe
+and needs no escaping. What is not safe is a bare option in a fence attached
+to no command; write the verb with it.
+
+**Name the tool when an option is not vq's.** The pages document other
+programs too. Options after `--` belong to whatever is being run, which is
+why the checks split the line there, and the two shipped wrappers are checked
+against `contrib/`. An option belonging to a tool this repository does not
+ship has nowhere to be checked, so it goes in the guard's `_FOREIGN_OPTIONS`
+with the tool that owns it. There are three today: `--section` is
+`vibe-view capture`'s, `-m` is python's and `-a` is `xvfb-run`'s. Keep that
+list short: a long one is how a guard stops guarding. Keep it reachable, too.
+The first version of that check only read spans that looked like a bare
+option, so `capture --section ID` never reached it and the exemption was
+decorative; removing the entry changed nothing.
+
+Configuration keys are read only from `toml` fences, not from prose. The
+prose also writes bracketed names that are not vq configuration at all, such
+as `[outputs].status` and `[plan]`, which are sections of vibe-qc's `.system`
+manifest. Every table the prose refers to appears in a fence as well, so
+nothing is lost by the narrower rule.
 
 The first check replaced one that could never fail. That version kept only
 names already in the enum, so a renamed state dropped out of what it checked
@@ -211,6 +319,23 @@ reader who handled all of them still missed one vq produces. The pattern is
 `tests/test_admin_outcomes.py`'s, which pins `docs/orchestration.md` against
 `admin.ADMIN_OUTCOMES`.
 
-The other rows are still prose against prose. They are the cheaper half of the
-practice and the reason a drift is recoverable at all, but they are not a
-guard.
+What is still prose against prose is the *behaviour* half of every row: that
+`--expected-sha` refuses a moved checkout, that `--vibeqc-preflight` is not
+forwarded to a remote submit, that cleanup is dry-run until `-x`. The guard
+can tell you a flag exists and is spelled onto the right command. It cannot
+tell you the sentence around it is still true.
+
+Be blunt about what that costs, because the number is the useful part: the
+guard was run against the pages as they stood before the 2026-09-18 audit and
+**passed**. Not one of the six corrections above was of the kind it catches.
+A missing `--np` is an absence, not a wrong token; a verb used for the wrong
+job is a real verb; an invented sample output, an unmeasured timing claim and
+a mislabelled link are all prose. What the guard covers is the class the
+original vibe-queue#39 report was about, `vq throttle --max-jobs 1` and
+`[programs.*]` keys that never existed, and that class is now closed. The
+class this audit found is still yours to catch by reading.
+
+So when a release touches submit, fetch, cleanup, the lifecycle or the
+wrappers, re-read the behaviour claims against the source. That is the
+cheaper half of the practice and the reason a drift is recoverable at all,
+but it is not a guard.

@@ -195,5 +195,55 @@ failure refuses execution. A missing outcome after a crash or append failure
 means the result needs investigation, not that replay is safe. These records
 do not identify a person or provide the future tamper-evident audit chain.
 
+### Console calculation previews
+
+`/api/v1/fleet/jobs/<id>/preview` (#65) returns a structured summary of a
+job's calculation: formula, method and basis, SCF convergence, headline
+energies. It is derived from the stdout tail that the job drill-down already
+shows the same identity, fetched through the same `vq status --json` path.
+There is one exception: an ORCA job whose command runs `run-orca.sh` writes its
+output to a single named file (the wrapper's explicit output argument, or
+`<input>.out`). For that job the preview reads that file's tail through
+`vq tail --name`, which rejects absolute and `..` paths. Either source is
+bounded to 2000 lines and 256 KiB and parsed as text. It walks no workdir and
+deserialises no result container. It sits
+behind the same login or bearer gate as the rest of the fleet API. Structures
+and energies of unpublished work are sensitive: no preview field belongs in
+any anonymous or public view (#66).
+
+### Public fleet snapshot
+
+The only anonymous surface is a static snapshot, schema `vq.public-fleet/1`
+(#66), defined in `src/vq/web/public_snapshot.py`. The authenticated
+console does not serve it and is unchanged: it stays on loopback behind the
+TLS proxy. The intended deployment has an operator-side process, which holds
+the fleet credentials, write the files, and a separate unprivileged account,
+with no fleet credentials and no inbound path to the console, serve them.
+vq ships no public server or listener.
+
+The schema is the complete allowlist, default deny, and every object in it
+forbids additional properties:
+
+- **Hosts:** a display name the operator configured under
+  `[public_snapshot.hosts]`, a coarse availability (`up`, `down`, `unknown`)
+  and a coarse load bucket. A host with no configured name is left out
+  entirely, never shown under its config key. A down or unreachable host
+  keeps its card, with no reason, error or diagnostic.
+- **Calculations:** only a job whose submitter tagged it `public.<alias>`
+  appears, as that alias, a coarse lifecycle state and the display name of
+  its host (or `null`). No job is public by default. Two different public
+  tags on one job leave it out.
+- **Snapshot metadata:** the schema id, when the fleet was observed, when the
+  page turns stale, and an optional operator-chosen title.
+
+Never included: job ids, program names and arguments, structures, energies
+and other preview fields, paths, logs, submitters or account names, host
+config keys, SSH aliases, addresses, and anything a host reports about
+itself (hostname, versions, errors). Display names, the title and aliases are
+operator- or submitter-chosen text published verbatim; choosing them is a
+publication decision. A finding is any path by which a value outside this
+list reaches the snapshot, or by which the public page can reach the console
+or the fleet.
+
 If you are unsure whether a finding is in scope, email it to the address above
 and we will triage together.

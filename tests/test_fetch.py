@@ -600,7 +600,8 @@ class TestFetchRemote:
     ) -> bytes:
         """Build a tar archive with the given files under top_dir/, return bytes."""
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in files.items():
                 data = content.encode()
                 info = tarfile.TarInfo(f"{top_dir}/{name}")
@@ -947,7 +948,9 @@ class TestFetchRemote:
         argv = captured[0]
         assert argv[0] == "ssh"
         assert "BatchMode=yes" in argv  # the hardened _ssh_base prefix
-        assert argv[-2:] == ["host_d", "vq tar-workspace abc123def456"]
+        assert argv[-2:] == [
+            "host_d", "vq tar-workspace abc123def456 --fetch-protocol-token " + "0" * 32,
+        ]
 
     def test_remote_failure_raises(
         self,
@@ -1003,7 +1006,8 @@ class TestFetchRemote:
         import io
         import tarfile
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tf:
+        with tarfile.open(fileobj=buf, mode="w",
+                          pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             info = tarfile.TarInfo("abc123def456")
             info.type = tarfile.DIRTYPE
             tf.addfile(info)
@@ -1185,7 +1189,8 @@ class TestFetchRemote:
         atomic os.replace only on full success; on failure the staging dir is
         rmtree'd and no destination is created."""
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             d = tarfile.TarInfo("destdir")
             d.type = tarfile.DIRTYPE
             tf.addfile(d)
@@ -2035,7 +2040,8 @@ class TestFetchWorkdirRemote:
 
     def _build_tar_bytes(self, files: dict[str, str], top_dir: str) -> bytes:
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in files.items():
                 data = content.encode()
                 info = tarfile.TarInfo(f"{top_dir}/{name}")
@@ -2111,7 +2117,7 @@ class TestFetchWorkdirRemote:
         argv = captured[0]
         assert argv[0] == "ssh"
         assert "BatchMode=yes" in argv
-        assert argv[-2:] == ["host_d", "vq tar-workdir abc999"]
+        assert argv[-2:] == ["host_d", "vq tar-workdir abc999 --fetch-protocol-token " + "0" * 32]
 
     def test_remote_failure_raises(
         self,
@@ -2405,3 +2411,11 @@ class TestSelectedWorkdirArtifact:
         result = CliRunner().invoke(main, ["fetch", "localhost", "selectedwd12", *options])
         assert result.exit_code == 2
         assert "--subdir requires" in result.output or "mutually exclusive" in result.output
+
+
+@pytest.fixture(autouse=True)
+def negotiated_fetch_protocol():
+    """Bind synthetic current-emitter tar streams to their fixture request."""
+    with pytest.MonkeyPatch.context() as protocol_patch:
+        protocol_patch.setattr(fetch, "_new_fetch_protocol_token", lambda: "0" * 32)
+        yield

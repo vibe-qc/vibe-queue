@@ -1860,6 +1860,7 @@ def test_invalid_all_host_json_is_wrapped_but_currently_nonfatal(
     assert "driver-secret" not in launch["argv"]
 
 
+@pytest.mark.no_autopatch_lifecycle_lock
 class TestDeployOnePinFromTheReport:
     """`--from-report` takes the pinned argv from the report, not from typing.
 
@@ -1874,9 +1875,11 @@ class TestDeployOnePinFromTheReport:
     SHA = "6" * 40
 
     def _config(self, state_dir: Path) -> None:
+        self.reports = state_dir / "private-reports"
+        subprocess.run(["git", "init", "-q", str(self.reports)], check=True)
         _write_config(
             state_dir,
-            """
+            f"fleet_report_repo = {json.dumps(str(self.reports))}\n" + """
             default_host = "driver"
 
             [hosts.driver]
@@ -1900,11 +1903,9 @@ class TestDeployOnePinFromTheReport:
     def _report(self, monkeypatch: pytest.MonkeyPatch, **pins: object) -> None:
         from vq import fleet_release
 
-        monkeypatch.setattr(
-            "vq.cli.fleet_release.runtime_repo", lambda: Path("/repo"),
-        )
-
         def discover(repo: Path, **kwargs: object) -> object:
+            assert repo == self.reports.resolve()
+            assert ("checkout", str(repo)) in cli.admin_module._active_toolset_lifecycle_resources()
             return fleet_release.FleetReleaseReport(
                 source_ref="origin/main",
                 source_path="vibe-queue/releases/v0.17.0.json",
@@ -2092,9 +2093,11 @@ class TestProvisionDelegation:
     SHA = "7" * 40
 
     def _config(self, state_dir: Path) -> None:
+        self.reports = state_dir / "private-reports"
+        subprocess.run(["git", "init", "-q", str(self.reports)], check=True)
         _write_config(
             state_dir,
-            """
+            f"fleet_report_repo = {json.dumps(str(self.reports))}\n" + """
             default_host = "driver"
 
             [hosts.driver]
@@ -2151,18 +2154,16 @@ class TestProvisionDelegation:
             "--show-output",
         ]]
 
+    @pytest.mark.no_autopatch_lifecycle_lock
     def test_from_report_is_resolved_here_and_not_forwarded(
         self, state_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The report and its runtime checkout live on the driver. A host that
+        """The external report store lives on the driver. A host that
         received `--from-report` would have to discover one of its own."""
         from vq import fleet_release
 
         self._config(state_dir)
         sent = self._forwarded(monkeypatch)
-        monkeypatch.setattr(
-            "vq.cli.fleet_release.runtime_repo", lambda: Path("/repo"),
-        )
         monkeypatch.setattr(
             "vq.cli.fleet_release.discover_latest_report",
             lambda repo, **kw: fleet_release.FleetReleaseReport(

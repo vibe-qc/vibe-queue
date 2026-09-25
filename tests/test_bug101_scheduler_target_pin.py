@@ -266,6 +266,35 @@ def _queued_specs() -> list[JobSpec]:
     return [JobSpec.read(p) for p in sorted(paths.queue_dir().glob("*.json"))]
 
 
+@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_scheduler_only_registration_preserves_target_identity(
+    state_dir: Path, tmp_path: Path, verified: bool, matching: bool,
+) -> None:
+    _write_config(
+        state_dir / "cfg",
+        driver_program_block='[programs.vibeqc-release]\nkind = "scheduler"',
+    )
+    if verified:
+        _record_host_c_runtime()
+    result = _submit(tmp_path, "host_c", host_c_SHA if matching else "f" * 40)
+    if not verified or not matching:
+        assert result.exit_code != 0
+        assert not _queued_specs()
+        return
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    assert spec.command == [host_c_WRAPPER, "run.py"]
+    assert spec.program_runtime_pin is not None
+    assert spec.program_runtime_pin.expected_git_sha == host_c_SHA
+    assert spec.program_runtime_pin.scheduler_host == "host_c"
+    from vq.daemon import _program_runtime_pin_dispatch_resolution
+
+    resolution = _program_runtime_pin_dispatch_resolution(spec)
+    assert resolution.failure is None
+    assert resolution.resolved_git_sha == host_c_SHA
+
+
 def test_matching_target_sha_submits_despite_driver_drift(
     state_dir: Path, driver_checkout: tuple[Path, str], tmp_path: Path
 ) -> None:
