@@ -97,13 +97,19 @@ personal config.
 
 ## State files (single-user)
 
-All under ``state_root()`` = ``~/.local/share/vq/`` by default.
+All under ``state_root()`` = ``~/.local/share/vq/`` by default, **except the
+two disposable per-job trees**, which live under ``scratch_root()`` =
+``<state root>-scratch`` since #63 (``~/.local/share/vq-scratch`` by default;
+``$VQ_SCRATCH_DIR`` or the ``scratch_root`` config key overrides it). They were
+children of the state root before that and every job that recorded them there
+keeps them; both roots are read, swept and accounted until the old one is
+empty.
 
 | Path | Function | Owner / who writes | Purpose |
 |------|----------|---------------------|---------|
 | ``queue/<jobid>.json`` | ``spec_path(jobid)`` | daemon (lifecycle), CLI (submit, kill, cleanup) | per-job spec |
-| ``jobs/<jobid>/`` | ``workspace_dir(jobid)`` | daemon (creates at dispatch), user job process (writes), CLI (fetch reads) | submitted workspace |
-| ``workdirs/<jobid>/`` | ``workdir_for(jobid)`` | daemon (creates at dispatch), user job process (writes), CLI (``fetch --workdir`` reads) | per-job scratch (v0.6.54) |
+| ``<scratch>/jobs/<jobid>/`` | ``workspace_dir(jobid)`` | daemon (creates at dispatch), user job process (writes), CLI (fetch reads) | submitted workspace. Pre-#63: ``state_jobs_dir()`` |
+| ``<scratch>/workdirs/<jobid>/`` | ``workdir_for(jobid)`` | daemon (creates at dispatch), user job process (writes), CLI (``fetch --workdir`` reads) | per-job scratch (v0.6.54). Pre-#63: ``state_workdir_root()`` |
 | ``archive/<jobid>.tar.bz2`` | ``archive_path(jobid)`` | ``vq cleanup --archive`` | workspace tarball |
 | ``admin-status.json`` | ``admin_status_path()`` | ``vq admin update`` / ``mark-ok`` / ``reset-branch`` / ``auto-update`` | per-env last-update outcome |
 | ``scheduler-runtime-status.json`` | ``scheduler_runtime_status_path()`` | ``vq admin update PROGRAM HOST`` | per-host, per-program runtime LAST OK + verified identity |
@@ -113,6 +119,7 @@ All under ``state_root()`` = ``~/.local/share/vq/`` by default.
 | ``daemon.pid`` | ``daemon_pidfile()`` | daemon at startup | pidfile (single-user only - multi-user uses ``/var/lib/vq/daemon.pid``) |
 | ``daemon.log`` | ``daemon_logfile()`` | daemon | daemon's own structured log. v0.12.1: rotates at 20 MB × 3 (previously an unrotated ``FileHandler`` that grew forever) and honours ``VQ_LOG_LEVEL`` (previously hardcoded INFO) |
 | ``daemon-state.json`` | ``daemon_state_path()`` | daemon (lifecycle persistence) | running-jobs index, suspended-jobs ledger, retry state |
+| ``scheduler-scratch-roots.json`` | ``scheduler_scratch_roots_path()`` | daemon (when a scheduler host's ``scratch_root`` changes) | The remote ``scratch_root`` this daemon last served per scheduler host, as a bare string when adopted or ``{"root": ..., "confirmed": false}`` when served on a first start that could not check it. #63 refuses to adopt a changed value while a host still has a job that may already be staged and carries no recorded workspace; the in-memory dispatcher cache cannot answer "what was it before" after a restart or a reload, and those are the two moments an operator changes the key. Daemon-owned and daemon-written, written only when the daemon looks a host up (never by a poll). ``vq doctor`` reads it, together with the queue, for its ``scheduler_scratch_root`` check; no CLI verb writes it. A missing file means "no memory yet", and an unreadable one is treated the same rather than guessed at |
 | ``daemon.sock`` | ``rpc.socket_path()`` | daemon (RPC server) | Unix socket for ``get_*``/``set_*`` RPC (admin-status, drain, throttle, config reload) |
 | ``rpc-audit.jsonl`` | ``audit.audit_log_path()`` | daemon RPC server | append-only record of **mutating** (``set_*``) RPC calls; read with ``vq audit``. No rotation |
 | ``drain.json`` | ``drain.drain_state_path()`` | ``vq drain`` | drain marker (suppresses dispatch) |
@@ -139,6 +146,7 @@ per-user files move under ``users/<uid>/``.
 ├── daemon.log                     daemon_logfile(multi_user=True)
 ├── daemon-state.json              system-wide lifecycle persistence
 ├── admin-status.json              daemon's per-env update outcomes
+├── scheduler-scratch-roots.json   last-served scheduler scratch_root per host
 ├── scheduler-runtime-status.json  per-host/per-program runtime LAST OK
 ├── admin-update-in-progress       first/legacy-compatible scoped receipt
 ├── admin-update-markers/          additional scoped update receipts
@@ -154,15 +162,29 @@ per-user files move under ``users/<uid>/``.
 └── users/
     └── <uid>/                     user_dir(uid)
         ├── queue/                 user_queue_dir(uid)
-        ├── jobs/                  user_jobs_dir(uid)
-        ├── workdirs/              user_workdir_root(uid)
         └── archive/               user_archive_dir(uid)
+
+/var/lib/vq-scratch/               multi_user_scratch_root()
+└── users/
+    └── <uid>/                     user_scratch_dir(uid)
+        ├── jobs/                  user_jobs_dir(uid)
+        └── workdirs/              user_workdir_root(uid)
 ```
 
 Per-user dirs are owned by ``<uid>:<gid>`` (chown'd by
 ``provision_user_state`` at daemon startup for every admin-group
 member). The root-owned ``/var/lib/vq/`` itself prevents
-unprivileged users from materializing their own subtree.
+unprivileged users from materializing their own subtree, and
+``/var/lib/vq-scratch/`` carries the same structural policy: a real
+daemon-owned root, a root-owned ``<uid>/`` parent at mode 0750, and
+uid-owned children with no group or world write.
+
+``jobs/`` and ``workdirs/`` were children of ``users/<uid>/`` before #63.
+``user_state_jobs_dir(uid)`` and ``user_state_workdir_root(uid)`` still name
+those paths, and a job that recorded one keeps it;
+``managed_user_jobs_roots(uid)`` / ``managed_user_workdir_roots(uid)`` are what
+cleanup, accounting and the multi-user workspace gate iterate.
+``$VQ_MULTI_USER_SCRATCH_ROOT`` overrides the scratch root.
 
 ## Known gotchas
 

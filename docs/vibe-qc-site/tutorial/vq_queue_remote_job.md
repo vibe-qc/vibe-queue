@@ -136,10 +136,10 @@ also disable automatic preflight.
 ## Step 3, monitor
 
 ```sh
-# Snapshot of the queue.
+# Snapshot of the queue: one row per job, under the columns ID, STATE,
+# CPUS, SUBMITTED (UTC) and COMMAND. A NAME column appears once some
+# listed job was given one with --job-name.
 vq queue
-# JOBID         STATE     ELAPSED   NAME              SCRIPT
-# c0ff50a06462  running   00:00:08  input-mgo-pbe0    input-mgo-pbe0.py
 
 # One job in detail, with the tails of stdout and stderr.
 vq status c0ff50a06462
@@ -359,14 +359,20 @@ succeed.
 ### Holding the queue back
 
 ```sh
-vq pause                 # stop dispatching; running jobs continue
-vq resume                # dispatch again
-vq drain --max-jobs 1    # partial drain: cap concurrency without pausing
+vq drain                 # stop dispatching; running jobs continue
+vq drain --max-jobs 1    # partial: cap concurrency instead of stopping
+vq drain --release       # dispatch again
 ```
 
 Useful when you want the box for an interactive session and would rather vq
-did not fill the CPU underneath you. To make one *running* job step aside
-instead, `vq throttle` lowers its CPU weight; see
+did not fill the CPU underneath you. Drain gates new dispatches only, and the
+daemon records it, so it outlives a daemon restart or a reboot until you
+release it.
+
+Work that is already running is a different set of verbs, and each one needs a
+job id or `--all`: `vq pause` stops a job's process group and moves it into the
+`suspended` state, `vq resume` returns it to `running`, and `vq throttle`
+lowers a job's CPU weight without stopping it. See
 [throttling](https://vibe-qc.com/vibe-queue/docs/throttle.html).
 
 (why-vibeqc-preflight-matters)=

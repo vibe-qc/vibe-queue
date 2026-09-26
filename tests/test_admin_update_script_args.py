@@ -299,7 +299,7 @@ def legacy_install(tmp_path):
     (venv / 'bin').mkdir(parents=True)
     (venv / 'pyvenv.cfg').write_text('')
     (venv / 'bin/python').symlink_to(sys.executable)
-    metadata = venv / 'lib/python3.13/site-packages/vq-0.11.0.dist-info/direct_url.json'
+    metadata = venv / 'lib/python3.13/site-packages/vibe_queue-0.11.0.dist-info/direct_url.json'
     metadata.parent.mkdir(parents=True)
     metadata.write_text(json.dumps({'url': project.as_uri(), 'dir_info': {'editable': True}}))
     prog = config.VenvProgram(
@@ -334,7 +334,7 @@ def test_managed_adoption_refuses_ambiguous_provenance(legacy_install, damage):
     if damage == 'different-origin':
         metadata.write_text(json.dumps({'url': project.parent.as_uri()}))
     elif damage == 'duplicate-record':
-        other = metadata.parent.with_name('vq-0.12.0.dist-info')
+        other = metadata.parent.with_name('vibe_queue-0.12.0.dist-info')
         other.mkdir()
         (other / metadata.name).write_bytes(metadata.read_bytes())
     elif damage == 'symlink-only':
@@ -344,7 +344,7 @@ def test_managed_adoption_refuses_ambiguous_provenance(legacy_install, damage):
         other.write_bytes(data)
         metadata.symlink_to(other)
     elif damage == 'different-alias':
-        other = venv / 'lib64/python3.13/site-packages/vq-0.11.0.dist-info'
+        other = venv / 'lib64/python3.13/site-packages/vibe_queue-0.11.0.dist-info'
         other.mkdir(parents=True)
         (other / metadata.name).symlink_to(metadata)
         metadata.unlink()

@@ -1444,6 +1444,32 @@ def format_overview_text(overview: HostOverview) -> str:
     return "\n".join(lines)
 
 
+#: Keys of a slot transaction's receipt that the overview JSON carries. The
+#: rest of that receipt (the registry and service files' bytes and inode
+#: identities that recovery replays) stays in the owner-only marker file on
+#: the host; it is recovery evidence, not status.
+_SLOT_RECEIPT_STATUS_KEYS = ("root", "sha", "staged")
+
+
+def _admin_marker_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """An admin-update marker for JSON output: its receipt without file bytes."""
+    raw = payload.get("managed_transaction")
+    if isinstance(raw, dict) and isinstance(raw.get("slot_transaction"), dict):
+        context = raw["slot_transaction"]
+        payload = {**payload, "managed_transaction": {
+            **raw,
+            "slot_transaction": {key: context.get(key) for key in _SLOT_RECEIPT_STATUS_KEYS},
+        }}
+    return payload
+
+
+def _admin_marker_snapshot_json(payload: dict[str, Any]) -> dict[str, Any]:
+    marker = payload.get("marker")
+    if isinstance(marker, dict):
+        payload = {**payload, "marker": _admin_marker_json(marker)}
+    return payload
+
+
 def format_overview_json(overview: HostOverview) -> dict[str, Any]:
     """Single dict for the JSON output. Stable schema — every field
     appears with its documented type even when None. Mirrors
@@ -1464,9 +1490,12 @@ def format_overview_json(overview: HostOverview) -> dict[str, Any]:
         "recent_terminal_counts": overview.recent_terminal_counts,
         "daemon_health": (asdict(overview.daemon_health) if overview.daemon_health else None),
         "envs": [asdict(e) for e in overview.envs],
-        "admin_marker": (asdict(overview.admin_marker) if overview.admin_marker else None),
+        "admin_marker": (
+            _admin_marker_json(asdict(overview.admin_marker)) if overview.admin_marker else None
+        ),
         "admin_markers": [
-            asdict(snapshot) for snapshot in _admin_marker_snapshots(overview)
+            _admin_marker_snapshot_json(asdict(snapshot))
+            for snapshot in _admin_marker_snapshots(overview)
         ],
         "admin_marker_stale_reason": overview.admin_marker_stale_reason,
         "admin_marker_status": overview.admin_marker_status,

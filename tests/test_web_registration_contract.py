@@ -382,6 +382,15 @@ _FLEET_ROUTES: list[RouteContract] = [
         0,
         False,
     ),
+    (
+        ("GET",),
+        "/api/v1/fleet/jobs/{jobid}/preview",
+        "api_fleet_job_preview",
+        True,
+        "default:JSONResponse",
+        0,
+        False,
+    ),
 ]
 
 
@@ -674,6 +683,7 @@ _FLEET_TEMPLATE_CONTEXTS = {
         "fleet_job_detail.html",
         {
             "can_act",
+            "chart",
             "daemon_pid",
             "daemon_running",
             "detail",
@@ -681,6 +691,7 @@ _FLEET_TEMPLATE_CONTEXTS = {
             "flash",
             "identity",
             "jobid",
+            "preview",
             "queue_host",
         },
     ),
@@ -890,6 +901,7 @@ def test_fleet_jobs_api_preserves_ignored_row_limit(
         ("get", "/api/v1/fleet/doctor"),
         ("get", "/api/v1/fleet/jobs"),
         ("get", "/api/v1/fleet/audit"),
+        ("get", "/api/v1/fleet/jobs/job000000001/preview?host=localhost"),
     ],
 )
 def test_fleet_fragment_and_api_auth_gate_contract(
