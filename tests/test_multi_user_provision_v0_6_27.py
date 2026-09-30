@@ -42,8 +42,11 @@ class TestProvisionUserState:
         paths.provision_user_state(uid, gid)
         assert paths.user_dir(uid).is_dir()
         assert paths.user_queue_dir(uid).is_dir()
-        assert paths.user_jobs_dir(uid).is_dir()
         assert paths.user_archive_dir(uid).is_dir()
+        # #63: jobs/ and workdirs/ are provisioned under the scratch tree.
+        assert paths.user_scratch_dir(uid).is_dir()
+        assert paths.user_jobs_dir(uid).is_dir()
+        assert paths.user_workdir_root(uid).is_dir()
 
     def test_idempotent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -61,10 +64,11 @@ class TestProvisionUserState:
         monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(tmp_path / "vq"))
         uid, gid = os.getuid(), os.getgid()
         paths.provision_user_state(uid, gid)
-        structural = paths.user_dir(uid).stat()
-        assert structural.st_uid == os.geteuid()
-        assert structural.st_gid == gid
-        assert stat.S_IMODE(structural.st_mode) == 0o750
+        for structural_dir in (paths.user_dir(uid), paths.user_scratch_dir(uid)):
+            structural = structural_dir.stat()
+            assert structural.st_uid == os.geteuid()
+            assert structural.st_gid == gid
+            assert stat.S_IMODE(structural.st_mode) == 0o750
         for child in (
             paths.user_queue_dir(uid),
             paths.user_jobs_dir(uid),
@@ -82,28 +86,32 @@ class TestProvisionUserState:
         uid, gid = os.getuid(), os.getgid()
         user_root = paths.user_dir(uid)
         user_root.mkdir(parents=True)
+        scratch_root = paths.user_scratch_dir(uid)
+        scratch_root.mkdir(parents=True)
+        # (parent dir, name) -> mode as found, then mode after hardening.
         expected_modes = {
-            "queue": 0o700,
-            "jobs": 0o770,
-            "archive": 0o777,
-            "workdirs": 0o751,
+            (user_root, "queue"): 0o700,
+            (scratch_root, "jobs"): 0o770,
+            (user_root, "archive"): 0o777,
+            (scratch_root, "workdirs"): 0o751,
         }
         hardened_modes = {
-            "queue": 0o700,
-            "jobs": 0o750,
-            "archive": 0o755,
-            "workdirs": 0o751,
+            (user_root, "queue"): 0o700,
+            (scratch_root, "jobs"): 0o750,
+            (user_root, "archive"): 0o755,
+            (scratch_root, "workdirs"): 0o751,
         }
-        for name, mode in expected_modes.items():
-            child = user_root / name
+        for (parent, name), mode in expected_modes.items():
+            child = parent / name
             child.mkdir()
             child.chmod(mode)
 
         paths.provision_user_state(uid, gid)
 
         assert stat.S_IMODE(user_root.stat().st_mode) == 0o750
-        for name, mode in hardened_modes.items():
-            assert stat.S_IMODE((user_root / name).stat().st_mode) == mode
+        assert stat.S_IMODE(scratch_root.stat().st_mode) == 0o750
+        for (parent, name), mode in hardened_modes.items():
+            assert stat.S_IMODE((parent / name).stat().st_mode) == mode
 
     def test_repairs_writable_structural_roots(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -164,37 +172,54 @@ class TestProvisionUserState:
 
         assert not (outside / ".vq-daemon.lock").exists()
 
-    @pytest.mark.parametrize("name", ["queue", "jobs", "archive", "workdirs"])
+    @pytest.mark.parametrize(
+        ("tree", "name"),
+        [
+            ("state", "queue"),
+            ("state", "archive"),
+            ("scratch", "jobs"),
+            ("scratch", "workdirs"),
+        ],
+    )
     def test_refuses_symlinked_managed_child_without_following_target(
         self,
+        tree: str,
         name: str,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(tmp_path / "vq"))
+        monkeypatch.setenv(
+            paths.ENV_MULTI_USER_SCRATCH_ROOT, str(tmp_path / "vq-scratch")
+        )
         uid, gid = os.getuid(), os.getgid()
-        user_root = paths.user_dir(uid)
-        user_root.mkdir(parents=True)
+        parent = (
+            paths.user_dir(uid) if tree == "state" else paths.user_scratch_dir(uid)
+        )
+        parent.mkdir(parents=True)
         outside = tmp_path / f"outside-{name}"
         outside.mkdir()
         before = outside.stat()
-        (user_root / name).symlink_to(outside, target_is_directory=True)
+        (parent / name).symlink_to(outside, target_is_directory=True)
 
         with pytest.raises(paths.UnsafeMultiUserStateError, match=name):
             paths.provision_user_state(uid, gid)
 
         after = outside.stat()
-        assert (user_root / name).is_symlink()
+        assert (parent / name).is_symlink()
         assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
 
     def test_refuses_non_directory_managed_child(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(tmp_path / "vq"))
+        monkeypatch.setenv(
+            paths.ENV_MULTI_USER_SCRATCH_ROOT, str(tmp_path / "vq-scratch")
+        )
         uid, gid = os.getuid(), os.getgid()
-        user_root = paths.user_dir(uid)
-        user_root.mkdir(parents=True)
-        (user_root / "jobs").write_text("not a directory", encoding="utf-8")
+        scratch_root = paths.user_scratch_dir(uid)
+        scratch_root.mkdir(parents=True)
+        (scratch_root / "jobs").write_text("not a directory", encoding="utf-8")
 
         with pytest.raises(paths.UnsafeMultiUserStateError, match="jobs"):
             paths.provision_user_state(uid, gid)

@@ -609,6 +609,7 @@ class TestDoctor:
         assert payload["scheduler_lane"] == {
             "partition": "batch",
             "max_wall_time_seconds": 28_800,
+            "max_cpus": None,
             "source": "host-config",
         }
         assert captured == [
@@ -1407,7 +1408,7 @@ class TestSchedulerLivenessVerdict:
                 "server_state": "Idle",
                 "pbs_sched_running": False,
                 "scheduler_daemons": ["maui"],
-                "queues": [{"name": "atokat", "enabled": True, "started": True}],
+                "queues": [{"name": "workq", "enabled": True, "started": True}],
             },
             host="host_f",
             driver_is_local=False,

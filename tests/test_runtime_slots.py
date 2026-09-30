@@ -139,8 +139,9 @@ class TestRuntimePythonLauncher:
         with pytest.raises(runtime_slots.RuntimeSlotError):
             runtime_slots.exec_current_python(tmp_path, [])
 
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
     def test_real_venvs_keep_late_imports_and_process_identity_across_activation(
-        self, tmp_path: Path,
+        self, tmp_path: Path, venv_subdir: str,
     ) -> None:
         repo = tmp_path / "upstream"
         repo.mkdir()
@@ -162,7 +163,7 @@ class TestRuntimePythonLauncher:
             shas.append(sha)
             transaction = ("1" if version == "A" else "2") * 32
             runtime_slots.begin_slot_build(root, sha, transaction_id=transaction,
-                                           in_use=lambda: set())
+                                           in_use=lambda: set(), venv_subdir=venv_subdir)
             runtime_slots.materialize_source(repo, root, sha)
             py = runtime_slots.slot_python(root, sha)
             venv.EnvBuilder(with_pip=False, symlinks=True).create(py.parent.parent)
@@ -571,6 +572,48 @@ class TestMaterializeSource:
     """Populating a slot with a checkout at exactly its own SHA."""
 
     @pytest.mark.parametrize("relative_origin", [False, True])
+    def test_generation_can_prepare_next_commit_without_legacy_checkout(
+        self, tmp_path: Path, relative_origin: bool,
+    ) -> None:
+        repo, _first, second = _live_repo(tmp_path)
+        upstream = tmp_path / "upstream"
+        _git(tmp_path, "clone", "--quiet", str(repo), str(upstream))
+        _git(repo, "remote", "add", "origin",
+             "../upstream" if relative_origin else str(upstream))
+        root = tmp_path / "rt"
+        old = runtime_slots.materialize_source(repo, root, second)
+        refs_before = _git(old, "show-ref")
+        (upstream / "VERSION").write_text("three")
+        _git(upstream, "add", "VERSION")
+        _git(upstream, "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "commit", "-m", "three", "--quiet")
+        target = _git(upstream, "rev-parse", "HEAD")
+        # A sandbox-only unavailable legacy path exposes hidden Git dependencies.
+        repo.rename(tmp_path / "retained-legacy")
+
+        new = runtime_slots.materialize_source(old, root, target)
+
+        assert _git(new, "rev-parse", "HEAD") == target
+        assert _git(old, "rev-parse", "HEAD") == second
+        assert _git(old, "show-ref") == refs_before
+        assert (old / "VERSION").read_text() == "two"
+        assert _git(old, "remote", "get-url", "origin") == str(upstream)
+        assert _git(new, "remote", "get-url", "origin") == str(upstream)
+
+    def test_generation_does_not_borrow_source_alternate_objects(self, tmp_path: Path) -> None:
+        repo, _first, second = _live_repo(tmp_path)
+        shared = tmp_path / "shared"
+        _git(tmp_path, "clone", "--quiet", "--shared", str(repo), str(shared))
+        assert (shared / ".git/objects/info/alternates").is_file()
+
+        source = runtime_slots.materialize_source(shared, tmp_path / "rt", second)
+        repo.rename(tmp_path / "retained-object-source")
+
+        assert _git(source, "show", f"{second}:VERSION") == "two"
+        assert not (source / ".git/objects/info/alternates").exists()
+        assert _git(source, "fsck", "--full") == ""
+
+    @pytest.mark.parametrize("relative_origin", [False, True])
     def test_fetches_new_commit_only_into_unpublished_slot(
         self, tmp_path: Path, relative_origin: bool,
     ) -> None:
@@ -688,22 +731,114 @@ class TestMaterializeSource:
                 repo, root, first, runner=lying_runner
             )
 
-    def test_objects_are_shared_with_the_source_not_copied(
-        self, tmp_path: Path
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_materialization_copies_objects_without_hardlink_dependency(
+        self, tmp_path: Path, packed: bool,
     ) -> None:
-        """`--local` hardlinks git's object store. Safe here precisely because
-        git objects are immutable and content-addressed -- unlike a venv, which
-        records absolute paths and cannot be shared at all."""
+        """Independent object bytes work when a filesystem cannot hardlink."""
+        import shutil
+
         repo, first, _ = _live_repo(tmp_path)
+        if packed:
+            _git(repo, "gc", "--prune=now")
         root = tmp_path / "rt"
-
         source = runtime_slots.materialize_source(repo, root, first)
+        objects = repo / ".git" / "objects"
+        files = [p for p in objects.rglob("*") if p.is_file() and p.parent.name != "info"]
+        assert files
+        for original in files:
+            copied = source / ".git" / "objects" / original.relative_to(objects)
+            assert copied.read_bytes() == original.read_bytes()
+            assert not copied.samefile(original), "runtime objects must not require hardlinks"
+        shutil.rmtree(repo)
+        assert _git(source, "rev-parse", "HEAD") == first
+        _git(source, "fsck", "--full")
 
-        assert (source / ".git").exists()
+    def test_cross_device_clone_refusal_is_avoided(self, tmp_path: Path) -> None:
+        """Model Git's EXDEV failure; all successful Git operations stay real."""
+        import subprocess
+
+        repo, first, _ = _live_repo(tmp_path)
+
+        def cross_device_runner(argv, **kwargs):
+            if argv[:2] == ["git", "clone"] and "--no-hardlinks" not in argv:
+                return subprocess.CompletedProcess(argv, 128, "", "Invalid cross-device link")
+            return subprocess.run(argv, **kwargs)
+
+        source = runtime_slots.materialize_source(
+            repo, tmp_path / "rt", first, runner=cross_device_runner,
+        )
         assert _git(source, "rev-parse", "HEAD") == first
 
 
 class TestDurableSlotBuild:
+    @pytest.mark.parametrize(
+        "patch",
+        [
+            {"venv_subdir": "../outside"},
+            {"venv_subdir": "/outside"},
+            {"venv_subdir": ".venv"},
+            {"schema": 1},
+            {"schema": 3},
+            {"extra": "unexpected"},
+        ],
+    )
+    def test_custom_layout_receipt_cannot_redirect_interpreter(
+        self, tmp_path: Path, patch: dict[str, object],
+    ) -> None:
+        root = tmp_path / "rt"
+        runtime_slots.begin_slot_build(
+            root, SHA_A, transaction_id="1" * 32, in_use=lambda: set(),
+            venv_subdir=".venv-viewer",
+        )
+        marker = runtime_slots.slot_path(root, SHA_A) / runtime_slots.SLOT_STATE_MARKER
+        payload = json.loads(marker.read_text())
+        marker.write_text(json.dumps({**payload, **patch}))
+        with pytest.raises(runtime_slots.RuntimeSlotError):
+            runtime_slots.slot_python(root, SHA_A)
+
+    @pytest.mark.parametrize("sealed", [False, True])
+    def test_custom_venv_binding_cannot_change_on_retry_or_reuse(
+        self, tmp_path: Path, sealed: bool,
+    ) -> None:
+        repo, sha, _second = _live_repo(tmp_path)
+        root = tmp_path / "rt"
+        runtime_slots.begin_slot_build(
+            root, sha, transaction_id="1" * 32, in_use=lambda: set(),
+            venv_subdir=".venv-viewer",
+        )
+        runtime_slots.materialize_source(repo, root, sha)
+        self._add_venv(root, sha)
+        if sealed:
+            runtime_slots.seal_slot_build(root, sha, transaction_id="1" * 32)
+        before = {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+        }
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="different virtualenv"):
+            runtime_slots.begin_slot_build(
+                root, sha, transaction_id="2" * 32, in_use=lambda: set(),
+                venv_subdir=".venv",
+            )
+        assert before == {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+        }
+
+    @pytest.mark.parametrize(
+        "name", ["../outside", "/absolute", ".git", "current", "..", "nested/env"],
+    )
+    def test_custom_venv_must_be_one_source_local_directory(
+        self, tmp_path: Path, name: str,
+    ) -> None:
+        root = tmp_path / "rt"
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="source-local directory"):
+            runtime_slots.begin_slot_build(
+                root, SHA_A, transaction_id="1" * 32, in_use=lambda: set(),
+                venv_subdir=name,
+            )
+        assert not root.exists()
+
     def _start(
         self,
         repo: Path,

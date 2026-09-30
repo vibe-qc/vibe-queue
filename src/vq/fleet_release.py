@@ -1219,6 +1219,127 @@ def git_is_pin_ancestor(
     return git_is_ancestor(repo, older, newer)
 
 
+@dataclass(frozen=True)
+class BranchHead:
+    """One branch head resolved in the checkout its report pin resolves in."""
+
+    pin_name: str
+    branch: str
+    sha: str
+    committed_at: int | None
+
+
+def pin_repo(
+    report: FleetReleaseReport,
+    pin_name: str,
+    runtime_repo_path: Path,
+    *,
+    pin_repos: Mapping[str, Path | str] | None = None,
+) -> Path:
+    """The checkout the named report pin's provenance is verified in."""
+    try:
+        pin = report.pins[pin_name]
+    except KeyError as exc:
+        raise FleetReleaseError(
+            f"{report.source_path}: unknown pin {pin_name!r}"
+        ) from exc
+    return _repo_for_pin(
+        pin,
+        schema=report.raw.get("schema"),
+        runtime_repo_path=runtime_repo_path,
+        pin_repos=resolve_pin_repos(pin_repos),
+        source_path=report.source_path,
+    )
+
+
+def git_commit_time(
+    repo: Path, sha: str, *, runner: Runner = subprocess.run,
+) -> int | None:
+    """Committer time of ``sha`` in ``repo``, or ``None`` when unresolvable."""
+    proc = runner(
+        ["git", "-C", str(repo), "show", "-s", "--format=%ct", f"{sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    value = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not value.isdigit():
+        return None
+    return int(value)
+
+
+def resolve_branch_heads(
+    report: FleetReleaseReport,
+    branches: Mapping[str, str],
+    runtime_repo_path: Path,
+    *,
+    pin_repos: Mapping[str, Path | str] | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, BranchHead]:
+    """Fetch and resolve each tracked branch head, keyed by report pin name.
+
+    ``branches`` maps a report pin name to the branch its lanes follow. Each
+    branch is fetched into ``refs/remotes/origin/<branch>`` of the pin's own
+    checkout under that checkout's lifecycle fence, exactly as report
+    discovery refreshes ``main``; the fetch changes refs only. A failed fetch
+    is fatal rather than a fallback to a cached head. The head must descend
+    from the report pin: a tracked lane never moves behind what was released.
+    """
+    from vq import admin
+
+    repos = {
+        pin_name: pin_repo(report, pin_name, runtime_repo_path, pin_repos=pin_repos)
+        for pin_name in branches
+    }
+    sources = sorted({path.resolve() for path in repos.values()})
+    heads: dict[str, BranchHead] = {}
+    try:
+        resources = tuple(
+            ("checkout", str(admin._canonical_lifecycle_checkout(source)))
+            for source in sources
+        )
+        with admin.toolset_lifecycle_lock(
+            [], action="vq-tracking-fetch", extra_resources=resources,
+        ):
+            for pin_name, branch in sorted(branches.items()):
+                repo = repos[pin_name]
+                ref = f"refs/remotes/origin/{branch}"
+                try:
+                    _git(
+                        repo, "fetch", "--quiet", "--no-tags", "origin",
+                        f"+refs/heads/{branch}:{ref}", runner=runner,
+                    )
+                    sha = _git(
+                        repo, "rev-parse", "--verify", "--quiet",
+                        f"{ref}^{{commit}}", runner=runner,
+                    )
+                except (FleetReleaseError, OSError, subprocess.SubprocessError) as exc:
+                    raise FleetReleaseError(
+                        f"could not resolve tracked branch {branch!r} for pin "
+                        f"{pin_name!r} in {repo}: {exc}"
+                    ) from exc
+                sha = _require_sha(sha, field=f"tracked branch {branch} head")
+                pin_sha = report.pins[pin_name].sha
+                contains = git_is_ancestor(repo, pin_sha, sha, runner=runner)
+                if contains is not True:
+                    raise FleetReleaseError(
+                        f"tracked branch {branch!r} head {sha[:12]} does not "
+                        f"contain the report's {pin_name} pin {pin_sha[:12]}"
+                        + ("" if contains is False else " (ancestry unknown)")
+                        + "; a tracked lane never moves behind its pin"
+                    )
+                heads[pin_name] = BranchHead(
+                    pin_name=pin_name,
+                    branch=branch,
+                    sha=sha,
+                    committed_at=git_commit_time(repo, sha, runner=runner),
+                )
+    except admin.AdminError as exc:
+        raise FleetReleaseError(f"could not fence tracked branch fetch: {exc}") from exc
+    return heads
+
+
 def git_is_ancestor(
     repo: Path,
     older: str,

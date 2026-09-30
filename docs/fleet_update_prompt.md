@@ -1,5 +1,7 @@
 # Maintenance task inputs
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 Give the maintenance agent an explicit host, program, intended full source
 revision and the applicable private operator runbook. Include active holds and
 running-job constraints. Do not put private inventory, accounts, credentials

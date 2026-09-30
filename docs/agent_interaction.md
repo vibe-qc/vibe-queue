@@ -1,5 +1,7 @@
 # Agent interaction protocol -- compute-d / compute-a (and any other vq-managed host)
 
+**Audience: agents.** Part of [The agent contract](agent/index.md).
+
 This page is the contract for **other dev chats** (basis-opt,
 periodic-SCF, molecular methods, basissetdev, vqfetch, docs, …)
 that need to run things on compute-d or compute-a. The queue chat owns
@@ -150,8 +152,10 @@ response can observe only that exact run and cannot replay it.
 This does not make a remote return code of zero the rollout verdict. It means
 only `deploy-completed-unverified`; independent login-host verification, LAST
 OK, and marker finalization remain authoritative. If the recorder or outer
-child dies, global reconciliation still blocks and does not positively query
-the remote receipt. Scheduler-helper actions, Slurm allocation builds, and
+child dies, global reconciliation still blocks. The owner settles it on the
+driver with `vq admin reconcile-operation OPERATION_ID`, which reads the bound
+remote receipt and re-runs the login-host verification without any replay
+(see `docs/operations.md`). Scheduler-helper actions, Slurm allocation builds, and
 manual commands without the validated outer context remain outside this
 increment. It is source-only: no accepted report carries it, and no live host,
 root daemon, scheduler, drain, or fleet operation exercised it. Focused
@@ -177,6 +181,30 @@ older immutable releases. A transcript that says the cache was reused and
 then starts configuring libecpint is therefore a cache-handoff defect, not an
 ordinary long build; stop at the next action boundary and diagnose it before
 allowing another native lane to rebuild.
+
+## Where things live on a host
+
+Every vq-managed host is converging on one home-directory layout, sorted by
+**lifecycle** rather than by content type (vibe-qc#1). Before you create,
+move or clean up anything on a host, know which of these you are standing in:
+
+| directory | holds | may an agent write here? |
+|---|---|---|
+| `~/gitlab` | managed checkouts | **No.** `vq admin update` territory; see the TL;DR. |
+| `~/vq` | what vq runs: `runtimes/` (per-SHA releases with `current` and `previous`) and `programs/` (external programs) | **No.** Deploys write here. |
+| `~/vqstate` | queue database, leases, audit trail, run records | **Never**, and it is never pruned. |
+| `~/vqscratch` | submitted work and fetched results not yet judged | Through `vq submit` and `$VQ_WORKDIR`. Disposable: do not keep the only copy of anything here. |
+| `~/vqruns` | results staged for promotion into a calculations repository | Yes, for results worth keeping. It is staging, not an archive: promote accepted results into the owning paper's repository. |
+| `~/bin` | wrappers and symlinks into `~/vq` | **No.** Its *paths* are provenance: finished jobs' receipts name them, so they must keep resolving even when what they point at moves. |
+| sync targets (a file-sync client's folders) | mirrored off the machine | **Never touched.** A local delete propagates. |
+
+A host may not be there yet. **Do not infer the layout from this table**: a root
+can be absent, can be a symlink, or can already hold live state or another
+lane's files. `contrib/fleet_layout_migrate.py survey` reports what a host
+really has without changing it, and [the layout page](fleet_layout.md) explains
+the migration, what is tooled, and which steps need the maintainer first.
+Moving a host onto the layout is a fleet change (`AGENTS.md`, hard rule 5), not
+something a job-submitting chat does.
 
 ## Why this exists
 
@@ -423,9 +451,9 @@ this looks stale):
 | compute-a | 12 | 62 GB | daemon host; 48 GB job-memory cap |
 | compute-b | 16 | 49,340 MB admission cap | daemon configuration rechecked 2026-09-07; route larger jobs elsewhere |
 | compute-c | 6 | 31 GB | daemon host |
-| pbs-cluster (= `atokat` queue) | 20 | ~94 GB | Torque, ~24 nodes |
-| pbs-cluster-itwin | 12 | ~94 GB | 8 nodes |
-| pbs-cluster-jtwin | 12 | 252 GB | 8 nodes |
+| pbs-cluster (= `workq` queue) | 20 | ~94 GB | Torque, ~24 nodes |
+| pbs-cluster-lanea | 12 | ~94 GB | 8 nodes |
+| pbs-cluster-laneb | 12 | 252 GB | 8 nodes |
 | pbs-cluster-big | 48-64 | 504 GB | 2 nodes (64c + 48c); request 48 unless you need a specific node |
 | pbs-cluster-amd | 64-128 | 504 GB | mixed 64c/128c nodes; request 64 unless you target the 128c node |
 | slurm-cluster / slurm-cluster-campaign | 96 | ~1000 GB | SLURM `intelsr_medium`, 192 nodes, wall default = max = 24 h |
@@ -563,6 +591,125 @@ daemon; those are omitted rather than guessed. If the list is empty and the job
 still will not run, it is either one of those or simply waiting its turn -- check
 `queue position` in the same output.
 
+### Why has my *scheduler* job not started? (#23)
+
+The section above is about a job the vq daemon has not dispatched. A job vq
+has already handed to PBS or Slurm is a different question: its vq `state` is
+already `"running"` -- that is the reservation -- and it is the cluster that
+has not started it. Two reads answer that, and both are stable JSON.
+
+**Per job: the scheduler's own words.** `scheduler_queued_reason` is the
+verbatim string the scheduler gave, Torque's `qstat -f` `comment` or Slurm's
+`squeue` `Reason`, with no vq interpretation over it. It sits at the top level
+of `vq status --json` and of every `vq queue --json` row, spelled the same way
+in both.
+
+```sh
+vq status pbs-cluster <jobid> --json | jq -r .scheduler_queued_reason
+# "Not Running: Not enough of the right type of nodes are available to run the job"
+
+# every blocked row on a lane, in one call
+vq queue pbs-cluster --json \
+  | jq -r '.[] | select(.scheduler_queued_reason)
+           | [.id, .scheduler_queued_reason] | @tsv'
+```
+
+`null` means **not reported**, never "no reason": a local job, a job that is
+not queued, and a scheduler that offers no explanation all read `null`. A
+*present* value never needs a freshness check -- vq sets it only while the
+cluster job is pending and clears it the moment it is not, so a running job
+never explains why it is waiting.
+
+The human spellings are `queued_why:` in `vq status`, and a footnote under the
+`vq queue` / `vq list` table, grouped by reason and naming the affected ids.
+It is a footnote rather than a column because a Torque comment is routinely
+wider than the whole table. That footnote is bounded the way every other
+remote scheduler diagnostic is -- one printable line, 240 characters -- while
+the JSON is never abridged. Human output is for people; poll the JSON.
+
+**Per host and lane: what could start at all.** A reason tells you this job is
+waiting. It does not tell you whether a request of that width is schedulable
+here in the first place, which is what a wave planner needs *before*
+submitting. `vq scheduler-probe HOST --json` carries a `capacity` object for
+that (read-only: `pbsnodes -a` on PBS, `sinfo -N` on Slurm; it touches no
+scheduler state).
+
+The payload's own `schema` field is **top level, not under `capacity`**, and
+its value is `vq.scheduler-probe.v1`. Check it. A consumer that pins it learns
+a shape change from the field rather than from a key that stopped being there,
+which is how the replacement of `capacity.nodes[].group` reached consumers
+before there was a version to read. The number rises when a field changes
+meaning or goes away; adding a field does not raise it.
+
+| field | means |
+|---|---|
+| `capacity.max_cpus_now` | free cores on the widest usable node -- the largest **single-node** request that could start now |
+| `capacity.max_cpus_when_free` | total cores on the widest usable node -- the largest single-node request the scheduler could **ever** run |
+| `capacity.usable_nodes`, `capacity.unusable_nodes` | the node counts behind those two figures |
+| `capacity.groups[]` | `name` plus the same two figures and counts per lane, and `authority` / `queues` -- see **Which lane is a lane** below |
+| `capacity.nodes[]` | per node: `name`, `total_cpus`, `free_cpus`, `state` (the scheduler's verbatim string), `usable`, and `lanes[]`, every lane the node is in |
+| `capacity.error` | why the census could not be read. Every figure above is then `null` |
+
+The two figures answer different questions, and conflating them is the bug
+this exists to prevent. A request wider than `max_cpus_now` **waits**. A
+request wider than `max_cpus_when_free` **waits forever**, however long you
+leave it, because no node the scheduler can still use is that wide even when
+idle. A node that is merely busy stays in both figures; only one the scheduler
+will not place work on at all (PBS `down`, `offline` or `unknown`; Slurm
+`down`, `drain`, `fail`, `maint` and the other non-allocatable states) is
+subtracted from what it could ever run. Each node's own `state` string is in
+`capacity.nodes[]` verbatim if you need to judge for yourself.
+
+Three `null`s that do not mean the same thing:
+
+* `capacity: null` -- no census was attempted. The host is not a scheduler
+  host, or the client binary is absent.
+* `capacity.error` set -- a census was attempted and failed.
+* a figure `null` inside a successful census -- the scheduler did not report
+  that number.
+
+**None of them means "nothing is free."** An agent that reads an unreadable
+census as zero capacity will refuse work the cluster can run.
+
+Both figures are per-node maxima, not sums, so they bound a single-node
+request only. vq does not currently compute what a multi-node request could
+get. Neither figure is enforced at submit time: `vq submit` warns against the
+operator-declared `scheduler_max_cpus`, not against a live census.
+
+#### Which lane is a lane
+
+`capacity.groups[]` repeats the two figures per lane, and
+`capacity.groups[].authority` says what makes that lane a lane. **Read it
+before you route work by lane name**: the three values are not equally strong
+claims.
+
+| `authority` | dialect | means |
+|---|---|---|
+| `partition` | Slurm | the lane **is** a Slurm partition. A partition is the scheduling lane; there is nothing to infer |
+| `queue_default` | PBS | a queue's `resources_default.neednodes` names this node property. `groups[].queues[]` lists those queues: that is the queue to submit to for this row's capacity |
+| `node_property` | PBS | **inferred.** The property is on nodes, but no queue vq could read routes to it. The figures are true of the nodes carrying it; that any queue sends work there is not |
+
+On Slurm a partition is the lane by definition, so `authority` is always
+`partition` and `queues[]` is always empty. On PBS a lane is a node property,
+and a property is not a queue: vq reads `resources_default.neednodes` from
+`qstat -Qf` (read-only) and treats it as the authority for which property a
+queue routes to. Where a site sets no such default, or where `qstat` could not
+be read at all, every lane comes back `node_property` and nothing is being
+claimed about queues.
+
+A PBS node carries as many properties as the site gave it and their order
+means nothing, so a node appears in `groups[]` once per property it has and
+`capacity.nodes[].lanes[]` lists all of them. Do not treat `lanes[0]` as *the*
+lane -- vq itself used to, reporting an arbitrary first property as if it were
+the node's lane, and that guess is what this field replaced. On Slurm,
+`sinfo -N` emits one row per node *per partition*, so a node in two partitions
+is two entries in `capacity.nodes[]`, each with a single-element `lanes[]`.
+
+A lane vq does not report is not a lane that does not exist: a
+`resources_default.neednodes` naming something no node declares as a property
+(a host name, a resource vq does not model) contributes no group at all,
+because a group with no nodes would read as unknown capacity rather than none.
+
 ### Reading results back
 
 ```sh
@@ -585,10 +732,13 @@ vq fetch-all compute-d -o ~/Downloads/            # v0.12.0: ALL terminal jobs a
 vq fetch-all --all-hosts -o ~/Downloads/        # v0.12.0: every configured host at once
 ```
 
-`vq fetch` tars and copies the **workspace** back. If a local daemon job has
-a separate workdir, this implicit selection exits with an explicit
-`--workdir` hint after copying the workspace, so an inputs-only tree is not
-reported as artifact retrieval. Use `--workspace` to explicitly request only
+`vq fetch` tars and copies the **workspace** back. If a local daemon job
+wrote anything to its separate workdir (`$VQ_WORKDIR`), this implicit
+selection exits 1 with an explicit `--workdir` hint after copying the
+workspace, so an inputs-only tree is not reported as artifact retrieval. A
+job whose workdir the host proves empty (it never used `$VQ_WORKDIR`, as a
+vibe-qc job writing next to its script does not) fetches cleanly (#120). A
+swept, missing or unreadable workdir counts as not proven empty. Use `--workspace` to explicitly request only
 the submitted workspace and queue logs. Terminal local-job receipts from
 older remotes without workdir metadata also require this explicit selection.
 `--workspace`, `--workdir`, and `--name` are mutually exclusive.
@@ -702,6 +852,16 @@ The contract:
   `--name` is the documented sidecar-free exception.
 * **`stale: true` means do not reason about this tree.** Re-fetch it. A
   successful refresh clears the flag.
+* **`partial: true` means the tree is current but incomplete.** Since #62, a
+  file vq cannot read on the source host, and a member the tar extraction
+  filter refuses on the way in (an absolute symlink out of the workspace, for
+  instance), cost that entry rather than the whole job. The tree's
+  `_vq/fetch-exclusions.json` (`vq.fetch-exclusions.v1`) names every missing
+  entry, which stage lost it (`archive` on the host, `extract` on the
+  receiver), and why. An empty `excluded` list means the tree is complete; a
+  missing sidecar means the tree predates this contract and proves nothing.
+  A coverage claim over a fetched corpus should read this, not the directory
+  count.
 
 Automated watchers should treat `fetched_at` as the age of the evidence:
 results-presence is the loop's mandated terminal-detection method precisely
@@ -744,6 +904,17 @@ terminal states (e.g. `-s completed`). This is the fleet answer to
 "PBS copies everything to scratch, how do I get my files back": one
 sweep brings the whole `--array` or AICCM batch home.
 
+Every sweep writes a machine-readable run report to
+`<output_dir>/_vq/fetch-all-report.json` (`vq.fetch-all-report.v1`;
+`--report PATH` moves it, `--report none` declines it). It names every selected
+job with its host, outcome, destination and — for a partial tree — the entries
+it does not contain. Read it instead of counting directories or grepping the
+log: a summary line says *how many* jobs were lost, the report says *which*,
+and a tree that arrived incomplete is listed there rather than looking like a
+complete one. A partial job is reported as fetched and does not fail the sweep,
+but it is tagged `[PARTIAL: N excluded]` on its row and counted separately in
+the summary.
+
 Per-job `vq fetch HOST JOBID` retries **refresh** the destination when it is a
 prior vq fetch of that same job, as proven by its
 `_vq/terminal-diagnosis.json` sidecar; see the fetch-freshness contract
@@ -783,6 +954,12 @@ then poll `vq status HOST JOBID --json`. Queue JSON rows include every
 `JobSpec` field plus `effective_state`, `scheduler_running_confirmed`,
 `queue_handle`, and `terminal_diagnosis`; status JSON carries the same state
 projection and adds the live monitor fields below.
+
+Among those `JobSpec` fields, one is worth naming for a cockpit that shows
+scheduler lanes: `scheduler_queued_reason`, the scheduler's own verbatim
+explanation for a row it has not started. It is present on both surfaces with
+the same spelling and the same `null`-means-not-reported rule -- see
+[Why has my *scheduler* job not started?](#why-has-my-scheduler-job-not-started-23).
 
 For an interactive lookup that has only a job ID, hostless `vq status JOBID`
 can discover a unique owner from durable queue rows even when the configured
@@ -855,10 +1032,11 @@ level; the monitor-relevant stable fields are:
     "done": true,
     "outcome": "converged"
   },
-  "runtime_workdir": "/var/lib/vq/users/UID/workdirs/abc123",
-  "workdir": "/var/lib/vq/users/UID/workdirs/abc123",
+  "runtime_workdir": "/var/lib/vq-scratch/users/<uid>/workdirs/abc123",
+  "workdir": "/var/lib/vq-scratch/users/<uid>/workdirs/abc123",
   "checkpoint_qvf_filename": "checkpoint.qvf",
-  "checkpoint_qvf_path": "/var/lib/vq/users/UID/workdirs/abc123/checkpoint.qvf",
+  "checkpoint_qvf_path":
+    "/var/lib/vq-scratch/users/<uid>/workdirs/abc123/checkpoint.qvf",
   "checkpoint_qvf_exists": false,
   "stdout": "...",
   "stderr": "..."
@@ -971,6 +1149,19 @@ daemon, scheduler clients/liveness, configured program hooks, and
 or config failure: fix `[hosts.HOST].remote_vq` or update the queue install
 before submitting production jobs.
 
+`vq submit` asks the same `scheduler_remote_vq` question on the driver before
+it queues for a scheduler target. A helper whose source tree or `SOURCE-SHA`
+differs from the driver's gets a warning by default, with both identities and
+the remedy (`vq admin update HOST`) in the message. A helper in that state left
+jobs `unpolled` with no scheduler job id, but a driver-first rollout must not
+refuse submits while the helpers catch up (maintainer decision on #127). With
+`[fleet] strict_helper_identity = true` in the driver's config, such a submit is
+refused instead, and `--allow-helper-mismatch` queues one anyway with the
+warning. A helper that did not answer in time, or could not be reached, is
+always a warning, so a submit to a briefly unreachable host still queues for
+later dispatch. A remote driver runs the check with its own config when the
+relayed submit reaches it; the flag is forwarded only when set.
+
 Doctor runs a **local leg** first, so an unreachable host is diagnosed without
 guessing. Read these checks before concluding anything about the remote side:
 
@@ -1004,6 +1195,12 @@ stderr can use:
 ```sh
 vq wait HOST JOBID --json
 ```
+
+Add `--timeout 30m` to bound the wait. Numeric seconds remain valid, including
+fractional and scientific notation; one lowercase `s`, `m`, `h`, or `d`
+suffix scales the number to seconds. For example, `--timeout 1.5h` waits at
+most 5400 seconds. The value must be finite and at least 0.1 seconds. Parsing
+happens on the client, so the same syntax works for remote and broker jobs.
 
 Terminal success or failure prints a single JSON object on stdout:
 
@@ -1048,8 +1245,11 @@ The process exits with `cli_exit_code`, matching plain `vq wait`. If
 `runtime_workdir` is the path the job sees as `$VQ_WORKDIR`. For ordinary
 local/daemon jobs it matches `workdir`. For scheduler-backed jobs, `workdir`
 can remain `null` because there is no local vq scratch directory, while
-`runtime_workdir` is the scheduler remote workspace path when the driver
-config can resolve it. `checkpoint_qvf_exists` is `true` or `false` only for
+`runtime_workdir` is the remote workspace **that job is bound to** — the one
+recorded on it before submission (#63), not a fresh derivation from the
+driver's current `scratch_root`. A job dispatched before that binding existed
+falls back to the derivation, which is where it was staged. `checkpoint_qvf_path`
+is `runtime_workdir` plus the checkpoint filename, so it follows the same rule. `checkpoint_qvf_exists` is `true` or `false` only for
 local paths vq can stat; it is `null` for remote scheduler paths or unknown
 workdirs.
 
@@ -1186,10 +1386,14 @@ payload cwd depends on the execution path.
 The daemon creates a per-job **workdir** at dispatch, distinct from the
 workspace (cwd, which holds your submitted source):
 
-* **Path**: `/var/lib/vq/users/<your-uid>/workdirs/<jobid>/`
-  (multi-user) or `~/.local/share/vq/workdirs/<jobid>/`
-  (single-user). The path is injected into your job's environment
-  as `$VQ_WORKDIR`.
+* **Path**: `/var/lib/vq-scratch/users/<your-uid>/workdirs/<jobid>/`
+  (multi-user) or `~/.local/share/vq-scratch/workdirs/<jobid>/`
+  (single-user) since v0.26.10, which moved disposable scratch out of
+  the state root (#63); a job dispatched before that keeps the path it
+  recorded under the state root. Read the resolved roots from
+  `vq daemon status`, and any individual job's from its own status
+  payload, rather than assuming either layout. The path is injected
+  into your job's environment as `$VQ_WORKDIR`.
 * **Permissions**: owned by your uid (root-daemon-chowned), so
   your script can read/write freely.
 * **Lifetime**: by default the workdir lingers after the job
@@ -1551,6 +1755,8 @@ need an interactive shell, ask the maintainer.
   **maintainer** action during a release rollout, not a job-submitting chat's.
   Do not run it.
 * Modifying anything in another user's `/var/lib/vq/users/<uid>/`.
+* Creating, moving or deleting anything in `~/vq`, `~/vqstate` or `~/bin`, or
+  anything at all in a file-sync folder. See § "Where things live on a host".
 
 All of these are the queue chat's or the operator's responsibility.
 If your work *seems* to need any of them, you're holding the wrong
