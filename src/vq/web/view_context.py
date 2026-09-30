@@ -702,3 +702,53 @@ def doctor_context(state: Mapping[str, object]) -> dict[str, object]:
         "ok_count": ok_count,
         "bad_count": bad_count,
     }
+
+
+def convergence_chart(
+    preview: dict[str, object] | None,
+    *,
+    width: int = 360,
+    height: int = 120,
+) -> dict[str, object] | None:
+    """Polyline geometry for an SCF convergence plot (#65, V2).
+
+    Plots log10 of the ``||[F,DS]||`` residual against the iteration, so the
+    page draws one ``<polyline>`` with no script. ``None`` when the preview has
+    fewer than two positive residuals.
+    """
+    import math
+
+    series = preview.get("scf") if isinstance(preview, dict) else None
+    if not isinstance(series, list):
+        return None
+    points = [
+        (int(p["iter"]), math.log10(float(p["residual"])))
+        for p in series
+        if isinstance(p, dict) and isinstance(p.get("residual"), (int, float))
+        and p["residual"] > 0 and isinstance(p.get("iter"), int)
+    ]
+    if len(points) < 2:
+        return None
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = math.floor(min(ys)), math.ceil(max(ys))
+    if y1 == y0:
+        y1 = y0 + 1
+    pad = 6
+
+    def sx(x: int) -> float:
+        return pad + (width - 2 * pad) * ((x - x0) / (x1 - x0) if x1 > x0 else 0.0)
+
+    def sy(y: float) -> float:
+        return pad + (height - 2 * pad) * (y1 - y) / (y1 - y0)
+
+    return {
+        "width": width,
+        "height": height,
+        "points": " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points),
+        "first_iter": x0,
+        "last_iter": x1,
+        "log_top": y1,
+        "log_bottom": y0,
+    }

@@ -224,17 +224,70 @@ class TestValidatorRejectsForgedSubmitter:
 
 
 class TestValidatorRejectsPathEscapes:
+    """Every case here needs the submitter's jobs root to EXIST.
+
+    Without it the gate refuses at the earlier "which roots does this uid
+    have" step and never reaches the check under test. That used to pass
+    silently, because the refusal quoted the missing path and pytest's
+    tmp-dir name is derived from the test name -- so ``"outside" in reason``
+    matched ``.../test_cwd_outside_jobs_tree_r0/...`` rather than the
+    sentence these tests exist to pin (found while splitting the roots for
+    #63).
+    """
+
     def test_cwd_outside_jobs_tree_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # cwd=/etc — the daemon would chown -R /etc to the attacker.
         d = _make_mu_daemon(tmp_path, monkeypatch)
         try:
+            paths.user_jobs_dir(4242).mkdir(parents=True)
             spec = _spec(4242, "job-1", submitter="4242", cwd="/etc")
             d._job_uid["job-1"] = "4242"
             reason = d._validate_multi_user_spec(spec)
             assert reason is not None
-            assert "outside" in reason
+            assert "is outside the submitter's jobs trees" in reason
+        finally:
+            d._queue_lock_fd.close()
+
+    def test_no_jobs_root_at_all_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#63: a uid with neither managed jobs root fails closed."""
+        d = _make_mu_daemon(tmp_path, monkeypatch)
+        try:
+            spec = _spec(
+                4242, "job-1", submitter="4242", cwd=_honest_cwd(4242, "job-1")
+            )
+            d._job_uid["job-1"] = "4242"
+            reason = d._validate_multi_user_spec(spec)
+            assert reason is not None
+            assert "no managed jobs root exists" in reason
+        finally:
+            d._queue_lock_fd.close()
+
+    def test_cwd_under_the_pre_63_state_jobs_root_is_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#63: a job dispatched before the scratch split keeps its cwd.
+
+        This is the #69 lesson applied to the gate: the record names the old
+        root, the bytes are still there, and refusing it would strand every
+        job that existed at upgrade time.
+        """
+        uid = os.getuid()
+        d = _make_mu_daemon(tmp_path, monkeypatch)
+        try:
+            legacy_root = paths.user_state_jobs_dir(uid)
+            (legacy_root / "job-1").mkdir(parents=True)
+            spec = _spec(
+                uid,
+                "job-1",
+                submitter=str(uid),
+                cwd=str(legacy_root / "job-1"),
+            )
+            d._job_uid["job-1"] = str(uid)
+            assert d._validate_multi_user_spec(spec) is None
         finally:
             d._queue_lock_fd.close()
 
@@ -284,6 +337,7 @@ class TestValidatorRejectsPathEscapes:
     ) -> None:
         d = _make_mu_daemon(tmp_path, monkeypatch)
         try:
+            paths.user_jobs_dir(4242).mkdir(parents=True)
             spec = _spec(
                 4242, "job-1",
                 submitter="4242", cwd=_honest_cwd(4242, "job-1"),
@@ -301,6 +355,7 @@ class TestValidatorRejectsPathEscapes:
     ) -> None:
         d = _make_mu_daemon(tmp_path, monkeypatch)
         try:
+            paths.user_jobs_dir(4242).mkdir(parents=True)
             spec = _spec(
                 4242, "job-1",
                 submitter="4242", cwd=_honest_cwd(4242, "job-1"),

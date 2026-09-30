@@ -26,6 +26,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import selectors
 import shlex
 import signal
@@ -56,6 +57,9 @@ DEFAULT_REMOTE_VQ_TIMEOUT_SECONDS = 600.0
 # Keep ten minutes beyond the default four-hour update_script cap for git,
 # process-group cleanup, activation, verification, and daemon restart work.
 DEFAULT_REMOTE_ADMIN_UPDATE_TIMEOUT_SECONDS = 15000.0
+
+_FORWARDED_BUILD_PARALLELISM = "CMAKE_BUILD_PARALLEL_LEVEL"
+"""The one non-timeout name a remote admin update may carry (#133)."""
 
 _REMOTE_ADMIN_TIMEOUT_ENV_RULES = {
     "VQ_UPDATE_SCRIPT_TIMEOUT": False,
@@ -515,10 +519,11 @@ def _remote_admin_timeout_env_prefix(
     """
     expected = set(_REMOTE_ADMIN_TIMEOUT_ENV_RULES)
     actual = set(remote_env)
-    if actual != expected:
+    if actual - {_FORWARDED_BUILD_PARALLELISM} != expected:
         raise ValueError(
             "remote admin timeout environment must contain exactly "
-            f"{sorted(expected)!r}"
+            f"{sorted(expected)!r}, plus optionally "
+            f"{_FORWARDED_BUILD_PARALLELISM!r}"
         )
 
     canonical: dict[str, str] = {}
@@ -540,6 +545,15 @@ def _remote_admin_timeout_env_prefix(
                 f"{name} value"
             )
         canonical[name] = str(value)
+    if _FORWARDED_BUILD_PARALLELISM in remote_env:
+        # #133: an operator's cap set on the driver; ssh would not carry it.
+        level = remote_env[_FORWARDED_BUILD_PARALLELISM]
+        if not isinstance(level, str) or re.fullmatch(r"[1-9][0-9]{0,3}", level) is None:
+            raise ValueError(
+                "remote admin timeout environment contains an invalid "
+                f"{_FORWARDED_BUILD_PARALLELISM} value"
+            )
+        canonical[_FORWARDED_BUILD_PARALLELISM] = level
 
     return [
         "/usr/bin/env",

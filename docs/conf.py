@@ -130,10 +130,8 @@ intersphinx_mapping = {
 # but they are not product documentation and several of them would be the
 # largest pages on the site.
 #
-# Two of these are excluded for a second reason: the fleet runbooks describe
-# named real hosts. `docs/hosts.md` is sanitized and publishable; the
-# runbooks are not, and are not worth sanitizing for an audience that does
-# not exist.
+# The portable fleet runbooks remain source-tree references for maintenance
+# agents; the operator index links to their public source copies.
 exclude_patterns = [
     "_build",
     "README.md",
@@ -149,7 +147,7 @@ exclude_patterns = [
     "design_*.md",
     "pbs_dispatcher_backend_design.md",
     "v0_7_1_lamports_clock_design.md",
-    # Fleet-internal runbooks: name real hosts, no external audience.
+    # Maintenance references: linked from the operator index in the source tree.
     "fleet_update_runbook.md",
     "fleet_update_prompt.md",
     "state_file_audit.md",
@@ -162,9 +160,9 @@ exclude_patterns = [
     "vibe-qc-site/**",
 ]
 
-# Cross-references into excluded pages are expected: the published pages
-# legitimately point at working-memory documents that live in the
-# repository. Do not "fix" these by publishing the target.
+# Link to excluded pages through their public source URL, since relative
+# cross-references render as plain text. Do not publish a working-memory
+# document merely to make a link resolve.
 suppress_warnings = ["myst.xref_missing"]
 
 
