@@ -1,5 +1,7 @@
 # Retiring multi-user mode on compute-d and compute-a
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 **Status: ON HOLD (maintainer, 2026-08-05). Nothing here has run, and nothing
 here should run for now.**
 

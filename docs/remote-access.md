@@ -1,5 +1,7 @@
 # Reaching the queue from the internet
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 How to submit jobs to a vq queue host that lives behind a home/lab
 router, from anywhere — securely.
 

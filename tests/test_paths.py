@@ -22,7 +22,9 @@ def _resolve_default_in_subprocess(
     env = dict(os.environ)
     for name in (
         paths.ENV_STATE_DIR,
+        paths.ENV_SCRATCH_DIR,
         paths.ENV_CONFIG_DIR,
+        paths.ENV_MULTI_USER_SCRATCH_ROOT,
         "PYTEST_CURRENT_TEST",
         "PYTEST_VERSION",
         "PYTEST_ADDOPTS",
@@ -53,9 +55,11 @@ def isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wipe path env vars so tests see a deterministic default."""
     for var in (
         paths.ENV_STATE_DIR,
+        paths.ENV_SCRATCH_DIR,
         paths.ENV_CONFIG_DIR,
         paths.ENV_ARCHIVE_DIR,
         paths.ENV_MULTI_USER_ROOT,
+        paths.ENV_MULTI_USER_SCRATCH_ROOT,
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
     ):
@@ -110,13 +114,17 @@ class TestSubpaths:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         state = tmp_path / "state"
+        scratch = tmp_path / "scratch"
         monkeypatch.setenv(paths.ENV_STATE_DIR, str(state))
+        monkeypatch.setenv(paths.ENV_SCRATCH_DIR, str(scratch))
         assert paths.queue_dir() == state / "queue"
-        assert paths.jobs_dir() == state / "jobs"
         assert paths.spec_path("abc") == state / "queue" / "abc.json"
-        assert paths.workspace_dir("abc") == state / "jobs" / "abc"
         assert paths.daemon_pidfile() == state / "daemon.pid"
         assert paths.daemon_logfile() == state / "daemon.log"
+        # #63: the disposable trees hang off the scratch root.
+        assert paths.jobs_dir() == scratch / "jobs"
+        assert paths.workspace_dir("abc") == scratch / "jobs" / "abc"
+        assert paths.workdir_root() == scratch / "workdirs"
 
 
 class TestAtomicWrite:

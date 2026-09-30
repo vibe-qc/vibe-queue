@@ -46,7 +46,13 @@ PROGRAM_PINS = {
     "vibeqc-dev": "dev",
     "vibe-view": "vibe_view",
 }
+TRACKABLE_PROGRAMS = frozenset(config.FLEET_TRACKABLE_PROGRAMS)
+"""Programs whose lanes may follow a branch head (#109); a subset of pins."""
+assert set(PROGRAM_PINS) - {"vibeqc-queue", "vibeqc-release"} >= TRACKABLE_PROGRAMS
+_TRACKING_PHASES = frozenset({"scheduler-runtime", "local-runtime"})
 SCHEDULER_PROGRAM_ORDER = ("vibeqc-release", "vibeqc-dev", "vibe-view")
+# The planner's converged verdict for a healthy lane proven ahead of its pin.
+_DESCENDANT_SKIP_REASON = "newer descendant already deployed; no downgrade"
 LOCAL_PROGRAM_ORDER = (
     "vibeqc-queue",
     "vibeqc-release",
@@ -255,6 +261,88 @@ class LaneState:
     which is the safe reading either way."""
 
 
+@dataclass(frozen=True)
+class TrackingTarget:
+    """One program's lanes deploy this branch head instead of its report pin.
+
+    Resolved once per rollout (:func:`vq.fleet_release.resolve_branch_heads`)
+    and carried unchanged through driver re-entry, so every lane of the
+    program and the final verification agree on one exact SHA. The report pin
+    stays the floor: the head must descend from it.
+    """
+
+    program: str
+    pin_name: str
+    branch: str
+    sha: str
+    committed_at: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "program": self.program,
+            "pin_name": self.pin_name,
+            "branch": self.branch,
+            "sha": self.sha,
+            "committed_at": self.committed_at,
+        }
+
+
+def tracking_targets(
+    cfg: config.Config,
+    heads: Mapping[str, fleet_release.BranchHead],
+) -> tuple[TrackingTarget, ...]:
+    """Pair the configured tracking lanes with their resolved heads."""
+    targets: list[TrackingTarget] = []
+    for program, branch in sorted(cfg.fleet_tracking_lanes.items()):
+        head = heads.get(PROGRAM_PINS[program])
+        if head is None or head.branch != branch:
+            raise FleetRolloutError(
+                f"tracked program {program} has no resolved head for {branch!r}"
+            )
+        targets.append(
+            TrackingTarget(
+                program=program,
+                pin_name=head.pin_name,
+                branch=branch,
+                sha=head.sha,
+                committed_at=head.committed_at,
+            )
+        )
+    return tuple(targets)
+
+
+def tracking_branches(cfg: config.Config) -> dict[str, str]:
+    """Configured tracking branches keyed by report pin name."""
+    branches: dict[str, str] = {}
+    for program, branch in cfg.fleet_tracking_lanes.items():
+        pin_name = PROGRAM_PINS[program]
+        if branches.setdefault(pin_name, branch) != branch:
+            raise FleetRolloutError(
+                f"programs sharing the {pin_name} pin track different branches"
+            )
+    return branches
+
+
+def _validated_tracking(
+    report: fleet_release.FleetReleaseReport,
+    tracking: Sequence[TrackingTarget],
+) -> dict[str, TrackingTarget]:
+    by_program: dict[str, TrackingTarget] = {}
+    for target in tracking:
+        if (
+            type(target) is not TrackingTarget
+            or target.program not in TRACKABLE_PROGRAMS
+            or target.pin_name != PROGRAM_PINS[target.program]
+            or target.pin_name not in report.pins
+            or not isinstance(target.sha, str)
+            or _SOURCE_SHA.fullmatch(target.sha) is None
+            or target.program in by_program
+        ):
+            raise FleetRolloutError(f"invalid tracking target {target!r}")
+        by_program[target.program] = target
+    return by_program
+
+
 @dataclass
 class RolloutAction:
     id: str
@@ -310,6 +398,8 @@ class RolloutPlan:
     topology_errors: list[str] = field(default_factory=list)
     retained_legacy_fences: list[dict[str, str]] = field(default_factory=list)
     created_at: str | None = None
+    tracking: tuple[TrackingTarget, ...] = ()
+    """Branch heads this plan's tracked lanes target (#109); empty by default."""
     _scheduler_hold_targets: dict[
         str, tuple[tuple[str, str], ...]
     ] = field(default_factory=dict, repr=False)
@@ -347,6 +437,24 @@ class RolloutPlan:
         return [action for action in self.actions if action.decision == "update"]
 
     def as_dict(self) -> dict[str, Any]:
+        payload = self._as_dict()
+        if self.tracking:
+            payload["tracking"] = [target.as_dict() for target in self.tracking]
+        return payload
+
+    def tracked_target(self, action: RolloutAction) -> TrackingTarget | None:
+        """The tracking target an action deploys, if it deploys one exactly."""
+        for target in self.tracking:
+            if (
+                action.program == target.program
+                and action.phase in _TRACKING_PHASES
+                and action.pin_name == target.pin_name
+                and action.target_sha == target.sha
+            ):
+                return target
+        return None
+
+    def _as_dict(self) -> dict[str, Any]:
         return {
             "driver": self.driver,
             "report": self.report,
@@ -1217,6 +1325,7 @@ def finalize_run(
     *,
     complete: bool,
     report_digest_resolver: ReportDigestResolver | None = None,
+    control_runner: Runner = subprocess.run,
 ) -> RolloutRun:
     """Finalize from the newest journal while fenced against another run.
 
@@ -1241,6 +1350,8 @@ def finalize_run(
                 "rollout journal changed to a different accepted report "
                 "during final verification"
             )
+        # A deferral must leave nothing behind (#99).
+        _release_deferred_holds(current, control_runner)
         unsettled_hold = any(
             isinstance(value, dict)
             and value.get("owned") is True
@@ -2537,7 +2648,7 @@ def _lane_decision(
                 f"{hint}",
             )
         if lane.last_ok:
-            return "skip", "newer descendant already deployed; no downgrade"
+            return "skip", _DESCENDANT_SKIP_REASON
         if lane.acknowledged:
             return (
                 "update",
@@ -2615,11 +2726,19 @@ def _action(
     probe_error: str | None = None,
     ahead_is_release_drift: bool = False,
     redeploy_hint: str | None = None,
+    tracking: TrackingTarget | None = None,
+    tracking_block: str | None = None,
 ) -> RolloutAction:
     action_argv = list(argv)
     action_target_sha = pin.sha
     action_target_version: str | None = pin.version
     action_target_tag = pin.tag
+    if tracking is not None:
+        # A branch head has no release tag, and the report pin's version
+        # describes the floor, not this commit. Like an ahead repair, keep the
+        # unknown explicit until the deployed lane reports its own version.
+        action_target_version = None
+        action_target_tag = None
     if probe_error is not None:
         # Checked before the lane decision: a failed probe yields an empty
         # payload, which _lane_decision would read as "not configured" and
@@ -2675,6 +2794,10 @@ def _action(
                 f"newer descendant {current} {provenance}; repair that "
                 "descendant without downgrade"
             )
+    if tracking_block is not None:
+        # Fail closed whatever the lane or probe says: a head that does not
+        # descend from the pin must never be deployed.
+        decision, reason = "block", tracking_block
     return RolloutAction(
         id=action_id,
         phase=phase,
@@ -2704,8 +2827,14 @@ def build_plan(
     doctor: Mapping[str, Any],
     ancestry: Ancestry,
     target_vq_tree_sha256: str | None = None,
+    tracking: Sequence[TrackingTarget] = (),
 ) -> RolloutPlan:
-    """Create the complete serial plan without changing fleet state."""
+    """Create the complete serial plan without changing fleet state.
+
+    ``tracking`` retargets the lanes of each named program from its report
+    pin to one resolved branch head (#109). Every other lane, and the plan's
+    report identity, stay exactly as without it.
+    """
     topology = resolve_topology(cfg, admin_status)
     driver = derive_driver(cfg, topology)
     topology_errors = [
@@ -2729,6 +2858,34 @@ def build_plan(
         if topology[name].role == "managed"
     ]
     actions: list[RolloutAction] = []
+
+    tracked = _validated_tracking(report, tracking)
+    lane_pins: dict[str, fleet_release.FleetPin] = {}
+    tracking_blocks: dict[str, str] = {}
+    for program, target in tracked.items():
+        floor = report.pins[target.pin_name]
+        contains = (
+            True
+            if floor.sha == target.sha
+            else ancestry(target.pin_name, floor.sha, target.sha)
+        )
+        if contains is not True:
+            # Re-proved here, not only at resolution, so no caller can hand
+            # the planner a head that would move a lane behind its pin.
+            tracking_blocks[program] = (
+                f"tracked {target.branch} head {target.sha[:12]} does not "
+                f"descend from the report {target.pin_name} pin {floor.sha[:12]}"
+                + ("" if contains is False else " (ancestry unknown)")
+            )
+        lane_pins[program] = replace(
+            floor,
+            sha=target.sha,
+            tag=None,
+            deploy_flags=("--expected-sha", target.sha),
+        )
+
+    def lane_pin(program: str) -> fleet_release.FleetPin:
+        return lane_pins.get(program) or report.pins[PROGRAM_PINS[program]]
 
     driver_pin = report.pins["vq"]
     driver_required = topology[driver].role == "vq-only"
@@ -2907,7 +3064,7 @@ def build_plan(
                 requested_envs=[f"scheduler-runtime:{host}:{program}"],
                 requested_host=host,
             )
-            pin = report.pins[PROGRAM_PINS[program]]
+            pin = lane_pin(program)
             lane = _scheduler_lane_state(
                 admin_status,
                 host=host,
@@ -2934,6 +3091,8 @@ def build_plan(
                     hold_reason=hold,
                     marker_reason=marker,
                     probe_error=probe,
+                    tracking=tracked.get(program),
+                    tracking_block=tracking_blocks.get(program),
                 )
             )
 
@@ -2946,7 +3105,7 @@ def build_plan(
         for program in LOCAL_PROGRAM_ORDER:
             if host == driver and program == "vibeqc-queue":
                 continue
-            pin = report.pins[PROGRAM_PINS[program]]
+            pin = lane_pin(program)
             marker = _marker_reason(
                 admin_status,
                 host,
@@ -2987,6 +3146,8 @@ def build_plan(
                         if program == "vibeqc-queue"
                         else None
                     ),
+                    tracking=tracked.get(program),
+                    tracking_block=tracking_blocks.get(program),
                 )
             )
 
@@ -3013,6 +3174,7 @@ def build_plan(
         _scheduler_hold_targets=scheduler_hold_targets,
         provenance_lanes=provenance_lanes,
         topology_errors=topology_errors,
+        tracking=tuple(tracked.values()),
     )
 
 
@@ -3041,22 +3203,36 @@ class HostSelection:
 
     only: tuple[str, ...] = ()
     skip: tuple[str, ...] = ()
+    tracking: tuple[str, ...] = ()
+    """``--only-tracking`` (#109): the tracked programs whose runtime lanes
+    this invocation may change. Empty means every lane of a selected host.
+    Lane-granular, unlike the host selection it composes with."""
 
     @property
     def scoped(self) -> bool:
-        return bool(self.only or self.skip)
+        return bool(self.only or self.skip or self.tracking)
 
     def includes(self, host: str) -> bool:
         if self.only:
             return host in self.only
         return host not in self.skip
 
+    def includes_action(self, action: RolloutAction) -> bool:
+        if not self.includes(action.host):
+            return False
+        if not self.tracking:
+            return True
+        return action.program in self.tracking and action.phase in _TRACKING_PHASES
+
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "only": list(self.only),
             "skip": list(self.skip),
             "scoped": self.scoped,
         }
+        if self.tracking:
+            payload["only_tracking"] = list(self.tracking)
+        return payload
 
 
 def resolve_selection(
@@ -3064,11 +3240,12 @@ def resolve_selection(
     *,
     only: Sequence[str] = (),
     skip: Sequence[str] = (),
+    only_tracking: bool = False,
 ) -> HostSelection:
     """Validate operator host selection against the configured fleet.
 
     Fails closed on an unknown name rather than silently selecting nothing: a
-    typo in ``--only planetxx`` that quietly became "update no hosts" would
+    typo in ``--only hostzzzz`` that quietly became "update no hosts" would
     report a clean exit for a rollout that did nothing at all.
     """
     only_names = tuple(dict.fromkeys(only))
@@ -3085,7 +3262,15 @@ def resolve_selection(
             f"unknown host(s) {', '.join(unknown)}; configured hosts are "
             + ", ".join(sorted(cfg.hosts))
         )
-    return HostSelection(only=only_names, skip=skip_names)
+    tracking: tuple[str, ...] = ()
+    if only_tracking:
+        tracking = tuple(sorted(cfg.fleet_tracking_lanes))
+        if not tracking:
+            raise FleetRolloutError(
+                "--only-tracking needs [fleet_tracking_lanes] in the driver "
+                "config; no lane tracks a branch"
+            )
+    return HostSelection(only=only_names, skip=skip_names, tracking=tracking)
 
 
 def select_hosts(plan: RolloutPlan, selection: HostSelection) -> RolloutPlan:
@@ -3101,10 +3286,27 @@ def select_hosts(plan: RolloutPlan, selection: HostSelection) -> RolloutPlan:
     if not selection.scoped:
         return plan
     actions = [replace(action) for action in plan.actions]
+    # --only-tracking leaves each host's own vq and scheduler helper alone, so
+    # a tracked lane there would be deployed by a vq the report does not pin.
+    lagging_vq_hosts = {
+        action.host
+        for action in actions
+        if selection.tracking
+        and (action.phase == "helper" or action.program == "vibeqc-queue")
+        and action.phase not in SCOPE_EXEMPT_PHASES
+        and action.decision != "skip"
+    }
     for action in actions:
         if action.phase in SCOPE_EXEMPT_PHASES:
             continue
-        if selection.includes(action.host):
+        if selection.includes_action(action):
+            if action.host in lagging_vq_hosts and action.decision == "update":
+                action.decision = "defer"
+                action.reason = (
+                    f"{SCOPE_EXCLUDED_REASON}: {action.host}'s own vq is not "
+                    "on its report pin; run a full rollout before "
+                    "--only-tracking"
+                )
             continue
         if action.decision == "update":
             action.decision = "defer"
@@ -3123,6 +3325,7 @@ def select_hosts(plan: RolloutPlan, selection: HostSelection) -> RolloutPlan:
             dict(fence) for fence in plan.retained_legacy_fences
         ],
         created_at=plan.created_at,
+        tracking=plan.tracking,
     )
 
 
@@ -3223,6 +3426,7 @@ def fence_retained_legacy_holds(
         topology_errors=topology_errors,
         retained_legacy_fences=retained_fences,
         created_at=plan.created_at,
+        tracking=plan.tracking,
     )
 
 
@@ -3260,6 +3464,12 @@ def assert_selection_in_plan(plan: RolloutPlan, selection: HostSelection) -> Non
         raise FleetRolloutError(
             f"{_selection_phrase(selection)} leaves no lane to act on; "
             "hosts with lanes in this plan are " + ", ".join(planned)
+        )
+    if selection.tracking and not any(
+        selection.includes_action(action) for action in plan.actions
+    ):
+        raise FleetRolloutError(
+            f"{_selection_phrase(selection)} leaves no tracked lane to act on"
         )
 
 
@@ -3336,13 +3546,14 @@ def restrict_plan(
         actions=[
             action
             for action in plan.actions
-            if selection.includes(action.host) or action.phase in keep_phases
+            if selection.includes_action(action) or action.phase in keep_phases
         ],
         _scheduler_hold_targets=dict(plan._scheduler_hold_targets),
         provenance_lanes=[
             lane
             for lane in plan.provenance_lanes
-            if selection.includes(lane.host)
+            # Read-only provenance is never a tracked lane.
+            if selection.includes(lane.host) and not selection.tracking
         ],
         topology_errors=[
             error
@@ -3355,13 +3566,19 @@ def restrict_plan(
             if _in_scope(str(fence.get("host") or ""))
         ],
         created_at=plan.created_at,
+        tracking=plan.tracking,
     )
 
 
 def _selection_phrase(selection: HostSelection) -> str:
+    parts = []
     if selection.only:
-        return "--only " + ", ".join(selection.only)
-    return "--skip " + ", ".join(selection.skip)
+        parts.append("--only " + ", ".join(selection.only))
+    elif selection.skip:
+        parts.append("--skip " + ", ".join(selection.skip))
+    if selection.tracking:
+        parts.append("--only-tracking (" + ", ".join(selection.tracking) + ")")
+    return " ".join(parts)
 
 
 def collect_json(
@@ -5221,7 +5438,7 @@ def _release_rollout_hold_group(
 
 
 def release_rollout_hold(
-    plan: RolloutPlan,
+    plan: RolloutPlan | None,
     run: RolloutRun,
     *,
     hold: Mapping[str, Any],
@@ -5244,7 +5461,7 @@ def release_rollout_hold(
         control_host = _journaled_hold_control_host(
             host,
             hold,
-            legacy_default=plan.driver,
+            legacy_default=plan.driver if plan is not None else None,
         )
         if hold.get("acquire_unconfirmed") is True:
             # The mutation may have committed even though its response never
@@ -6124,6 +6341,49 @@ def _is_accepted_report_path(value: object) -> bool:
     return _accepted_report_version(value) is not None
 
 
+_PIN_VERSION = re.compile(
+    r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[.-]?(dev|a|b|rc)([0-9]+))?"
+)
+_PIN_PHASE_RANK = {"dev": 0, "a": 1, "b": 2, "rc": 3, None: 4}
+
+
+def _pin_version_key(value: object) -> tuple[int, ...] | None:
+    """Order ``X.Y.Z`` with an optional devN/aN/bN/rcN suffix, else None."""
+    match = _PIN_VERSION.fullmatch(value.strip()) if isinstance(value, str) else None
+    if match is None:
+        return None
+    major, minor, patch, phase, number = match.groups()
+    return (int(major), int(minor), int(patch), _PIN_PHASE_RANK[phase],
+            int(number) if number is not None else 0)
+
+
+def _report_is_pinwise_newer(
+    older: fleet_release.FleetReleaseReport,
+    newer: fleet_release.FleetReleaseReport,
+) -> bool:
+    """Whether a same-filename re-pin is strictly newer (#93).
+
+    A re-pin keeps the report file name, so the name cannot order the two.
+    It is newer only when both pin the same products, every pin is either
+    identical or a strictly higher version of that product, and at least one
+    is higher. An unparseable version, a changed pin set or any downgrade is
+    not newer.
+    """
+    if set(older.pins) != set(newer.pins):
+        return False
+    higher = False
+    for name, old_pin in older.pins.items():
+        new_pin = newer.pins[name]
+        if (new_pin.sha, new_pin.version) == (old_pin.sha, old_pin.version):
+            continue
+        old_key = _pin_version_key(old_pin.version)
+        new_key = _pin_version_key(new_pin.version)
+        if old_key is None or new_key is None or new_key <= old_key:
+            return False
+        higher = True
+    return higher
+
+
 @dataclass(frozen=True)
 class _ValidatedLegacyRetention:
     """Strict durable receipts that replace a fleet-global legacy block."""
@@ -6142,6 +6402,7 @@ def _validate_plan_bound_hold_supersede_receipt(
     hold: Mapping[str, Any],
     raw: Mapping[str, Any],
     current_report: fleet_release.FleetReleaseReport | None = None,
+    historical_report: fleet_release.FleetReleaseReport | None = None,
 ) -> None:
     """Validate one permanent, exact plan-bound hold coverage receipt.
 
@@ -6151,6 +6412,13 @@ def _validate_plan_bound_hold_supersede_receipt(
     newer accepted plan found every current scheduler lane healthy at its
     exact target, and a supported read-only drain snapshot found the exact
     target inactive.  The historical hold remains byte-bound for audit.
+
+    Since #130 a lane may instead be proven healthy at the obsolete
+    rollout's own pin (``"basis": "historical"``); such an item is checked
+    against ``historical_report`` when the caller authenticated it. Since #138
+    a non-vq lane may be a healthy descendant of the current pin
+    (``"basis": "descendant"``): its expected SHA is the current pin and its
+    observed SHA the live descendant.
     """
     fields = {
         "schema",
@@ -6192,7 +6460,10 @@ def _validate_plan_bound_hold_supersede_receipt(
         or raw.get("hold_record_sha256") != _legacy_subtree_sha256(hold)
         or historical_version is None
         or current_version is None
-        or current_version <= historical_version
+        or current_version < historical_version
+        # A same-filename re-pin (#93) must at least change the digest; its
+        # pin-wise ordering was proven when the receipt was written.
+        or current_digest == run.report_digest_sha256
         or not isinstance(current_digest, str)
         or _SOURCE_TREE_SHA256.fullmatch(current_digest) is None
         or raw.get("current_rollout_id")
@@ -6234,17 +6505,22 @@ def _validate_plan_bound_hold_supersede_receipt(
             if isinstance(item, Mapping)
             else None
         )
+        item_fields = {
+            "action_id",
+            "phase",
+            "host",
+            "program",
+            "expected_sha",
+            "observed_sha",
+        }
+        descendant = isinstance(item, Mapping) and item.get("basis") == "descendant"
         if (
             not isinstance(item, Mapping)
-            or set(item)
-            != {
-                "action_id",
-                "phase",
-                "host",
-                "program",
-                "expected_sha",
-                "observed_sha",
-            }
+            or set(item) not in (item_fields, item_fields | {"basis"})
+            or (
+                "basis" in item
+                and item.get("basis") not in {"historical", "descendant"}
+            )
             or not isinstance(item.get("action_id"), str)
             or expected is None
             or item.get("phase") != expected[0]
@@ -6252,7 +6528,18 @@ def _validate_plan_bound_hold_supersede_receipt(
             or item.get("program") != expected[1]
             or not isinstance(item.get("expected_sha"), str)
             or _SOURCE_SHA.fullmatch(str(item["expected_sha"])) is None
-            or item.get("observed_sha") != item.get("expected_sha")
+            or (
+                # #138: a descendant records the live SHA beside its pin; the
+                # planner proved the ancestry when the receipt was written.
+                (
+                    expected[2] == "vq"
+                    or not isinstance(item.get("observed_sha"), str)
+                    or _SOURCE_SHA.fullmatch(str(item["observed_sha"])) is None
+                    or item.get("observed_sha") == item.get("expected_sha")
+                )
+                if descendant
+                else item.get("observed_sha") != item.get("expected_sha")
+            )
         ):
             raise FleetRolloutError(
                 f"rollout {run.rollout_id} has incoherent plan-bound hold "
@@ -6278,6 +6565,8 @@ def _validate_plan_bound_hold_supersede_receipt(
             )
         for item in actions:
             assert isinstance(item, Mapping)
+            if item.get("basis") == "historical":
+                continue  # checked against the historical report below
             expected = expected_actions[str(item["action_id"])]
             try:
                 pin = current_report.pins[expected[2]]
@@ -6290,6 +6579,27 @@ def _validate_plan_bound_hold_supersede_receipt(
                 raise FleetRolloutError(
                     f"rollout {run.rollout_id} plan-bound hold supersede "
                     f"action evidence is not report-pinned for {host!r}"
+                )
+    if historical_report is not None:
+        if (
+            type(historical_report) is not fleet_release.FleetReleaseReport
+            or historical_report.digest_sha256 != run.report_digest_sha256
+        ):
+            raise FleetRolloutError(
+                f"rollout {run.rollout_id} plan-bound hold supersede historical "
+                f"report is not the journal's own for {host!r}"
+            )
+        for item in actions:
+            assert isinstance(item, Mapping)
+            if item.get("basis") != "historical":
+                continue
+            expected = expected_actions[str(item["action_id"])]
+            pin = historical_report.pins.get(expected[2])
+            if pin is None or item["expected_sha"] != pin.sha:
+                raise FleetRolloutError(
+                    f"rollout {run.rollout_id} plan-bound hold supersede "
+                    f"historical evidence is not pinned by its own report "
+                    f"for {host!r}"
                 )
 
 
@@ -6434,6 +6744,26 @@ def _validate_legacy_retention_receipts(
     identity_mismatch_hosts: set[str] = set()
     receipt_contexts: set[tuple[str, str, str]] = set()
 
+    def _receipt_report_is_repinned_older(raw: Mapping[str, Any]) -> bool:
+        if report_repo is None or current_report_source_path is None:
+            return False
+        try:
+            receipt_report = fleet_release.discover_historical_report_by_digest(
+                str(raw["current_report_path"]),
+                str(raw["current_report_digest_sha256"]),
+                report_repo,
+                fetch=False,
+            )
+            present = fleet_release.discover_historical_report_by_digest(
+                current_report_source_path,
+                current_report_digest_sha256,
+                report_repo,
+                fetch=False,
+            )
+        except fleet_release.FleetReleaseError:
+            return False
+        return _report_is_pinwise_newer(receipt_report, present)
+
     def record_identity_mismatch(
         raw: Mapping[str, Any],
         *,
@@ -6447,6 +6777,17 @@ def _validate_legacy_retention_receipts(
             raw["current_report_digest_sha256"]
             != current_report_digest_sha256
         )
+        if digest_changed and not path_changed:
+            # A same-filename re-pin (#93): the name cannot order the two
+            # reports, so authenticate both and require the present one to be
+            # pin-wise newer than the receipt's.
+            if not _receipt_report_is_repinned_older(raw):
+                raise FleetRolloutError(
+                    f"rollout {run.rollout_id} retained legacy {receipt_kind} "
+                    f"receipt has incoherent current report identity for {host!r}"
+                )
+            identity_mismatch_hosts.add(host)
+            return
         if path_changed != digest_changed:
             raise FleetRolloutError(
                 f"rollout {run.rollout_id} retained legacy {receipt_kind} "
@@ -6599,6 +6940,7 @@ def _validate_legacy_retention_receipts(
                 hold=hold,
                 raw=raw,
                 current_report=receipt_report,
+                historical_report=_supersede_historical_report(run, raw, report_repo),
             )
             if (configured_hosts is not None and host not in configured_hosts
                     and host not in retired):
@@ -7912,10 +8254,21 @@ def reconcile_durable_operations(
                     and (run.rollout_id, host)
                     not in legacy_inventory.retained_hold_refs
                 ):
+                    # Fleet-global on purpose, even under --only (#138):
+                    # name the recovery instead of hiding the hold.
+                    recovery = (
+                        "; if that rollout is obsolete and the host is "
+                        "healthy, cover the hold with `vq admin "
+                        f"rollout-latest --supersede-plan-hold {run.rollout_id} "
+                        f"{host}`, otherwise run a mutating rollout to "
+                        "reconcile it"
+                        if hold.get("kind") == "scheduler-target"
+                        else "; run a mutating rollout to reconcile it"
+                    )
                     raise FleetRolloutError(
                         f"rollout {run.rollout_id} retains an owned hold on "
                         f"{host}; dry-run/verify-only will not release or "
-                        "reconcile it"
+                        f"reconcile it{recovery}"
                     )
     reentry_rollouts: dict[str, tuple[str, RolloutReentryCapability]] = {}
     authenticated_reentry_consumed = False
@@ -8899,13 +9252,39 @@ def _validate_exact_plan_bound_scheduler_hold(
     return action_host, control_host
 
 
+_LANE_EVIDENCE_KEYS = frozenset({
+    "configured", "current_sha", "current_version", "current_tag", "dirty",
+    "last_ok", "acknowledged", "detail", "metrics",
+})
+"""LaneState evidence fields a supersede proves, besides probe_unavailable."""
+
+
 def _healthy_scheduler_supersede_actions(
     plan: RolloutPlan,
     *,
     action_host: str,
     accepted_report: fleet_release.FleetReleaseReport,
+    historical_report: fleet_release.FleetReleaseReport | None = None,
 ) -> list[dict[str, str]]:
-    """Return exact healthy current-lane evidence or fail closed."""
+    """Return exact healthy lane evidence or fail closed.
+
+    Each scheduler lane of ``action_host`` must be healthy (LAST OK, clean,
+    unacknowledged, probe answered) at an exact accepted pin. That pin is the
+    current report's (the plan skips the lane as already at target), or,
+    when ``historical_report`` is given, the obsolete rollout's own pin (the
+    plan would update the lane from exactly there). The second basis (#130)
+    proves the obsolete rollout left nothing half-done on that lane when the
+    new pin can only be installed by the rollout its hold blocks. Its
+    evidence item says ``"basis": "historical"``.
+
+    A third basis (#138) is the planner's own converged verdict for a lane
+    ahead of the pin: skip "newer descendant already deployed; no
+    downgrade", which it gives only after proving the live SHA descends from
+    the pin. A dev lane deployed from ``main`` sits there indefinitely. Its
+    evidence item says ``"basis": "descendant"`` and records the live SHA
+    beside the pin it descends from. The vq pin never qualifies: a vq lane
+    ahead of its pin is release drift, which the planner blocks.
+    """
     actions = sorted(
         (
             action
@@ -8940,13 +9319,18 @@ def _healthy_scheduler_supersede_actions(
                 action.id,
                 accepted_report,
             )
+            old_pin = (
+                historical_report.pins[expected_pin_name]
+                if historical_report is not None
+                else None
+            )
         except (FleetRolloutError, KeyError) as exc:
             raise FleetRolloutError(
                 f"plan-bound scheduler hold action {action.id!r} is not "
                 "bound to an accepted-report scheduler lane"
             ) from exc
         observed = action.before.get("current_sha")
-        if (
+        bound = not (
             type(action) is not RolloutAction
             or phase != action.phase
             or parsed_host != action_host
@@ -8959,20 +9343,12 @@ def _healthy_scheduler_supersede_actions(
             or action.rc is not None
             or action.outcome is not None
             or action.output_tail is not None
-            or set(action.before)
-            != {
-                "configured",
-                "current_sha",
-                "current_version",
-                "current_tag",
-                "dirty",
-                "last_ok",
-                "acknowledged",
-                "detail",
-                "metrics",
-            }
-            or action.decision != "skip"
-            or action.reason != "already at target with LAST OK=true"
+        )
+        healthy = bound and not (
+            # asdict(LaneState) carries probe_unavailable (#98); plans from
+            # before that field have the other nine keys only.
+            set(action.before) - {"probe_unavailable"} != _LANE_EVIDENCE_KEYS
+            or action.before.get("probe_unavailable", False) is not False
             or action.before.get("configured") is not True
             or action.before.get("last_ok") is not True
             or action.before.get("dirty") is not False
@@ -8993,8 +9369,30 @@ def _healthy_scheduler_supersede_actions(
             )
             or not isinstance(observed, str)
             or _SOURCE_SHA.fullmatch(observed) is None
-            or observed != pin.sha
-        ):
+        )
+        at_current = (
+            healthy
+            and action.decision == "skip"
+            and action.reason == "already at target with LAST OK=true"
+            and observed == pin.sha
+        )
+        at_historical = (
+            healthy
+            and not at_current
+            and old_pin is not None
+            and action.decision == "update"
+            and observed == old_pin.sha
+        )
+        at_descendant = (
+            healthy
+            and not at_current
+            and not at_historical
+            and expected_pin_name != "vq"
+            and action.decision == "skip"
+            and action.reason == _DESCENDANT_SKIP_REASON
+            and observed != pin.sha
+        )
+        if not (at_current or at_historical or at_descendant):
             if action.before.get("probe_unavailable") is True:
                 # Not a verdict about the host: the live probe did not answer,
                 # so nothing is known. Retrying is exactly right, and refusing
@@ -9010,18 +9408,87 @@ def _healthy_scheduler_supersede_actions(
             raise FleetRolloutError(
                 f"plan-bound scheduler hold action host {action_host!r} "
                 f"lacks strictly healthy exact-target evidence at {action.id}"
+                + (
+                    " (neither at the current pin, nor a healthy descendant "
+                    "of it, nor at the obsolete rollout's own pin)"
+                    if historical_report is not None
+                    else ""
+                )
             )
-        evidence.append(
-            {
-                "action_id": action.id,
-                "phase": action.phase,
-                "host": action.host,
-                "program": action.program,
-                "expected_sha": action.target_sha,
-                "observed_sha": observed,
-            }
-        )
+        item = {
+            "action_id": action.id,
+            "phase": action.phase,
+            "host": action.host,
+            "program": action.program,
+            "expected_sha": str(old_pin.sha) if at_historical else pin.sha,
+            "observed_sha": observed,
+        }
+        if at_historical:
+            item["basis"] = "historical"
+        elif at_descendant:
+            item["basis"] = "descendant"
+        evidence.append(item)
     return evidence
+
+
+def _supersede_historical_report(
+    run: RolloutRun, raw: Mapping[str, Any], repo: Path,
+) -> fleet_release.FleetReleaseReport | None:
+    """The journal's own report, authenticated, when a receipt needs it (#130)."""
+    actions = raw.get("current_actions")
+    if not isinstance(actions, list) or not any(
+        isinstance(item, Mapping) and item.get("basis") == "historical"
+        for item in actions
+    ):
+        return None
+    try:
+        return fleet_release.discover_historical_report_by_digest(
+            run.report_source_path, run.report_digest_sha256, repo, fetch=False,
+        )
+    except fleet_release.FleetReleaseError as exc:
+        raise FleetRolloutError(
+            f"rollout {run.rollout_id} plan-bound hold supersede historical "
+            f"report could not be authenticated: {exc}"
+        ) from exc
+
+
+def _obsolete_host_unsettled_actions(run: RolloutRun, action_host: str) -> list[str]:
+    """Actions of ``run`` on ``action_host`` whose operation is not settled.
+
+    Settled means completed and harvested, and not an unacknowledged failed
+    mutation: the same test the executor uses before releasing a hold.
+    """
+    unsettled = []
+    for action_id, record in sorted(run.actions.items()):
+        try:
+            _phase, host, _program = _legacy_action_parts(action_id)
+        except FleetRolloutError:
+            continue
+        if host != action_host:
+            continue
+        for item in _operation_attempts(record):
+            operation = item.get("operation_id")
+            try:
+                observed = (
+                    fleet_operation.observe_operation(operation)
+                    if isinstance(operation, str) else None
+                )
+            except fleet_operation.OperationError:
+                observed = None
+            if (
+                observed is None
+                or observed.state != "completed"
+                or item.get("harvested") is not True
+                or (
+                    observed.result is not None
+                    and observed.result.get("executed") is True
+                    and observed.result.get("returncode") != 0
+                    and item.get("failure_retry_authorized") is not True
+                )
+            ):
+                unsettled.append(action_id)
+                break
+    return unsettled
 
 
 def _observe_obsolete_legacy_scheduler_hold(
@@ -9356,6 +9823,7 @@ def supersede_obsolete_plan_bound_hold(
                 hold=hold,
                 raw=existing,
                 current_report=receipt_report,
+                historical_report=_supersede_historical_report(run, existing, repo),
             )
             return PlanBoundHoldSupersession(
                 rollout_id=rollout_id_value,
@@ -9375,7 +9843,7 @@ def supersede_obsolete_plan_bound_hold(
             run.report_digest_sha256 == accepted_report.digest_sha256
             or historical_version is None
             or current_version is None
-            or current_version <= historical_version
+            or current_version < historical_version
         ):
             raise FleetRolloutError(
                 f"rollout {rollout_id_value} is not strictly older than the "
@@ -9393,6 +9861,14 @@ def supersede_obsolete_plan_bound_hold(
                 f"obsolete rollout {rollout_id_value} historical report "
                 f"could not be authenticated: {exc}"
             ) from exc
+        if current_version == historical_version and not _report_is_pinwise_newer(
+            historical, accepted_report,
+        ):
+            # A same-filename re-pin (#93) is newer only pin by pin.
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} is not strictly older than the "
+                "current accepted report"
+            )
         if not _historical_report_binds_run(historical, run):
             raise FleetRolloutError(
                 f"obsolete rollout {rollout_id_value} does not bind its "
@@ -9410,7 +9886,18 @@ def supersede_obsolete_plan_bound_hold(
             plan,
             action_host=action_host,
             accepted_report=accepted_report,
+            historical_report=historical,
         )
+        if any(item.get("basis") == "historical" for item in action_evidence):
+            # Healthy at its own pins is proof only if nothing of that
+            # rollout is still in flight on the host (#130).
+            unsettled = _obsolete_host_unsettled_actions(run, action_host)
+            if unsettled:
+                raise FleetRolloutError(
+                    f"obsolete rollout {rollout_id_value} still has an unsettled "
+                    f"operation on {action_host}: {', '.join(unsettled)}; "
+                    "reconcile it first"
+                )
         observed = _observe_obsolete_legacy_scheduler_hold(
             run,
             host=host,
@@ -9466,6 +9953,7 @@ def supersede_obsolete_plan_bound_hold(
             hold=hold,
             raw=receipt,
             current_report=accepted_report,
+            historical_report=historical,
         )
         current.legacy_retained_holds[host] = receipt
         current.complete = False
@@ -9489,6 +9977,7 @@ def supersede_obsolete_plan_bound_hold(
             hold=persisted_hold,
             raw=persisted_receipt,
             current_report=accepted_report,
+            historical_report=historical,
         )
         return PlanBoundHoldSupersession(
             rollout_id=rollout_id_value,
@@ -9496,6 +9985,206 @@ def supersede_obsolete_plan_bound_hold(
             current_rollout_id=current_rollout_id,
             replayed=False,
         )
+
+
+@dataclass(frozen=True)
+class AbandonedHost:
+    rollout_id: str
+    host: str
+    actions: tuple[str, ...]
+    replayed: bool
+
+
+def _observe_abandonable_target(
+    run: RolloutRun,
+    *,
+    host: str,
+    hold: Mapping[str, Any],
+    control_host: str,
+    runner: Runner,
+) -> str:
+    """Prove from a supported read-only snapshot that only this hold claims ``host``.
+
+    Returns the snapshot's ``observed_at``. Acceptable: no drain policy on the
+    target, or owner-scoped leases on it that all belong to this hold's exact
+    lease owner (the release that follows removes them). A legacy claim, any
+    other owner, incomplete coverage or a fail-closed snapshot refuses.
+    """
+    argv = ["drain", "--status", "--json", "--read-only-snapshot", control_host]
+    try:
+        proc = _run_control(argv, runner=runner,
+                            timeout=_DRAIN_LIVENESS_CONTROL_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FleetRolloutError(
+            f"supported read-only drain snapshot for {host} unavailable: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "(no output)").strip()
+        raise FleetRolloutError(
+            f"supported read-only drain snapshot for {host} unavailable: "
+            f"exit {proc.returncode}: {detail}"
+        )
+    try:
+        snapshot = _validate_final_drain_status(_strict_liveness_json(proc.stdout))
+    except (RecursionError, TypeError, ValueError) as exc:
+        raise FleetRolloutError(
+            f"malformed supported read-only drain snapshot for {host}: {exc}"
+        ) from exc
+    if not all(snapshot["coverage"].values()) or snapshot["safety_fail_closed"] is True:
+        raise FleetRolloutError(
+            f"read-only drain snapshot coverage for {host} is incomplete"
+        )
+    observed_at = str(snapshot["observed_at"])
+    policy = snapshot["policy"]
+    if policy is None or host not in set(policy["scheduler_hosts"]):
+        return observed_at
+    if host in set(policy["legacy_scheduler_hosts"]):
+        raise FleetRolloutError(
+            f"{host} carries a legacy drain claim; reconcile it before abandoning"
+        )
+    owners = {
+        str(lease["owner"]) for lease in snapshot["scheduler_leases"]
+        if lease["scheduler_host"] == host
+    }
+    if owners and owners == {str(hold.get("lease_owner"))}:
+        return observed_at
+    raise FleetRolloutError(
+        f"{host} is claimed by another owner ({', '.join(sorted(owners)) or 'unknown'}); "
+        f"rollout {run.rollout_id} can only abandon its own hold"
+    )
+
+
+def abandon_deferred_host(
+    *,
+    rollout_id_value: str,
+    host: str,
+    control_runner: Runner = subprocess.run,
+) -> AbandonedHost:
+    """Release a finished rollout's owned hold on a host it never started (#96).
+
+    A rollout that deferred a host keeps its owned plan-bound hold there, and
+    every later plan refuses while it exists; superseding it needs health
+    evidence only a rollout of that host can produce. The owner may instead
+    abandon the deferred child: every action for the host must be ``not-run``
+    with no operation attempt, the hold must carry its exact control binding,
+    and a supported read-only drain snapshot must prove the target inactive.
+    The journal then records the abandonment on the hold and those actions,
+    and the hold is released through :func:`release_rollout_hold`. Nothing is
+    executed on the host; the next rollout plans it normally.
+    """
+    if (
+        not isinstance(rollout_id_value, str) or not rollout_id_value
+        or rollout_id_value != rollout_id_value.strip()
+        or not isinstance(host, str) or not host or host != host.strip()
+    ):
+        raise FleetRolloutError("abandoning a host requires exact rollout and host identities")
+    with _rollout_execution_lock(rollout_id_value):
+        run, journal_digest = _load_run_with_digest(rollout_id_value)
+        if run is None or journal_digest is None:
+            raise FleetRolloutError(f"rollout journal {rollout_id_value!r} does not exist")
+        _validate_journal_records(run)
+        hold = run.holds.get(host)
+        if not isinstance(hold, Mapping) or hold.get("owned") is not True:
+            raise FleetRolloutError(f"rollout {rollout_id_value} owns no hold on {host!r}")
+        if hold.get("status") == "released" and hold.get("abandoned_at"):
+            return AbandonedHost(rollout_id_value, host,
+                                 tuple(hold.get("abandoned_actions") or ()), True)
+        if hold.get("status") not in {"active", "cleanup-failed"}:
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} hold on {host!r} is "
+                f"{hold.get('status')!r}, not an active owned hold"
+            )
+        if hold.get("control_host") is None:
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} hold on {host!r} has no exact control "
+                "binding; reconcile it through the legacy path instead"
+            )
+        actions = _never_started_actions(run, host, hold)
+        if actions is None:
+            raise FleetRolloutError(
+                f"rollout {rollout_id_value} already started an action for {host}; "
+                "only a never-started deferred host can be abandoned"
+            )
+        observed_at = _observe_abandonable_target(
+            run, host=host, hold=hold,
+            control_host=_journaled_hold_control_host(host, hold), runner=control_runner,
+        )
+        current, current_digest = _load_run_with_digest(rollout_id_value)
+        if current is None or current_digest != journal_digest:
+            raise FleetRolloutError(
+                f"rollout journal {rollout_id_value} changed during abandonment"
+            )
+        _record_abandonment(current, host, actions, observed_at, control_runner)
+        return AbandonedHost(rollout_id_value, host, tuple(actions), False)
+
+
+def _never_started_actions(
+    run: RolloutRun, host: str, hold: Mapping[str, Any],
+) -> list[str] | None:
+    """Action ids for ``host``'s lane when none started, else ``None``."""
+    action_host = hold.get("action_host") or host
+    actions: list[str] = []
+    for action_id, record in sorted(run.actions.items()):
+        try:
+            _phase, lane_host, _program = _legacy_action_parts(action_id)
+        except FleetRolloutError:
+            continue
+        if lane_host not in {host, action_host}:
+            continue
+        if record.get("status") != "not-run" or _operation_attempts(record):
+            return None
+        actions.append(action_id)
+    return actions
+
+
+def _record_abandonment(
+    run: RolloutRun, host: str, actions: list[str], observed_at: str, runner: Runner,
+) -> None:
+    """Stamp the abandonment on the journal, then release the hold by exact owner."""
+    stamp = utcnow_iso()
+    for action_id in actions:
+        _replace_action_record(run, action_id, {**run.actions[action_id], "abandoned_at": stamp})
+    record = {
+        **run.holds[host], "abandoned_at": stamp,
+        "abandoned_observed_at": observed_at, "abandoned_actions": actions,
+    }
+    record.pop("auto_release_refused", None)
+    run.holds[host] = record
+    save_run(run)
+    release_rollout_hold(None, run, hold=record, runner=runner)
+
+
+def _release_deferred_holds(run: RolloutRun, runner: Runner) -> None:
+    """At a rollout's end, release owned holds of hosts it never started (#99).
+
+    Same proof as ``--abandon-host``: every action for the host is ``not-run``
+    with no operation attempt, the hold carries its exact control binding, and
+    a supported read-only drain snapshot shows no claim but this rollout's own
+    lease. A hold that fails the proof is kept, with the reason recorded on it,
+    and ``--abandon-host`` remains the manual path. Caller holds the rollout's
+    execution lock.
+    """
+    for host, hold in sorted(run.holds.items()):
+        if (
+            not isinstance(hold, Mapping)
+            or hold.get("owned") is not True
+            or hold.get("status") not in {"active", "cleanup-failed"}
+            or hold.get("control_host") is None
+        ):
+            continue
+        actions = _never_started_actions(run, host, hold)
+        if actions is None:
+            continue
+        try:
+            observed_at = _observe_abandonable_target(
+                run, host=host, hold=hold,
+                control_host=_journaled_hold_control_host(host, hold), runner=runner,
+            )
+            _record_abandonment(run, host, actions, observed_at, runner)
+        except FleetRolloutError as exc:
+            if isinstance(run.holds.get(host), Mapping):
+                run.holds[host] = {**run.holds[host], "auto_release_refused": str(exc)}
+                save_run(run)
 
 
 def _failure_report_ref(
@@ -12554,6 +13243,75 @@ def abort_unselected_pre_authorization_operations(
         )
 
 
+_TRACKING_RETARGET_FIELDS = frozenset(
+    {"attempt", "target_sha", "target_version", "target_tag", "argv"}
+)
+
+
+def _tracked_head_advanced(
+    plan: RolloutPlan,
+    action: RolloutAction,
+    item: Mapping[str, Any],
+    desired: fleet_operation.OperationIdentity,
+    *,
+    allow_reconciled_retry: bool = False,
+) -> bool:
+    """Whether a tracked lane's settled attempt may be followed by a new head.
+
+    One rollout id covers every run of one accepted report, so a lane that
+    tracks a branch meets its own earlier attempt when the branch has moved
+    on. That opens a new attempt only when the action deploys the plan's
+    resolved head, the latest attempt completed and was harvested, and the
+    two identities differ in nothing but the target: the same argv with the
+    old SHA replaced by the new one. The latest attempt must have exited 0,
+    or have failed and had its failure fence consumed and a retry authorized
+    by a fresh-plan reconciliation (``allow_reconciled_retry``), exactly the
+    condition under which the same target could be retried. An unknown,
+    running, unharvested or unreconciled attempt keeps every existing
+    refusal, as does any other difference in identity.
+    """
+    if plan.tracked_target(action) is None:
+        return False
+    if item.get("harvested") is not True:
+        return False
+    try:
+        observed = fleet_operation.observe_operation(item["operation_id"])
+    except (fleet_operation.OperationError, KeyError):
+        return False
+    result = observed.result or {}
+    previous = _identity_from_observation(observed)
+    if (
+        observed.state != "completed"
+        or result.get("executed") is not True
+        or item.get("request_sha256") != _request_sha256(observed)
+        or item.get("identity") != previous.as_dict()
+        or previous.target_sha == desired.target_sha
+    ):
+        return False
+    succeeded = result.get("returncode") == 0 and result.get("status") == "success"
+    reconciled_failure = (
+        allow_reconciled_retry
+        and result.get("returncode") not in {None, 0}
+        and item.get("failure_fence_consumed") is True
+        and item.get("failure_retry_authorized") is True
+    )
+    if not (succeeded or reconciled_failure):
+        return False
+    retargeted_argv = tuple(
+        desired.target_sha if argument == previous.target_sha else argument
+        for argument in previous.argv
+    )
+    if retargeted_argv != tuple(desired.argv):
+        return False
+    before = previous.constructor_fields()
+    after = desired.constructor_fields()
+    return all(
+        before.get(key) == after.get(key)
+        for key in set(before) | set(after)
+        if key not in _TRACKING_RETARGET_FIELDS
+    )
+
+
 def _durable_execute_one(
     plan: RolloutPlan,
     action: RolloutAction,
@@ -12588,6 +13346,13 @@ def _durable_execute_one(
     identity = desired
     operation = ""
     request_digest = ""
+    if attempts and _tracked_head_advanced(
+        plan, action, attempts[-1], desired,
+        allow_reconciled_retry=allow_reconciled_terminal_retry,
+    ):
+        # The previous head's attempt is settled and stays in the journal;
+        # the new head is new work under a fresh attempt number (#109).
+        attempts = []
     if attempts:
         item = attempts[-1]
         candidate = item["operation_id"]
@@ -13441,15 +14206,21 @@ def reconcile_scheduler_parity_holds(
             "scheduler parity plans do not bind the current rollout report"
         )
     _validate_current_report(verification, report_digest_resolver)
+    def in_scope(action: RolloutAction) -> bool:
+        # Lane-granular: under --only-tracking an untracked lane on a
+        # selected host (for example a blocked release lane) is out of scope
+        # and must not keep the host held after its tracked lanes converged.
+        return (
+            selection is None
+            or not selection.scoped
+            or selection.includes_action(action)
+        )
+
     initial_by_host: dict[str, list[RolloutAction]] = {}
     for action in initial.actions:
         if action.phase not in {"helper", "scheduler-runtime"}:
             continue
-        if (
-            selection is not None
-            and selection.scoped
-            and not selection.includes(action.host)
-        ):
+        if not in_scope(action):
             continue
         if SCOPE_EXCLUDED_REASON in action.reason:
             continue
@@ -13491,7 +14262,7 @@ def reconcile_scheduler_parity_holds(
     verification_by_id = {action.id: action for action in verification.actions}
     verification_by_host: dict[str, list[RolloutAction]] = {}
     for action in verification.actions:
-        if action.phase in {"helper", "scheduler-runtime"}:
+        if action.phase in {"helper", "scheduler-runtime"} and in_scope(action):
             verification_by_host.setdefault(action.host, []).append(action)
 
     held = _journaled_exact_owner_holds(current)
@@ -13556,6 +14327,7 @@ def reenter_after_driver(
     as_json: bool,
     selection: HostSelection | None = None,
     reconcile_legacy: bool = False,
+    tracking: Sequence[TrackingTarget] = (),
     runner: Runner = subprocess.run,
 ) -> int:
     """Resume orchestration in a fresh interpreter after updating driver vq.
@@ -13563,7 +14335,8 @@ def reenter_after_driver(
     Host selection must survive the re-entry. The driver's own vq lane is exempt
     from narrowing (:func:`select_hosts`), so a scoped run can and does reach
     this branch — and a re-entry that dropped ``--only`` would silently widen a
-    single-host recovery into a full-fleet rollout.
+    single-host recovery into a full-fleet rollout. The resolved tracking heads
+    survive it too, so the lanes deploy the head this invocation planned.
     """
     executable = python or sys.executable
     argv = [
@@ -13580,6 +14353,10 @@ def reenter_after_driver(
         argv += ["--only", host]
     for host in (selection or HostSelection()).skip:
         argv += ["--skip", host]
+    if (selection or HostSelection()).tracking:
+        argv.append("--only-tracking")
+    for target in tracking:
+        argv += ["--tracking-sha", f"{target.program}={target.sha}"]
     if reconcile_legacy:
         argv.append("--reconcile-legacy")
     if as_json:
@@ -14012,6 +14789,11 @@ def result_payload(
         ],
         "journal": run.as_dict() if run is not None else None,
         "summary": verification.as_dict()["summary"],
+        **(
+            {"tracking": [target.as_dict() for target in verification.tracking]}
+            if verification.tracking
+            else {}
+        ),
     }
 
 
@@ -14069,6 +14851,7 @@ def verify_payload(
     rollout_id: str,
     selection: HostSelection | None = None,
     consoles: Mapping[str, ConsoleState] | None = None,
+    tracking_lanes: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """One machine-checkable convergence verdict for the accepted report.
 
@@ -14091,7 +14874,7 @@ def verify_payload(
         selection=selection,
     )
     degraded = degraded_hosts(plan, doctor, consoles)
-    return {
+    payload = {
         # /3: adds read-only provenance lanes and folds them into the verdict.
         "schema": "vq.fleet.rollout_verify/3",
         "verdict": "converged" if not degraded else "degraded",
@@ -14110,6 +14893,102 @@ def verify_payload(
         "lanes": result["lanes"],
         "provenance_lanes": result["provenance_lanes"],
     }
+    if tracking_lanes:
+        # Additive and informational: the verdict above already judged each
+        # tracked lane against its report pin as the floor.
+        payload["tracking"] = [dict(row) for row in tracking_lanes]
+    return payload
+
+
+def tracking_lane_report(
+    plan: RolloutPlan,
+    targets: Sequence[TrackingTarget],
+    *,
+    ancestry: Ancestry,
+    commit_time: Callable[[str, str], int | None],
+    now: float,
+) -> list[dict[str, Any]]:
+    """Where each tracked lane stands against its branch head (#109).
+
+    ``plan`` is the verify-only plan, which judges tracked lanes against the
+    report pin: any healthy SHA descending from the pin is converged there.
+    This adds what that verdict does not say: the lane's SHA, how old that
+    commit is, and whether the lane is at, behind or ahead of the head.
+    ``commit_time(pin_name, sha)`` returns a commit's time or ``None``.
+    """
+    by_program = {target.program: target for target in targets}
+    rows: list[dict[str, Any]] = []
+    for action in plan.actions:
+        target = by_program.get(action.program)
+        if target is None or action.phase not in _TRACKING_PHASES:
+            continue
+        raw_current = action.before.get("current_sha")
+        current = (
+            raw_current
+            if isinstance(raw_current, str) and _SOURCE_SHA.fullmatch(raw_current)
+            else None
+        )
+        committed_at = (
+            commit_time(target.pin_name, current) if current is not None else None
+        )
+        if current is None:
+            relation = "unknown"
+        elif current == target.sha:
+            relation = "at-head"
+        elif ancestry(target.pin_name, current, target.sha) is True:
+            relation = "behind-head"
+        elif ancestry(target.pin_name, target.sha, current) is True:
+            relation = "ahead-of-head"
+        else:
+            relation = "unknown"
+        rows.append({
+            "host": action.host,
+            "program": action.program,
+            "branch": target.branch,
+            "head_sha": target.sha,
+            "current_sha": current,
+            "committed_at": committed_at,
+            "age_seconds": (
+                max(0, int(now) - committed_at)
+                if committed_at is not None
+                else None
+            ),
+            "relation_to_head": relation,
+            "decision": action.decision,
+            "reason": action.reason,
+        })
+    return rows
+
+
+def _render_age(seconds: object) -> str:
+    if not isinstance(seconds, int):
+        return "age ?"
+    if seconds < 3600:
+        return f"{seconds // 60}m old"
+    if seconds < 172800:
+        return f"{seconds // 3600}h old"
+    return f"{seconds // 86400}d old"
+
+
+def _render_tracking_lines(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    lines: list[str] = []
+    for row in raw:
+        if not isinstance(row, Mapping):
+            continue
+        current = row.get("current_sha")
+        head = row.get("head_sha")
+        lines.append(
+            f"TRACKING {_single_line(row.get('host') or '?'):16} "
+            f"{_single_line(row.get('program') or '?'):16} "
+            f"{(str(current)[:12] if current else '-'):12}  "
+            f"{_render_age(row.get('age_seconds'))}, "
+            f"{_single_line(row.get('relation_to_head') or 'unknown')} "
+            f"{_single_line(row.get('branch') or '?')} "
+            f"{str(head)[:12] if head else '-'}"
+        )
+    return lines
 
 
 def _single_line(value: Any) -> str:
@@ -14189,9 +15068,11 @@ def render_verify_text(payload: Mapping[str, Any]) -> str:
                 HostSelection(
                     only=tuple(selection.get("only") or ()),
                     skip=tuple(selection.get("skip") or ()),
+                    tracking=tuple(selection.get("only_tracking") or ()),
                 )
             )
         )
+    lines.extend(_render_tracking_lines(payload.get("tracking")))
     for host, reasons in degraded.items():
         for reason in reasons:
             lines.append(f"DEGRADED {host:16} {reason}")
@@ -14206,6 +15087,11 @@ def render_plan_text(plan: RolloutPlan, *, title: str) -> str:
         f"driver: {plan.driver}",
     ]
     lines.extend(_render_coverage_lines(_coverage_payload(plan)))
+    for target in plan.tracking:
+        lines.append(
+            f"tracking: {target.program} follows {target.branch} at "
+            f"{target.sha[:12]} (report {target.pin_name} pin is the floor)"
+        )
     for error in plan.topology_errors:
         lines.append(f"BLOCK topology {error}")
     for fence in plan.retained_legacy_fences:

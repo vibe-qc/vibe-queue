@@ -190,7 +190,7 @@ def _default_runner(
 class Hop:
     """One endpoint in a resolved SSH route."""
 
-    label: str  # "target" or "jump host 'ssh4'"
+    label: str  # "target" or "jump host 'jump-a'"
     host: str
     port: int
 
