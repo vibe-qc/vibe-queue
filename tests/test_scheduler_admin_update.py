@@ -2016,6 +2016,29 @@ def test_status_table_names_the_last_good_identity(state_dir: Path) -> None:
     assert "aaaaaaaaaaaa (v0.15.50)" in text
 
 
+def test_status_table_shows_the_participant_inventory(state_dir: Path) -> None:
+    """#72: STORE/PREVIOUS/SCHEMA come from the last participant inventory."""
+    _write_scheduler_config(state_dir / "cfg", runtime_program="vibeqc-release")
+    cfg = config.load_config()
+    admin.record_scheduler_runtime_outcome(
+        _runtime_result(success=True, sha="a" * 40, tag="v0.15.50")
+    )
+    header, row = admin.format_scheduler_runtime_status("host_f", cfg).splitlines()[-2:]
+    assert "STORE     PREVIOUS     SCHEMA LAST GOOD" in header
+    assert row.split()[-5:-2] == ["-", "-", "-"]
+
+    records = admin.load_scheduler_runtime_status()
+    records["host_f:vibeqc-release"].inventory = {
+        "store": "canonical", "previous": "c" * 40, "launcher_schema": 3}
+    admin._write_scheduler_runtime_status(records)
+
+    row = admin.format_scheduler_runtime_status("host_f", cfg).splitlines()[-1]
+    assert "canonical cccccccccccc 3      aaaaaaaaaaaa (v0.15.50)" in row
+    status = json.loads(admin.format_scheduler_runtime_status_json("host_f", cfg))
+    last = status["deployments"]["vibeqc-release"]["last"]
+    assert last["inventory"]["store"] == "canonical"
+
+
 def test_scheduler_phase_poll_projects_vq_specs_as_single_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

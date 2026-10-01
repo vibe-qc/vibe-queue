@@ -1,5 +1,13 @@
 # Wall-time enforcement: design notes and future options
 
+**History: design notes from v0.5.8 (2026-05-10), kept because they explain a
+decision.** The decision stands for jobs the daemon runs itself: the Python
+watchdog enforces wall time, and cgroup `RuntimeMaxSec` stays dropped. A job
+sent to PBS or Slurm is limited by the scheduler instead. The page does not
+track later changes; the current statement is
+[SPEC § 5.2](SPEC.md#52-cgroups-v2-strategy), and `--time-limit` is shown
+for users in [running jobs](user/index.md).
+
 **Audience:** the next vq dev chat that picks up wall-time
 enforcement as a real architectural item (probably driven by
 `vq admin update` in v0.6, or multi-host in v0.7+).
@@ -135,7 +143,10 @@ Mitigation today:
   compute-d: ≪1 s.
 * The v0.4 orphan-reattach reconciler picks up wall-time
   accounting on next daemon start (started_monotonic is
-  recovered from `started_at` on the spec).
+  recovered from `started_at` on the spec). Until #97 the code
+  anchored a re-attached job at the restart instead, so each
+  restart granted a fresh budget. A missing, unparseable or
+  future `started_at` still falls back to the restart.
 * `--max-jobs=1` makes the blast radius small: at most one
   in-flight job to over-run, and the host can absorb that.
 

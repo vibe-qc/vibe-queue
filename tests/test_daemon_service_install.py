@@ -10,6 +10,7 @@ looking correct. Only `vq doctor`'s `daemon_rpc` version revealed it.
 from __future__ import annotations
 
 import json
+import plistlib
 import subprocess
 from pathlib import Path
 
@@ -467,3 +468,359 @@ class TestInstallWritesWhatStatusReads:
         settled = CliRunner().invoke(main, ["daemon", "status"])
         assert f"owner:   vq {__version__}" in settled.output
         assert "0.25.7" not in settled.output
+
+
+OPERATOR_PATH = (
+    "Environment=PATH=%h/bin:/opt/example/orca:/usr/local/sbin:"
+    "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
+
+
+def _write_unit_lines(host: Path, *service_lines: str) -> Path:
+    path = _unit_path(host)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[Unit]\nDescription=vq job queue daemon\n\n[Service]\n"
+        + "".join(f"{line}\n" for line in service_lines)
+        + "ExecStart=%h/.local/bin/vq daemon run\nRestart=always\n\n"
+        "[Install]\nWantedBy=default.target\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _dry_run(*extra: str) -> object:
+    return CliRunner().invoke(
+        main,
+        ["daemon", "install", "--manager", "systemd-user", "--dry-run", *extra],
+    )
+
+
+def _marker(host: Path) -> dict:
+    return json.loads(
+        (host / "config" / install.DAEMON_MARKER_NAME).read_text(encoding="utf-8")
+    )
+
+
+class TestOperatorEnvironmentIsNotDroppedSilently:
+    """#125: the daemon's environment is what every job inherits.
+
+    A host's hand-written unit set PATH (``%h/bin`` and the ORCA directory)
+    next to VQ_STATE_DIR. `vq daemon install --dry-run` kept VQ_STATE_DIR,
+    which it re-derives from the shell, and dropped PATH without a word; ORCA
+    and the ``~/bin`` wrappers would have stopped resolving after the rewrite.
+    Every test here generates the real unit text.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _config(self, host: Path) -> None:
+        (host / "config" / "config.toml").write_text(
+            'default_host = "localhost"\n', encoding="utf-8",
+        )
+
+    def test_the_operator_path_survives_the_rewrite_verbatim(self, host: Path) -> None:
+        state_line = f"Environment=VQ_STATE_DIR={host / 'state'}"
+        _write_unit_lines(host, OPERATOR_PATH, state_line)
+
+        result = _dry_run()
+
+        assert result.exit_code == 0, result.output
+        assert OPERATOR_PATH in result.output.splitlines(), (
+            "PATH, %h specifier included, must be carried over as written"
+        )
+        # The unit already sets the root this install would set, so it is
+        # not written twice.
+        assert result.output.count("VQ_STATE_DIR=") == 1
+        assert state_line in result.output.splitlines()
+        assert "kept the environment of the unit being replaced: PATH, VQ_STATE_DIR" in (
+            result.output
+        )
+        assert _unit_path(host).read_text().startswith("[Unit]"), (
+            "a dry run must not have rewritten the unit"
+        )
+
+    def test_the_preserved_lines_come_before_exec_start_in_service(
+        self, host: Path,
+    ) -> None:
+        _write_unit_lines(host, OPERATOR_PATH)
+
+        unit = install.build_plan(
+            manager="systemd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        ).writes[0].content
+        lines = unit.splitlines()
+
+        assert lines.index("[Service]") < lines.index(OPERATOR_PATH)
+        assert lines.index(OPERATOR_PATH) < next(
+            i for i, line in enumerate(lines) if line.startswith("ExecStart=")
+        )
+
+    def test_quoting_several_assignments_and_continuations_are_kept(
+        self, host: Path,
+    ) -> None:
+        quoted = "Environment=\"GREETING=hello world\" LANG=C 'SCRATCH=%h/scr'"
+        continued = "Environment=OMP_NUM_THREADS=1 \\\n    MKL_NUM_THREADS=1"
+        _write_unit_lines(host, quoted, continued)
+
+        plan = install.build_plan(
+            manager="systemd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+
+        unit = plan.writes[0].content
+        assert quoted in unit
+        assert continued in unit
+        assert plan.preserved_environment == {
+            "GREETING": "hello world",
+            "LANG": "C",
+            "SCRATCH": "%h/scr",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+        }
+        assert plan.dropped_environment == []
+
+    def test_install_records_the_preserved_environment_and_is_idempotent(
+        self, host: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            install.subprocess,
+            "run",
+            lambda argv, **_: subprocess.CompletedProcess(argv, 0, "", ""),
+        )
+        _write_unit_lines(host, OPERATOR_PATH)
+
+        result = CliRunner().invoke(
+            main, ["daemon", "install", "--manager", "systemd-user"],
+        )
+
+        assert result.exit_code == 0, result.output
+        written = _unit_path(host).read_text(encoding="utf-8")
+        assert OPERATOR_PATH in written.splitlines()
+        # Recorded as written: systemd resolves %h at load time.
+        assert _marker(host)["preserved_environment"]["PATH"] == (
+            OPERATOR_PATH.removeprefix("Environment=PATH=")
+        )
+        again = install.build_plan(
+            manager="systemd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+        assert again.writes[0].exists_with_same_content(), (
+            "re-installing over a vq-written unit must not change it"
+        )
+
+    def test_a_percent_h_root_equal_to_this_install_s_is_kept_not_refused(
+        self, host: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(host))
+        _write_unit_lines(host, "Environment=VQ_STATE_DIR=%h/state")
+
+        result = _dry_run()
+
+        assert result.exit_code == 0, result.output
+        assert "Environment=VQ_STATE_DIR=%h/state" in result.output.splitlines()
+        assert result.output.count("VQ_STATE_DIR=") == 1
+
+    @pytest.mark.parametrize(
+        "directive",
+        [
+            "EnvironmentFile=-/etc/vq/daemon.env",
+            "PassEnvironment=ORCA_DIR",
+            "UnsetEnvironment=PYTHONPATH",
+        ],
+    )
+    def test_environment_it_cannot_carry_is_refused_and_named(
+        self, host: Path, directive: str,
+    ) -> None:
+        _write_unit_lines(host, OPERATOR_PATH, directive)
+
+        result = _dry_run()
+
+        assert result.exit_code != 0
+        assert directive in result.output
+        assert "--allow-dropping-unit-environment" in result.output
+        assert "--- replace" not in result.output
+
+    def test_unbalanced_quoting_is_refused_rather_than_guessed(
+        self, host: Path,
+    ) -> None:
+        _write_unit_lines(host, 'Environment="PATH=/opt/bin')
+
+        result = _dry_run()
+
+        assert result.exit_code != 0
+        assert "unbalanced quoting" in result.output
+
+    def test_the_refusal_can_be_overridden_deliberately(self, host: Path) -> None:
+        _write_unit_lines(host, OPERATOR_PATH, "EnvironmentFile=/etc/vq/daemon.env")
+
+        result = _dry_run("--allow-dropping-unit-environment")
+
+        assert result.exit_code == 0, result.output
+        assert "EnvironmentFile" not in result.output
+        assert OPERATOR_PATH in result.output.splitlines(), (
+            "the opt-out drops only what cannot be carried"
+        )
+
+    def test_a_root_set_differently_from_this_shell_is_refused(
+        self, host: Path,
+    ) -> None:
+        """Silently moving the daemon's state root is a change of environment."""
+        _write_unit_lines(host, "Environment=VQ_STATE_DIR=/srv/elsewhere")
+
+        result = _dry_run()
+
+        assert result.exit_code != 0
+        assert "VQ_STATE_DIR=/srv/elsewhere" in result.output
+        assert str(host / "state") in result.output
+
+    def test_an_overridden_root_is_written_after_the_preserved_line(
+        self, host: Path,
+    ) -> None:
+        """With the opt-out, this install's root wins: systemd applies the
+        later of two assignments."""
+        _write_unit_lines(host, "Environment=VQ_STATE_DIR=/srv/elsewhere")
+
+        result = _dry_run("--allow-dropping-unit-environment")
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        generated = f'Environment="VQ_STATE_DIR={host / "state"}"'
+        assert lines.index("Environment=VQ_STATE_DIR=/srv/elsewhere") < lines.index(
+            generated
+        )
+
+    def test_environment_outside_service_is_not_copied(self, host: Path) -> None:
+        path = _unit_path(host)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "[Unit]\nDescription=x\n# Environment=PATH=/commented\n"
+            "[Service]\n; Environment=ALSO=commented\n"
+            "ExecStart=/bin/vq daemon run\n",
+            encoding="utf-8",
+        )
+
+        plan = install.build_plan(
+            manager="systemd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+
+        assert plan.preserved_environment == {}
+        assert "commented" not in plan.writes[0].content
+
+
+class TestLaunchdEnvironmentIsNotDroppedSilently:
+    """The same guarantee for a launchd agent's ``EnvironmentVariables``."""
+
+    @pytest.fixture
+    def agent(self, host: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        monkeypatch.setenv("HOME", str(host / "home"))
+        path = (
+            host / "home" / "Library" / "LaunchAgents" / "com.vq.daemon.plist"
+        )
+        path.parent.mkdir(parents=True)
+        return path
+
+    def _write(self, agent: Path, variables: object) -> None:
+        agent.write_bytes(plistlib.dumps({
+            "Label": "com.vq.daemon",
+            "ProgramArguments": ["/old/venv/bin/vq", "daemon", "run"],
+            "EnvironmentVariables": variables,
+        }))
+
+    def test_operator_variables_are_carried_over(
+        self, host: Path, agent: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._write(agent, {"PATH": "/opt/orca:/usr/bin:/bin", "OMP_NUM_THREADS": "1"})
+        monkeypatch.setattr(install, "detect_manager", lambda: "launchd-user")
+        (host / "config" / "config.toml").write_text(
+            'default_host = "localhost"\n', encoding="utf-8",
+        )
+
+        result = CliRunner().invoke(main, ["daemon", "install", "--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        plan = install.build_plan(
+            manager="launchd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+        variables = plistlib.loads(plan.writes[0].content.encode())[
+            "EnvironmentVariables"
+        ]
+        assert variables["PATH"] == "/opt/orca:/usr/bin:/bin"
+        assert variables["OMP_NUM_THREADS"] == "1"
+        assert variables[paths.ENV_STATE_DIR] == str(host / "state")
+        assert json.loads(plan.final_writes[0].content)["preserved_environment"] == {
+            "PATH": "/opt/orca:/usr/bin:/bin",
+            "OMP_NUM_THREADS": "1",
+        }
+
+    def test_a_value_it_cannot_carry_is_refused(
+        self, host: Path, agent: Path,
+    ) -> None:
+        self._write(agent, {"PATH": "/usr/bin", "WORKERS": 4})
+
+        plan = install.build_plan(
+            manager="launchd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+
+        assert plan.dropped_environment == [
+            "EnvironmentVariables 'WORKERS' (not a string)",
+        ]
+
+    def test_a_root_set_differently_is_named(
+        self, host: Path, agent: Path,
+    ) -> None:
+        self._write(agent, {paths.ENV_STATE_DIR: "/srv/elsewhere"})
+
+        plan = install.build_plan(
+            manager="launchd-user",
+            kind=install.DAEMON_SERVICE,
+            preserve_environment=True,
+        )
+
+        assert plan.dropped_environment == [
+            f"{paths.ENV_STATE_DIR}=/srv/elsewhere "
+            f"(this install sets {host / 'state'})",
+        ]
+
+
+def test_every_offered_manager_plans(
+    host: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#129: the --manager choices and the planner must agree.
+
+    `launchd` was offered but only `launchd-user` plans. The choices are read
+    from the command itself, so a future drift fails here. The systemd-system
+    account is stubbed with a real home: a CI user may have none, and that
+    refusal is not what this test is about.
+    """
+    import getpass
+    import os
+
+    from vq.cli import daemon_install
+
+    service_home = host / "service-home"
+    service_home.mkdir()
+    monkeypatch.setattr(
+        install,
+        "_service_account",
+        lambda username: install.ServiceAccount(
+            username, service_home, os.getuid(), frozenset(os.getgroups()),
+        ),
+    )
+    (host / "config" / "config.toml").write_text('default_host = "localhost"\n',
+                                                 encoding="utf-8")
+    manager = next(p for p in daemon_install.params if p.name == "manager")
+    for choice in manager.type.choices:
+        extra = ["--service-user", getpass.getuser()] if choice == "systemd-system" else []
+        result = CliRunner().invoke(
+            main, ["daemon", "install", "--manager", choice, "--dry-run", *extra])
+        assert result.exit_code == 0, (choice, result.output)
+        assert "dry run" in result.output, choice

@@ -1,5 +1,13 @@
 # PBS / SGE dispatcher backend — design proposal
 
+**History: a design proposal from June 2026, written at v0.9.2 and kept for its
+rationale.** The backend it proposes has shipped, with Torque/PBS and Slurm
+dialects, and this page was not brought along. Its status line below is a
+snapshot, not the state of the product. Do not use it to configure a scheduler
+host: the operator reference is [operations](operations.md) and
+[scheduler runtime deployment](scheduler_runtime_deployment.md), and what vq
+guarantees is [SPEC § 8.2](SPEC.md#82-scheduler-backends).
+
 **Status:** SUBMIT PATH AND OPERATOR SURFACES WIRED; pbs-cluster validation remains.
 Landed on `main`: the dispatcher seam (`4ff48938`), the Torque **dialect**
 (`ffa436d8`), the **`SchedulerDispatcher`** + whole-workspace copy-back +

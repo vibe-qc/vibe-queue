@@ -1,5 +1,7 @@
 # The vq fleet console
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 A read-only web dashboard for a vq fleet: one card per configured host,
 a cross-host job table, and a doctor board. It runs on one machine -- the
 *coordinator* -- and reaches the rest of the fleet over the SSH you have
@@ -8,7 +10,7 @@ port anywhere but the coordinator.
 
 This page is for someone setting it up on **their own** fleet. If you
 want to know how the console is put together, see
-[`fleet_dashboard_design.md`](fleet_dashboard_design.md).
+[`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md).
 
 ---
 
@@ -18,10 +20,11 @@ want to know how the console is put together, see
 |---|---|
 | `/fleet` | One card per configured host: daemon health, queue counts, CPU and memory, deployed program versions, and the machine's own name for itself. Plus a fleet roll-up -- how many hosts, how many running, how many unreachable, and **how many distinct vq versions**, which is the number you watch during a rolling update. |
 | `/fleet/jobs` | Every job on every host in one filterable, sortable table. |
-| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve -- fetched live, not from the cached snapshot. |
+| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve -- fetched live, not from the cached snapshot. For vibe-qc and ORCA jobs, a "calculation" section: system, method/basis, energies, optimisation state and an SCF convergence plot, parsed from the same output tail. |
 | `/fleet/doctor` | `vq doctor` across the fleet, on demand. |
 | `/fleet/audit` | Who did what through the console (admins only). |
 | `/api/v1/fleet` | The whole snapshot as JSON. |
+| `/api/v1/fleet/jobs/<id>/preview?host=H` | A calculation preview parsed from the job's stdout tail: formula, method/basis, the latest SCF series, per-step energies, total energy and gap, optimisation summary, fatal error. vibe-qc and ORCA jobs; `preview` is `null` for other programs. The job's stdout is read, except that an ORCA job run through `contrib/run-orca.sh` is read from the one output file the wrapper writes (its output argument, or `<input>.out`); `source` in the response names which. |
 
 The host grid is served from a snapshot that a background thread
 refreshes on a timer (30 s by default). The job drill-down is not -- it
@@ -140,6 +143,17 @@ be owned by the console account and mode 0700; the database must be an owned
 regular file at mode 0600. Both are created automatically. All workers of one
 console must use the same local configuration directory. Separate replicas
 with separate disks do not share revocation or login budgets.
+
+SQLite serializes writers, so on a busy console the workers contend for the
+store: they are separate processes, and the most contended moment is several of
+them racing to create the store's tables on first use. A statement waits up to
+**15 seconds** for another worker before giving up with `database is locked`.
+That budget was 2 seconds, which a loaded CI runner exceeded, failing a request
+that would have succeeded a moment later. Raising it costs latency only while
+the lock is actually held, and the work runs in a worker thread rather than on
+the event loop. A store that is genuinely wedged still surfaces an error rather
+than hanging. `scripts/measure_session_lock_budget.py` measures what a given
+host needs if the default ever has to be revisited.
 
 Upgrading from stateless sessions signs every browser out once. Log in again;
 the existing account format remains valid. Login and account creation limit
@@ -288,6 +302,14 @@ loopback, do **both** of:
 `--i-understand-public-bind` or set `public_bind_ack = true`. The
 warning is about exposure, not about the bind being unsupported.
 
+**To show fleet status to the public, do not bind the console publicly.**
+Write a static snapshot with `vq web public-snapshot --out DIR`, and serve
+`DIR` from a separate unprivileged account. Only hosts you give a public
+display name appear, and only calculations submitted with a `public.<alias>`
+tag. The console stays on loopback. See
+[`web.md`, "Public fleet snapshot (#66)"](web.md#public-fleet-snapshot-66)
+and the [operator deployment runbook](public_snapshot_deployment.md).
+
 ---
 
 ## Keeping it current
@@ -433,8 +455,8 @@ was installed by hand, before `vq web install` existed. Re-run
 
 ## See also
 
-* [`fleet_dashboard_design.md`](fleet_dashboard_design.md) -- architecture and milestones.
-* [`web.md`](web.md) -- the single-host dashboard.
+* [`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md) -- what a console must preserve.
+* [`web.md`](web.md) -- the single-host dashboard, and the public fleet snapshot.
 * [`hosts.md`](hosts.md) -- configuring the fleet the console displays.
 * [`operations.md`](operations.md) -- day-to-day fleet operation.
 

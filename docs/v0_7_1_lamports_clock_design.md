@@ -1,5 +1,13 @@
 # v0.7.1 *Lamport's Clock* — operator-visibility hardening for `vq admin update`
 
+**History: the design record for a release that shipped long ago.** This is the
+plan for the v0.7.1 hardening of `vq admin update`, written on 2026-05-25. All
+six items shipped: the help text of `--update-script-arg`, `--show-output` and
+`vq admin mark-ok` names this release, and the tests for each item cite this
+page by item number, which is why it is kept. It is not maintained. For how
+`vq admin update` behaves now, read [Driving vq from a script](orchestration.md)
+and the [operator reference](operations.md).
+
 **Audience:** the next vq dev chat (or operator) that wants to
 understand why `vq admin update` got a multi-item hardening pass
 in v0.7.1 and what each piece does.
