@@ -53,17 +53,17 @@ def _prepare(tmp_path: Path, **kwargs: object) -> fleet_operation.OperationHandl
     return fleet_operation.prepare_operation(identity, state_root=tmp_path / "state")
 
 
-# A bound on "this eventually happens", never a timing claim. A healthy run
-# finishes these waits in milliseconds; a machine starved of CPU for seconds at
-# a time (load 88-131 on 2026-09-12, #26) must not turn a 3 s deadline into a
-# failure of an ordering property.
+# A bound on "this eventually happens", never a timing claim. The detached
+# recorder and CLI child can take several seconds to finish on a busy host.
+# Use this for every positive wait in this module; short authorization-expiry
+# probes below remain short because their deadline is the behavior under test.
 LIVENESS_SECONDS = 60.0
 
 
 def _wait_ready(
     handle: fleet_operation.OperationHandle,
     *,
-    timeout: float = 3.0,
+    timeout: float = LIVENESS_SECONDS,
 ) -> fleet_operation.OperationObservation:
     return fleet_operation.wait_for_ready(
         handle.operation_id,
@@ -112,7 +112,7 @@ def _child_pids(parent_pid: int) -> list[int]:
 def _wait_for_activation(
     handle: fleet_operation.OperationHandle,
     *,
-    timeout: float = 5.0,
+    timeout: float = LIVENESS_SECONDS,
 ) -> fleet_operation.OperationObservation:
     deadline = time.monotonic() + timeout
     while True:
@@ -575,12 +575,14 @@ def test_polling_waits_for_hardlink_publish_cleanup(
             timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
-        assert waiter_observing.wait(LIVENESS_SECONDS)
-        # A negative probe may stay short: load can only make it less strict,
-        # never make it fail.
-        time.sleep(0.03)
-        assert waiter.done() is False
-        allow_cleanup.set()
+        try:
+            assert waiter_observing.wait(LIVENESS_SECONDS)
+            # A negative probe may stay short: load can only make it less strict,
+            # never make it fail.
+            time.sleep(0.03)
+            assert waiter.done() is False
+        finally:
+            allow_cleanup.set()
         ready = waiter.result(timeout=LIVENESS_SECONDS)
         assert ready.ready is not None
         fleet_operation.authorize_operation(
@@ -692,7 +694,7 @@ def test_two_phase_success_writes_bound_receipts_and_output(tmp_path: Path) -> N
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
         ready = _wait_ready(handle)
@@ -702,7 +704,7 @@ def test_two_phase_success_writes_bound_receipts_and_output(tmp_path: Path) -> N
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
     observed = fleet_operation.observe_operation(
         handle.operation_id,
@@ -781,7 +783,7 @@ def test_live_output_reader_advances_a_bounded_append_only_offset(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=narrated_child,
         )
@@ -791,7 +793,7 @@ def test_live_output_reader_advances_a_bounded_append_only_offset(
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + LIVENESS_SECONDS
         first = None
         while first is None or not first.data:
             first = fleet_operation.read_output_since(
@@ -808,7 +810,7 @@ def test_live_output_reader_advances_a_bounded_append_only_offset(
         assert first.offset == 0
         assert first.next_offset == 5
         assert first.stored_bytes >= first.next_offset
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
     second = fleet_operation.read_output_since(
         handle.operation_id,
@@ -904,7 +906,7 @@ def test_child_output_is_continuously_drained_into_a_bounded_spool(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=noisy_child,
         )
@@ -914,7 +916,7 @@ def test_child_output_is_continuously_drained_into_a_bounded_spool(
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=10) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
     output = (handle.directory / "output.log").read_bytes()
     assert len(output) == fleet_operation.MAX_OUTPUT_BYTES
@@ -949,7 +951,7 @@ def test_only_one_supervisor_can_hold_the_lifetime_lease(tmp_path: Path) -> None
         **kwargs: object,
     ) -> subprocess.Popen[bytes]:
         entered.set()
-        assert release.wait(3)
+        assert release.wait(LIVENESS_SECONDS)
         return subprocess.Popen(argv, **kwargs)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -957,7 +959,7 @@ def test_only_one_supervisor_can_hold_the_lifetime_lease(tmp_path: Path) -> None
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=blocking_child,
         )
@@ -967,7 +969,7 @@ def test_only_one_supervisor_can_hold_the_lifetime_lease(tmp_path: Path) -> None
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert entered.wait(3)
+        assert entered.wait(LIVENESS_SECONDS)
         second = pool.submit(
             fleet_operation.run_supervisor,
             handle.operation_id,
@@ -975,9 +977,9 @@ def test_only_one_supervisor_can_hold_the_lifetime_lease(tmp_path: Path) -> None
             authorization_timeout=0.1,
         )
         with pytest.raises(fleet_operation.OperationBusyError):
-            second.result(timeout=3)
+            second.result(timeout=LIVENESS_SECONDS)
         release.set()
-        assert first.result(timeout=5) == 0
+        assert first.result(timeout=LIVENESS_SECONDS) == 0
 
 
 def test_launch_intent_is_durable_before_child_popen(tmp_path: Path) -> None:
@@ -999,7 +1001,7 @@ def test_launch_intent_is_durable_before_child_popen(tmp_path: Path) -> None:
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=asserting_child,
         )
@@ -1009,7 +1011,7 @@ def test_launch_intent_is_durable_before_child_popen(tmp_path: Path) -> None:
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
 
 def test_activated_child_receives_only_validated_outer_operation_context(
@@ -1041,7 +1043,7 @@ def test_activated_child_receives_only_validated_outer_operation_context(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=capture_child,
         )
@@ -1051,7 +1053,7 @@ def test_activated_child_receives_only_validated_outer_operation_context(
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
     assert captured[fleet_operation.ENV_OPERATION_ID] == handle.operation_id
     assert captured[fleet_operation.ENV_OPERATION_REQUEST_SHA256] == (
@@ -1242,7 +1244,7 @@ def test_recorder_survives_supervisor_death_after_activation(
             "--poll-interval",
             "0.1",
             "--timeout",
-            "5",
+            str(2 * LIVENESS_SECONDS),
         ),
     )
     spec_path = _write_running_wait_spec(handle, jobid)
@@ -1250,7 +1252,7 @@ def test_recorder_survives_supervisor_death_after_activation(
         handle.operation_id,
         state_root=handle.state_root,
     )
-    _wait_ready(handle, timeout=5)
+    _wait_ready(handle)
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=REPORT_DIGEST,
@@ -1259,7 +1261,7 @@ def test_recorder_survives_supervisor_death_after_activation(
     _wait_for_activation(handle)
 
     supervisor.kill()
-    supervisor.wait(timeout=5)
+    supervisor.wait(timeout=LIVENESS_SECONDS)
     after_death = fleet_operation.observe_operation(
         handle.operation_id,
         state_root=handle.state_root,
@@ -1273,7 +1275,7 @@ def test_recorder_survives_supervisor_death_after_activation(
     spec.state = JobState.COMPLETED
     spec.exit_code = 0
     spec.write(spec_path)
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + LIVENESS_SECONDS
     while True:
         observed = fleet_operation.observe_operation(
             handle.operation_id,
@@ -1303,7 +1305,7 @@ def test_supervisor_death_before_recorder_activation_resumes_same_operation(
     ) -> subprocess.Popen[bytes]:
         del argv, kwargs
         recorder_popen_entered.write_text("entered\n")
-        time.sleep(30)
+        threading.Event().wait(2 * LIVENESS_SECONDS)
         raise AssertionError("killed supervisor unexpectedly resumed")
 
     supervisor_pid = os.fork()
@@ -1312,7 +1314,7 @@ def test_supervisor_death_before_recorder_activation_resumes_same_operation(
             fleet_operation.run_supervisor(
                 handle.operation_id,
                 state_root=handle.state_root,
-                authorization_timeout=5,
+                authorization_timeout=LIVENESS_SECONDS,
                 poll_interval=0.005,
                 recorder_popen=blocked_recorder_popen,
             )
@@ -1320,13 +1322,13 @@ def test_supervisor_death_before_recorder_activation_resumes_same_operation(
             os._exit(91)
         os._exit(0)
     try:
-        _wait_ready(handle, timeout=5)
+        _wait_ready(handle)
         fleet_operation.authorize_operation(
             handle.operation_id,
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + LIVENESS_SECONDS
         while not recorder_popen_entered.exists():
             if time.monotonic() >= deadline:
                 raise AssertionError("supervisor never reached recorder Popen")
@@ -1385,7 +1387,7 @@ def test_recorder_launch_exception_after_fd_inherit_preserves_lease(
         # sleeper deterministically owns the pass_fds copy before we inject
         # the asynchronous launch failure seen by the supervisor.
         child = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
+            [sys.executable, "-c", f"import time; time.sleep({2 * LIVENESS_SECONDS})"],
             **kwargs,
         )
         inherited_children.append(child)
@@ -1397,7 +1399,7 @@ def test_recorder_launch_exception_after_fd_inherit_preserves_lease(
                 fleet_operation.run_supervisor,
                 handle.operation_id,
                 state_root=handle.state_root,
-                authorization_timeout=3.0,
+                authorization_timeout=LIVENESS_SECONDS,
                 poll_interval=0.005,
                 recorder_popen=raise_after_inherit,
             )
@@ -1408,7 +1410,7 @@ def test_recorder_launch_exception_after_fd_inherit_preserves_lease(
                 state_root=handle.state_root,
             )
             with pytest.raises(RuntimeError, match="injected after recorder inherited"):
-                future.result(timeout=5)
+                future.result(timeout=LIVENESS_SECONDS)
 
         assert len(inherited_children) == 1
         assert inherited_children[0].poll() is None
@@ -1431,7 +1433,7 @@ def test_recorder_launch_exception_after_fd_inherit_preserves_lease(
         for child in inherited_children:
             with contextlib.suppress(ProcessLookupError):
                 child.kill()
-            child.wait(timeout=5)
+            child.wait(timeout=LIVENESS_SECONDS)
 
 
 def test_recorder_death_after_activation_remains_outcome_unknown(
@@ -1448,7 +1450,7 @@ def test_recorder_death_after_activation_remains_outcome_unknown(
             "--poll-interval",
             "0.1",
             "--timeout",
-            "5",
+            str(2 * LIVENESS_SECONDS),
         ),
     )
     _write_running_wait_spec(handle, jobid)
@@ -1456,14 +1458,14 @@ def test_recorder_death_after_activation_remains_outcome_unknown(
         handle.operation_id,
         state_root=handle.state_root,
     )
-    _wait_ready(handle, timeout=5)
+    _wait_ready(handle)
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=REPORT_DIGEST,
         state_root=handle.state_root,
     )
     _wait_for_activation(handle)
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + LIVENESS_SECONDS
     recorder_pids: list[int] = []
     while not recorder_pids:
         recorder_pids = _child_pids(supervisor.pid)
@@ -1476,7 +1478,7 @@ def test_recorder_death_after_activation_remains_outcome_unknown(
     assert os.getpgid(recorder_pid) == recorder_pid
 
     os.killpg(recorder_pid, signal.SIGKILL)
-    supervisor.wait(timeout=5)
+    supervisor.wait(timeout=LIVENESS_SECONDS)
     observed = fleet_operation.observe_operation(
         handle.operation_id,
         state_root=handle.state_root,
@@ -1513,7 +1515,7 @@ def test_any_child_popen_exception_after_intent_is_outcome_unknown(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=failing_child,
         )
@@ -1524,7 +1526,7 @@ def test_any_child_popen_exception_after_intent_is_outcome_unknown(
             state_root=handle.state_root,
         )
         with pytest.raises(type(failure), match="failed"):
-            future.result(timeout=5)
+            future.result(timeout=LIVENESS_SECONDS)
 
     observed = fleet_operation.observe_operation(
         handle.operation_id,
@@ -1546,8 +1548,12 @@ def test_timeout_and_authorization_cannot_both_commit(tmp_path: Path) -> None:
             authorization_timeout=0.04,
             poll_interval=0.005,
         )
-        _wait_ready(handle)
-        assert future.result(timeout=3) == (fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE)
+        # Completion may precede observation of readiness on a busy host.
+        # The immutable abort decision, not catching that brief window, is
+        # the contract under test.
+        assert future.result(timeout=LIVENESS_SECONDS) == (
+            fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE
+        )
     with pytest.raises(fleet_operation.OperationStateError):
         fleet_operation.authorize_operation(
             handle.operation_id,
@@ -1612,7 +1618,7 @@ def test_live_supervisor_obeys_abort_without_launching_child(tmp_path: Path) -> 
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
             child_popen=forbidden_child,
         )
@@ -1622,7 +1628,9 @@ def test_live_supervisor_obeys_abort_without_launching_child(tmp_path: Path) -> 
             state_root=handle.state_root,
             expected_request_sha256=handle.request_sha256,
         )
-        assert future.result(timeout=5) == (fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE)
+        assert future.result(timeout=LIVENESS_SECONDS) == (
+            fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE
+        )
     assert launched is False
     observed = fleet_operation.observe_operation(
         handle.operation_id,
@@ -1640,7 +1648,20 @@ def test_abort_racing_pre_ready_publication_binds_the_ready_nonce(
     handle = _prepare(tmp_path)
     ready_write_entered = threading.Event()
     allow_ready_write = threading.Event()
+    abort_at_decision_lock = threading.Event()
+    decision_inode = (handle.directory / "decision.lock").stat().st_ino
     original = fleet_operation._write_receipt_at
+    original_flock = fleet_operation.fcntl.flock
+
+    def watched_flock(fd: int, operation: int) -> None:
+        if (
+            operation == fcntl.LOCK_EX
+            and ready_write_entered.is_set()
+            and not allow_ready_write.is_set()
+            and os.fstat(fd).st_ino == decision_inode
+        ):
+            abort_at_decision_lock.set()
+        original_flock(fd, operation)
 
     def paused_write(
         directory_fd: int,
@@ -1649,30 +1670,38 @@ def test_abort_racing_pre_ready_publication_binds_the_ready_nonce(
     ) -> dict[str, object]:
         if name == "ready.json":
             ready_write_entered.set()
-            assert allow_ready_write.wait(3)
+            assert allow_ready_write.wait(LIVENESS_SECONDS)
         return original(directory_fd, name, payload)
 
     monkeypatch.setattr(fleet_operation, "_write_receipt_at", paused_write)
+    monkeypatch.setattr(fleet_operation.fcntl, "flock", watched_flock)
     with ThreadPoolExecutor(max_workers=2) as pool:
         supervisor = pool.submit(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
-        assert ready_write_entered.wait(3)
+        assert ready_write_entered.wait(LIVENESS_SECONDS)
         abort = pool.submit(
             fleet_operation.abort_operation,
             handle.operation_id,
             state_root=handle.state_root,
             expected_request_sha256=handle.request_sha256,
         )
-        time.sleep(0.03)
-        assert abort.done() is False
-        allow_ready_write.set()
-        decision = abort.result(timeout=5)
-        assert supervisor.result(timeout=5) == (fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE)
+        try:
+            # Witness the abort worker attempting the held decision lock;
+            # an unscheduled worker must not satisfy this ordering check.
+            assert abort_at_decision_lock.wait(LIVENESS_SECONDS)
+            time.sleep(0.03)
+            assert abort.done() is False
+        finally:
+            allow_ready_write.set()
+        decision = abort.result(timeout=LIVENESS_SECONDS)
+        assert supervisor.result(timeout=LIVENESS_SECONDS) == (
+            fleet_operation.SUPERVISOR_NOT_AUTHORIZED_EXIT_CODE
+        )
 
     ready = json.loads((handle.directory / "ready.json").read_text())
     assert decision["decision"] == "abort"
@@ -1690,7 +1719,7 @@ def test_run_authorization_and_abort_race_has_exactly_one_winner(
     tmp_path: Path,
 ) -> None:
     handle = _prepare(tmp_path)
-    barrier = threading.Barrier(2)
+    barrier = threading.Barrier(2, timeout=LIVENESS_SECONDS)
 
     def authorize() -> tuple[str, object]:
         barrier.wait()
@@ -1719,13 +1748,13 @@ def test_run_authorization_and_abort_race_has_exactly_one_winner(
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
         _wait_ready(handle)
         contenders = [pool.submit(authorize), pool.submit(abort)]
-        outcomes = [future.result(timeout=5)[0] for future in contenders]
-        supervisor.result(timeout=5)
+        outcomes = [future.result(timeout=LIVENESS_SECONDS)[0] for future in contenders]
+        supervisor.result(timeout=LIVENESS_SECONDS)
 
     assert sorted(outcomes) in (["abort", "run-error"], ["abort-error", "run"])
     observed = fleet_operation.observe_operation(
@@ -1751,7 +1780,7 @@ def test_authorization_requires_live_lease_nonce_and_report(tmp_path: Path) -> N
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
         _wait_ready(handle)
@@ -1766,7 +1795,34 @@ def test_authorization_requires_live_lease_nonce_and_report(tmp_path: Path) -> N
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
+
+
+@pytest.mark.parametrize(
+    ("nonce", "live_lease", "message"),
+    [("d" * 64, False, "lifetime lease"), ("invalid", True, "nonce")],
+)
+def test_authorization_rejects_stale_or_invalid_ready_receipt(
+    tmp_path: Path,
+    nonce: str,
+    live_lease: bool,
+    message: str,
+) -> None:
+    handle = _prepare(tmp_path)
+    output = handle.directory / "output.log"
+    output.write_bytes(b"")
+    output.chmod(0o600)
+    ready = fleet_operation._ready_payload(handle, nonce="d" * 64)
+    ready["nonce"] = nonce
+    fleet_operation._write_operation_receipt(handle, "ready.json", ready)
+    lease = _hold_operation_lease(handle) if live_lease else contextlib.nullcontext()
+    with lease, pytest.raises(fleet_operation.OperationStateError, match=message):
+        fleet_operation.authorize_operation(
+            handle.operation_id,
+            expected_report_digest_sha256=REPORT_DIGEST,
+            state_root=handle.state_root,
+        )
+    assert not (handle.directory / "authorization.json").exists()
 
 
 @pytest.mark.parametrize(
@@ -1961,7 +2017,7 @@ def test_result_output_digest_corruption_fails_closed(tmp_path: Path) -> None:
             fleet_operation.run_supervisor,
             handle.operation_id,
             state_root=handle.state_root,
-            authorization_timeout=3.0,
+            authorization_timeout=LIVENESS_SECONDS,
             poll_interval=0.005,
         )
         _wait_ready(handle)
@@ -1970,7 +2026,7 @@ def test_result_output_digest_corruption_fails_closed(tmp_path: Path) -> None:
             expected_report_digest_sha256=REPORT_DIGEST,
             state_root=handle.state_root,
         )
-        assert future.result(timeout=5) == 0
+        assert future.result(timeout=LIVENESS_SECONDS) == 0
 
     with (handle.directory / "output.log").open("ab") as stream:
         stream.write(b"tampered\n")

@@ -71,8 +71,8 @@ These are the only rules that are not a matter of judgment.
    `tests/test_no_maintainer_paths.py` check the mechanical part.
    - **Security bugs** go by email, per [`SECURITY.md`](SECURITY.md), not to a
      public issue.
-   - **A confidential issue's details** stay out of commits, CHANGELOG and
-     handovers until its fix is on `main`.
+   - **A confidential issue's details** stay out of commits, changelog
+     fragments and handovers until its fix is on `main`.
 4. **Don't create release refs** unless you are the release coordinator for
    that cut: no `vX.Y.Z` tags, no push to `release` or `release-candidate/*`,
    and no `releases/*.json`.
@@ -95,12 +95,16 @@ judgment, and say what you did.
   ```
 
   A push rejected after a clean rebase means someone landed first; repeat.
-  CI (`ruff`, `test`, `docs-build`) runs on `main` and on merge requests.
+  CI runs a fixed smoke sample on MRs; main runs Ruff/docs without repeating
+  pytest. Candidates and explicit full pipelines run the full suite. See
+  [testing policy and inventory](docs/testing.md).
 - **Keep `main` working.**
   - Run the tests your change touches and name them in the commit body.
   - Leave no half-finished code paths.
-  - Add a `CHANGELOG.md` entry under `[Unreleased]` for anything a user or
-    operator would notice.
+  - Add a changelog fragment, `changelog.d/<issue>-<topic>.<kind>.md`, for
+    anything a user or operator would notice. `CHANGELOG.md` itself is written
+    by the release cut (`scripts/fold_changelog.py`); see `CONTRIBUTING.md`,
+    "Changelog fragments".
 - **Name the issue in the subject** when a commit fixes one, e.g.
   `fix(dispatch): retry a probe that raced the job id (#42)`. In a subject,
   `(#N)` means an issue in the canonical queue tracker and nothing else;
@@ -111,14 +115,13 @@ judgment, and say what you did.
 
 ## Shared files and shared trees
 
-- **Shared ledgers.** `CHANGELOG.md` and the handovers take entries from many
-  sessions.
+- **Shared ledgers.** The handovers take entries from many sessions.
+  (`CHANGELOG.md` did too, until fragments replaced that: each change now
+  lands its own `changelog.d/` file, so there is nothing to conflict on.)
   - On a conflict, keep the union of both sides. Don't resolve with
     `--ours`/`--theirs`, which are inverted during a rebase anyway.
   - Before staging, `git diff :2:<file> <file>` and
     `git diff :3:<file> <file>` should show only removals you meant.
-  - After a rebase, check that your CHANGELOG entry is still under
-    `[Unreleased]`: a release cut can land underneath you.
 - **Shared working trees.** Stage explicit paths rather than `git add -A`.
   Don't stash, reset or delete changes, branches or worktrees you did not
   create.
