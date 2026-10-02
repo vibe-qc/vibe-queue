@@ -15,6 +15,23 @@ from vq import capacity, config, overview, paths, submit
 from vq.spec import JobSpec, JobState
 from vq.status import show_status_json
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# an in-process reader thread returning from a blocking FIFO open.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 1-5 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# No self-exiting process bounds it here: the reader is parked in `open()` on
+# a writerless FIFO and returns only once the code under test refuses to
+# block or a writer appears, so a longer budget cannot let it 'succeed' by
+# timing out. The assertion that the read did not block is
+# `not reader.is_alive()` after the join, which stays exactly as strict.
+_LIVENESS_SECONDS = 10.0
+
 
 @pytest.fixture
 def state_dir(tmp_path, monkeypatch):
@@ -336,7 +353,7 @@ def test_read_fifo_returns_none_without_blocking(state_dir):
     # In-process, so interpreter start-up is not on the clock. A blocking
     # open of a writerless FIFO never returns, so this budget only has to
     # tell "returned" from "stuck"; it is not a latency bound.
-    reader.join(timeout=5)
+    reader.join(timeout=_LIVENESS_SECONDS)
     try:
         assert not reader.is_alive(), "read_daemon_capacity blocked on a FIFO"
         assert results == [None]
@@ -346,7 +363,7 @@ def test_read_fifo_returns_none_without_blocking(state_dir):
             # leaking into the rest of the session.
             with contextlib.suppress(OSError):
                 writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-                reader.join(timeout=1)
+                reader.join(timeout=_LIVENESS_SECONDS)
                 os.close(writer)
 
 

@@ -67,9 +67,9 @@ class TestBulkFetch:
         )
         assert [r.jobid for r in results] == ["aaaaaaaaaaaa"]
 
-    def test_file_exists_becomes_skipped(self) -> None:
+    def test_positive_same_job_signal_becomes_skipped(self) -> None:
         def fake(jid: str) -> Path:
-            raise FileExistsError("destination already exists")
+            raise fetch.AlreadyFetched("destination already fetched")
 
         results = fetch.bulk_fetch(
             [_spec("aaaaaaaaaaaa", JobState.COMPLETED)], states=None, fetch_one=fake
@@ -373,7 +373,7 @@ class TestFetchAllCli:
             'scheduler_driver = "localhost"\n'
         )
         _job(
-            "twinterm0001",
+            "hostterm0001",
             {"out.txt": "T"},
             st=JobState.COMPLETED,
             scheduler_target="host_f",
@@ -384,7 +384,7 @@ class TestFetchAllCli:
         result = CliRunner().invoke(main, ["fetch-all", "host_f", "-o", str(out)])
 
         assert result.exit_code == 0, result.output
-        assert (out / "twinterm0001" / "out.txt").read_text() == "T"
+        assert (out / "hostterm0001" / "out.txt").read_text() == "T"
         assert not (out / "localterm001").exists()
         assert "1 fetched" in result.output
 

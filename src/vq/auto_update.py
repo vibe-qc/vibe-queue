@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from vq import admin, build_job, config
+from vq import admin, build_job, config, runtime_slots
 from vq.host import is_local_host
 
 log = logging.getLogger(__name__)
@@ -514,6 +514,84 @@ def _check_branch_drift(
     )
 
 
+def _slot_drift_sources(prog: config.VenvProgram) -> tuple[Path, Path, str]:
+    """Return (remote probe directory, active generation source, active SHA)."""
+    assert prog.runtime_slot_root is not None
+    remote_dir = admin._runtime_build_source(prog)
+    root = runtime_slots.layout(prog.runtime_slot_root).root
+    active = runtime_slots.resolve_current(root)
+    if active is None:
+        raise admin.AdminError(
+            f"no active runtime generation at {root}; unattended update needs "
+            "a first generation from `vq admin update --expected-sha`"
+        )
+    return remote_dir, runtime_slots.slot_source(root, active), active
+
+
+def _ls_remote_branch(git_dir: Path, branch: str) -> tuple[str | None, str]:
+    """Read ``origin``'s tip of ``branch`` without writing the repository."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(git_dir), "ls-remote", "origin", f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=_LS_REMOTE_TIMEOUT_SECONDS,
+            check=False, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"git ls-remote timed out after {_LS_REMOTE_TIMEOUT_SECONDS}s"
+    except OSError as e:
+        return None, f"git ls-remote failed to start: {e}"
+    if proc.returncode != 0:
+        return None, (proc.stderr or "git ls-remote failed").strip()
+    rows = [line.split("\t", 1) for line in proc.stdout.splitlines() if line.strip()]
+    tips = [sha.lower() for sha, ref in rows if ref == f"refs/heads/{branch}"]
+    if len(tips) != 1 or _FULL_SHA_RE.fullmatch(tips[0]) is None:
+        return None, f"origin has no single refs/heads/{branch}"
+    return tips[0], ""
+
+
+def _check_slot_branch_drift(
+    env: str, prog: config.VenvProgram, remote_dir: Path, active: str,
+) -> AutoUpdateDecision:
+    """Branch drift for a slot-rooted program, without fetching anywhere.
+
+    The target is read with ``ls-remote``. Whether it descends from the active
+    generation is proven later, inside the new unpublished generation, by the
+    build job (``admin.slot_build_requires_ancestor``).
+    """
+    def error(reason: str, target: str | None = None) -> AutoUpdateDecision:
+        return AutoUpdateDecision(
+            env_name=env, action="error", reason=reason,
+            current_tag=None, target_tag=None, policy="branch",
+            current_sha=active, target_sha=target,
+        )
+
+    if not prog.branch:
+        return error(
+            f"auto_update_policy='branch' requires `branch = \"...\"` in "
+            f"[programs.{env}]"
+        )
+    target, detail = _ls_remote_branch(remote_dir, prog.branch)
+    if target is None:
+        return error(f"could not read origin/{prog.branch}: {detail}")
+    if target == active:
+        return AutoUpdateDecision(
+            env_name=env, action="skip",
+            reason=f"active generation is origin/{prog.branch} ({active[:12]})",
+            current_tag=None, target_tag=None, policy="branch",
+            current_sha=active, target_sha=target,
+        )
+    return AutoUpdateDecision(
+        env_name=env, action="update",
+        reason=(
+            f"branch drift: active generation {active[:12]}, origin/"
+            f"{prog.branch}={target[:12]}; ancestry is proven in the new "
+            "generation before it is built"
+        ),
+        current_tag=None, target_tag=None, policy="branch",
+        current_sha=active, target_sha=target,
+    )
+
+
 def check_env_drift(env: str, cfg: config.Config) -> AutoUpdateDecision:
     """Decide whether ``env`` is behind its tracked source on origin.
     Pure function — no side effects, no spec writes, no workspace
@@ -536,6 +614,21 @@ def check_env_drift(env: str, cfg: config.Config) -> AutoUpdateDecision:
     """
     prog = admin._resolve_venv_program(env, cfg)
     git_dir = Path(prog.git_dir)
+    remote_dir = git_dir
+    if prog.runtime_slot_root is not None:
+        # Slot updates never move the build checkout: "current" is the active
+        # generation, and the remote is asked read-only through the build
+        # source. A published generation is never written (#72).
+        try:
+            remote_dir, git_dir, active = _slot_drift_sources(prog)
+        except (admin.AdminError, runtime_slots.RuntimeSlotError) as e:
+            return AutoUpdateDecision(
+                env_name=env, action="error", reason=str(e),
+                current_tag=None, target_tag=None,
+                policy=prog.auto_update_policy,
+            )
+        if prog.auto_update_policy == "branch":
+            return _check_slot_branch_drift(env, prog, remote_dir, active)
 
     if prog.auto_update_policy == "branch":
         return _check_branch_drift(env, prog, git_dir)
@@ -543,7 +636,7 @@ def check_env_drift(env: str, cfg: config.Config) -> AutoUpdateDecision:
 
     # Probe remote for tag list.
     try:
-        remote_tag_refs = _list_remote_tag_refs(git_dir)
+        remote_tag_refs = _list_remote_tag_refs(remote_dir)
     except subprocess.CalledProcessError as e:
         return AutoUpdateDecision(
             env_name=env,

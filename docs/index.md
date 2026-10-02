@@ -24,7 +24,7 @@ does not care whether that is what you run.
 ```sh
 vq submit compute -- python optimise.py
 vq queue
-vq fetch <jobid> -o results/
+vq fetch <jobid> -o results/ --workspace
 ```
 
 vq needs Python 3.12 or newer, and installs nothing on the remote host but
@@ -102,6 +102,17 @@ moves onto the internet.
 * **Cutting a release** — [the release process](release_process.md), and
   [version compatibility](version_compatibility.md) for what a vq version
   means to a fleet
+* **What is next** — the
+  [roadmap](https://github.com/vibe-qc/vibe-queue/blob/main/docs/roadmap.md):
+  what is planned, and what is released but not yet proven on a host
+* **History and design records** — kept in the
+  [source tree](https://github.com/vibe-qc/vibe-queue/tree/main/docs), not
+  published here. Each says in its first paragraph what it is. Four are
+  history: `roadmap_history.md` (v0.1 to v0.9),
+  `v0_7_1_lamports_clock_design.md`, `pbs_dispatcher_backend_design.md` and
+  `wall_time_design.md`. Two are approved designs still being built:
+  `design_immutable_venv_runtimes.md` and `design_broker.md`. Where any of them
+  disagrees with `vq <command> --help`, the help is right.
 
 vq is part of a set: [vibe-qc](https://vibe-qc.com/docs/) computes,
 [vibe-view](https://github.com/vibe-qc/vibe-view) renders the results,
@@ -125,4 +136,5 @@ orchestration
 version_compatibility
 codenames
 release_process
+testing
 ```

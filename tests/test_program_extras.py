@@ -235,15 +235,51 @@ class TestManagedUpdateHonorsDeclaredExtras:
         assert args[args.index("--extras") + 1] == "web"
 
     def test_an_update_that_cannot_apply_a_declaration_says_so(
-        self, serving_program: config.VenvProgram, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Config that looks applied and is not is the whole failure mode."""
+        """Config that looks applied and is not is the whole failure mode.
+
+        A vibe-view program, built here rather than borrowed from the
+        ``serving_program`` fixture: that fixture points at vq's own checkout
+        and vq's own ``scripts/update.sh``, so an ordinary update of it now
+        applies the declaration (#85) and this note is not what it gets. The
+        test was named for a program it never had.
+        """
+        checkout = tmp_path / "vibe-view"
+        (checkout / "scripts").mkdir(parents=True)
+        (checkout / "scripts" / "update.sh").write_text(
+            "#!/usr/bin/env bash\n", encoding="utf-8",
+        )
+        prog = config.VenvProgram(
+            kind="venv",
+            python=str(checkout / ".venv" / "bin" / "python"),
+            git_dir=str(checkout),
+            update_script="scripts/update.sh",
+            extras=["web"],
+        )
         said: list[str] = []
         monkeypatch.setattr(admin.output, "narrate", lambda text, *a, **k: said.append(text))
-        declared = serving_program.model_copy(update={"extras": ["web"]})
-        admin._warn_if_declared_extras_are_inert("vibeview-dev", declared)
-        assert said and "only a managed daemon update applies" in said[0]
-        assert "vibeview-dev" in said[0]
+
+        admin._warn_if_declared_extras_are_inert("vibeview-dev", prog)
+
+        assert said and "which this update does not apply" in said[0]
+        # The note names a route an operator can actually take from here. A
+        # fresh `vq admin install` is not one: this environment's checkout
+        # exists -- it is what this update just pulled -- and
+        # `_refuse_occupied_git_dir` refuses to provision over one, so naming
+        # it sends the reader to a command that refuses.
+        assert "vq admin install" not in said[0]
+        # Nor is the managed daemon transaction: it requires the same
+        # canonical script this program has not got, and refuses without it.
+        assert "A managed daemon update applies the declaration" not in said[0]
+        # And it does not describe a rebuild in terms of the metadata sidecar,
+        # which decides nothing when the configured update_script is not vq's.
+        assert ".vq-install-metadata" not in said[0]
+        # The route that does exist: make update_script vq's own, and every
+        # update applies the declaration.
+        assert (
+            "Point update_script at the checkout's own scripts/update.sh"
+        ) in said[0]
 
     def test_an_undeclared_program_says_nothing(
         self, serving_program: config.VenvProgram, monkeypatch: pytest.MonkeyPatch,
@@ -283,15 +319,82 @@ class TestDeclarationValidation:
                 extras=["wbe"],
             )
 
-    def test_a_program_vq_cannot_rebuild_may_not_declare_extras(self) -> None:
+    def test_a_program_vq_never_builds_may_not_declare_extras(self) -> None:
         """An accepted key that changes nothing is how this failed the first time."""
-        with pytest.raises(ValueError, match="extras requires update_script"):
+        with pytest.raises(
+            ValueError, match="extras requires install_script or update_script",
+        ):
             config.VenvProgram(
                 kind="venv",
                 python="/srv/vq/.venv/bin/python",
                 git_dir="/srv/vq",
                 extras=["web"],
             )
+
+    @pytest.mark.parametrize(
+        "scripts",
+        [
+            {"install_script": "vibe-queue/scripts/install.sh"},
+            {"update_script": "scripts/update.sh"},
+            {
+                "install_script": "vibe-queue/scripts/install.sh",
+                "update_script": "scripts/update.sh",
+            },
+        ],
+    )
+    def test_either_route_into_the_venv_admits_a_declaration(
+        self, scripts: dict[str, str],
+    ) -> None:
+        """A provision applies the floor too (#47), so install_script alone is a route.
+
+        Before `vq admin install` honoured the declaration, `update_script`
+        was the only way it could reach pip and the model required it. A
+        program that vq provisions but never rebuilds now has a working route,
+        and refusing its config would refuse a configuration that works.
+        """
+        prog = config.VenvProgram(
+            kind="venv",
+            python="/srv/vq/.venv/bin/python",
+            git_dir="/srv/vq",
+            extras=["web"],
+            **scripts,
+        )
+        assert prog.extras == ["web"]
+
+    def test_the_admitted_shape_is_told_what_it_does_and_does_not_get(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Loading is not the claim; what the shape *does* downstream is.
+
+        Asserting only `prog.extras == ["web"]` holds with every downstream
+        behaviour removed, which is how three messages that name `vq admin
+        update` as this shape's way out landed green. A program vq provisions
+        but never rebuilds gets the floor once, at provision, and nothing
+        after: an ordinary update runs its `update_script`, and there is none.
+        """
+        prog = config.VenvProgram(
+            kind="venv",
+            python="/srv/vq/.venv/bin/python",
+            git_dir="/srv/vq",
+            install_script="scripts/install.sh",
+            extras=["web"],
+        )
+        said: list[str] = []
+        monkeypatch.setattr(
+            admin.output, "narrate", lambda text, *a, **k: said.append(text),
+        )
+
+        admin._warn_if_declared_extras_are_inert("console", prog)
+
+        assert said and "rebuilds nothing" in said[0]
+        assert ".vq-install-metadata" not in said[0]
+        # The managed daemon transaction is not a route for it either: that
+        # path *is* the canonical update script, which this program has not
+        # got, so it refuses rather than planning a rebuild.
+        with pytest.raises(
+            admin.AdminError, match="requires the canonical update script",
+        ):
+            admin._managed_update_script_args(prog, None)
 
 
 class TestConsoleRuntimeGuard:
@@ -401,6 +504,64 @@ class TestConsoleRuntimeGuard:
         with pytest.raises(web_install.InstallError) as excinfo:
             web_install.require_console_runtime()
         assert 'extras = ["dev", "web"]' in str(excinfo.value)
+
+    def test_a_program_with_no_rebuild_route_is_told_to_add_one(
+        self, no_uvicorn: None, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`vq admin update` on an install_script-only program is a no-op.
+
+        This is the guard that exists so a console unit does not fail on every
+        start. Sending the operator to a command that pulls the checkout,
+        reports success and leaves uvicorn missing is that failure with an
+        extra step -- the unit keeps failing while the remedy reports success.
+        """
+        cfg = config.Config(
+            programs={
+                "vq-console": config.VenvProgram(
+                    kind="venv",
+                    python=str(Path(sys.executable).parent / "python"),
+                    git_dir=str(PROJECT),
+                    install_script="scripts/install.sh",
+                    extras=["web"],
+                ),
+            },
+        )
+        monkeypatch.setattr(config, "load_config", lambda: cfg)
+        with pytest.raises(web_install.InstallError) as excinfo:
+            web_install.require_console_runtime()
+        message = str(excinfo.value)
+        assert "already declares the web extra" in message
+        assert "configures no update_script" in message
+        assert 'update_script = "scripts/update.sh"' in message
+        assert "vq admin update vq-console" in message
+
+    def test_an_undeclared_program_with_no_rebuild_route_is_told_both_keys(
+        self, no_uvicorn: None, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Declaring the extra alone would leave the console down.
+
+        The declaration is still right -- it is what the next rebuild
+        preserves -- but on this shape there is no next rebuild until the
+        program has an `update_script`, so the remedy names both keys.
+        """
+        cfg = config.Config(
+            programs={
+                "vq-console": config.VenvProgram(
+                    kind="venv",
+                    python=str(Path(sys.executable).parent / "python"),
+                    git_dir=str(PROJECT),
+                    install_script="scripts/install.sh",
+                ),
+            },
+        )
+        monkeypatch.setattr(config, "load_config", lambda: cfg)
+        with pytest.raises(web_install.InstallError) as excinfo:
+            web_install.require_console_runtime()
+        message = str(excinfo.value)
+        assert "[programs.vq-console]" in message
+        assert 'extras = ["web"]' in message
+        assert 'update_script = "scripts/update.sh"' in message
+        assert "configures no update_script" in message
 
     def test_a_broken_config_still_yields_a_remedy(
         self, no_uvicorn: None, monkeypatch: pytest.MonkeyPatch,

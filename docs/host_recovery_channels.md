@@ -20,7 +20,7 @@ simultaneously:
 
 * sshd from workstation → rejected (no key)
 * sshd from compute-a → rejected (no key)
-* sshd from voyager (jump-host) → rejected (no key)
+* sshd from jump-a (jump host) → rejected (no key)
 * root ssh → hardened off
 * Cockpit / web admin → not installed
 * IPMI / BMC → not configured
