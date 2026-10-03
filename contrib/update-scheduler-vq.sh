@@ -224,6 +224,13 @@ else
     echo "source: existing target tree $target (vq $target_version)"
 fi
 
+# A helper venv installed by a release before the rename (#68) holds pip's
+# record for this same package under the name `vq`. Remove it first: its file
+# list owns `bin/vq`, which the install below writes again under `vibe-queue`.
+if "$venv/bin/python" -m pip show --quiet vq >/dev/null 2>&1; then
+    echo "removing the legacy 'vq' distribution record (the package is now vibe-queue)"
+    "$venv/bin/python" -m pip uninstall --quiet --yes vq
+fi
 "$venv/bin/python" -m pip install -e "$target"
 "$venv/bin/vq" --version
 if [ -n "$expected_tree_sha256" ]; then

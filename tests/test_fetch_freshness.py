@@ -69,7 +69,8 @@ def _materialize_job(
 
 def _tar_bytes(files: dict[str, str], top_dir: str) -> bytes:
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w|") as tf:
+    with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
         d = tarfile.TarInfo(top_dir)
         d.type = tarfile.DIRTYPE
         tf.addfile(d)
@@ -467,3 +468,11 @@ class TestStaleCacheOnTransportFailure:
         assert manifest["stale"] is False
         assert manifest["refresh_error"] is None
         assert (dst / "stdout.log").read_text() == "b\n"
+
+
+@pytest.fixture(autouse=True)
+def negotiated_fetch_protocol():
+    """Bind synthetic current-emitter tar streams to their fixture request."""
+    with pytest.MonkeyPatch.context() as protocol_patch:
+        protocol_patch.setattr(fetch, "_new_fetch_protocol_token", lambda: "0" * 32)
+        yield

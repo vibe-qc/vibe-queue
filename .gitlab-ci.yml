@@ -20,12 +20,16 @@ workflow:
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
     - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
+      auto_cancel:
+        on_new_commit: none
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
     - when: never
 
 
 ruff:
+  interruptible: true
   stage: test
   image: python:3.13-slim-bookworm
   tags:
@@ -37,6 +41,7 @@ ruff:
 
 
 test:
+  interruptible: true
   stage: test
   image: python:3.13-slim-bookworm
   tags:
@@ -67,12 +72,18 @@ test:
       "/tmp/vqtest-$CI_JOB_ID/vq-multi-user"
       "/tmp/vqtest-$CI_JOB_ID/pycache"
     - chown vqtest:vqtest "$CI_PROJECT_DIR"
+    - install -d -o vqtest -g vqtest "$CI_PROJECT_DIR/test-results"
     - >-
       runuser -u vqtest -- env HOME="/tmp/vqtest-$CI_JOB_ID"
       GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
       git config --global --add safe.directory "$CI_PROJECT_DIR"
   script:
-    - pip install -e ".[test,web]"
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = merge_request_event ]; then
+        pip install -e '.[test]'
+      else
+        pip install -e '.[test,web]'
+      fi
     - >-
       runuser -u vqtest -- env -u PYTEST_ADDOPTS
       HOME="/tmp/vqtest-$CI_JOB_ID"
@@ -91,7 +102,20 @@ test:
       GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
       PYTHONPYCACHEPREFIX="/tmp/vqtest-$CI_JOB_ID/pycache"
       PYTHONPATH="$CI_PROJECT_DIR/src"
-      python -m pytest tests -q -p no:cacheprovider
+      python scripts/run_ci_tests.py
+      --junitxml="$CI_PROJECT_DIR/test-results/pytest.xml"
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    reports:
+      junit: test-results/pytest.xml
+  # Main already passed MR smoke; direct pushes require a manual full pipeline
+  # when more assurance is needed. Candidates and explicit runs stay complete.
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
 
 # --------------------------------------------------------------------
 # Documentation site: Sphinx + furo, published under
@@ -113,6 +137,7 @@ test:
 
 
 docs-build:
+  interruptible: true
   stage: build
   image: python:3.13-slim-bookworm
   tags:
@@ -150,4 +175,12 @@ docs-build:
     - if: '$CI_COMMIT_BRANCH == "main"'
     - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "docs/**/*"
+        - "README.md"
+        - "CONTRIBUTING.md"
+        - "CHANGELOG.md"
+        - "changelog.d/**/*"
+        - "pyproject.toml"
+        - ".gitlab-ci.yml"
     - if: '$CI_PIPELINE_SOURCE == "web"'

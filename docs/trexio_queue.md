@@ -1,5 +1,7 @@
 # TREXIO export and READ through vq
 
+**Audience: people who run jobs.** Part of [Running jobs](user/index.md).
+
 QVF remains the default calculation container. TREXIO is an opt-in workload
 output/input format; vq transfers its contents without interpreting orbitals.
 TREXIO HDF5 is one regular file (normally `run.trexio.h5`), while the text
