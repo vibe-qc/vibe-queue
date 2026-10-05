@@ -32,20 +32,24 @@ import tarfile
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
-from vq import capacity, config, drain, events, paths, spec_access, transport
+from vq import capacity, config, dirfd, drain, events, paths, spec_access, transport
 from vq.config import HostConfig, VenvProgram
 from vq.host import is_local_host
-from vq.scheduler_dialect import enforce_scheduler_wall_time_limit
+from vq.scheduler_dialect import (
+    enforce_scheduler_wall_time_limit,
+    scheduler_width_warning,
+)
 from vq.spec import (
     JOB_NAME_MAX_LEN,
     JOB_NAME_PATTERN,
     JobSpec,
     JobState,
     ProgramRuntimePin,
+    utcnow_iso,
     validate_job_id,
 )
 from vq.vibeqc_preflight import vibeqc_dry_run_preflight
@@ -74,6 +78,7 @@ _IMPOSSIBLE_CAPACITY_WARNING_PATTERNS = (
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _IDEMPOTENCY_CLAIM_SCHEMA = "vq.submit-idempotency.v1"
+_IDEMPOTENCY_FENCE_SCHEMA = "vq.submit-idempotency-fence.v1"
 _IDEMPOTENCY_CLAIM_LIMIT = 16 * 1024
 REMOTE_SUBMIT_STDOUT_MAX_BYTES = 1024 * 1024
 REMOTE_SUBMIT_STDERR_MAX_BYTES = 64 * 1024
@@ -89,6 +94,10 @@ def _non_masking_warning(message: str, *args: object) -> None:
 
 class IdempotencyConflict(ValueError):
     """One owner reused a submit key for a different canonical intent."""
+
+
+class IdempotencyFenced(IdempotencyConflict):
+    """The key was fenced on this host, so no submission can ever claim it (#64)."""
 
 
 class _AuthorityReplacedError(ValueError):
@@ -222,6 +231,7 @@ class _NormalizedSubmitRequest:
     refresh_before: str | None
     qvf_force: bool
     idempotency_key: str | None = None
+    allow_helper_mismatch: bool = False
 
 
 @dataclass(frozen=True)
@@ -263,7 +273,15 @@ def _resolve_requested_submit_target(
         host_opt == "auto"
         or (not host_opt and args and args[0] == "auto")
     )
-    if pool is not None and not auto_selected:
+    candidate = host_opt or (
+        args[0] if args and args[0] in cfg.hosts else cfg.default_host
+    )
+    names_broker = (
+        candidate is not None
+        and candidate in cfg.hosts
+        and cfg.hosts[candidate].broker
+    )
+    if pool is not None and not auto_selected and not names_broker:
         raise ValueError(
             "--pool only applies to `vq submit auto` (it scopes the "
             "memory-aware host pick to a [pools.POOL] group)."
@@ -1186,8 +1204,10 @@ def _validated_archive_members(
                     f"{member.name!r} has a non-file terminal path "
                     f"component in staged archive payload {source_archive}"
                 )
-            if ".." in filtered.name.split("/"):
-                traversal_members.append(filtered)
+            # Some tarfile versions normalize away parent components. Keep
+            # vq's rejection policy bound to the original archive spelling.
+            if ".." in member.name.split("/"):
+                traversal_members.append(member)
             if not member_parts and not filtered.isdir():
                 raise PayloadValidationError(
                     "payload validation failed: archive member "
@@ -1664,6 +1684,7 @@ def _resolve_submit_plan(
     # A direct local request owns registry validation before any hidden
     # scheduler target is consulted.
     if directly_requested_local:
+        _validate_program_execution_target(cfg, request.program, target.scheduler_target)
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1742,6 +1763,9 @@ def _resolve_submit_plan(
     if is_local_host(execution_target.execution_host) and not directly_requested_local:
         # A local scheduler driver contributes only an observational fallback
         # when the target did not require an authoritative runtime lookup.
+        _validate_program_execution_target(
+            cfg, request.program, execution_target.scheduler_target,
+        )
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1774,6 +1798,84 @@ def _resolve_submit_plan(
         request=request,
         program_runtime_pin=program_runtime_pin,
         receipt_runtime_pin=receipt_runtime_pin,
+    )
+
+
+def _probe_scheduler_helper(
+    cfg: config.Config, scheduler_host: str,
+) -> dict[str, object]:
+    """Run the doctor's ``scheduler_remote_vq`` check for one submit (#127).
+
+    One function so a test can answer the probe without a transport. The
+    budget is the doctor's, ``[fleet] check_timeout_seconds`` when set.
+    """
+    from vq import doctor  # noqa: PLC0415
+
+    host_cfg = cfg.host(scheduler_host)
+    timeout = cfg.fleet.check_timeout_seconds
+    return doctor.scheduler_remote_vq_check(
+        host_cfg,
+        host_label=scheduler_host,
+        check_timeout=(
+            timeout if timeout is not None else doctor.DEFAULT_CHECK_TIMEOUT_SECONDS
+        ),
+    )
+
+
+def _refuse_stale_scheduler_helper(
+    cfg: config.Config,
+    scheduler_host: str,
+    *,
+    allow_mismatch: bool,
+    warning_sink: Callable[[str], None] | None,
+) -> None:
+    """Warn, or in strict mode refuse, for a helper proven to differ (#127).
+
+    The driver polls a scheduler job through the host's remote vq helper. A
+    helper from another source tree left jobs on a host ``unpolled`` with no
+    scheduler job id, silently (#127). The doctor already reports the
+    mismatch; this is the same verdict, asked on the driver before the spec
+    is written.
+
+    By maintainer decision the default only warns: a proven mismatch queues
+    the job with a warning naming both identities and the remedy, so a
+    driver-first rollout never refuses submits while helpers catch up. With
+    ``[fleet] strict_helper_identity = true`` on the driver, a verdict that
+    names both identities refuses, and ``--allow-helper-mismatch`` turns that
+    refusal back into the warning. A helper that did not answer in time or
+    could not be reached leaves the question open and is always a warning: a
+    queue-now, dispatch-later submit to a host that is briefly unreachable
+    must keep working.
+    """
+    from vq import doctor  # noqa: PLC0415
+
+    verdict = _probe_scheduler_helper(cfg, scheduler_host)
+    if verdict.get("ok") is True:
+        return
+    message = str(verdict.get("message") or "(no detail)")
+    if not doctor.helper_identity_mismatch(verdict):
+        if warning_sink is not None:
+            warning_sink(
+                f"scheduler helper on {scheduler_host} not verified, queued "
+                f"anyway: {message}"
+            )
+        return
+    if not cfg.fleet.strict_helper_identity or allow_mismatch:
+        if warning_sink is not None:
+            why = "--allow-helper-mismatch" if allow_mismatch else "warn-only by default"
+            warning_sink(
+                f"queued despite a scheduler helper mismatch on {scheduler_host} "
+                f"({why}): {message}; the driver may not poll this job until "
+                f"`vq admin update {scheduler_host}` brings the helper level"
+            )
+        return
+    raise ValueError(
+        f"scheduler helper on {scheduler_host} does not match this driver: "
+        f"{message}; the driver cannot show it can poll a job it queues there, "
+        f"and such a job sits unpolled. Run `vq admin update {scheduler_host}` "
+        "to bring the helper level with the driver, or pass "
+        "--allow-helper-mismatch to queue it anyway ([fleet] "
+        "strict_helper_identity is set on this driver)"
     )
 
 
@@ -1883,7 +1985,24 @@ def _execute_submit_plan(
             if request.idempotency_key is not None
             else {}
         ),
+        # Off the wire unless set: an older driver would refuse the option.
+        **({"allow_helper_mismatch": True} if request.allow_helper_mismatch else {}),
     )
+
+
+def _validate_program_execution_target(
+    cfg: config.Config, program_name: str | None, scheduler_target: str | None,
+) -> None:
+    """A scheduler-only registration must never authorize local execution."""
+    if (
+        program_name is not None
+        and isinstance(cfg.programs.get(program_name), config.SchedulerProgram)
+        and scheduler_target is None
+    ):
+        raise ValueError(
+            f"--program {program_name!r} is scheduler-only; submit to a "
+            "configured scheduler host or register a local installation"
+        )
 
 
 def _validate_program_for_submit(
@@ -1909,12 +2028,20 @@ def _validate_program_for_submit(
     if local_spec:
         prog = cfg.programs[program_name]
         if isinstance(prog, VenvProgram):
+            prog = _execution_program_for_submit(prog)
             mismatches = prog.runtime_pin_mismatches()
             if mismatches:
                 raise ValueError(
                     f"--program {program_name!r} runtime pin mismatch: "
                     + "; ".join(mismatches)
                 )
+
+
+def _execution_program_for_submit(prog: VenvProgram) -> VenvProgram:
+    try:
+        return prog.execution_program()
+    except config.ConfigError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _git_sha_matches(actual: str, expected: str) -> bool:
@@ -1967,6 +2094,7 @@ def _validate_expected_sha_for_submit(
             f"--expected-sha requires --program {program_name!r} to be a "
             "venv program with a git_dir"
         )
+    prog = _execution_program_for_submit(prog)
     actual_sha = prog.current_git_sha(full=len(expected_sha) == 40)
     if actual_sha is None:
         raise ValueError(
@@ -2228,6 +2356,7 @@ def _program_runtime_pin_for_submit(
     prog = cfg.programs.get(program_name)
     if not isinstance(prog, VenvProgram):
         return None
+    prog = _execution_program_for_submit(prog)
     # An explicit or configured SHA is enforced. A discovered SHA without
     # either requirement is observational and must survive runtime rollovers.
     expected_git_sha = expected_sha or prog.expected_git_sha
@@ -2319,6 +2448,7 @@ def _qvf_command(
                 f"single-QVF submit requires --program {program!r} to be a "
                 f"managed venv program; known programs: {known}"
             )
+        prog = _execution_program_for_submit(prog)
         command = [prog.python, "-m", "vibeqc._cli", "run", artifact_name]
     if force:
         command.append("--force")
@@ -2428,6 +2558,40 @@ def new_array_group_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _scheduler_width_warnings(
+    *,
+    cpus: int,
+    jobid: str,
+    scheduler_target: str,
+) -> tuple[str, ...]:
+    """Warn when a request is wider than its scheduler lane can ever run.
+
+    vibe-qc#148: five ``ppn=128`` jobs were accepted onto a lane whose only
+    nodes that wide were one busy and one offline, and queued for six days.
+    The scheduler accepts such a request without complaint, and until now so
+    did vq -- this path returned nothing at all for a scheduler target, so
+    the one moment a human was watching passed in silence.
+
+    Advisory and best effort in both directions: an unreadable config costs
+    the warning and never the submission, and an exceeded limit warns rather
+    than refuses, because a declared lane width goes stale as nodes return
+    to service.
+    """
+    try:
+        host_cfg = config.load_config().host(scheduler_target)
+    except Exception:
+        return ()
+    lane = host_cfg.scheduler_lane_metadata()
+    partition = lane.get("partition") if lane is not None else None
+    message = scheduler_width_warning(
+        cpus,
+        host_cfg.scheduler_max_cpus,
+        scheduler_host=scheduler_target,
+        partition=partition if isinstance(partition, str) else None,
+    )
+    return () if message is None else (f"job {jobid}: {message}",)
+
+
 def _impossible_capacity_warnings(
     *,
     cpus: int,
@@ -2436,9 +2600,13 @@ def _impossible_capacity_warnings(
     multi_user: bool,
     scheduler_target: str | None,
 ) -> tuple[str, ...]:
-    """Describe requests that can never fit this local daemon."""
+    """Describe requests this host can never run as asked."""
     if scheduler_target is not None:
-        return ()
+        return _scheduler_width_warnings(
+            cpus=cpus,
+            jobid=jobid,
+            scheduler_target=scheduler_target,
+        )
     try:
         caps = capacity.read_daemon_capacity(multi_user=multi_user)
     except Exception:
@@ -2681,7 +2849,7 @@ def _copy_directory_snapshot(
     destination: Path,
 ) -> None:
     """Recursively copy a stable no-follow view from one directory fd."""
-    names_before = sorted(os.listdir(source_fd), key=os.fsencode)
+    names_before = sorted(dirfd.listdir(source_fd), key=os.fsencode)
     for name in names_before:
         metadata = os.stat(
             name,
@@ -2767,7 +2935,7 @@ def _copy_directory_snapshot(
                 "payload validation failed: directory payload contains an "
                 f"unsupported filesystem object at {name!r}"
             )
-    if sorted(os.listdir(source_fd), key=os.fsencode) != names_before:
+    if sorted(dirfd.listdir(source_fd), key=os.fsencode) != names_before:
         raise PayloadValidationError(
             "payload directory changed while its immutable submission "
             "snapshot was created"
@@ -2776,7 +2944,7 @@ def _copy_directory_snapshot(
 
 def _copy_directory_snapshot_at(source_fd: int, destination_fd: int) -> None:
     """Copy a stable tree between already-open directory authorities."""
-    names_before = sorted(os.listdir(source_fd), key=os.fsencode)
+    names_before = sorted(dirfd.listdir(source_fd), key=os.fsencode)
     for name in names_before:
         metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
@@ -2872,7 +3040,7 @@ def _copy_directory_snapshot_at(source_fd: int, destination_fd: int) -> None:
                 "payload validation failed: directory payload contains an "
                 f"unsupported filesystem object at {name!r}"
             )
-    if sorted(os.listdir(source_fd), key=os.fsencode) != names_before:
+    if sorted(dirfd.listdir(source_fd), key=os.fsencode) != names_before:
         raise PayloadValidationError(
             "payload directory changed while its immutable submission "
             "snapshot was staged"
@@ -3010,7 +3178,7 @@ def _directory_payload_digest_at(directory_fd: int) -> str:
     digest.update(b"vq.payload.directory.v2\0")
 
     def visit(parent_fd: int, prefix: tuple[str, ...]) -> None:
-        for name in sorted(os.listdir(parent_fd), key=os.fsencode):
+        for name in sorted(dirfd.listdir(parent_fd), key=os.fsencode):
             relative = (*prefix, name)
             metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
@@ -3088,7 +3256,10 @@ def _submission_intent_digest(
     runtime_pin = (
         spec.program_runtime_pin.model_dump(
             mode="json",
-            exclude={"resolved_git_sha"},
+            # Dispatch receipts are observations, not submission intent. Omit
+            # even absent additive fields to preserve pre-upgrade claim hashes.
+            exclude={"resolved_git_sha", "resolved_runtime_root",
+                     "resolved_runtime_source", "resolved_runtime_python"},
         )
         if spec.program_runtime_pin is not None
         else None
@@ -3401,7 +3572,7 @@ def _remove_tree_at(
         opened = os.fstat(child_fd)
         if not _same_inode(metadata, opened):
             raise ValueError("owned workspace changed during rollback")
-        for child_name in os.listdir(child_fd):
+        for child_name in dirfd.listdir(child_fd):
             _remove_tree_at(child_fd, child_name)
         final_entry = os.stat(
             name,
@@ -3656,6 +3827,19 @@ def _read_idempotency_claim(
         payload = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid durable idempotency claim record") from exc
+    if isinstance(payload, dict) and payload.get("schema") == _IDEMPOTENCY_FENCE_SCHEMA:
+        if (
+            set(payload) != {"schema", "owner_hash", "key_hash", "fenced_at"}
+            or payload.get("owner_hash") != binding.owner_hash
+            or payload.get("key_hash") != binding.key_hash
+            or not isinstance(payload.get("fenced_at"), str)
+        ):
+            raise ValueError("invalid durable idempotency fence record")
+        _revalidate_idempotency_store(store)
+        raise IdempotencyFenced(
+            "idempotency key was fenced on this host; a submission under it "
+            "can never be accepted"
+        )
     required = {
         "schema",
         "owner_hash",
@@ -3689,7 +3873,6 @@ def _write_idempotency_claim(
     job_id: str,
     store: _IdempotencyStore,
 ) -> None:
-    _revalidate_idempotency_store(store)
     payload = {
         "schema": _IDEMPOTENCY_CLAIM_SCHEMA,
         "owner_hash": binding.owner_hash,
@@ -3697,6 +3880,20 @@ def _write_idempotency_claim(
         "intent_digest": binding.intent_digest,
         "job_id": validate_job_id(job_id),
     }
+    if not _link_idempotency_record(store, payload):
+        existing = _read_idempotency_claim(binding, store)
+        if existing != (job_id, binding.intent_digest):
+            raise IdempotencyConflict(
+                "durable idempotency key is already bound to a "
+                "different job"
+            )
+
+
+def _link_idempotency_record(
+    store: _IdempotencyStore, payload: Mapping[str, object],
+) -> bool:
+    """Publish one create-once record at the claim name; False if one exists."""
+    _revalidate_idempotency_store(store)
     encoded = (
         json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -3734,18 +3931,79 @@ def _write_idempotency_claim(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            existing = _read_idempotency_claim(binding, store)
-            if existing != (job_id, binding.intent_digest):
-                raise IdempotencyConflict(
-                    "durable idempotency key is already bound to a "
-                    "different job"
-                ) from None
+            created = False
         else:
             _fsync_durable_directory(store.owner_fd)
+            created = True
         _revalidate_idempotency_store(store)
+        return created
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=store.owner_fd)
+
+
+def fence_idempotency_key(queue_dir: Path, key: str) -> dict[str, object]:
+    """Settle whether a keyed submission was accepted here, and forbid it if not.
+
+    A broker whose keyed transfer to this host was refused, or whose answer
+    was lost, cannot tell from outside whether a copy of that request might
+    still land (#64). Under the same per-key lock every keyed submit holds:
+
+    * a claim, or a spec left by a crash before its claim, means the
+      submission was accepted: the claim is repaired if needed and its job
+      id is returned (``"accepted"``);
+    * otherwise a create-once fence record is written at the claim's name,
+      so any later submission under the key is refused (``"fenced"``).
+
+    Repeatable: an existing fence answers ``"fenced"`` again.
+    """
+    _validate_idempotency_key(key)
+    binding = _idempotency_binding(queue_dir, key=key, intent_digest="0" * 64)
+    with _idempotency_store_lock(
+        queue_dir,
+        binding,
+        create_namespace=True,
+        create_lock=True,
+    ) as store:
+        assert store is not None
+        try:
+            claim = _read_idempotency_claim(binding, store)
+        except IdempotencyFenced:
+            return {"state": "fenced", "job_id": None}
+        if claim is not None:
+            return {"state": "accepted", "job_id": claim[0]}
+        matches = _idempotency_spec_matches(queue_dir, binding, store)
+        if len(matches) > 1:
+            raise IdempotencyConflict(
+                "idempotency key is bound to multiple durable job specs"
+            )
+        if matches:
+            spec = matches[0]
+            _write_idempotency_claim(
+                replace(
+                    binding, intent_digest=str(spec.submission_intent_digest),
+                ),
+                spec.id,
+                store,
+            )
+            return {"state": "accepted", "job_id": spec.id}
+        fence = {
+            "schema": _IDEMPOTENCY_FENCE_SCHEMA,
+            "owner_hash": binding.owner_hash,
+            "key_hash": binding.key_hash,
+            "fenced_at": utcnow_iso(),
+        }
+        if not _link_idempotency_record(store, fence):
+            # Lost a race to a submit or another fence under our own lock
+            # cannot happen; read what is there rather than guess.
+            try:
+                claim = _read_idempotency_claim(binding, store)
+            except IdempotencyFenced:
+                return {"state": "fenced", "job_id": None}
+            if claim is None:
+                raise ValueError("idempotency record vanished while fencing")
+            return {"state": "accepted", "job_id": claim[0]}
+        return {"state": "fenced", "job_id": None}
 
 
 def ensure_idempotency_claim_for_spec(
@@ -3892,6 +4150,29 @@ def _lookup_idempotent_submission(
         _revalidate_idempotency_store(store)
         return job_id, False
 
+    matches = _idempotency_spec_matches(queue_dir, binding, store)
+    if not matches:
+        _revalidate_idempotency_store(store)
+        return None
+    if len(matches) != 1:
+        raise IdempotencyConflict(
+            "idempotency key is bound to multiple durable job specs"
+        )
+    match = matches[0]
+    if match.submission_intent_digest != binding.intent_digest:
+        raise IdempotencyConflict(
+            "idempotency key was already used for a different submission intent"
+        )
+    _revalidate_idempotency_store(store)
+    return match.id, True
+
+
+def _idempotency_spec_matches(
+    queue_dir: Path,
+    binding: _IdempotencyBinding,
+    store: _IdempotencyStore,
+) -> list[JobSpec]:
+    """Every durable spec bound to this owner and key (crash-repair evidence)."""
     # Scan through the same held queue descriptor whose ancestry and inode are
     # revalidated above. Reopening ``queue_dir`` by pathname here would admit
     # a rename/restore ABA: both pathname checks could see the right directory
@@ -3899,7 +4180,7 @@ def _lookup_idempotent_submission(
     _fsync_durable_directory(store.queue_fd)
     spec_names = sorted(
         name
-        for name in os.listdir(store.queue_fd)
+        for name in dirfd.listdir(store.queue_fd)
         if name.endswith(".json")
     )
     candidates: list[tuple[str, JobSpec]] = []
@@ -3941,20 +4222,7 @@ def _lookup_idempotent_submission(
             and candidate.idempotency_key_hash == binding.key_hash
         ):
             matches.append(candidate)
-    if not matches:
-        _revalidate_idempotency_store(store)
-        return None
-    if len(matches) != 1:
-        raise IdempotencyConflict(
-            "idempotency key is bound to multiple durable job specs"
-        )
-    match = matches[0]
-    if match.submission_intent_digest != binding.intent_digest:
-        raise IdempotencyConflict(
-            "idempotency key was already used for a different submission intent"
-        )
-    _revalidate_idempotency_store(store)
-    return match.id, True
+    return matches
 
 
 def _write_spec_exclusive(
@@ -4096,7 +4364,7 @@ def _fsync_workspace_tree(directory: Path) -> None:
 
 def _fsync_workspace_tree_at(directory_fd: int) -> None:
     """Durably sync a staged tree below one held directory descriptor."""
-    for name in os.listdir(directory_fd):
+    for name in dirfd.listdir(directory_fd):
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = os.open(
@@ -5246,6 +5514,7 @@ def _build_remote_submit_argv(
     scheduler_target: str | None,
     qvf_force: bool,
     idempotency_key: str | None = None,
+    allow_helper_mismatch: bool = False,
 ) -> list[str]:
     """Serialize resolved submit inputs for the remote ``vq`` CLI.
 
@@ -5303,6 +5572,11 @@ def _build_remote_submit_argv(
         remote_argv.extend(["--scheduler-target", scheduler_target])
     if idempotency_key is not None:
         remote_argv.extend(["--idempotency-key", idempotency_key])
+    if allow_helper_mismatch:
+        # The driver runs the helper check (#127); carry the operator's
+        # decision to it. Absent by default, so an older driver's wire is
+        # unchanged.
+        remote_argv.append("--allow-helper-mismatch")
     if remote_input_file is not None:
         if qvf_force:
             remote_argv.append("--qvf-force")
@@ -5435,6 +5709,7 @@ def submit_remote(
     qvf_force: bool = False,
     idempotency_key: str | None = None,
     warning_sink: Callable[[str], None] | None = None,
+    allow_helper_mismatch: bool = False,
 ) -> list[str]:
     """Submit a job to a remote host via SSH.
 
@@ -5654,6 +5929,7 @@ def submit_remote(
             scheduler_target=scheduler_target,
             qvf_force=qvf_force,
             idempotency_key=idempotency_key,
+            allow_helper_mismatch=allow_helper_mismatch,
         )
         proc = transport.run_remote_vq(
             host_cfg,

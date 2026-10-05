@@ -1,5 +1,7 @@
 # Driving vq from a script
 
+**Audience: operators and agents.** Part of [Running a host](operator/index.md) and [The agent contract](agent/index.md).
+
 **Match on `outcome`. Never on message text.**
 
 This page is the contract between vq and an unattended caller. It exists

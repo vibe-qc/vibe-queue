@@ -34,9 +34,11 @@ _SESSION_ENV_NAMES = (
     "XDG_CONFIG_HOME",
     "XDG_CACHE_HOME",
     "VQ_STATE_DIR",
+    "VQ_SCRATCH_DIR",
     "VQ_CONFIG_DIR",
     "VQ_ARCHIVE_DIR",
     "VQ_MULTI_USER_ROOT",
+    "VQ_MULTI_USER_SCRATCH_ROOT",
     "VQ_TEST_SANDBOX_ROOT",
     "VQ_TEST_SHORT_TMPDIR",
     "VQ_TEST_SYSTEM_CONFIG_FILE",
@@ -120,9 +122,14 @@ def _start_session_sandbox(config: pytest.Config) -> None:
         "XDG_CONFIG_HOME": root / "xdg-config",
         "XDG_CACHE_HOME": root / "xdg-cache",
         "VQ_STATE_DIR": root / "isolated-state",
+        # #63: scratch is its own root now. Declared explicitly rather than
+        # left to the "-scratch sibling of the state root" default so an
+        # operator's inherited VQ_SCRATCH_DIR cannot reach a test process.
+        "VQ_SCRATCH_DIR": root / "isolated-scratch",
         "VQ_CONFIG_DIR": root / "isolated-config",
         "VQ_ARCHIVE_DIR": root / "isolated-archive",
         "VQ_MULTI_USER_ROOT": root / "isolated-multi-user",
+        "VQ_MULTI_USER_SCRATCH_ROOT": root / "isolated-multi-user-scratch",
         "VQ_TEST_SANDBOX_ROOT": sandbox_root,
     }
     for path in roots.values():
@@ -138,13 +145,17 @@ def _start_session_sandbox(config: pytest.Config) -> None:
     # fallback to the process's default XDG roots changes the snapshot and
     # makes the complete run fail even if the offending test itself passes.
     sentinel_state = roots["XDG_DATA_HOME"] / "vq"
+    sentinel_scratch = roots["XDG_DATA_HOME"] / "vq-scratch"
     sentinel_config = roots["XDG_CONFIG_HOME"] / "vq"
     home_state = roots["HOME"] / ".local" / "share" / "vq"
+    home_scratch = roots["HOME"] / ".local" / "share" / "vq-scratch"
     home_config = roots["HOME"] / ".config" / "vq"
     _session_sentinel_roots = (
         sentinel_state,
+        sentinel_scratch,
         sentinel_config,
         home_state,
+        home_scratch,
         home_config,
     )
     for index, sentinel in enumerate(_session_sentinel_roots):
@@ -226,6 +237,15 @@ def pytest_configure(config: pytest.Config) -> None:
         "verbose_probe (typically by injecting its own runner, or by "
         "probing a local socket it opened itself).",
     )
+    config.addinivalue_line(
+        "markers",
+        "no_autopatch_scheduler_helper_guard: opt OUT of the autouse stub "
+        "that answers the submit-time scheduler helper identity probe "
+        "(#127) with a match. The test exercises the real "
+        "vq.submit._probe_scheduler_helper, which runs the doctor's "
+        "scheduler_remote_vq check over the remote-vq transport, and "
+        "injects its own verdicts or transport.",
+    )
 
 
 def pytest_sessionfinish(session: pytest.Session) -> None:
@@ -294,17 +314,28 @@ def _isolate_vq_state_env(
         "XDG_CONFIG_HOME": tmp_path / "xdg-config",
         "XDG_CACHE_HOME": tmp_path / "xdg-cache",
         paths.ENV_STATE_DIR: tmp_path / "vq-state",
+        paths.ENV_SCRATCH_DIR: tmp_path / "vq-scratch",
         _config.ENV_CONFIG_DIR: tmp_path / "vq-config",
         paths.ENV_ARCHIVE_DIR: tmp_path / "vq-archive",
         paths.ENV_MULTI_USER_ROOT: tmp_path / "vq-multi-user",
+        paths.ENV_MULTI_USER_SCRATCH_ROOT: tmp_path / "vq-multi-user-scratch",
     }
     for path in roots.values():
         path.mkdir(parents=True, exist_ok=True)
     sentinel_state = roots["XDG_DATA_HOME"] / "vq"
+    sentinel_scratch = roots["XDG_DATA_HOME"] / "vq-scratch"
     sentinel_config = roots["XDG_CONFIG_HOME"] / "vq"
     home_state = roots["HOME"] / ".local" / "share" / "vq"
+    home_scratch = roots["HOME"] / ".local" / "share" / "vq-scratch"
     home_config = roots["HOME"] / ".config" / "vq"
-    sentinel_roots = (sentinel_state, sentinel_config, home_state, home_config)
+    sentinel_roots = (
+        sentinel_state,
+        sentinel_scratch,
+        sentinel_config,
+        home_state,
+        home_scratch,
+        home_config,
+    )
     for index, sentinel in enumerate(sentinel_roots):
         sentinel.mkdir(parents=True)
         (sentinel / "live-root-sentinel").write_bytes(
@@ -633,4 +664,32 @@ def _autopatch_ssh_probe(
     monkeypatch.setattr("vq.ssh_probe.verbose_probe", _stub_verbose)
     monkeypatch.setattr(
         "vq.ssh_probe.control_master_active", lambda destination, **_kw: False
+    )
+
+
+@pytest.fixture(autouse=True)
+def _autopatch_scheduler_helper_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Answer the submit-time scheduler helper probe (#127) with a match.
+
+    ``vq submit`` to a scheduler target asks the doctor's
+    ``scheduler_remote_vq`` check, on the driver, whether the host's remote
+    vq helper is the driver's own source tree. That is an SSH round trip;
+    every scheduler submit test written before the guard would otherwise dial
+    its fake host alias and wait out a transport timeout. The stub answers
+    "match". Tests of the guard opt out with
+    ``@pytest.mark.no_autopatch_scheduler_helper_guard`` and inject their own
+    verdict or transport.
+    """
+    if "no_autopatch_scheduler_helper_guard" in request.keywords:
+        return
+    monkeypatch.setattr(
+        "vq.submit._probe_scheduler_helper",
+        lambda cfg, scheduler_host: {
+            "name": "scheduler_remote_vq",
+            "ok": True,
+            "message": "stubbed by tests/conftest.py: helper matches driver",
+        },
     )

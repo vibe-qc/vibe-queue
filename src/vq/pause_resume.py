@@ -24,11 +24,13 @@ Limitations (worth documenting for the user):
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import functools
 import logging
 import os
 import signal
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +52,33 @@ log = logging.getLogger(__name__)
 
 _HOLD_OUTCOME_UNKNOWN = "hold_outcome_unknown"
 _RELEASE_OUTCOME_UNKNOWN = "release_outcome_unknown"
+
+# One admission deadline spans every nested scan and mutation recheck in an
+# exact proof. Once it expires, uncontended locks remain admissible; contended
+# rows fail closed without another wait. Healthy retained history therefore
+# does not fail merely because parsing all its rows takes longer than this.
+PROOF_LOCK_TIMEOUT_SECONDS = 5.0
+_proof_lock_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "vq_proof_lock_deadline", default=None,
+)
+
+
+def _bounded_proof_locks[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """Give nested proof operations one shared lock-admission deadline (#70)."""
+    @functools.wraps(function)
+    def bounded(*args: P.args, **kwargs: P.kwargs) -> R:
+        if _proof_lock_deadline.get() is not None:
+            return function(*args, **kwargs)
+        token = _proof_lock_deadline.set(
+            time.monotonic() + PROOF_LOCK_TIMEOUT_SECONDS,
+        )
+        try:
+            return function(*args, **kwargs)
+        finally:
+            # An interrupted entry may retain its lock through a traceback.
+            # A later cleanup/recovery operation must get a fresh deadline.
+            _proof_lock_deadline.reset(token)
+    return bounded
 
 
 class PauseError(RuntimeError):
@@ -144,7 +173,10 @@ def _all_user_spec_paths(queue_root: Path | None = None) -> list[Path]:
 
 
 def _bulk_control_candidates(
-    spec_paths: Sequence[Path], *, multi_user: bool,
+    spec_paths: Sequence[Path],
+    *,
+    multi_user: bool,
+    policy: ownership.AuthorizationPolicy | None = None,
 ) -> Iterator[Path]:
     """Omit terminal history before taking any per-job control locks.
 
@@ -155,6 +187,11 @@ def _bulk_control_candidates(
     counts from omitted rows. Retain rows with pause evidence,
     even when terminal, for the ordinary control/recovery path. Exact token
     admission and reconciliation proofs deliberately do not use this filter.
+
+    ``policy`` is the caller's already-resolved authorization policy for this
+    one operation. Every row is checked either way; passing it just stops each
+    row re-reading and re-validating the config, which is what made this
+    filter's cost grow with everything the queue retains (#22).
     """
     for spec_path in spec_paths:
         try:
@@ -173,7 +210,9 @@ def _bulk_control_candidates(
             and spec.pause_intent_monotonic_at is None
         ):
             try:
-                ownership.check_owner(spec, multi_user=multi_user)
+                ownership.check_owner(
+                    spec, multi_user=multi_user, policy=policy,
+                )
             except ownership.OwnershipError:
                 pass
             else:
@@ -243,6 +282,7 @@ def _locked_authorized_spec(
     spec_path: Path,
     *,
     multi_user: bool,
+    policy: ownership.AuthorizationPolicy | None = None,
 ) -> Iterator[JobSpec]:
     """Load and authorize one spec inside its mutation lock.
 
@@ -251,10 +291,20 @@ def _locked_authorized_spec(
     Every caller classifies or mutates only the snapshot yielded here.  Bulk
     callers release this lock before invoking a single-job helper, which then
     repeats the same locked authorization against the final snapshot.
+
+    ``policy`` is the caller's already-resolved authorization policy for this
+    one operation; the snapshot is authorized against it exactly as it would be
+    against a freshly loaded one.
     """
-    with paths.spec_lock(spec_path):
+    deadline = _proof_lock_deadline.get()
+    lock = (
+        paths.spec_lock(spec_path)
+        if deadline is None
+        else paths.spec_lock(spec_path, timeout=max(0.0, deadline - time.monotonic()))
+    )
+    with lock:
         spec = JobSpec.read(spec_path)
-        ownership.check_owner(spec, multi_user=multi_user)
+        ownership.check_owner(spec, multi_user=multi_user, policy=policy)
         yield spec
 
 
@@ -386,6 +436,7 @@ def _reconcile_pause_intent_path(
     spec_path: Path,
     *,
     multi_user: bool,
+    omit_without_intent: bool = False,
 ) -> str | None:
     """Complete one fsynced pause intent under its exact spec lock.
 
@@ -394,7 +445,26 @@ def _reconcile_pause_intent_path(
     ``None`` when no intent exists.  An unsafe/ambiguous intent is retained and
     raises :class:`PauseError`; dropping it would erase the only evidence that
     the corresponding process group may already be stopped.
+
+    ``omit_without_intent`` reads the row before taking its lock and stops
+    there when there is no intent to finish.  It is a negative hint about work
+    to do, never authorization to signal a process: a row that carries an
+    intent, and a row that cannot be read at all, still go through the locked
+    and authorized path unchanged.  Specs are published by atomic replace, so
+    the unlocked read always sees one whole record -- the snapshot the locked
+    read would have taken a moment earlier.  An intent armed concurrently is
+    therefore reconciled by the next sweep, exactly as one armed a moment
+    later already is, so this belongs to a caller that sweeps repeatedly and
+    not to one whose single sweep has to be exact.  Off by default for that
+    reason; see :func:`reconcile_pause_intents`.
     """
+    if omit_without_intent:
+        try:
+            if JobSpec.read(spec_path).pause_intent_at is None:
+                return None
+        except (OSError, ValueError):
+            pass
+
     with _locked_authorized_spec(spec_path, multi_user=multi_user) as spec:
         if spec.pause_intent_at is None:
             return None
@@ -466,12 +536,15 @@ def _reconcile_pause_intent_path(
         return "completed"
 
 
+@_bounded_proof_locks
 def reconcile_pause_intents(
     host: str,
     *,
     queue_dir: Path | None = None,
     queue_root: Path | None = None,
     multi_user: bool = False,
+    omit_rows_without_intent: bool = False,
+    rows_proven_without_intent: Callable[[Path], bool] | None = None,
 ) -> PauseIntentReconcileResult:
     """Finish every durable local pause intent visible to this caller.
 
@@ -479,11 +552,54 @@ def reconcile_pause_intents(
     it before token-scoped resume proof.  Per-job failures are returned rather
     than discarded so a caller that owns an update marker can keep that marker
     armed until every potential stopped process is accounted for.
+
+    A queue retains its terminal jobs, so this sweep is sized by everything
+    the host has ever run rather than by what is live (#22).  Locking and
+    authorizing a job only to find it carries no intent costs three file opens
+    apiece -- the lock, the spec, and the authorization config -- which the
+    daemon then pays for every retained job on every tick.
+    ``omit_rows_without_intent`` reads each row first and skips the ones with
+    nothing to finish.  It is for a caller that sweeps repeatedly, so a row
+    that arms an intent between the read and the lock is simply picked up next
+    time.  ``pause_token_scope_with_proof`` leaves it off: an exact proof
+    scans every row under its lock, including terminal ones, and must not rest
+    on an unlocked hint.
+
+    ``rows_proven_without_intent`` is the same negative hint one step cheaper
+    (#82).  Reading each row to learn it has no intent still costs an open, a
+    JSON parse and a model validation per retained job per tick, which is what
+    made this sweep the largest term in a daemon tick once the admission scan
+    stopped paying it.  A caller that already knows, from its own pass over
+    the same directory, that a row's bytes are the ones it read and found
+    settled and intent-free may say so here, and this sweep will pass over
+    that path without opening it.  The predicate answers about one path and is
+    consulted before anything is read; a row it declines, a row it does not
+    know and a row whose bytes have changed are all swept exactly as before.
+    A row the predicate accepts is not opened at all, so if it has become
+    unreadable since it was proven the sweep no longer reports that -- the
+    predicate answers about bytes already read, and the daemon's
+    implementation says why that is the right trade.  It is only honoured
+    together with
+    ``omit_rows_without_intent`` -- passing it alone is a programming error
+    rather than a quiet weakening of an exact scan -- so neither
+    ``pause_token_scope_with_proof`` nor :func:`_prove_pause_token_absent`,
+    which take the default, can inherit it.  The daemon's predicate is
+    :meth:`vq.daemon.Daemon._pause_intent_sweep_may_skip`.
     """
     if not is_local_host(host):
         raise NotImplementedError(
             f"pause-intent reconciliation for {host!r} is local-only"
     )
+    if rows_proven_without_intent is not None and not omit_rows_without_intent:
+        # Fail closed. An exact proof takes the default, so the only way a
+        # proof could ever inherit a caller's unlocked skip is a keyword
+        # threaded through by mistake; that must be an error here rather than
+        # a scan that silently stops being exact.
+        raise ValueError(
+            "rows_proven_without_intent is a cheaper form of "
+            "omit_rows_without_intent and cannot be used to skip rows in an "
+            "exact scan; pass omit_rows_without_intent=True with it"
+        )
     if multi_user:
         spec_paths = _all_user_spec_paths(queue_root)
     else:
@@ -495,9 +611,21 @@ def reconcile_pause_intents(
     cleared_gone: list[str] = []
     errors: list[tuple[str, str]] = []
     for spec_path in spec_paths:
+        if (
+            rows_proven_without_intent is not None
+            and rows_proven_without_intent(spec_path)
+        ):
+            # Proven to carry no intent without being read (#82). A row this
+            # declines is swept in full below, so an unknown path and changed
+            # bytes cost exactly what they did before. A row it accepts is
+            # never opened, so a row that became unreadable without changing
+            # is passed over silently rather than reported once per tick.
+            continue
         try:
             result = _reconcile_pause_intent_path(
-                spec_path, multi_user=multi_user,
+                spec_path,
+                multi_user=multi_user,
+                omit_without_intent=omit_rows_without_intent,
             )
         except ConfigError:
             raise
@@ -1166,10 +1294,17 @@ def pause_scheduler_all(
     skipped: list[str] = []
     errors: list[tuple[str, str]] = []
 
-    for spec_path in _bulk_control_candidates(spec_paths, multi_user=multi_user):
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if spec_paths
+        else None
+    )
+    for spec_path in _bulk_control_candidates(
+        spec_paths, multi_user=multi_user, policy=policy,
+    ):
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if spec.scheduler_target != scheduler_target:
                     continue
@@ -1234,10 +1369,17 @@ def resume_scheduler_all(
     paused_by_other: list[str] = []
     errors: list[tuple[str, str]] = []
 
-    for spec_path in _bulk_control_candidates(spec_paths, multi_user=multi_user):
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if spec_paths
+        else None
+    )
+    for spec_path in _bulk_control_candidates(
+        spec_paths, multi_user=multi_user, policy=policy,
+    ):
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if spec.scheduler_target != scheduler_target:
                     continue
@@ -1332,10 +1474,17 @@ def pause_all(
     skipped: list[str] = []
     errors: list[tuple[str, str]] = []
 
-    for spec_path in _bulk_control_candidates(spec_paths, multi_user=multi_user):
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if spec_paths
+        else None
+    )
+    for spec_path in _bulk_control_candidates(
+        spec_paths, multi_user=multi_user, policy=policy,
+    ):
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if exclude_jobids and spec.id in exclude_jobids:
                     # The caller IS this job (a build-env job pausing the
@@ -1364,7 +1513,10 @@ def pause_all(
                 multi_user=multi_user,
             )
             paused.append(jobid)
-        except (PauseError, FileNotFoundError, ownership.OwnershipError) as exc:
+        except (
+            PauseError, FileNotFoundError, ownership.OwnershipError,
+            paths.SpecLockTimeout,
+        ) as exc:
             # PauseError can fire if the job's pgid is gone (race
             # with daemon reaping); we just skip those.
             errors.append((jobid, str(exc)))
@@ -1433,10 +1585,17 @@ def pause_provides_branches(
     skipped: list[str] = []
     errors: list[tuple[str, str]] = []
 
-    for spec_path in _bulk_control_candidates(spec_paths, multi_user=multi_user):
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if spec_paths
+        else None
+    )
+    for spec_path in _bulk_control_candidates(
+        spec_paths, multi_user=multi_user, policy=policy,
+    ):
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if spec.branch not in branch_set:
                     # Out of scope for this update -- leave it alone,
@@ -1467,7 +1626,10 @@ def pause_provides_branches(
                 multi_user=multi_user,
             )
             paused.append(jobid)
-        except (PauseError, FileNotFoundError, ownership.OwnershipError) as exc:
+        except (
+            PauseError, FileNotFoundError, ownership.OwnershipError,
+            paths.SpecLockTimeout,
+        ) as exc:
             errors.append((jobid, str(exc)))
 
     summary = _format_bulk_summary(
@@ -1538,6 +1700,7 @@ def _process_group_alive(pgid: int | None) -> bool:
     return True
 
 
+@_bounded_proof_locks
 def pause_token_scope_with_proof(
     host: str,
     paused_by: str,
@@ -1589,10 +1752,15 @@ def pause_token_scope_with_proof(
     )
     captured: dict[Path, tuple[str, int | None]] = {}
     unresolved: list[tuple[str, str]] = []
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if initial_paths
+        else None
+    )
     for spec_path in initial_paths:
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user,
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if spec_path.stem != spec.id:
                     unresolved.append(
@@ -1655,7 +1823,7 @@ def pause_token_scope_with_proof(
         captured_row = captured.get(spec_path)
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user,
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 currently_eligible_running = (
                     in_scope(spec) and spec.state == JobState.RUNNING
@@ -1831,10 +1999,17 @@ def resume_all(
     paused_by_other: list[str] = []  # v0.6.22: filter mismatches
     errors: list[tuple[str, str]] = []
 
-    for spec_path in _bulk_control_candidates(spec_paths, multi_user=multi_user):
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if spec_paths
+        else None
+    )
+    for spec_path in _bulk_control_candidates(
+        spec_paths, multi_user=multi_user, policy=policy,
+    ):
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 if spec.state == JobState.RUNNING:
                     already_running.append(spec.id)
@@ -1868,7 +2043,10 @@ def resume_all(
                 multi_user=multi_user,
             )
             resumed.append(jobid)
-        except (PauseError, FileNotFoundError, ownership.OwnershipError) as exc:
+        except (
+            PauseError, FileNotFoundError, ownership.OwnershipError,
+            paths.SpecLockTimeout,
+        ) as exc:
             errors.append((jobid, str(exc)))
 
     # Same summary shape, with a v0.6.22 addition for paused-by
@@ -1941,14 +2119,20 @@ def _prove_pause_token_absent(
 ) -> tuple[tuple[str, str], ...]:
     """Locked second pass proving no durable row still owns ``paused_by``."""
     unresolved: list[tuple[str, str]] = []
-    for spec_path in _pause_scope_spec_paths(
+    scope_paths = _pause_scope_spec_paths(
         queue_dir=queue_dir,
         queue_root=queue_root,
         multi_user=multi_user,
-    ):
+    )
+    policy = (
+        ownership.authorization_policy(multi_user=multi_user)
+        if scope_paths
+        else None
+    )
+    for spec_path in scope_paths:
         try:
             with _locked_authorized_spec(
-                spec_path, multi_user=multi_user,
+                spec_path, multi_user=multi_user, policy=policy,
             ) as spec:
                 reasons: list[str] = []
                 if (
@@ -1984,6 +2168,7 @@ def _prove_pause_token_absent(
     return tuple(unresolved)
 
 
+@_bounded_proof_locks
 def prove_pause_token_absent(
     host: str,
     paused_by: str,
@@ -2024,6 +2209,7 @@ def prove_pause_token_absent(
     )
 
 
+@_bounded_proof_locks
 def resume_token_scope_with_proof(
     host: str,
     paused_by: str,

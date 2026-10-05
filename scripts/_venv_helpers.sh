@@ -440,7 +440,7 @@ vq_assert_mutable_runtime_target() {
         echo "Publish a new generation and atomically switch its stable pointer instead." >&2
         return 1
     fi
-    if [[ "$target" =~ ^(.+)/releases/([0-9a-f]{40})/source/\.venv$ ]]; then
+    if [[ "$target" =~ ^(.+)/releases/([0-9a-f]{40})/source/([^/]+)$ ]]; then
         generation="${BASH_REMATCH[1]}/releases/${BASH_REMATCH[2]}"
         state_marker="$generation/.vq-runtime-slot-state"
         if [ "$allow_admin_slot_build" = "1" ] && \
@@ -451,14 +451,22 @@ vq_assert_mutable_runtime_target() {
 import json, pathlib, re, stat, sys
 path = pathlib.Path(sys.argv[1])
 sha = sys.argv[2]
+venv = sys.argv[3]
 info = path.lstat()
 value = json.loads(path.read_text(encoding="utf-8"))
+layout_fields = {"schema"} if venv == ".venv" else {"schema", "venv_subdir"}
+layout_valid = (
+    value.get("schema") == 1 if venv == ".venv" else
+    value.get("schema") == 2 and value.get("venv_subdir") == venv
+    and re.fullmatch(r"[A-Za-z0-9_.-]+", venv)
+    and venv not in {".", "..", ".git", "current", "previous"}
+)
 valid = (
     stat.S_ISREG(info.st_mode)
     and info.st_nlink == 1
-    and set(value) == {"schema", "kind", "id", "transaction", "state"}
+    and set(value) == layout_fields | {"kind", "id", "transaction", "state"}
     and type(value.get("schema")) is int
-    and value.get("schema") == 1
+    and layout_valid
     and value.get("kind") == "vq-runtime-slot-build"
     and value.get("id") == sha
     and value.get("state") == "building"
@@ -466,7 +474,7 @@ valid = (
     and re.fullmatch(r"[0-9a-f]{32}", value["transaction"])
 )
 raise SystemExit(0 if valid else 1)
-' "$state_marker" "${BASH_REMATCH[2]}"; then
+' "$state_marker" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"; then
             authorized=1
         fi
         if [ "$authorized" != "1" ]; then
@@ -653,7 +661,6 @@ vq_legacy_pep610_matches_checkout() {
 
     vq_find_external_inspector inspector "$target" || return
     PYTHONNOUSERSITE=1 "$inspector" -I -S - "$target" "$VQ_PROJECT_DIR" <<'PY'
-import glob
 import json
 import os
 import pathlib
@@ -662,11 +669,39 @@ import urllib.parse
 
 root = pathlib.Path(sys.argv[1])
 expected = os.path.realpath(sys.argv[2])
-patterns = (
-    root / "lib" / "python*" / "site-packages" / "vq-*.dist-info" / "direct_url.json",
-    root / "lib64" / "python*" / "site-packages" / "vq-*.dist-info" / "direct_url.json",
-)
-matches = sorted({pathlib.Path(path) for pattern in patterns for path in glob.glob(str(pattern))})
+# vibe_queue is the normalized distribution name from pyproject.toml, per
+# PEP 427. vq is the record a release before the rename left behind, #68.
+# tests/test_distribution_name.py keeps these spellings in step with the
+# package. Both are read and UNIONED, never preferred one over the other: a
+# venv holding one record under each name is two independent installs
+# recording two origins, and the guard below refuses to guess between them
+# exactly as it does for two payloads under one name. The directories are
+# listed rather than globbed because glob swallows a PermissionError and
+# reports "no match", which would turn an unreadable current record into a
+# confident answer from a stale one.
+def records(prefixes):
+    found = set()
+    for lib in sorted(root.iterdir()):
+        if not lib.name.startswith("lib") or not lib.is_dir():
+            continue
+        for interpreter in sorted(lib.iterdir()):
+            if not interpreter.name.startswith("python") or not interpreter.is_dir():
+                continue
+            site = interpreter / "site-packages"
+            if not site.is_dir():
+                continue
+            for entry in sorted(site.iterdir()):
+                if not entry.name.endswith(".dist-info"):
+                    continue
+                if entry.name[: -len(".dist-info")].partition("-")[0] not in prefixes:
+                    continue
+                if "direct_url.json" in os.listdir(entry):
+                    found.add(entry / "direct_url.json")
+    return sorted(found)
+try:
+    matches = records(("vibe_queue", "vq"))
+except OSError:
+    raise SystemExit(1)
 safe_matches = []
 for candidate in matches:
     if not candidate.is_file():
@@ -736,22 +771,53 @@ vq_detect_installed_editable() {
     [ -n "$target" ] || return 1
     vq_find_external_inspector inspector "$target" 2>/dev/null || return 1
     detected="$(PYTHONNOUSERSITE=1 "$inspector" -I -S - "$target" <<'PY'
-import glob
 import json
 import os
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-patterns = (
-    root / "lib" / "python*" / "site-packages" / "vq-*.dist-info" / "direct_url.json",
-    root / "lib64" / "python*" / "site-packages" / "vq-*.dist-info" / "direct_url.json",
-)
-matches = sorted({pathlib.Path(path) for pattern in patterns for path in glob.glob(str(pattern))})
+# vibe_queue is the normalized distribution name from pyproject.toml, per
+# PEP 427. vq is the record a release before the rename left behind, #68.
+# tests/test_distribution_name.py keeps these spellings in step with the
+# package. Both are read and UNIONED, never preferred one over the other: a
+# venv holding one record under each name is two independent installs
+# recording two origins, and the guard below refuses to guess between them
+# exactly as it does for two payloads under one name. The directories are
+# listed rather than globbed because glob swallows a PermissionError and
+# reports "no match", which would turn an unreadable current record into a
+# confident answer from a stale one.
+def records(prefixes):
+    found = set()
+    for lib in sorted(root.iterdir()):
+        if not lib.name.startswith("lib") or not lib.is_dir():
+            continue
+        for interpreter in sorted(lib.iterdir()):
+            if not interpreter.name.startswith("python") or not interpreter.is_dir():
+                continue
+            site = interpreter / "site-packages"
+            if not site.is_dir():
+                continue
+            for entry in sorted(site.iterdir()):
+                if not entry.name.endswith(".dist-info"):
+                    continue
+                if entry.name[: -len(".dist-info")].partition("-")[0] not in prefixes:
+                    continue
+                if "direct_url.json" in os.listdir(entry):
+                    found.add(entry / "direct_url.json")
+    return sorted(found)
+try:
+    matches = records(("vibe_queue", "vq"))
+except OSError:
+    raise SystemExit(1)
 if not matches:
     raise SystemExit(1)
 # A lib64 -> lib alias is normal and names one inode; anything else is two
-# installs or a redirected payload, and this must not guess between them.
+# installs -- under one distribution name, or one under each of the two (#68)
+# -- or a redirected payload, and this must not guess between them. Reporting
+# nothing leaves the fallback in update.sh to decide; reporting the mode of
+# the wrong origin is the silent editable-to-copied conversion this exists to
+# prevent.
 try:
     if any(not os.path.samefile(candidate, matches[0]) for candidate in matches):
         raise SystemExit(1)
@@ -1559,14 +1625,83 @@ vq_record_install_metadata() {
 # Install / verify
 # ---------------------------------------------------------------------------
 
+# Remove the record a release before the rename (#68) left behind.
+#
+# Through v0.26.9 the distribution was named `vq`; it is `vibe-queue` now, and
+# pip does not know the two names are one project. Installing the new name
+# over an old venv would leave both records: `pip show vq` would keep
+# reporting a version the host no longer runs, and the old RECORD still owns
+# `bin/vq`, so a later `pip uninstall vq` would delete the live command. So
+# the old record goes first, and the install that follows writes `bin/vq`
+# again. A venv that never had it is left alone.
+# Set by vq_remove_legacy_distribution when it actually removed the old record,
+# so a failed reinstall can say that the command is gone rather than leaving the
+# operator to discover it. Reset per environment: reinstall.sh installs twice.
+VQ_LEGACY_DISTRIBUTION_REMOVED=0
+
+vq_remove_legacy_distribution() {
+    local venv="$1"
+
+    "$venv/bin/python" -m pip show --quiet vq >/dev/null 2>&1 || return 0
+    echo "==> Removing the legacy 'vq' distribution record (the package is now vibe-queue)..."
+    "$venv/bin/python" -m pip uninstall --quiet --yes vq || return
+    VQ_LEGACY_DISTRIBUTION_REMOVED=1
+}
+
+# Between that uninstall and the install below, the environment has no vq
+# command. The order is not free, and neither half of it can be swapped out:
+#
+#   * The legacy RECORD owns bin/vq. Installing vibe-queue first and
+#     uninstalling vq afterwards would delete the command the install had just
+#     written -- the same missing binary, reached by a longer road.
+#   * Deleting the legacy .dist-info by hand instead would leave a legacy
+#     EDITABLE install's .pth and __editable__ finder on sys.path, still
+#     importing whatever they point at.
+#
+# So the window stays, and what is left is to bound it and make it legible.
+# Bounded: the network-bound pip/setuptools/wheel upgrade runs BEFORE the
+# removal, so the step most likely to fail fails while bin/vq still exists;
+# install.sh and reinstall.sh build into a replacement venv and roll the whole
+# directory back; and the managed fleet transaction always passes
+# --recreate-venv, so no fleet host is exposed. A direct in-place
+# `scripts/update.sh` deliberately owns no backup, and that is where a pip
+# failure strands an environment with no vq at all. It cannot be prevented from
+# here -- only said, exactly, at the moment it happens.
+vq_report_removed_vq_command() {
+    local venv="$1"
+    local extras_spec="$2"
+    local editable="${3:-0}"
+    local editable_flag=""
+
+    [ "$VQ_LEGACY_DISTRIBUTION_REMOVED" = "1" ] || return 0
+    [ ! -e "$venv/bin/vq" ] || return 0
+    if [ "$editable" = "1" ]; then
+        editable_flag=" --editable"
+    fi
+    cat >&2 <<EOF
+Error: this environment no longer provides a vq command.
+       The legacy 'vq' distribution was uninstalled first, because its record
+       owned $venv/bin/vq, and the install that would have written that file
+       again has failed. Nothing was rolled back: an in-place update owns no
+       venv backup.
+       Restore it from this checkout, with the same profile and mode:
+         $venv/bin/python -m pip install --upgrade$editable_flag ${VQ_PROJECT_DIR}${extras_spec}
+       or rebuild the environment, which does roll back:
+         $VQ_PROJECT_DIR/scripts/update.sh --venv $venv --recreate-venv
+EOF
+}
+
 vq_install_environment() {
     local venv="$1"
     local extras_spec="$2"
     local editable="${3:-0}"
     local -a pip_args=(--upgrade)
+    local status=0
 
+    VQ_LEGACY_DISTRIBUTION_REMOVED=0
     echo "==> Updating pip and wheel-build tools..."
     "$venv/bin/python" -m pip install --quiet --upgrade pip setuptools wheel
+    vq_remove_legacy_distribution "$venv"
 
     if [ "$editable" = "1" ]; then
         pip_args+=(--editable)
@@ -1574,7 +1709,14 @@ vq_install_environment() {
     else
         echo "==> Installing vq${extras_spec} from this checkout..."
     fi
-    "$venv/bin/python" -m pip install "${pip_args[@]}" "${VQ_PROJECT_DIR}${extras_spec}"
+    "$venv/bin/python" -m pip install "${pip_args[@]}" \
+        "${VQ_PROJECT_DIR}${extras_spec}" || status=$?
+    if [ "$status" -ne 0 ]; then
+        # Propagate pip's own status, so a caller under `set -e` still exits
+        # with what pip said, exactly as it did before this reported anything.
+        vq_report_removed_vq_command "$venv" "$extras_spec" "$editable"
+        return "$status"
+    fi
 }
 
 # Stamp the package-local SOURCE-SHA provenance marker.

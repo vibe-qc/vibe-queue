@@ -19,6 +19,8 @@ def _resolve_production_default(expression: str, tmp_path: Path) -> Path:
     env = dict(os.environ)
     for name in (
         paths.ENV_MULTI_USER_ROOT,
+        paths.ENV_MULTI_USER_SCRATCH_ROOT,
+        paths.ENV_CONFIG_DIR,
         paths.ENV_TEST_SANDBOX_ROOT,
         "PYTEST_ADDOPTS",
         "PYTEST_CURRENT_TEST",
@@ -73,9 +75,36 @@ class TestMultiUserPaths:
         ) == Path("/var/lib/vq/users/1000/queue")
 
     def test_user_jobs_dir(self, tmp_path: Path) -> None:
+        # #63: the disposable trees default to the -scratch sibling of the
+        # multi-user root, the same derivation single-user mode uses.
         assert _resolve_production_default(
             "paths.user_jobs_dir(1000)", tmp_path
+        ) == Path("/var/lib/vq-scratch/users/1000/jobs")
+
+    def test_multi_user_scratch_root_default(self, tmp_path: Path) -> None:
+        assert _resolve_production_default(
+            "paths.multi_user_scratch_root()", tmp_path
+        ) == Path("/var/lib/vq-scratch")
+
+    def test_user_workdir_root(self, tmp_path: Path) -> None:
+        assert _resolve_production_default(
+            "paths.user_workdir_root(1000)", tmp_path
+        ) == Path("/var/lib/vq-scratch/users/1000/workdirs")
+
+    def test_user_state_jobs_dir_still_names_the_pre_63_root(
+        self, tmp_path: Path
+    ) -> None:
+        assert _resolve_production_default(
+            "paths.user_state_jobs_dir(1000)", tmp_path
         ) == Path("/var/lib/vq/users/1000/jobs")
+
+    def test_multi_user_scratch_root_env_override(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        custom = tmp_path / "custom-scratch"
+        monkeypatch.setenv(paths.ENV_MULTI_USER_SCRATCH_ROOT, str(custom))
+        assert paths.multi_user_scratch_root() == custom
+        assert paths.user_jobs_dir(1000) == custom / "users" / "1000" / "jobs"
 
     def test_user_archive_dir(self, tmp_path: Path) -> None:
         assert _resolve_production_default(
@@ -93,7 +122,7 @@ class TestMultiUserPaths:
         assert _resolve_production_default(
             "paths.user_workspace_dir(1000, 'abc123')", tmp_path
         ) == Path(
-            "/var/lib/vq/users/1000/jobs/abc123"
+            "/var/lib/vq-scratch/users/1000/jobs/abc123"
         )
 
     def test_daemon_pidfile_multi_user(self, tmp_path: Path) -> None:
