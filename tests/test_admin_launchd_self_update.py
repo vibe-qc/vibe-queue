@@ -175,7 +175,7 @@ def test_launchd_self_update_requires_verified_rpc_source(
     monkeypatch.setattr(
         admin,
         "_verify_restarted_daemon",
-        lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+        lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
             verified=False,
             actual_sha=STALE_SHA,
             actual_tree_sha256=None,
@@ -443,7 +443,7 @@ def test_launchd_self_update_accepts_verified_rpc_source(
     monkeypatch.setattr(
         admin,
         "_verify_restarted_daemon",
-        lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+        lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
             verified=True,
             actual_sha=EXPECTED_SHA,
             actual_tree_sha256=None,
@@ -659,7 +659,7 @@ def test_the_digest_expectation_is_asked_of_the_updated_interpreter(
     )
     captured: dict[str, object] = {}
 
-    def fake_verify(sha, *, expected_tree_sha256=None):  # type: ignore[no-untyped-def]
+    def fake_verify(sha, *, expected_tree_sha256=None, **_kw):  # type: ignore[no-untyped-def]
         captured["tree"] = expected_tree_sha256
         return admin.DaemonProvenance(
             verified=True,

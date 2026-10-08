@@ -7444,8 +7444,8 @@ _host_f_PLAN_HOLD_TARGETS = (
     "host_f-amd",
     "host_f-big",
     "host_f-inf",
-    "host_f-itwin",
-    "host_f-jtwin",
+    "host_f-lanea",
+    "host_f-laneb",
 )
 
 
@@ -7654,7 +7654,7 @@ def test_plan_bound_hold_supersede_covers_host_f_six_lane_class(
     )
     with pytest.raises(
         fleet_rollout.FleetRolloutError,
-        match="host_f-jtwin.*matching report/config",
+        match="host_f-laneb.*matching report/config",
     ):
         fleet_rollout._inventory_legacy_scheduler_holds(
             fleet_rollout._all_rollout_runs(),
@@ -8550,7 +8550,7 @@ def test_only_and_skip_are_mutually_exclusive() -> None:
 def test_an_unknown_selection_name_fails_closed() -> None:
     """A typo must not quietly become "act on no hosts" and exit 0."""
     with pytest.raises(fleet_rollout.FleetRolloutError, match="unknown host"):
-        _selection(only=["planetxx"])
+        _selection(only=["hostzzzz"])
 
 
 def test_a_selection_naming_only_lane_less_hosts_fails_closed() -> None:
@@ -9720,6 +9720,40 @@ def test_reconciliation_recovers_pre_exact_local_hold_before_release(
     assert ["--status" in args for args in controls] == [True, False]
 
 
+# A liveness bound, not a timing claim.  After authorization a real operation
+# starts two cold interpreters (the recorder, then ``python -m vq`` importing
+# the whole CLI), which takes seconds on an idle machine and more than ten
+# under load.  A dead operation is caught at once by its free lease instead.
+_OPERATION_LIVENESS_SECONDS = 120.0
+
+
+def _wait_for_completed_operation(
+    operation_id: str,
+) -> fleet_operation.OperationObservation:
+    deadline = time.monotonic() + _OPERATION_LIVENESS_SECONDS
+    while True:
+        observed = fleet_operation.observe_operation(operation_id)
+        if observed.state == "completed":
+            return observed
+        if not observed.lease_busy:
+            # The result is read before the lease, so a recorder that exits
+            # between the two reads looks dead once; look again to be sure.
+            observed = fleet_operation.observe_operation(operation_id)
+            if observed.state == "completed":
+                return observed
+            if not observed.lease_busy:
+                pytest.fail(
+                    f"operation {operation_id} stopped in {observed.state} "
+                    "without a result"
+                )
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"operation {operation_id} still {observed.state} after "
+                f"{_OPERATION_LIVENESS_SECONDS:.0f} s"
+            )
+        time.sleep(0.01)
+
+
 def _safe_durable_action(*, phase: fleet_rollout.Phase = "local-runtime"):
     return fleet_rollout.RolloutAction(
         id=f"{phase}:localhost:vibeqc-queue",
@@ -9852,15 +9886,14 @@ def test_driver_reentry_requires_exact_receipt_and_mutating_resume(
     )
     supervisor = fleet_operation.launch_supervisor(handle.operation_id)
     del supervisor
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,
     )
-    deadline = time.monotonic() + 10
-    while fleet_operation.observe_operation(handle.operation_id).state != "completed":
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    _wait_for_completed_operation(handle.operation_id)
 
     harvested = fleet_rollout.reconcile_durable_operations(
         current_report_digest_sha256=digest,
@@ -10711,7 +10744,9 @@ def test_controller_death_after_authorization_is_adopted_and_harvested_once(
         handle.operation_id,
         lifecycle_handoff=operation_handoff,
     )
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=report_digest,
@@ -10824,7 +10859,9 @@ def test_controller_death_nonzero_harvest_stays_host_local_without_replay(
 
     supervisor = threading.Thread(target=forced_failure_supervisor)
     supervisor.start()
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,
@@ -11005,17 +11042,14 @@ def test_harvested_failure_after_driver_reentry_is_not_replayed(
     for handle in handles:
         supervisor = fleet_operation.launch_supervisor(handle.operation_id)
         del supervisor
-        fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+        fleet_operation.wait_for_ready(
+            handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+        )
         fleet_operation.authorize_operation(
             handle.operation_id,
             expected_report_digest_sha256=digest,
         )
-        deadline = time.monotonic() + 10
-        while fleet_operation.observe_operation(handle.operation_id).state != (
-            "completed"
-        ):
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
+        _wait_for_completed_operation(handle.operation_id)
 
     first = fleet_rollout.reconcile_durable_operations(
         current_report_digest_sha256=digest,
@@ -16737,7 +16771,10 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
     source_path = fleet_rollout.rollout_state_path(host_e.rollout_id)
     paths = (source_path, current_path, scheduler_path)
     before = {path: path.read_bytes() for path in paths}
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             name: config.HostConfig(ssh=name, fleet_role="managed")
             for name in ("localhost", "host_a", "host_e", "host_c")
@@ -16760,17 +16797,18 @@ def test_pending_failure_cli_handoff_keeps_real_scheduler_inventory(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -17021,7 +17059,10 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
     assert current is not None
     assert current.legacy_failure_update_intent is not None
 
+    reports = tmp_path / "private-reports"
+    reports.mkdir()
     cfg = config.Config(
+        fleet_report_repo=str(reports),
         hosts={
             "localhost": config.HostConfig(ssh="localhost", fleet_role="managed"),
             "host_e": config.HostConfig(ssh="host_e", fleet_role="managed"),
@@ -17044,17 +17085,18 @@ def test_failure_transition_restart_cli_cannot_launch_before_durable_clear(
 
     monkeypatch.setattr("vq.cli.config.load_config", lambda: cfg)
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: tmp_path)
-    monkeypatch.setattr(
-        "vq.cli.fleet_release.discover_latest_report",
-        lambda repo, **kwargs: accepted,
-    )
+    def discover(repo: Path, **kwargs: Any):
+        assert repo == reports
+        return accepted
+
+    monkeypatch.setattr("vq.cli.fleet_release.discover_latest_report", discover)
     monkeypatch.setattr(
         "vq.cli.fleet_release.git_is_ancestor",
         lambda repo, older, newer: True,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: tmp_path,
+        lambda path: path,
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -19748,7 +19790,9 @@ def test_current_pre_authorized_attempt_is_adopted_without_a_second_launch(
     fleet_rollout.save_run(run)
     launched = fleet_operation.launch_supervisor(handle.operation_id)
     del launched
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     plan = fleet_rollout.RolloutPlan(
         driver="localhost",
         report={"digest_sha256": digest, "source_path": "report.json"},
@@ -19803,13 +19847,7 @@ def test_stale_report_after_ready_aborts_before_authorization(
     run = fleet_rollout.load_run("v0.15.60-stale-after-ready")
     assert run is not None
     operation = run.actions[action.id]["operation_attempts"][0]["operation_id"]
-    deadline = time.monotonic() + 10
-    while True:
-        observed = fleet_operation.observe_operation(operation)
-        if observed.state == "completed":
-            break
-        assert time.monotonic() < deadline
-        time.sleep(0.01)
+    observed = _wait_for_completed_operation(operation)
     assert observed.authorization is not None
     assert observed.authorization["decision"] == "abort"
     assert observed.activation is None
@@ -20038,7 +20076,7 @@ def test_inspect_only_blocks_owned_hold_without_operation_and_changes_nothing(
     with pytest.raises(
         fleet_rollout.FleetRolloutError,
         match="retains an owned hold.*will not release or reconcile",
-    ):
+    ) as refused:
         fleet_rollout.reconcile_durable_operations(
             current_report_digest_sha256="a" * 64,
             inspect_only=True,
@@ -20048,6 +20086,10 @@ def test_inspect_only_blocks_owned_hold_without_operation_and_changes_nothing(
         )
 
     assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    # #138: the refusal names its recovery; supersede fits only a scheduler hold.
+    supersede_hint = f"--supersede-plan-hold {rollout} host_d"
+    assert (supersede_hint in str(refused.value)) is (hold_kind != "local-exact")
+    assert "run a mutating rollout to reconcile it" in str(refused.value)
 
 
 def test_durable_terminal_failure_isolated_per_host_and_retains_hold(
@@ -20439,7 +20481,9 @@ def test_activation_without_result_is_outcome_unknown_and_never_replayed(
 
     thread = threading.Thread(target=supervisor)
     thread.start()
-    fleet_operation.wait_for_ready(handle.operation_id, timeout=10)
+    fleet_operation.wait_for_ready(
+        handle.operation_id, timeout=_OPERATION_LIVENESS_SECONDS
+    )
     fleet_operation.authorize_operation(
         handle.operation_id,
         expected_report_digest_sha256=digest,
@@ -21577,7 +21621,7 @@ def test_retirement_cannot_hide_unknown_hosts_or_damaged_live_evidence(
     if damage == 'missing-declaration':
         del declarations['host_b']
     elif damage == 'misspelled-host':
-        declarations['maruu'] = declarations.pop('host_b')
+        declarations['hostbb'] = declarations.pop('host_b')
     elif damage == 'wrong-digest':
         declarations['host_b'].retained_receipts[run.rollout_id] = '0' * 64
     elif damage == 'changed-hold':
@@ -21673,3 +21717,251 @@ def test_retirement_audit_command_only_prints_exact_bindings(tmp_path, monkeypat
     assert path.read_bytes() == before
     missing = CliRunner().invoke(main, ['host', 'retirement-audit', 'misspelled-host'])
     assert missing.exit_code != 0 and 'no retained rollout evidence' in missing.output
+
+
+def _historical_basis_case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """#130: the helper lane sits healthy at the OLD report's vq pin.
+
+    The current report pins a newer vq that only a rollout can install, and
+    the obsolete rollout's hold blocks that rollout.
+    """
+    import dataclasses
+
+    monkeypatch.setattr(fleet_rollout.paths, "state_root", lambda: tmp_path)
+    historical = _report_at(155, digest="a" * 64)
+    base = _report_at(157, digest="c" * 64)
+    current = dataclasses.replace(
+        base, pins={**base.pins, "vq": _pin("vq", "d" * 40, "0.26.19")})
+    old_rollout = fleet_rollout.rollout_id(historical)
+    fleet_rollout.save_run(fleet_rollout.RolloutRun(
+        rollout_id=old_rollout,
+        report_digest_sha256=historical.digest_sha256,
+        report_source_path=historical.source_path,
+        holds={"host_f": _plan_bound_hold(old_rollout, host="host_f")},
+    ))
+    plan = _plan_bound_supersede_plan(current)
+    helper = next(a for a in plan.actions if a.id == "helper:host_f")
+    old_vq = historical.pins["vq"]
+    helper.decision = "update"
+    helper.reason = "target is newer"
+    helper.before = {**helper.before, "current_sha": old_vq.sha,
+                     "current_version": old_vq.version, "current_tag": old_vq.tag}
+    reports = {(r.source_path, r.digest_sha256): r for r in (historical, current)}
+    monkeypatch.setattr(
+        fleet_rollout.fleet_release, "discover_historical_report_by_digest",
+        lambda path, digest, repo, *, fetch: reports[(path, digest)])
+
+    def inactive(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_supported_drain_snapshot(host=argv[-1])), stderr="")
+
+    def supersede(runner=inactive):
+        return fleet_rollout.supersede_obsolete_plan_bound_hold(
+            rollout_id_value=old_rollout, host="host_f", accepted_report=current,
+            plan=plan, repo=tmp_path,
+            current_report_digest_resolver=lambda: current.digest_sha256,
+            control_runner=runner)
+
+    return old_rollout, current, helper, old_vq, supersede
+
+
+def test_130_a_lane_healthy_at_the_obsolete_pin_supersedes_the_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_rollout, current, _helper, old_vq, supersede = _historical_basis_case(
+        tmp_path, monkeypatch)
+
+    assert supersede().replayed is False
+
+    receipt = fleet_rollout.load_run(old_rollout).legacy_retained_holds["host_f"]
+    helper_item = next(i for i in receipt["current_actions"]
+                       if i["action_id"] == "helper:host_f")
+    assert helper_item["basis"] == "historical"
+    assert helper_item["expected_sha"] == helper_item["observed_sha"] == old_vq.sha
+    assert all("basis" not in i for i in receipt["current_actions"]
+               if i["action_id"] != "helper:host_f")
+    assert supersede(runner=lambda *a, **k: pytest.fail("replay re-probed")).replayed
+    inventory = fleet_rollout._validate_running_journals(
+        {}, current_report_source_path=current.source_path,
+        current_report_digest_sha256=current.digest_sha256,
+        configured_retention_hosts=frozenset({"host_f"}), report_repo=tmp_path)
+    assert (old_rollout, "host_f") in inventory.superseded_plan_hold_refs
+
+
+def test_130_a_lane_at_neither_pin_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _old, _current, helper, _old_vq, supersede = _historical_basis_case(
+        tmp_path, monkeypatch)
+    helper.before = {**helper.before, "current_sha": "e" * 40}
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="neither at the current pin"):
+        supersede()
+
+
+def test_130_an_unsettled_obsolete_operation_blocks_the_historical_basis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _old, _current, _helper, _old_vq, supersede = _historical_basis_case(
+        tmp_path, monkeypatch)
+    monkeypatch.setattr(fleet_rollout, "_obsolete_host_unsettled_actions",
+                        lambda run, host: ["helper:host_f"])
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="unsettled operation"):
+        supersede()
+
+
+def test_130_historical_evidence_must_match_the_journal_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_rollout, current, _helper, _old_vq, supersede = _historical_basis_case(
+        tmp_path, monkeypatch)
+    supersede()
+    run = fleet_rollout.load_run(old_rollout)
+    receipt = run.legacy_retained_holds["host_f"]
+    for item in receipt["current_actions"]:
+        if item.get("basis") == "historical":
+            item["expected_sha"] = item["observed_sha"] = "f" * 40
+    fleet_rollout.save_run(run)
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="historical evidence"):
+        fleet_rollout._validate_running_journals(
+            {}, current_report_source_path=current.source_path,
+            current_report_digest_sha256=current.digest_sha256,
+            configured_retention_hosts=frozenset({"host_f"}), report_repo=tmp_path)
+
+
+def _descendant_basis_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, old_dev_sha: str | None = None,
+):
+    """#138: the dev lane runs healthy at a main commit ahead of its pin.
+
+    The planner proved the descent and skipped the lane as converged; every
+    other lane sits at the current pin. ``old_dev_sha`` gives the obsolete
+    rollout's report an older dev pin than the current one.
+    """
+    import dataclasses
+
+    monkeypatch.setattr(fleet_rollout.paths, "state_root", lambda: tmp_path)
+    historical = _report_at(155, digest="a" * 64)
+    if old_dev_sha is not None:
+        historical = dataclasses.replace(historical, pins={
+            **historical.pins,
+            "dev": dataclasses.replace(historical.pins["dev"], sha=old_dev_sha)})
+    current = _report_at(157, digest="c" * 64)
+    old_rollout = fleet_rollout.rollout_id(historical)
+    fleet_rollout.save_run(fleet_rollout.RolloutRun(
+        rollout_id=old_rollout,
+        report_digest_sha256=historical.digest_sha256,
+        report_source_path=historical.source_path,
+        holds={"host_f": _plan_bound_hold(old_rollout, host="host_f")},
+    ))
+    plan = _plan_bound_supersede_plan(current)
+    dev = next(a for a in plan.actions
+               if a.id == "scheduler-runtime:host_f:vibeqc-dev")
+    dev.reason = "newer descendant already deployed; no downgrade"
+    dev.before = {**dev.before, "current_sha": "e" * 40,
+                  "current_version": None, "current_tag": None}
+    reports = {(r.source_path, r.digest_sha256): r for r in (historical, current)}
+    monkeypatch.setattr(
+        fleet_rollout.fleet_release, "discover_historical_report_by_digest",
+        lambda path, digest, repo, *, fetch: reports[(path, digest)])
+
+    def inactive(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps(_supported_drain_snapshot(host=argv[-1])), stderr="")
+
+    def supersede(runner=inactive):
+        return fleet_rollout.supersede_obsolete_plan_bound_hold(
+            rollout_id_value=old_rollout, host="host_f", accepted_report=current,
+            plan=plan, repo=tmp_path,
+            current_report_digest_resolver=lambda: current.digest_sha256,
+            control_runner=runner)
+
+    return old_rollout, current, plan, dev, supersede
+
+
+def _validate_journals(current, tmp_path: Path):
+    return fleet_rollout._validate_running_journals(
+        {}, current_report_source_path=current.source_path,
+        current_report_digest_sha256=current.digest_sha256,
+        configured_retention_hosts=frozenset({"host_f"}), report_repo=tmp_path)
+
+
+@pytest.mark.parametrize("old_dev_sha", [None, "b" * 40], ids=["same-pin", "older-pin"])
+def test_138_a_healthy_descendant_lane_supersedes_the_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_dev_sha: str | None,
+) -> None:
+    old_rollout, current, _plan, dev, supersede = _descendant_basis_case(
+        tmp_path, monkeypatch, old_dev_sha=old_dev_sha)
+
+    assert supersede().replayed is False
+
+    receipt = fleet_rollout.load_run(old_rollout).legacy_retained_holds["host_f"]
+    item = next(i for i in receipt["current_actions"] if i["action_id"] == dev.id)
+    assert item["basis"] == "descendant"
+    assert item["expected_sha"] == current.pins["dev"].sha
+    assert item["observed_sha"] == "e" * 40
+    assert all("basis" not in i for i in receipt["current_actions"]
+               if i["action_id"] != dev.id)
+    assert supersede(runner=lambda *a, **k: pytest.fail("replay re-probed")).replayed
+    inventory = _validate_journals(current, tmp_path)
+    assert (old_rollout, "host_f") in inventory.superseded_plan_hold_refs
+
+
+@pytest.mark.parametrize(
+    "unhealthy",
+    [{"acknowledged": True}, {"dirty": True}, {"last_ok": False},
+     {"probe_unavailable": False, "current_sha": None}],
+)
+def test_138_an_unhealthy_descendant_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unhealthy: dict,
+) -> None:
+    _old, _current, _plan, dev, supersede = _descendant_basis_case(
+        tmp_path, monkeypatch)
+    dev.before = {**dev.before, **unhealthy}
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="healthy descendant"):
+        supersede()
+
+
+def test_138_only_the_planners_descendant_verdict_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _old, _current, _plan, dev, supersede = _descendant_basis_case(
+        tmp_path, monkeypatch)
+    dev.decision = "update"
+    dev.reason = "target is newer"
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="healthy descendant"):
+        supersede()
+
+
+def test_138_a_vq_helper_ahead_of_its_pin_is_never_descendant_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _old, _current, plan, _dev, supersede = _descendant_basis_case(
+        tmp_path, monkeypatch)
+    helper = next(a for a in plan.actions if a.id == "helper:host_f")
+    helper.reason = "newer descendant already deployed; no downgrade"
+    helper.before = {**helper.before, "current_sha": "f" * 40}
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="at helper:host_f"):
+        supersede()
+
+
+@pytest.mark.parametrize("tamper", ["observed-equals-expected", "helper", "unknown-basis"])
+def test_138_the_receipt_validator_rejects_an_incoherent_descendant_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tamper: str,
+) -> None:
+    old_rollout, current, _plan, dev, supersede = _descendant_basis_case(
+        tmp_path, monkeypatch)
+    supersede()
+    run = fleet_rollout.load_run(old_rollout)
+    items = run.legacy_retained_holds["host_f"]["current_actions"]
+    item = next(i for i in items if i["action_id"] == dev.id)
+    if tamper == "observed-equals-expected":
+        item["observed_sha"] = item["expected_sha"]
+    elif tamper == "helper":
+        helper = next(i for i in items if i["action_id"] == "helper:host_f")
+        helper["basis"] = "descendant"
+        helper["observed_sha"] = "f" * 40
+    else:
+        item["basis"] = "ahead"
+    fleet_rollout.save_run(run)
+    with pytest.raises(fleet_rollout.FleetRolloutError, match="incoherent"):
+        _validate_journals(current, tmp_path)

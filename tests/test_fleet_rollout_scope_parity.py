@@ -20,8 +20,8 @@ TARGETS = (
     "host_f-big2",
     "host_f-big3",
     "host_f-inf",
-    "host_f-itwin",
-    "host_f-jtwin",
+    "host_f-lanea",
+    "host_f-laneb",
 )
 
 

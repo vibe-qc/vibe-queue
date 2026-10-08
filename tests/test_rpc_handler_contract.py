@@ -55,6 +55,7 @@ _EXPECTED_IMPORT_SITES = {
 
 _EXPECTED_METHODS = {
     "get_admin_status",
+    "get_admission_snapshot",
     "get_daemon_capacity",
     "get_drain_state",
     "get_drain_read_only_snapshot",
@@ -261,6 +262,7 @@ def running_multi_user_server(
         clear_state=lambda: throttle.clear_throttle_state(via_rpc=False),
         replace_state=throttle.replace_throttle_state_from_mapping,
     )
+    rpc.register_get_admission_snapshot_method(server, lambda: None)
     rpc.register_capacity_methods(
         server,
         capacity.DaemonCapacity(
