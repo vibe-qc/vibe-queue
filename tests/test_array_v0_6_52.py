@@ -291,7 +291,7 @@ class TestDaemonEnv:
         # running the process. Returning a quickly-exited fake is
         # enough — we don't need to follow the lifecycle.
         class FakePopen:
-            def __init__(self, *args, **kwargs):  # noqa: ANN
+            def __init__(self, *args, **kwargs):
                 captured["args"] = args
                 captured["kwargs"] = kwargs
                 self.pid = 12345
@@ -327,7 +327,7 @@ class TestDaemonEnv:
         captured: dict[str, object] = {}
 
         class FakePopen:
-            def __init__(self, *args, **kwargs):  # noqa: ANN
+            def __init__(self, *args, **kwargs):
                 captured["kwargs"] = kwargs
                 self.pid = 12345
 

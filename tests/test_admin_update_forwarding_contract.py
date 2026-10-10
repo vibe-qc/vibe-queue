@@ -268,6 +268,10 @@ def _capture_transport(
         remote_env=None,
     ):
         assert check is True
+        if remote_env:
+            # The real transport validates the forwarded environment before
+            # ssh; a stub that skipped it let #133 ship a dict it refused.
+            transport._remote_admin_timeout_env_prefix(remote_env)
         calls.append(
             {
                 "ssh": host_cfg.ssh,
@@ -930,6 +934,39 @@ def test_single_venv_forwards_only_validated_timeout_allowlist(
     assert "VQ_TOKEN" not in forwarded["remote_env"]
 
 
+def test_a_driver_build_parallelism_is_forwarded_to_the_remote_update(
+    state_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#133: CMAKE_BUILD_PARALLEL_LEVEL on the driver reaches the remote update."""
+    _write_config(
+        state_dir,
+        """
+        default_host = "remote"
+
+        [hosts.remote]
+        ssh = "remote.example.invalid"
+
+        [programs.vibeqc-dev]
+        kind = "venv"
+        python = "/fake/python"
+        git_dir = "/fake/repo"
+        branch = "main"
+        """,
+    )
+    monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "2")
+    calls = _capture_transport(monkeypatch)
+
+    result = CliRunner().invoke(main, ["admin", "update", "vibeqc-dev", "remote"])
+
+    assert result.exit_code == 0, result.output
+    forwarded = [c["transport"]["remote_env"] for c in calls
+                 if "remote_env" in c["transport"]]
+    assert forwarded and all(
+        env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2" for env in forwarded
+    )
+
+
 def test_single_venv_accepts_safe_outer_below_unset_default(
     state_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1194,6 +1231,10 @@ def test_all_host_venv_json_error_and_forwarding_transcript(
         remote_env=None,
     ):
         assert check is True
+        if remote_env:
+            # The real transport validates the forwarded environment before
+            # ssh; a stub that skipped it let #133 ship a dict it refused.
+            transport._remote_admin_timeout_env_prefix(remote_env)
         calls.append(
             {
                 "ssh": host_cfg.ssh,
@@ -1860,6 +1901,7 @@ def test_invalid_all_host_json_is_wrapped_but_currently_nonfatal(
     assert "driver-secret" not in launch["argv"]
 
 
+@pytest.mark.no_autopatch_lifecycle_lock
 class TestDeployOnePinFromTheReport:
     """`--from-report` takes the pinned argv from the report, not from typing.
 
@@ -1874,9 +1916,11 @@ class TestDeployOnePinFromTheReport:
     SHA = "6" * 40
 
     def _config(self, state_dir: Path) -> None:
+        self.reports = state_dir / "private-reports"
+        subprocess.run(["git", "init", "-q", str(self.reports)], check=True)
         _write_config(
             state_dir,
-            """
+            f"fleet_report_repo = {json.dumps(str(self.reports))}\n" + """
             default_host = "driver"
 
             [hosts.driver]
@@ -1900,11 +1944,9 @@ class TestDeployOnePinFromTheReport:
     def _report(self, monkeypatch: pytest.MonkeyPatch, **pins: object) -> None:
         from vq import fleet_release
 
-        monkeypatch.setattr(
-            "vq.cli.fleet_release.runtime_repo", lambda: Path("/repo"),
-        )
-
         def discover(repo: Path, **kwargs: object) -> object:
+            assert repo == self.reports.resolve()
+            assert ("checkout", str(repo)) in cli.admin_module._active_toolset_lifecycle_resources()
             return fleet_release.FleetReleaseReport(
                 source_ref="origin/main",
                 source_path="vibe-queue/releases/v0.17.0.json",
@@ -2092,9 +2134,11 @@ class TestProvisionDelegation:
     SHA = "7" * 40
 
     def _config(self, state_dir: Path) -> None:
+        self.reports = state_dir / "private-reports"
+        subprocess.run(["git", "init", "-q", str(self.reports)], check=True)
         _write_config(
             state_dir,
-            """
+            f"fleet_report_repo = {json.dumps(str(self.reports))}\n" + """
             default_host = "driver"
 
             [hosts.driver]
@@ -2105,7 +2149,7 @@ class TestProvisionDelegation:
             kind = "venv"
             python = "/fake/repo/.venv/bin/python"
             git_dir = "/fake/repo"
-            upstream = "ssh://git@example.invalid:26/mpei/vibe-qc.git"
+            upstream = "ssh://git@example.invalid:26/example-org/vibe-qc.git"
             install_script = "scripts/install.sh"
             """,
         )
@@ -2151,18 +2195,16 @@ class TestProvisionDelegation:
             "--show-output",
         ]]
 
+    @pytest.mark.no_autopatch_lifecycle_lock
     def test_from_report_is_resolved_here_and_not_forwarded(
         self, state_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The report and its runtime checkout live on the driver. A host that
+        """The external report store lives on the driver. A host that
         received `--from-report` would have to discover one of its own."""
         from vq import fleet_release
 
         self._config(state_dir)
         sent = self._forwarded(monkeypatch)
-        monkeypatch.setattr(
-            "vq.cli.fleet_release.runtime_repo", lambda: Path("/repo"),
-        )
         monkeypatch.setattr(
             "vq.cli.fleet_release.discover_latest_report",
             lambda repo, **kw: fleet_release.FleetReleaseReport(
@@ -2214,7 +2256,7 @@ class TestProvisionDelegation:
             kind = "venv"
             python = "/fake/repo/.venv/bin/python"
             git_dir = "/fake/repo"
-            upstream = "ssh://git@example.invalid:26/mpei/vibe-qc.git"
+            upstream = "ssh://git@example.invalid:26/example-org/vibe-qc.git"
             install_script = "scripts/install.sh"
             """,
         )

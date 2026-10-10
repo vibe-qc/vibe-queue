@@ -270,7 +270,7 @@ class TestTopCLI:
         paths.queue_dir().mkdir(parents=True, exist_ok=True)
         host_f = _running_spec(
             tmp_path,
-            "twintop00001",
+            "hosttop00001",
             cpu=125.0,
             ts="2026-06-05T12:00:00+00:00",
             scheduler_target="host_f",
@@ -288,9 +288,9 @@ class TestTopCLI:
 
         assert result.exit_code == 0, result.output
         rows = json.loads(result.output)
-        assert [row["jobid"] for row in rows] == ["twintop00001"]
+        assert [row["jobid"] for row in rows] == ["hosttop00001"]
         assert rows[0]["queue_handle"] == {
-            "job_id": "twintop00001",
+            "job_id": "hosttop00001",
             "host": "host_f",
             "submitted_at": rows[0]["queue_handle"]["submitted_at"],
         }

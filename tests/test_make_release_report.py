@@ -404,7 +404,7 @@ def test_sibling_pin_resolves_in_its_own_repository(
 
     pin = report_script.sibling_pin("vq", "/somewhere/vibe-queue")
 
-    assert pin["repo"] == "mpei/vibe-queue"
+    assert pin["repo"] == "example-org/vibe-queue"
     assert pin["project_id"] == 36
     assert pin["sha"] == sibling_sha
     assert pin["version"] == "0.25.10"

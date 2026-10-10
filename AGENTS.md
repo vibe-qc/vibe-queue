@@ -71,8 +71,8 @@ These are the only rules that are not a matter of judgment.
    `tests/test_no_maintainer_paths.py` check the mechanical part.
    - **Security bugs** go by email, per [`SECURITY.md`](SECURITY.md), not to a
      public issue.
-   - **A confidential issue's details** stay out of commits, CHANGELOG and
-     handovers until its fix is on `main`.
+   - **A confidential issue's details** stay out of commits, changelog
+     fragments and handovers until its fix is on `main`.
 4. **Don't create release refs** unless you are the release coordinator for
    that cut: no `vX.Y.Z` tags, no push to `release` or `release-candidate/*`,
    and no `releases/*.json`.
@@ -95,30 +95,35 @@ judgment, and say what you did.
   ```
 
   A push rejected after a clean rebase means someone landed first; repeat.
-  CI (`ruff`, `test`, `docs-build`) runs on `main` and on merge requests.
+  Ordinary MRs and main pushes do not launch or wait for CI. Run the bounded
+  local check the change needs. Candidate and explicit pipelines use smoke
+  unless `VQ_TEST_SCOPE=full` is supplied. See [testing policy](docs/testing.md).
 - **Keep `main` working.**
   - Run the tests your change touches and name them in the commit body.
   - Leave no half-finished code paths.
-  - Add a `CHANGELOG.md` entry under `[Unreleased]` for anything a user or
-    operator would notice.
+  - Add a changelog fragment, `changelog.d/<issue>-<topic>.<kind>.md`, for
+    anything a user or operator would notice. `CHANGELOG.md` itself is written
+    by the release cut (`scripts/fold_changelog.py`); see `CONTRIBUTING.md`,
+    "Changelog fragments".
 - **Name the issue in the subject** when a commit fixes one, e.g.
   `fix(dispatch): retry a probe that raced the job id (#42)`. In a subject,
   `(#N)` means an issue in the canonical queue tracker and nothing else;
   refer to handover items as `§ N`.
-- **Merged is not validated.** When a fix needs host or CI evidence, comment
-  on the issue with the commit and how to check it. Close the issue on that
-  evidence.
+- **Match validation to the defect.** A source-only fix is complete when its
+  focused check passes and it lands. If a defect requires host evidence,
+  record the exact missing observation, build and owner on the issue; close on
+  that evidence. Do not repeat unchanged source checks while waiting, or block
+  unrelated fixes on that acceptance.
 
 ## Shared files and shared trees
 
-- **Shared ledgers.** `CHANGELOG.md` and the handovers take entries from many
-  sessions.
+- **Shared ledgers.** The handovers take entries from many sessions.
+  (`CHANGELOG.md` did too, until fragments replaced that: each change now
+  lands its own `changelog.d/` file, so there is nothing to conflict on.)
   - On a conflict, keep the union of both sides. Don't resolve with
     `--ours`/`--theirs`, which are inverted during a rebase anyway.
   - Before staging, `git diff :2:<file> <file>` and
     `git diff :3:<file> <file>` should show only removals you meant.
-  - After a rebase, check that your CHANGELOG entry is still under
-    `[Unreleased]`: a release cut can land underneath you.
 - **Shared working trees.** Stage explicit paths rather than `git add -A`.
   Don't stash, reset or delete changes, branches or worktrees you did not
   create.
@@ -136,6 +141,11 @@ judgment, and say what you did.
 
 ## Tests, practically
 
+- Run the smallest relevant existing test selection once. Add one regression
+  when it proves the fix; do not add exhaustive matrices by default. Stop when
+  checks pass unless new changes or a concrete concern justify more work.
+- Use docs/privacy checks for prose-only edits. Do not collect or run the whole
+  suite as routine preflight. Full runs are explicit, not automatic per patch.
 - **Invocation.** The canonical one is in `CONTRIBUTING.md`. With uv:
   `uv run --extra test pytest -q -p no:cacheprovider <paths>`.
   - The full suite also needs `--extra web` and takes about 25 minutes.

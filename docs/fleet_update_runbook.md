@@ -1,5 +1,7 @@
 # Portable maintenance checks
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 Real fleet inventory and site-specific update commands live in private
 operator storage. This page states the product contracts that an operator's
 runbook must preserve. See [scheduler runtime deployment](scheduler_runtime_deployment.md)

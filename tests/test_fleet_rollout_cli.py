@@ -150,7 +150,7 @@ def _patch_discovery(
     monkeypatch.setattr("vq.cli.fleet_release.runtime_repo", lambda: Path("/repo"))
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_checkout",
-        lambda path: Path("/repo"),
+        lambda path, **kwargs: Path("/repo"),
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._canonical_lifecycle_target",
@@ -192,7 +192,7 @@ def _patch_discovery(
     )
     monkeypatch.setattr(
         "vq.cli.fleet_rollout.collect_snapshots",
-        lambda: (
+        lambda **kwargs: (
             {},
             {},
             doctor
@@ -1957,10 +1957,21 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
     initial = _plan(report, [_action(action_id="driver", decision="skip")])
     final = _plan(report, [_action(action_id="driver", decision="skip")])
     _patch_discovery(monkeypatch, report=report, plans=[initial, final])
+    config.load_config().fleet_report_repo = "/private-reports"
+    monkeypatch.setattr(
+        "vq.cli.admin_module._canonical_lifecycle_checkout", lambda path: path,
+    )
     events: list[str] = []
     rollout_active = False
     lifecycle_depth = 0
-    resources = (("checkout", "/repo"), ("target", "/repo/.venv"))
+    resources = (("checkout", "/private-reports"), ("checkout", "/repo"),
+                 ("target", "/repo/.venv"))
+    @contextmanager
+    def adopt(**kwargs: Any):
+        assert kwargs["expected_lifecycle_resources"] == resources
+        yield None
+
+    monkeypatch.setattr("vq.cli.fleet_rollout.adopt_rollout_reentry_handoff", adopt)
     handoff = json.dumps(
         {
             "schema": "vq.toolset.lifecycle_handoff/1",
@@ -1971,7 +1982,7 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
                     "fd": fd,
                     "path": f"/tmp/test-controller-{scope}.lock",
                 }
-                for fd, (scope, resource) in zip((91, 92), resources, strict=True)
+                for fd, (scope, resource) in zip((91, 92, 93), resources, strict=True)
             ],
         },
         separators=(",", ":"),
@@ -1995,9 +2006,10 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
     @contextmanager
     def lifecycle_lock(*args: Any, **kwargs: Any):
         nonlocal lifecycle_depth
-        del args, kwargs
+        del args
         assert rollout_active
         if lifecycle_depth == 0:
+            assert kwargs["extra_resources"] == (("checkout", "/private-reports"),)
             events.append("lifecycle-enter")
         lifecycle_depth += 1
         try:
@@ -2009,7 +2021,7 @@ def test_controller_lifecycle_fence_and_handoff_span_execute_plan(
 
     def active_handoff() -> tuple[str, tuple[int, ...]]:
         assert lifecycle_depth > 0
-        return handoff, (91, 92)
+        return handoff, (91, 92, 93)
 
     def active_resources() -> tuple[tuple[str, str], ...]:
         assert lifecycle_depth > 0
@@ -2090,10 +2102,21 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
             report_digest_sha256=report.digest_sha256,
         ),
     )
+    config.load_config().fleet_report_repo = "/private-reports"
+    monkeypatch.setattr(
+        "vq.cli.admin_module._canonical_lifecycle_checkout", lambda path: path,
+    )
     events: list[str] = []
     rollout_active = False
     lifecycle_depth = 0
-    resources = (("checkout", "/repo"), ("target", "/repo/.venv"))
+    resources = (("checkout", "/private-reports"), ("checkout", "/repo"),
+                 ("target", "/repo/.venv"))
+    @contextmanager
+    def adopt(**kwargs: Any):
+        assert kwargs["expected_lifecycle_resources"] == resources
+        yield None
+
+    monkeypatch.setattr("vq.cli.fleet_rollout.adopt_rollout_reentry_handoff", adopt)
     handoff = json.dumps(
         {
             "schema": "vq.toolset.lifecycle_handoff/1",
@@ -2104,7 +2127,7 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
                     "fd": fd,
                     "path": f"/tmp/test-controller-{scope}.lock",
                 }
-                for fd, (scope, resource) in zip((91, 92), resources, strict=True)
+                for fd, (scope, resource) in zip((91, 92, 93), resources, strict=True)
             ],
         },
         separators=(",", ":"),
@@ -2127,9 +2150,10 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
     @contextmanager
     def lifecycle_lock(*args: Any, **kwargs: Any):
         nonlocal lifecycle_depth
-        del args, kwargs
+        del args
         assert rollout_active
         if lifecycle_depth == 0:
+            assert kwargs["extra_resources"] == (("checkout", "/private-reports"),)
             events.append("lifecycle-enter")
         lifecycle_depth += 1
         try:
@@ -2143,7 +2167,7 @@ def test_driver_action_and_reentry_keep_controller_fences_until_child_returns(
     monkeypatch.setattr("vq.cli.admin_module.toolset_lifecycle_lock", lifecycle_lock)
     monkeypatch.setattr(
         "vq.cli.admin_module._active_toolset_lifecycle_handoff",
-        lambda: (handoff, (91, 92)),
+        lambda: (handoff, (91, 92, 93)),
     )
     monkeypatch.setattr(
         "vq.cli.admin_module._active_toolset_lifecycle_resources",
@@ -3057,15 +3081,15 @@ class TestLegacyReconciliationPreview:
 class TestRepeatedPlanHoldSupersession:
     """One obsolete rollout can retain a hold per scheduler lane.
 
-    host_f retained six -- host_f, host_f-amd, host_f-big, host_f-inf, host_f-itwin,
-    host_f-jtwin -- from a single obsolete rollout, and clearing them took six
+    host_f retained six -- host_f, host_f-amd, host_f-big, host_f-inf, host_f-lanea,
+    host_f-laneb -- from a single obsolete rollout, and clearing them took six
     near-identical invocations of a recovery-only command, each writing
     durable state. Repetition invites copy-paste error in exactly the place
     you least want it.
     """
 
     HOSTS = (
-        "host_f", "host_f-amd", "host_f-big", "host_f-inf", "host_f-itwin", "host_f-jtwin",
+        "host_f", "host_f-amd", "host_f-big", "host_f-inf", "host_f-lanea", "host_f-laneb",
     )
     ROLLOUT = "v0.15.155-deadbeefdead"
 
@@ -3275,9 +3299,9 @@ def component_histories(tmp_path: Path):
     git(runtime, "commit", "-m", "accepted split report")
     git(runtime, "update-ref", "refs/remotes/origin/main", "HEAD")
     repos = {
-        "mpei/vibe-qc": histories["qc"]["repo"],
-        "mpei/vibe-view": histories["view"]["repo"],
-        "mpei/vibe-queue": runtime,
+        "example-org/vibe-qc": histories["qc"]["repo"],
+        "example-org/vibe-view": histories["view"]["repo"],
+        "example-org/vibe-queue": runtime,
     }
     report = fleet_release.discover_latest_report(
         runtime, fetch=False, pin_repos=repos,
@@ -3408,7 +3432,7 @@ def test_legacy_ancestry_uses_configured_monorepo_or_runtime_fallback(
         raw_bytes=json.dumps(payload).encode(),
     )
     runtime = histories["queue"]["repo"] if configured_monorepo else qc["repo"]
-    mapping = {"mpei/vibeqc": qc["repo"]} if configured_monorepo else {}
+    mapping = {"example-org/vibeqc": qc["repo"]} if configured_monorepo else {}
     for name in fleet_release.PIN_NAMES:
         for older, newer, expected in (
             (qc["base"], qc["target"], True),
@@ -3440,7 +3464,7 @@ def test_split_ancestry_fails_closed_without_searching_other_repositories(
         )
     # Even when the correct checkout is present under another slug, only the
     # authenticated pin's configured slug is eligible; no SHA-based rerouting.
-    wrong = {**repos, "mpei/vibe-qc": runtime}
+    wrong = {**repos, "example-org/vibe-qc": runtime}
     assert fleet_release.git_is_pin_ancestor(
         report, "dev", runtime, qc["base"], qc["target"], pin_repos=wrong,
     ) is None

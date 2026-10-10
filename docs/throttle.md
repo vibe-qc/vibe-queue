@@ -1,5 +1,7 @@
 # vq throttle — soft CPU priority control
 
+**Audience: people who run jobs and operators.** Part of [Running jobs](user/index.md) and [Running a host](operator/index.md).
+
 `vq throttle` lets you adjust a running job's CPU weight without
 killing or pausing it. The job continues running but gets less CPU
 under contention.

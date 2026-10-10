@@ -316,7 +316,7 @@ def pending_queue_position(spec: JobSpec, pending: list[JobSpec]) -> tuple[int, 
     (higher priority first, then FIFO by submission time; this is exactly the
     key ``_dispatch_pending`` sorts by).
 
-    Scheduler-backed jobs have independent target lanes: a pbs-cluster itwin pending
+    Scheduler-backed jobs have independent target lanes: a pbs-cluster lane-a pending
     job should not count unrelated localhost or pbs-cluster big jobs in its position.
     ``rank`` is 1-based and ``total`` is the number of pending jobs in the
     same scheduler-target lane as ``spec``; local jobs use the ``None`` lane.
@@ -522,6 +522,13 @@ def format_table(
     inherits CPUS, submitted_at, and command from the array's first
     element (they're identical across the group by design). Non-
     array specs render unchanged in the same table.
+
+    Issue #23: when a scheduler has said why a row has not started,
+    the scheduler's own string is reported in a footnote under the
+    table (see :func:`_queued_reason_lines`), never as a column --
+    it is free text as wide as a sentence. Under ``collapse_arrays`` the
+    footnote still names individual element ids, as the occupancy
+    footer does, because that is what ``vq status`` takes.
     """
     if not specs:
         lines = ["(no jobs)"]
@@ -659,6 +666,7 @@ def format_table(
     if total_cpus is not None:
         lines.append("")
         lines.append(f"active cpus: {used}/{total_cpus}")
+    lines.extend(_queued_reason_lines(specs))
     lines.extend(
         _scheduler_occupancy_lines(
             specs,
@@ -666,6 +674,80 @@ def format_table(
         )
     )
     return "\n".join(lines)
+
+
+# How many job ids, and how many distinct reasons, a footnote names before it
+# summarises the rest. Matches the cap the scheduler probe uses for unusable
+# nodes: enough to act on, bounded against a queue of a thousand rows.
+_MAX_REASON_ROWS = 8
+
+# One reason's rendered width. A queued reason is free text from a remote
+# scheduler, and this module already refuses to interpolate a raw
+# `scheduler_state` into terminal output for that reason (see
+# `normalized_scheduler_phase`). 240 is the bound every other remote scheduler
+# diagnostic is rendered at; a Torque "Not Running: ..." comment is a third of
+# it, so ordinary output is untouched, and `--json` carries the field
+# unconditionally whole for anything that needs it byte for byte.
+_MAX_REASON_CHARS = 240
+
+
+def _bounded_reason(reason: str) -> str:
+    """One printable line of a scheduler's free text, bounded for a terminal."""
+    text = "".join(c if c.isprintable() else " " for c in reason)
+    text = " ".join(text.split())
+    if len(text) > _MAX_REASON_CHARS:
+        return text[:_MAX_REASON_CHARS] + "... (truncated; `vq status` has it whole)"
+    return text
+
+
+def _queued_reason_lines(specs: list[JobSpec]) -> list[str]:
+    """Report the scheduler's own explanation for rows that have not started.
+
+    The whole point of ``scheduler_queued_reason`` is that it is the
+    scheduler's exact words, and a Torque ``comment`` routinely runs wider
+    than this entire table. So it goes in a footnote **under** the table
+    rather than in a column of it: nothing in the aligned rows moves, a long
+    line simply wraps in the terminal, and the string stays whole. It is
+    deliberately not fitted to a column width -- PBS puts the distinguishing
+    detail at the *end* of the comment, so a cell would cut off precisely the
+    part worth reading. It is bounded as remote free text rather than as a
+    table cell (see :func:`_bounded_reason`); a consumer that needs the
+    string byte for byte reads ``--json``, which is never abridged.
+
+    Rows are grouped by reason, because the case this exists for is several
+    jobs blocked behind one condition (issue #23: five ``ppn=128`` jobs, one
+    busy node and one down). Grouping states that once, and orders the
+    reasons by how many rows each is holding, so the caps below drop the
+    least important lines first.
+
+    Only nonterminal rows are considered. The daemon clears the reason the
+    moment a job stops being pending, but an archived or failed row can still
+    carry the last one it was given, and "why has this not started" is not a
+    question about a job that has already finished.
+    """
+    grouped: dict[str, list[str]] = {}
+    for spec in specs:
+        if spec.is_terminal:
+            continue
+        reason = _bounded_reason(spec.scheduler_queued_reason or "")
+        if not reason:
+            continue
+        grouped.setdefault(reason, []).append(spec.id)
+    if not grouped:
+        return []
+    lines = ["", "not started, in the scheduler's own words:"]
+    ordered = sorted(grouped.items(), key=lambda item: (-len(item[1]), item[0]))
+    for reason, ids in ordered[:_MAX_REASON_ROWS]:
+        shown = ", ".join(ids[:_MAX_REASON_ROWS])
+        if len(ids) > _MAX_REASON_ROWS:
+            shown += f", +{len(ids) - _MAX_REASON_ROWS} more"
+        lines.append(f"  {shown}: {reason}")
+    if len(ordered) > _MAX_REASON_ROWS:
+        lines.append(
+            f"  (+{len(ordered) - _MAX_REASON_ROWS} further reason(s); "
+            "`vq status HOST JOBID` reports one job's in full)"
+        )
+    return lines
 
 
 def _scheduler_occupancy_lines(
