@@ -5,7 +5,8 @@ what you need to know about a machine before you point a queue at it, and
 what changes about vq's behaviour when each of those facts changes.
 
 For HOW to submit / monitor / fetch, see
-[`chat-onboarding.md`](chat-onboarding.md). For the SSH setup story (key
+[running jobs](user/index.md), and [the agent interaction protocol](agent_interaction.md)
+for the machine-readable form. For the SSH setup story (key
 generation, sshd hardening, fail2ban, router port-forwards) see
 [`remote-access.md`](remote-access.md). For the design contract see
 [`SPEC.md`](SPEC.md).
@@ -14,7 +15,7 @@ generation, sshd hardening, fail2ban, router port-forwards) see
 
 The filled-in table for this project's own fleet is **not in this
 repository**, and must not come back into it. It lives in the private
-`mpei/scripts` project, as `hosts.md`.
+`example-org/scripts` project, as `hosts.md`.
 
 That is not tidiness. A populated host inventory is an attack surface
 document: it pairs a resolvable public hostname with an external SSH port,
@@ -134,9 +135,12 @@ First print the bindings for the local retained evidence:
 vq host retirement-audit retired-worker
 ```
 
-This reads local journals and prints each rollout ID and its host evidence
-digest. It does not authorize retirement. After the maintainer's retirement
-decision, record that decision and the exact returned bindings in the VQ config:
+This reads local journals and prints one JSON object: the host, and a
+`retained_receipts` map from each rollout ID to its host evidence digest. It
+exits 1 with "no retained rollout evidence" when no journal on this machine
+holds retained evidence for the host, and it writes nothing. It does not authorize retirement.
+After the maintainer's retirement decision, record that decision and the exact
+returned bindings in the VQ config:
 
 ```toml
 [fleet.retired_hosts.retired-worker]
@@ -148,8 +152,8 @@ authorization_reference = "Maintainer retirement decision in the issue tracker"
 "ROLLOUT_ID_FROM_AUDIT" = "SHA256_FROM_AUDIT"
 ```
 
-Replace both placeholders with the command's output. Every affected rollout
-needs its own binding. The timestamp must include a timezone, the reason and
+Replace both placeholders with an entry of the command's `retained_receipts`
+map. Every affected rollout needs its own binding. The timestamp must include a timezone, the reason and
 authorization reference must be nonempty, and every digest must be a full
 lowercase SHA-256 value. Older VQ builds reject this new `[fleet]` field;
 install code supporting it before distributing the configuration.

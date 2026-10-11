@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from vq import paths
+from vq import dirfd, paths
 
 IDENTITY_SCHEMA = "vq.fleet.rollout_operation_identity/1"
 REQUEST_SCHEMA = "vq.fleet.rollout_operation_request/1"
@@ -48,6 +48,7 @@ DETACHED_SCHEDULER_BINDING_SCHEMA = (
     "vq.fleet.rollout_detached_scheduler_binding/1"
 )
 DETACHED_SCHEDULER_PROTOCOL = "fixed-host-detached-build/1"
+RECONCILIATION_SCHEMA = "vq.fleet.rollout_operation_reconciliation/1"
 
 ENV_OPERATION_ID = "VQ_FLEET_OPERATION_ID"
 ENV_OPERATION_REQUEST_SHA256 = "VQ_FLEET_OPERATION_REQUEST_SHA256"
@@ -100,10 +101,12 @@ _OPERATION_FILES = frozenset(
         "activation.json",
         "result.json",
         "scheduler-command.json",
+        "reconciliation.json",
     }
 )
 _RECEIPT_TEMP = re.compile(
-    r"^\.(request|ready|authorization|activation|result|scheduler-command)\.json\."
+    r"^\.(request|ready|authorization|activation|result|scheduler-command"
+    r"|reconciliation)\.json\."
     r"[0-9a-f]{32}\.tmp\Z"
 )
 
@@ -1003,6 +1006,7 @@ def _write_receipt_at(
         "activation.json",
         "result.json",
         "scheduler-command.json",
+        "reconciliation.json",
     }:
         raise OperationSecurityError(f"unsupported receipt name {name!r}")
     if _contains_nul(payload):
@@ -1204,7 +1208,7 @@ def _validate_operation_entries_at(
     """
     recovered_target_names: set[str] = set()
     changed = False
-    for name in sorted(os.listdir(operation_fd)):
+    for name in sorted(dirfd.listdir(operation_fd)):
         match = _RECEIPT_TEMP.fullmatch(name)
         if match is None:
             continue
@@ -1250,7 +1254,7 @@ def _validate_operation_entries_at(
         raise OperationStateError("interrupted receipt publish requires explicit mutating recovery")
     if changed:
         os.fsync(operation_fd)
-    unknown = sorted(set(os.listdir(operation_fd)) - _OPERATION_FILES)
+    unknown = sorted(set(dirfd.listdir(operation_fd)) - _OPERATION_FILES)
     if unknown:
         raise OperationSecurityError(
             f"unexpected entries in operation directory: {', '.join(unknown)}"
@@ -1412,7 +1416,7 @@ def list_operation_ids(
     try:
         with _open_operations_fd(root, create=False) as operation_root_fd:
             result: list[str] = []
-            for name in sorted(os.listdir(operation_root_fd)):
+            for name in sorted(dirfd.listdir(operation_root_fd)):
                 if not _OPERATION_ID.fullmatch(name):
                     raise OperationSecurityError(f"unexpected entry in operation root: {name!r}")
                 operation_fd = _open_directory_at(
@@ -1980,7 +1984,15 @@ def _validate_result(
     activation: Mapping[str, object] | None,
     authorization_decision: str,
     operation_fd: int,
+    reconciled: bool = False,
 ) -> bool:
+    """Validate a terminal result; returns whether it is retry-safe.
+
+    ``reconciled`` says a valid ``reconciliation.json`` exists. Only then may
+    an executed result carry no child identity: the recorder that would have
+    named the child died, and the owner established success from the bound
+    remote evidence instead (:func:`record_reconciled_result`).
+    """
     _expect_receipt_fields(
         payload,
         schema=RESULT_SCHEMA,
@@ -2028,7 +2040,15 @@ def _validate_result(
         expected_status = "success" if returncode == 0 else "failed"
         if status_value != expected_status:
             raise OperationStateError("result status disagrees with child returncode")
-        _validate_process_identity(child, label="result receipt")
+        if reconciled:
+            if child is not None or returncode != 0:
+                raise OperationStateError(
+                    "a reconciled result must be a child-less success"
+                )
+        else:
+            _validate_process_identity(child, label="result receipt")
+    elif reconciled:
+        raise OperationStateError("a reconciled result must be an executed success")
     elif status_value != "aborted" or returncode is not None or not retry_safe or child is not None:
         raise OperationStateError("non-executed result is not a safe terminal decision")
     elif status_value == "aborted" and (
@@ -2105,6 +2125,11 @@ def _observe_locked_from_fd(
         label="activation receipt",
     )
     result = _read_optional_receipt_at(operation_fd, "result.json", label="result receipt")
+    reconciliation = _read_optional_receipt_at(
+        operation_fd,
+        "reconciliation.json",
+        label="reconciliation receipt",
+    )
     try:
         _validate_regular_at(
             operation_fd,
@@ -2132,6 +2157,21 @@ def _observe_locked_from_fd(
         if authorization_decision != "run" or ready_nonce is None:
             raise OperationStateError("activation exists without run authorization")
         _validate_activation(activation, handle, nonce=ready_nonce)
+    if reconciliation is not None:
+        if (
+            authorization_decision != "run"
+            or authorization_nonce is None
+            or activation is None
+        ):
+            raise OperationStateError(
+                "reconciliation exists without an activated run authorization"
+            )
+        _validate_reconciliation(
+            reconciliation,
+            handle,
+            nonce=authorization_nonce,
+            operation_fd=operation_fd,
+        )
     terminal_retry_safe: bool | None = None
     if result is not None:
         if authorization_decision is None or authorization_nonce is None:
@@ -2143,6 +2183,7 @@ def _observe_locked_from_fd(
             activation=activation,
             authorization_decision=authorization_decision,
             operation_fd=operation_fd,
+            reconciled=reconciliation is not None,
         )
     if ready is not None and not output_exists:
         raise OperationStateError("ready receipt exists without operation output")
@@ -2209,7 +2250,7 @@ def _load_observation_from_fd(
             label="decision lock",
         )
     except OperationStateError as exc:
-        entries = set(os.listdir(operation_fd))
+        entries = set(dirfd.listdir(operation_fd))
         if entries not in (set(), {"decision.lock"}):
             raise OperationStateError(
                 "incomplete operation lacks its first permanent decision lock"
@@ -2232,7 +2273,7 @@ def _load_observation_from_fd(
             size_limit=0,
         )
         _validate_operation_entries_at(operation_fd, recover=recover)
-        entries = set(os.listdir(operation_fd))
+        entries = set(dirfd.listdir(operation_fd))
         if entries == {"decision.lock"}:
             if not recover:
                 raise OperationStateError(
@@ -2711,6 +2752,268 @@ def abort_operation(
                 )
             return payload
         finally:
+            fcntl.flock(decision_fd, fcntl.LOCK_UN)
+            os.close(decision_fd)
+
+
+_RECONCILIATION_EVIDENCE_FIELDS = frozenset(
+    {"remote_run_id", "remote_request_sha256", "remote_result", "verification"}
+)
+
+
+def detached_binding_sha256(binding: DetachedSchedulerCommandBinding) -> str:
+    """The digest the remote receipts of a bound run carry as binding_sha256."""
+    canonical = json.dumps(
+        binding.as_dict(),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_reconciliation(
+    payload: Mapping[str, object],
+    handle: OperationHandle,
+    *,
+    nonce: str,
+    operation_fd: int,
+) -> None:
+    """Check a reconciliation receipt against this operation's own binding.
+
+    It records why an outcome-unknown detached operation was settled as a
+    success without its recorder: the exact bound remote run finished with
+    rc 0, and the independent verification passed afterwards.
+    """
+    _expect_receipt_fields(
+        payload,
+        schema=RECONCILIATION_SCHEMA,
+        fields={
+            "schema",
+            "operation_id",
+            "request_sha256",
+            "nonce",
+            "reconciled_at",
+            "protocol",
+            "binding_sha256",
+            "evidence",
+        },
+        operation=handle.operation_id,
+        label="reconciliation receipt",
+    )
+    _validate_request_binding(payload, handle, label="reconciliation receipt")
+    if payload.get("nonce") != nonce:
+        raise OperationStateError("reconciliation nonce does not match authorization")
+    _validate_text("reconciliation timestamp", payload.get("reconciled_at"))
+    if payload.get("protocol") != DETACHED_SCHEDULER_PROTOCOL:
+        raise OperationStateError("reconciliation names an unsupported protocol")
+    binding_payload = _read_optional_receipt_at(
+        operation_fd,
+        "scheduler-command.json",
+        label="detached scheduler binding",
+    )
+    if binding_payload is None:
+        raise OperationStateError("reconciliation exists without a detached binding")
+    binding = DetachedSchedulerCommandBinding.from_dict(binding_payload)
+    if (
+        binding.operation_id != handle.operation_id
+        or binding.request_sha256 != handle.request_sha256
+        or binding.nonce != nonce
+    ):
+        raise OperationStateError("detached binding belongs to another authorization")
+    if payload.get("binding_sha256") != detached_binding_sha256(binding):
+        raise OperationStateError("reconciliation does not match the detached binding")
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != _RECONCILIATION_EVIDENCE_FIELDS:
+        raise OperationStateError("reconciliation evidence has invalid fields")
+    if (
+        evidence.get("remote_run_id") != binding.run_id
+        or evidence.get("remote_request_sha256") != binding.remote_request_sha256
+    ):
+        raise OperationStateError("reconciliation evidence names another remote run")
+    remote = evidence.get("remote_result")
+    if (
+        not isinstance(remote, dict)
+        or remote.get("status") != "success"
+        or remote.get("returncode") != 0
+        or isinstance(remote.get("returncode"), bool)
+        or remote.get("timed_out") is not False
+        or remote.get("binding_sha256") != payload.get("binding_sha256")
+    ):
+        raise OperationStateError("reconciliation lacks a successful remote result")
+    verification = evidence.get("verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("returncode") != 0
+        or isinstance(verification.get("returncode"), bool)
+        or verification.get("source_sha") != handle.identity.target_sha
+    ):
+        raise OperationStateError("reconciliation lacks a passing verification")
+
+
+def record_reconciled_result(
+    operation: str,
+    *,
+    expected_request_sha256: str,
+    binding: DetachedSchedulerCommandBinding,
+    evidence: Mapping[str, object],
+    state_root: Path | None = None,
+) -> dict[str, object]:
+    """Settle an outcome-unknown detached operation as a proven success.
+
+    Only the owner calls this, after it has read the exact bound remote run's
+    successful terminal receipt and passed the independent verification. It
+    never launches anything. Under the decision lock, and holding the
+    lifetime lease so no recorder can be running, it writes the evidence as
+    ``reconciliation.json`` and then a child-less executed success as
+    ``result.json``. A crash between the two leaves the operation
+    outcome-unknown with its evidence, and a repeat call finishes it; a
+    repeat after both returns the existing result.
+    """
+    operation = _validate_operation_id(operation)
+    if not isinstance(binding, DetachedSchedulerCommandBinding):
+        raise OperationSecurityError("reconciliation needs the exact detached binding")
+    root = _state_root(state_root)
+    with _open_operation_fd(operation, state_root=root, create=False) as operation_fd:
+        decision_fd = _secure_open_at(
+            operation_fd,
+            "decision.lock",
+            flags=os.O_RDWR,
+            label="decision lock",
+        )
+        lease_fd = -1
+        try:
+            fcntl.flock(decision_fd, fcntl.LOCK_EX)
+            _validate_operation_entries_at(operation_fd, recover=True)
+            handle = _load_handle_from_fd(
+                operation,
+                state_root=root,
+                operation_fd=operation_fd,
+            )
+            if handle.request_sha256 != expected_request_sha256:
+                raise OperationStateError("operation request changed before reconciliation")
+            ready = _read_optional_receipt_at(
+                operation_fd, "ready.json", label="ready receipt",
+            )
+            authorization = _read_optional_receipt_at(
+                operation_fd, "authorization.json", label="authorization receipt",
+            )
+            activation = _read_optional_receipt_at(
+                operation_fd, "activation.json", label="activation receipt",
+            )
+            if ready is None or authorization is None or activation is None:
+                raise OperationStateError(
+                    "only an activated run authorization can be reconciled"
+                )
+            ready_nonce = _validate_ready(ready, handle)
+            decision, nonce = _validate_authorization(
+                authorization, handle, ready_nonce=ready_nonce,
+            )
+            if decision != "run":
+                raise OperationStateError("only a run authorization can be reconciled")
+            _validate_activation(activation, handle, nonce=ready_nonce)
+            stored_binding = _read_optional_receipt_at(
+                operation_fd,
+                "scheduler-command.json",
+                label="detached scheduler binding",
+            )
+            if (
+                stored_binding is None
+                or DetachedSchedulerCommandBinding.from_dict(stored_binding) != binding
+            ):
+                raise OperationStateError(
+                    "reconciliation binding differs from the operation's own"
+                )
+            lease_fd = _secure_open_at(
+                operation_fd, "lease.lock", flags=os.O_RDWR, label="lease lock",
+            )
+            try:
+                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                raise OperationStateError(
+                    "the operation's recorder still holds its lifetime lease"
+                ) from None
+            reconciliation = _read_optional_receipt_at(
+                operation_fd,
+                "reconciliation.json",
+                label="reconciliation receipt",
+            )
+            existing_result = _read_optional_receipt_at(
+                operation_fd, "result.json", label="result receipt",
+            )
+            if existing_result is not None:
+                if reconciliation is None:
+                    raise OperationStateError("operation already has a terminal result")
+                _validate_reconciliation(
+                    reconciliation, handle, nonce=nonce, operation_fd=operation_fd,
+                )
+                _validate_result(
+                    existing_result,
+                    handle,
+                    nonce=nonce,
+                    activation=activation,
+                    authorization_decision=decision,
+                    operation_fd=operation_fd,
+                    reconciled=True,
+                )
+                return existing_result
+            if reconciliation is None:
+                reconciliation = {
+                    "schema": RECONCILIATION_SCHEMA,
+                    "operation_id": handle.operation_id,
+                    "request_sha256": _request_sha256(handle),
+                    "nonce": nonce,
+                    "reconciled_at": _timestamp(),
+                    "protocol": DETACHED_SCHEDULER_PROTOCOL,
+                    "binding_sha256": detached_binding_sha256(binding),
+                    "evidence": dict(evidence),
+                }
+                _validate_reconciliation(
+                    reconciliation, handle, nonce=nonce, operation_fd=operation_fd,
+                )
+                _write_receipt_at(operation_fd, "reconciliation.json", reconciliation)
+            else:
+                _validate_reconciliation(
+                    reconciliation, handle, nonce=nonce, operation_fd=operation_fd,
+                )
+            output_sha, output_bytes = _output_digest_at(operation_fd)
+            try:
+                activated_at = datetime.fromisoformat(str(activation["activated_at"]))
+                duration = max(0.0, (datetime.now(UTC) - activated_at).total_seconds())
+            except (TypeError, ValueError):
+                duration = 0.0
+            result = _result_payload(
+                handle,
+                nonce=nonce,
+                status="success",
+                executed=True,
+                returncode=0,
+                retry_safe=False,
+                child=None,
+                output_sha256=output_sha,
+                output_stored_bytes=output_bytes,
+                output_observed_bytes=output_bytes,
+                output_truncated=False,
+                duration_seconds=duration if math.isfinite(duration) else 0.0,
+            )
+            _validate_result(
+                result,
+                handle,
+                nonce=nonce,
+                activation=activation,
+                authorization_decision=decision,
+                operation_fd=operation_fd,
+                reconciled=True,
+            )
+            return _write_receipt_at(operation_fd, "result.json", result)
+        finally:
+            if lease_fd >= 0:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(lease_fd, fcntl.LOCK_UN)
+                os.close(lease_fd)
             fcntl.flock(decision_fd, fcntl.LOCK_UN)
             os.close(decision_fd)
 

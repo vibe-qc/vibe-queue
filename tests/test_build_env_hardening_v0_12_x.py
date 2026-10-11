@@ -759,8 +759,8 @@ def _prog(
     )
 
 
-def _managed_python(work: Path) -> Path:
-    python = work / ".venv" / "bin" / "python"
+def _managed_python(work: Path, venv_subdir: str = ".venv") -> Path:
+    python = work / venv_subdir / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text(
         "#!/bin/sh\n"
@@ -2779,6 +2779,105 @@ class TestSlotEnabledUpdate:
             runtime_slot_root=str(root),
         )
 
+    @pytest.mark.no_autopatch_branch_check
+    def test_custom_venv_build_preserves_registered_path_and_profile(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        (repo / "build.sh").write_text(
+            '#!/bin/bash\nset -eu\n'
+            'test "$1" = "--extras"\ntest "$2" = "all"\n'
+            'test "$3" = "--venv"\ntest "$4" = ".venv-viewer"\n'
+            'mkdir -p "$4/bin"\n'
+            "printf '#!/bin/sh\\nexit 0\\n' > \"$4/bin/python\"\n"
+            'chmod +x "$4/bin/python"\n'
+        )
+        (repo / ".gitignore").write_text(".venv*/\n")
+        _git(repo, "add", "build.sh", ".gitignore")
+        _git(repo, "commit", "-m", "custom virtualenv builder")
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        prog = self._prog(repo, root).model_copy(update={
+            "python": str(repo / ".venv-viewer/bin/python"),
+            "update_script": "build.sh --extras all --venv .venv-viewer",
+        })
+
+        result = admin._do_slot_update_work("viewer", prog, expected_sha=sha)
+
+        assert result.success, result.work_errors
+        assert runtime_slots.resolve_current(root) == sha
+        assert runtime_slots.slot_python(root, sha) == (
+            runtime_slots.slot_source(root, sha) / ".venv-viewer/bin/python"
+        )
+        assert not (runtime_slots.slot_source(root, sha) / ".venv").exists()
+        assert not (repo / ".venv-viewer").exists()
+
+    @pytest.mark.no_autopatch_branch_check
+    @pytest.mark.parametrize("field", ["update_script", "post_update_script"])
+    def test_absolute_update_script_builds_only_the_slot(
+        self, tmp_path: Path, field: str,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        script = repo / "build runtime.sh"
+        script.write_text(
+            '#!/bin/bash\nset -eu\n'
+            'test "$1" = "argument with spaces"\ntest "$2" = "--flag"\n'
+            'cd -- "$(dirname -- "$0")"\n'
+            'printf changed > sentinel\n'
+            'mkdir -p .venv/bin\n'
+            "printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python\n"
+            'chmod +x .venv/bin/python\n'
+        )
+        (repo / "sentinel").write_text("original")
+        (repo / ".gitignore").write_text(".venv/\nsentinel\n")
+        _git(repo, "add", script.name, ".gitignore")
+        _git(repo, "commit", "-m", "absolute-path builder")
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        program = self._prog(repo, root).model_copy(
+            update={field: shlex.join([str(script), "argument with spaces", "--flag"])},
+        )
+
+        result = admin._do_slot_update_work("demo", program, expected_sha=sha)
+
+        assert (repo / "sentinel").read_text() == "original"
+        assert result.success, result.work_errors
+        assert (runtime_slots.slot_source(root, sha) / "sentinel").read_text() == "changed"
+        assert runtime_slots.resolve_current(root) == sha
+
+    @pytest.mark.no_autopatch_branch_check
+    @pytest.mark.parametrize("field", ["update_script", "post_update_script"])
+    @pytest.mark.parametrize("spelling", ["absolute", "traversal", "symlink"])
+    def test_slot_script_cannot_escape_to_a_legacy_updater(
+        self, tmp_path: Path, field: str, spelling: str,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        sentinel = tmp_path / "sentinel"
+        sentinel.write_text("original")
+        outside = tmp_path / "outside.sh"
+        outside.write_text(f"printf changed > {shlex.quote(str(sentinel))}\n")
+        if spelling == "absolute":
+            command = str(outside)
+        elif spelling == "traversal":
+            command = "../outside.sh"
+        else:
+            (repo / "linked.sh").symlink_to(outside)
+            _git(repo, "add", "linked.sh")
+            _git(repo, "commit", "-m", "external script link")
+            command = "linked.sh"
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        program = self._prog(repo, root).model_copy(update={field: command})
+
+        result = admin._do_slot_update_work("demo", program, expected_sha=sha)
+
+        assert not result.success
+        assert sentinel.read_text() == "original"
+        assert any("source tree" in error for error in result.work_errors)
+        assert not (root / "current").exists()
+        if spelling != "symlink":
+            assert not root.exists(), "reject external paths before preparing a slot"
+
     def test_expected_sha_is_required(self, tmp_path: Path) -> None:
         """Slots are keyed by commit, so the target must be known up front."""
         repo, _first, _second = self._live_repo(tmp_path)
@@ -2969,9 +3068,11 @@ class TestSlotEnabledUpdate:
         ),
         ids=["nested-venv", "immutable-marker-component"],
     )
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
     def test_fresh_structural_slot_rejects_core_in_excluded_source_path(
-        self, tmp_path: Path, core_relative: str
+        self, tmp_path: Path, core_relative: str, venv_subdir: str,
     ) -> None:
+        core_relative = core_relative.replace(".venv", venv_subdir)
         repo = tmp_path / "live-vibeqc"
         repo.mkdir()
         _git(repo, "init", "-b", "main")
@@ -2991,20 +3092,20 @@ class TestSlotEnabledUpdate:
         source = repo / "cpp" / "src" / "bindings.cpp"
         source.parent.mkdir(parents=True)
         source.write_text("// native source\n", encoding="utf-8")
-        (repo / ".gitignore").write_text(".venv/\n__pycache__/\n")
+        (repo / ".gitignore").write_text(f"{venv_subdir}/\n__pycache__/\n")
         (repo / "build.sh").write_text(
             "#!/bin/bash\n"
             "set -eu\n"
-            f"mkdir -p .venv/bin {shlex.quote(str(Path(core_relative).parent))}\n"
+            f"mkdir -p {venv_subdir}/bin {shlex.quote(str(Path(core_relative).parent))}\n"
             f"echo CORE > {shlex.quote(core_relative)}\n"
-            "cat > .venv/bin/python <<'EOF'\n"
+            f"cat > {venv_subdir}/bin/python <<'EOF'\n"
             "#!/bin/sh\n"
             '_vq_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
             '_vq_source=$(dirname "$(dirname "$_vq_bin")")\n'
             f'PYTHONPATH="$_vq_source/python" exec {shlex.quote(sys.executable)} '
             '-S "$@"\n'
             "EOF\n"
-            "chmod +x .venv/bin/python\n",
+            f"chmod +x {venv_subdir}/bin/python\n",
             encoding="utf-8",
         )
         _git(repo, "add", "-A")
@@ -3013,7 +3114,7 @@ class TestSlotEnabledUpdate:
         root = tmp_path / "rt"
         program = config.VenvProgram(
             kind="venv",
-            python=str(repo / ".venv" / "bin" / "python"),
+            python=str(repo / venv_subdir / "bin" / "python"),
             git_dir=str(repo),
             branch="main",
             update_script="build.sh",
@@ -3031,8 +3132,9 @@ class TestSlotEnabledUpdate:
         assert "outside the slot's hashed content" in result.import_check_output
         assert runtime_slots.resolve_current(root) is None
 
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
     def test_verified_structural_slot_is_revalidated_before_reuse(
-        self, tmp_path: Path
+        self, tmp_path: Path, venv_subdir: str,
     ) -> None:
         repo = tmp_path / "live-vibeqc"
         repo.mkdir()
@@ -3046,14 +3148,14 @@ class TestSlotEnabledUpdate:
             "_vibeqc_core = _Core()\n"
             "_vibeqc_core.__file__ = str(\n"
             "    Path(__file__).resolve().parents[2]\n"
-            "    / '.venv' / 'lib' / 'vibeqc' / '_vibeqc_core.so'\n"
+            f"    / {venv_subdir!r} / 'lib' / 'vibeqc' / '_vibeqc_core.so'\n"
             ")\n",
             encoding="utf-8",
         )
         bindings = repo / "cpp" / "src" / "bindings.cpp"
         bindings.parent.mkdir(parents=True)
         bindings.write_text("// native source\n", encoding="utf-8")
-        (repo / ".gitignore").write_text(".venv/\n__pycache__/\n")
+        (repo / ".gitignore").write_text(f"{venv_subdir}/\n__pycache__/\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-m", "structural vibeqc")
         sha = _head(repo)
@@ -3064,10 +3166,11 @@ class TestSlotEnabledUpdate:
             sha,
             transaction_id=transaction,
             in_use=lambda: set(),
+            venv_subdir=venv_subdir,
         )
         source = runtime_slots.materialize_source(repo, root, sha)
-        _managed_python(source)
-        core = source / ".venv" / "lib" / "vibeqc" / "_vibeqc_core.so"
+        _managed_python(source, venv_subdir)
+        core = source / venv_subdir / "lib" / "vibeqc" / "_vibeqc_core.so"
         core.parent.mkdir(parents=True)
         core.write_text("STALE", encoding="utf-8")
         slot_bindings = source / "cpp" / "src" / "bindings.cpp"
@@ -3080,7 +3183,7 @@ class TestSlotEnabledUpdate:
         )
         program = config.VenvProgram(
             kind="venv",
-            python=str(repo / ".venv" / "bin" / "python"),
+            python=str(repo / venv_subdir / "bin" / "python"),
             git_dir=str(repo),
             branch="main",
             update_script="build.sh",

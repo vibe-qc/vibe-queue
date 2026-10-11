@@ -7,7 +7,7 @@ With ``detached_build = true`` the command runs under ``setsid`` with its
 output, rc, and pid parked in a per-run directory; the driver observes via
 fresh per-poll connections. These tests pin the protocol: a dropped poll is
 tolerated, output streams into the run log exactly once, a wall timeout
-kills the remote process group, and the runtime lane wires it end to end.
+attempts remote termination without assuming success, and the runtime lane wires it end to end.
 """
 from __future__ import annotations
 
@@ -1527,7 +1527,7 @@ def test_detached_build_survives_a_dropped_poll_connection(
     assert fake.cleanup_seen, "the run dir must be cleaned up after success"
 
 
-def test_detached_timeout_kills_the_remote_process_group(
+def test_detached_timeout_attempts_remote_process_group_termination(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = _FakeBuildHost(polls=[_poll("none", "", 0)] * 50)
@@ -1543,7 +1543,54 @@ def test_detached_timeout_kills_the_remote_process_group(
             mode="runtime vibeqc-release update",
         )
 
-    assert fake.kill_scripts, "the wall timeout must kill the process group"
+    assert fake.kill_scripts, "the wall timeout must request process-group termination"
+
+
+@pytest.mark.parametrize("returncode,stdout", [(255, ""), (0, "RC=none\nSIZE=0\n")])
+def test_detached_failed_poll_is_unobservable_without_termination(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str
+) -> None:
+    fake = _FakeBuildHost(polls=[])
+    def unavailable(host, *args, **kwargs):
+        if 'echo "RC=' in kwargs.get("stdin_data", ""):
+            return subprocess.CompletedProcess(
+                args, returncode, stdout, "banner exchange timed out"
+            )
+        return fake(host, *args, **kwargs)
+    ticks = iter(range(100))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(admin.time, "sleep", lambda _: None)
+    monkeypatch.setattr(admin, "DETACHED_BUILD_OBSERVATION_GRACE_SECONDS", 3)
+    monkeypatch.setattr(admin.transport, "run_remote_shell", unavailable)
+    with pytest.raises(transport.RemoteError, match="unobservable"):
+        admin._run_legacy_detached_scheduler_command(
+            _host_cfg(), ["/site/bin/deploy-runtime"], scratch_root="/scratch",
+            program="vibeqc-release", timeout=20, mode="runtime update",
+        )
+    assert not fake.kill_scripts
+    assert not fake.cleanup_seen
+
+
+def test_detached_timeout_does_not_claim_unconfirmed_termination(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeBuildHost(polls=[])
+    def unavailable_kill(host, *args, **kwargs):
+        if "kill --" in kwargs.get("stdin_data", ""):
+            raise transport.RemoteError("banner exchange timed out")
+        return fake(host, *args, **kwargs)
+    ticks = iter(range(100))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(admin.time, "sleep", lambda _: None)
+    monkeypatch.setattr(admin.transport, "run_remote_shell", unavailable_kill)
+    with pytest.raises(transport.RemoteError, match="termination.*unconfirmed") as exc:
+        admin._run_legacy_detached_scheduler_command(
+            _host_cfg(), ["/site/bin/deploy-runtime"], scratch_root="/scratch",
+            program="vibeqc-release", timeout=0.5, mode="runtime update",
+        )
+    assert "process group killed" not in str(exc.value)
+    assert "reconcile" in str(exc.value).lower()
+    assert not fake.cleanup_seen
 
 
 def test_runtime_lane_streams_a_detached_build_end_to_end(
