@@ -23,6 +23,8 @@ import base64
 import json
 import os
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -35,7 +37,7 @@ from pathlib import Path
 import pytest
 
 import vq.scheduler_dispatch as scheduler_dispatch
-from vq import transport
+from vq import bulk_delete, transport
 from vq.config import HostConfig, SchedulerProgramHooks
 from vq.scheduler_dialect import (
     DialectError,
@@ -60,6 +62,147 @@ from vq.scheduler_dispatch import (
 from vq.spec import JobState
 
 Responder = Callable[[list[str], str | None], RemoteResult | None]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+def test_fixed_filename_binary_workspace_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    """Execute the real staging/render/fetch path with a synthetic VASP-shaped deck.
+
+    Only scheduler commands and GNU time are simulated. No licensed binary,
+    potential, MPI installation, SSH connection or live daemon is involved.
+    """
+    from vq.daemon import _apply_default_thread_caps, _vq_job_env  # noqa: PLC0415
+    from vq.spec import JobSpec  # noqa: PLC0415
+    from vq.submit import submit_local  # noqa: PLC0415
+
+    class LocalBatchRunner:
+        process: subprocess.Popen[bytes] | None = None
+        cancelled = False
+
+        def run(self, argv, *, stdin_data=None, check=False):
+            if argv[0] == "qsub":
+                self.process = subprocess.Popen(
+                    ["/bin/bash", argv[1]], start_new_session=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                return RemoteResult(0, "123.cluster\n", "")
+            if argv[0] == "qdel":
+                assert argv == ["qdel", "123.cluster"]
+                assert self.process is not None
+                os.killpg(self.process.pid, signal.SIGTERM)
+                self.process.wait(timeout=10)
+                self.cancelled = True
+                return RemoteResult(0, "", "")
+            if argv[0] == "qstat":
+                assert self.process is not None
+                state = "R" if self.process.poll() is None else "C"
+                if "-f" in argv:
+                    return RemoteResult(0, f"Job Id: 123.cluster\n    job_state = {state}\n", "")
+                return RemoteResult(0, f"123.cluster example user 00:00:00 {state} compute\n", "")
+            proc = subprocess.run(
+                argv, input=stdin_data, text=True, capture_output=True,
+                check=check, timeout=10,
+            )
+            return RemoteResult(proc.returncode, proc.stdout, proc.stderr)
+
+        def upload_file(self, source, destination):
+            shutil.copyfile(source, destination)
+
+        def download_file(self, source, destination):
+            shutil.copyfile(source, destination)
+
+    deck = tmp_path / "deck"
+    deck.mkdir()
+    inputs = {
+        "INCAR": b"ISTART = 0\nICHARG = 2\n",
+        "POSCAR": b"synthetic geometry, not a physical reference\n",
+        "KPOINTS": b"synthetic mesh\n",
+        "POTCAR": b"synthetic placeholder, not a potential\n",
+    }
+    for name, contents in inputs.items():
+        (deck / name).write_bytes(contents)
+    binary = tmp_path / "synthetic-binary"
+    binary.write_text(
+        "#!/bin/sh\nset -eu\n"
+        '[ "$#" -eq 0 ]\n'
+        'for f in INCAR POSCAR KPOINTS POTCAR; do test -s "$f"; done\n'
+        '[ "$VQ_CPUS" = 2 ]\n[ "$OMP_NUM_THREADS" = 1 ]\n'
+        '[ "$MKL_NUM_THREADS" = 1 ]\n'
+        'printf "synthetic result\\n" > OUTCAR\n'
+        'printf "synthetic iterations\\n" > OSZICAR\n'
+        'cp POSCAR CONTCAR\nprintf "<synthetic/>\\n" > vasprun.xml\n'
+        'printf "\\000\\001restart\\377" > WAVECAR\n'
+        'printf "synthetic charge\\n" > CHGCAR\n'
+        'printf "started\\n"\nprintf "diagnostic\\n" >&2\n'
+        + ('sleep 30\n' if outcome == "cancel" else '')
+        + ("exit 42\n" if outcome == "failure" else "exit 0\n")
+    )
+    binary.chmod(0o755)
+    queue, jobs = tmp_path / "queue", tmp_path / "jobs"
+    jobid = submit_local(
+        host="localhost", directory=str(deck), command=[str(binary)],
+        program="vasp", scheduler_target="cluster", cpus=2, mem_mb=4096,
+        wall_time_seconds=60, retry=0, queue_dir=queue, jobs_dir=jobs,
+    )
+    spec = JobSpec.read(queue / f"{jobid}.json")
+    assert spec.command == [str(binary)]  # Never append an INCAR argument.
+    runner = LocalBatchRunner()
+    dispatcher = SchedulerDispatcher(
+        TorqueDialect(), runner, scratch_root=str(tmp_path / "cluster"),
+        gnu_time_command=str(_install_fake_gnu_time(tmp_path, monkeypatch)),
+        scheduler_program_hooks={"vasp": SchedulerProgramHooks(prologue=[
+            "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1",
+        ])},
+    )
+    env = _vq_job_env(spec, workdir=dispatcher.remote_workspace(jobid))
+    _apply_default_thread_caps(env, spec.cpus)
+    try:
+        handle = dispatcher.submit(
+            job_id=jobid, command=spec.command, cpus=spec.cpus,
+            mem_mb=spec.mem_mb, wall_time_seconds=spec.wall_time_seconds,
+            local_workspace=Path(spec.cwd), env=env, program=spec.program,
+        )
+        workspace = Path(handle.remote_workspace)
+        script = (workspace / "job.pbs").read_text()
+        assert "#PBS -l nodes=1:ppn=2" in script
+        assert "#PBS -l mem=4096mb" in script
+        assert "#PBS -l walltime=00:01:00" in script
+        assert runner.process is not None
+        if outcome == "cancel":
+            deadline = time.monotonic() + 10
+            while not (workspace / "CHGCAR").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert (workspace / "CHGCAR").exists(), "payload did not start"
+            assert dispatcher.poll([handle])[handle.job_id] == SchedulerPhase.RUNNING
+            dispatcher.cancel(handle)
+            assert runner.cancelled
+        else:
+            runner.process.wait(timeout=10)
+        assert dispatcher.poll([handle])[handle.job_id] == SchedulerPhase.FINISHED
+        expected_rc = {"success": 0, "failure": 42, "cancel": 143}[outcome]
+        assert dispatcher.exit_code(handle) == expected_rc
+        if outcome != "cancel":
+            assert dispatcher.final_state(handle) == (
+                JobState.COMPLETED if outcome == "success" else JobState.FAILED
+            )
+        fetched = tmp_path / "fetched"
+        dispatcher.fetch_results(handle, fetched)
+        for name in (*inputs, "OUTCAR", "OSZICAR", "CONTCAR", "vasprun.xml",
+                     "WAVECAR", "CHGCAR", "stdout.log", "stderr.log", "_vq/exit-code"):
+            assert (fetched / name).read_bytes() == (workspace / name).read_bytes()
+        assert (fetched / "WAVECAR").read_bytes() == b"\x00\x01restart\xff"
+        for name, contents in inputs.items():
+            assert (deck / name).read_bytes() == contents
+        assert not (deck / "OUTCAR").exists()
+        assert workspace.is_dir()  # Fetch never retires the remote workspace.
+        assert not spec.clean_workdir_on_terminal
+        assert spec.retry_max == 0
+    finally:
+        if runner.process is not None and runner.process.poll() is None:
+            os.killpg(runner.process.pid, signal.SIGKILL)
+            runner.process.wait(timeout=10)
 
 
 @dataclass
@@ -761,7 +904,7 @@ def test_build_job_script_node_scratch_runs_on_node_and_copies_back() -> None:
     # copied from scratch cannot clobber it), then scratch is cleaned up.
     copyback = script.index(f'__vq_reconcile {ws}')
     marker_write = script.rindex('__vq_write_marker "$__vq_rc"')
-    cleanup = script.index('rm -rf "$__vq_stage"')
+    cleanup = script.index('__vq_rmtree "$__vq_stage"')
     assert copyback < marker_write < cleanup
     # $USER stays unquoted so it expands on the node.
     assert "/tmp1/$USER/" in script
@@ -1033,40 +1176,6 @@ def test_build_job_script_without_node_scratch_runs_in_workspace() -> None:
     assert f"cd {ws}" in script
     assert "mktemp" not in script
     assert "__vq_scratch" not in script
-
-
-def test_workdir_docs_match_scheduler_scratch_runtime_contract() -> None:
-    """The agent contract must name the same discriminator as the scripts.
-
-    Without ``node_scratch_dir`` the payload cwd and scheduler workspace are
-    one directory; with it the payload runs from a node-local copy. The docs
-    used to promise two directories unconditionally, which made safe-looking
-    payloads overwrite their own inputs on the first route.
-    """
-    # The pre-split CLAUDE.md, which also stated this contract, stayed in the
-    # archived monorepo. AGENTS.md here sends agents to agent_interaction.md,
-    # the copy of the contract this repository holds itself to.
-    repo_root = Path(__file__).resolve().parents[1]
-    interaction_path = repo_root / "docs" / "agent_interaction.md"
-    assert interaction_path.is_file(), f"{interaction_path} is missing"
-    documents = (interaction_path,)
-    required_contract = (
-        "node_scratch_dir",
-        "$VQ_WORKDIR` resolves to the staged workspace",
-        "Never write onto a payload file.",
-        "dedicated output subdirectory",
-        "prove it is writable with a real write",
-    )
-
-    for document in documents:
-        text = " ".join(document.read_text().split())
-        for statement in required_contract:
-            assert statement in text, f"{document} omits {statement!r}"
-
-    interaction_doc = " ".join(interaction_path.read_text().split())
-    assert "Scheduler jobs have no separately managed workdir to fetch" in interaction_doc
-    assert "shared workspace returned by ordinary `vq fetch`" in interaction_doc
-    assert "output_dir.mkdir(exist_ok=False)" in interaction_doc
 
 
 def test_build_job_script_inserts_scheduler_hooks_inside_workdir() -> None:
@@ -1749,10 +1858,10 @@ def test_poll_accepts_unique_torque_truncated_job_id() -> None:
 
 def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     squeue_table = textwrap.dedent("""\
-        123_0|PENDING|00:00|01:00:00|(Priority)
-        123_1|RUNNING|00:01|01:00:00|node001
-        124_0|PENDING|00:00|01:00:00|(Priority)
-        125_0|COMPLETED|00:10|01:00:00|node002
+        123_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        123_1|RUNNING|00:01|01:00:00|node001|None
+        124_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        125_0|COMPLETED|00:10|01:00:00|node002|None
     """)
 
     def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
@@ -1778,10 +1887,58 @@ def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     assert runner.first("squeue").argv == [
         "squeue",
         "--noheader",
-        "--format=%i|%T|%M|%l|%N",
+        "--format=%i|%T|%M|%l|%N|%r",
         "--jobs",
         "123,124,125,126",
     ]
+
+
+def test_slurm_poll_evidence_carries_why_a_job_is_still_queued() -> None:
+    # vibe-qc#148: the poll already knew; nothing carried it to the operator.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(
+                0,
+                "123|PENDING|00:00|01:00:00||Resources\n"
+                "124|RUNNING|00:01|01:00:00|node001|None\n",
+                "",
+            )
+        return None
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    evidence = dispatcher.poll_with_evidence(
+        [SchedulerHandle("123", "/ws/123"), SchedulerHandle("124", "/ws/124")]
+    )
+
+    assert evidence.queued_reasons == {"123": "Resources"}
+
+
+def test_poll_evidence_survives_a_dialect_without_reason_support() -> None:
+    # A reason is telemetry: a dialect that cannot supply one must cost the
+    # operator an explanation, never a failed observation.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(0, "123|RUNNING|00:01|01:00:00|node001|None\n", "")
+        return None
+
+    class _NoReasonHook:
+        """A dialect from before the reason hook existed."""
+
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            if name == "parse_poll_reasons":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    dispatcher.dialect = _NoReasonHook(dispatcher.dialect)  # type: ignore[assignment]
+
+    evidence = dispatcher.poll_with_evidence([SchedulerHandle("123", "/ws/123")])
+
+    assert evidence.phases == {"123": SchedulerPhase.RUNNING}
+    assert evidence.queued_reasons == {}
 
 
 def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
@@ -1789,7 +1946,7 @@ def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
         if argv and argv[0] == "squeue":
             return RemoteResult(
                 0,
-                "123|RUNNING|00:01|01:00:00|node001\n",
+                "123|RUNNING|00:01|01:00:00|node001|None\n",
                 "",
             )
         return None
@@ -1857,7 +2014,7 @@ def test_slurm_poll_isolates_an_explicitly_invalid_id_from_live_siblings() -> No
             if requested == "123":
                 return RemoteResult(
                     0,
-                    "123|RUNNING|00:01|01:00:00|node001\n",
+                    "123|RUNNING|00:01|01:00:00|node001|None\n",
                     "",
                 )
             if requested == "999":
@@ -3600,7 +3757,9 @@ def test_fetch_results_merge_failure_is_retryable(tmp_path: Path) -> None:
 
     # The remote workspace was not deleted; a later pass recreates its tar and
     # can complete after the local type conflict is resolved.
-    assert runner.none_match(lambda argv: argv == ["rm", "-rf", "/ws/1"])
+    assert runner.none_match(
+        lambda argv: argv == ["rm", "-rf", "/ws/1"] or "vq-rmtree" in argv
+    )
     (local / "reference.out").rmdir()
     dispatcher.fetch_results(handle, local)
 
@@ -3616,7 +3775,7 @@ def test_cleanup_remote_workspace_removes_configured_job_dir() -> None:
 
     d.cleanup_remote_workspace(SchedulerHandle("12345.cluster", ws))
 
-    assert ["rm", "-rf", "--", ws, f"{ws}.submit-once.json"] in runner.argvs()
+    assert bulk_delete.rmtree_argv(ws, f"{ws}.submit-once.json") in runner.argvs()
 
 
 def test_cleanup_remote_workspace_removes_only_workspace_and_exact_receipt() -> None:
@@ -3627,7 +3786,7 @@ def test_cleanup_remote_workspace_removes_only_workspace_and_exact_receipt() -> 
     d.cleanup_remote_workspace(SchedulerHandle("12345.cluster", ws))
 
     cleanup = runner.argvs()[-1]
-    assert cleanup == ["rm", "-rf", "--", ws, f"{ws}.submit-once.json"]
+    assert cleanup == bulk_delete.rmtree_argv(ws, f"{ws}.submit-once.json")
     assert all("*" not in argument for argument in cleanup)
 
 

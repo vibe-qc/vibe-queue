@@ -531,6 +531,166 @@ def wait_for_terminal_remote(
         _sleep(poll_interval)
 
 
+class BrokerViewUnavailable(Exception):
+    """One poll of a broker job failed in a way a later poll may fix."""
+
+
+_BROKER_UNPLACED_STATES = frozenset({"held", "reserved", "transferring", "returned"})
+
+
+def _broker_unplaced_detail(view: Mapping[str, Any]) -> str:
+    parts = [f"broker_state={view.get('state')}"]
+    target_host = _payload_str(view, "target_host")
+    if target_host:
+        parts.append(f"target_host={target_host}")
+    blockers = view.get("blockers")
+    if isinstance(blockers, Mapping) and blockers:
+        parts.append(
+            "blockers=" + ", ".join(f"{host}: {why}" for host, why in sorted(blockers.items()))
+        )
+    diagnostics = view.get("diagnostics")
+    if isinstance(diagnostics, list) and diagnostics:
+        parts.append(f"diagnostic={diagnostics[-1]}")
+    action = _payload_str(view, "operator_action")
+    if action:
+        parts.append(f"OPERATOR ACTION: {action}")
+    return "; ".join(parts)
+
+
+def _broker_poll(
+    jobid: str, view: Mapping[str, Any], queue_handle: Mapping[str, Any]
+) -> tuple[JobState, str | None, WaitResult | None]:
+    """(last state, timeout detail, result once terminal) for one broker view.
+
+    A job the broker still holds, or whose transfer is in doubt, is pending
+    from the client's side. A cancelled broker job was never placed, so it
+    ends as killed. Once placed, the target job's own state decides.
+    """
+    state = view.get("state")
+    if state == "cancelled":
+        cancellation = view.get("cancellation")
+        diagnosis: dict[str, object] = {
+            "category": "manual_kill",
+            "action_hint": "operator_killed",
+            "summary": "The broker job was cancelled before placement; it never ran.",
+        }
+        if isinstance(cancellation, Mapping) and _payload_str(cancellation, "reason"):
+            diagnosis["reason"] = cancellation["reason"]
+        return JobState.KILLED, None, WaitResult(
+            jobid=jobid, state=JobState.KILLED, exit_code=None,
+            queue_handle=queue_handle, terminal_diagnosis=diagnosis,
+        )
+    if state in _BROKER_UNPLACED_STATES:
+        return JobState.PENDING, _broker_unplaced_detail(view), None
+    if state != "placed":
+        raise BrokerViewUnavailable(f"the broker reported an unknown state {state!r}")
+    target = view.get("target_status")
+    if not isinstance(target, Mapping):
+        raise BrokerViewUnavailable(
+            _payload_str(view, "target_status_error")
+            or "the broker returned no status for the target job"
+        )
+    try:
+        target_state = JobState(target.get("state"))
+    except ValueError as exc:
+        raise BrokerViewUnavailable(
+            f"the target job reported an unknown state {target.get('state')!r}"
+        ) from exc
+    placed = f"placed on {view.get('target_host')} as {view.get('target_job_id')}"
+    target_detail = _timeout_detail_from_payload(target)
+    detail = f"{placed}; {target_detail}" if target_detail else placed
+    if target_state not in TERMINAL_STATES:
+        return target_state, detail, None
+    exit_code = target.get("exit_code")
+    terminal_diagnosis = target.get("terminal_diagnosis")
+    return target_state, detail, WaitResult(
+        jobid=jobid,
+        state=target_state,
+        exit_code=exit_code if isinstance(exit_code, int) else None,
+        queue_handle=queue_handle,
+        terminal_diagnosis=(
+            terminal_diagnosis if isinstance(terminal_diagnosis, Mapping) else None
+        ),
+    )
+
+
+def remote_broker_view(
+    host_cfg: config.HostConfig, jobid: str
+) -> Callable[[], Mapping[str, Any]]:
+    """Read a broker job's view from the broker over SSH (a client's wait)."""
+    import json as _json
+
+    def read() -> Mapping[str, Any]:
+        try:
+            proc = transport.run_remote_vq(host_cfg, "status", "localhost", jobid, "--json")
+            view = _json.loads(proc.stdout)
+        except (transport.RemoteError, ValueError) as exc:
+            raise BrokerViewUnavailable(str(exc)) from exc
+        if not isinstance(view, Mapping):
+            raise BrokerViewUnavailable(f"the broker's status is not an object: {proc.stdout!r}")
+        return view
+
+    return read
+
+
+def local_broker_view(jobid: str) -> Callable[[], Mapping[str, Any]]:
+    """Read a broker job's view on the broker itself.
+
+    A busy store is retried. Any other broker error (no such record, the
+    role is off, the target is no longer configured) is final and raised.
+    """
+    from vq import broker_relay, broker_store
+
+    def read() -> Mapping[str, Any]:
+        try:
+            cfg, record = broker_relay.resolve_local(jobid)
+        except broker_store.BrokerStoreBusy as exc:
+            raise BrokerViewUnavailable(str(exc)) from exc
+        return broker_relay.status_payload(cfg, record)
+
+    return read
+
+
+def wait_for_broker_job(
+    jobid: str,
+    read_view: Callable[[], Mapping[str, Any]],
+    *,
+    broker_host: str,
+    poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    timeout: float | None = None,
+    _now: Callable[[], float] = time.monotonic,
+    _sleep: Callable[[float], None] = time.sleep,
+) -> WaitResult:
+    """Block until a broker job (``b-...``, #64) ends.
+
+    Polls the broker's view of the job, never the target directly: a client
+    may reach only the broker. The result keeps the broker job id, and its
+    queue handle names the broker, which is where the job stays addressable.
+    A poll that fails, or a placed job whose target status is momentarily
+    unavailable, is retried on the next tick, as for a remote wait.
+    """
+    from vq.listing import queue_handle_without_spec
+
+    queue_handle = queue_handle_without_spec(jobid, broker_host)
+    deadline = (_now() + timeout) if timeout is not None else None
+    last_state: JobState | None = None
+    last_detail: str | None = None
+    while True:
+        try:
+            last_state, last_detail, result = _broker_poll(jobid, read_view(), queue_handle)
+            if result is not None:
+                return result
+        except BrokerViewUnavailable as e:
+            log.warning(
+                "wait: transient error polling broker job %s "
+                "(will retry in %.1fs): %s",
+                jobid, poll_interval, e,
+            )
+        if deadline is not None and _now() >= deadline:
+            raise WaitTimeout(jobid, last_state, last_detail, queue_handle)
+        _sleep(poll_interval)
+
+
 def wait_for_terminal(
     host: str,
     jobid: str,
@@ -546,7 +706,26 @@ def wait_for_terminal(
 
     ``multi_user`` (v0.6.40) is forwarded to the local path; the
     remote path polls ``vq status`` over SSH and is mode-agnostic
-    (the remote vq resolves its own state layout)."""
+    (the remote vq resolves its own state layout).
+
+    A broker job id (#64) is waited for through its broker: on the broker
+    itself from the local record, elsewhere over SSH to ``host``."""
+    from vq.broker_store import BROKER_JOB_ID_PATTERN
+
+    if BROKER_JOB_ID_PATTERN.fullmatch(jobid) is not None:
+        if is_local_host(host):
+            read_view = local_broker_view(jobid)
+        elif host_cfg is None:
+            raise ValueError(
+                f"wait_for_terminal(host={host!r}): host_cfg required for "
+                f"non-local host"
+            )
+        else:
+            read_view = remote_broker_view(host_cfg, jobid)
+        return wait_for_broker_job(
+            jobid, read_view, broker_host=host,
+            poll_interval=poll_interval, timeout=timeout,
+        )
     if is_local_host(host):
         return wait_for_terminal_local(
             jobid, poll_interval=poll_interval, timeout=timeout,

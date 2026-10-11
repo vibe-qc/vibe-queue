@@ -126,6 +126,31 @@
 </section>
 {% endif %}
 
+{% if preview and (preview.method or preview.formula or preview.name or preview.scf
+    or preview.error or preview.optimisation or preview.headline.total_energy is not none) %}
+<section class="preview">
+  <h3>calculation</h3>
+  <dl>
+    {% if preview.name or preview.formula %}<dt>system</dt><dd>{{ preview.name or "" }}{% if preview.name and preview.formula %} &middot; {% endif %}{{ preview.formula or "" }}{% if preview.atoms %} ({{ preview.atoms }} atoms{% if preview.periodic_dimensions %}, {{ preview.periodic_dimensions }}D periodic{% endif %}){% endif %}</dd>{% endif %}
+    {% if preview.method %}<dt>method</dt><dd>{{ preview.method }}{% if preview.basis %} / {{ preview.basis }}{% endif %}</dd>{% endif %}
+    {% if preview.headline.total_energy is not none %}<dt>total energy</dt><dd class="num">{{ "%.10f" | format(preview.headline.total_energy) }} Ha</dd>{% endif %}
+    {% if preview.headline.gap_ev is not none %}<dt>gap</dt><dd class="num">{{ "%.4f" | format(preview.headline.gap_ev) }} eV</dd>{% endif %}
+    {% if preview.scf %}<dt>SCF</dt><dd class="num">iteration {{ preview.scf[-1].iter }}, E = {{ "%.10f" | format(preview.scf[-1].energy) }} Ha, residual {{ "%.2e" | format(preview.scf[-1].residual) }}</dd>{% endif %}
+    {% if preview.scf_energies | length > 1 %}<dt>SCF solutions</dt><dd class="num">{{ preview.scf_energies | length }} (latest {{ "%.10f" | format(preview.scf_energies[-1]) }} Ha)</dd>{% endif %}
+    {% if preview.optimisation %}<dt>optimisation</dt><dd class="num">{{ preview.optimisation.iterations }} iterations, max|grad| {{ "%.2e" | format(preview.optimisation.max_gradient) }}, {{ "converged" if preview.optimisation.converged else "not converged" }}</dd>{% endif %}
+    {% if preview.error %}<dt>error</dt><dd>{{ preview.error }}</dd>{% endif %}
+  </dl>
+  {% if chart %}
+  <figure>
+    <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" width="{{ chart.width }}" height="{{ chart.height }}" role="img" aria-label="SCF residual per iteration, log scale">
+      <polyline fill="none" stroke="currentColor" stroke-width="1.5" points="{{ chart.points }}"/>
+    </svg>
+    <figcaption class="hint">log10 ||[F,DS]|| from {{ chart.log_top }} to {{ chart.log_bottom }}, iterations {{ chart.first_iter }}&ndash;{{ chart.last_iter }}</figcaption>
+  </figure>
+  {% endif %}
+</section>
+{% endif %}
+
 <section class="logs">
   <h3>stdout (tail)</h3>
   {% if s.stdout %}<pre>{{ s.stdout }}</pre>{% else %}<p class="empty">No stdout captured yet.</p>{% endif %}

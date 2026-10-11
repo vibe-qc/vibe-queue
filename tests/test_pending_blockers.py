@@ -182,7 +182,7 @@ def test_matching_scheduler_admin_update_marker_is_reported(
     from vq import admin
 
     admin.acquire_admin_update_marker(
-        envs=["scheduler-runtime:host_c:vibeqc-dev"],
+        envs=["scheduler:host_c"],
         host="host_c",
     )
     _cap(monkeypatch)
@@ -192,7 +192,7 @@ def test_matching_scheduler_admin_update_marker_is_reported(
 
     assert len(blockers) == 1
     assert "admin update is in progress" in blockers[0]
-    assert "scheduler-runtime:host_c:vibeqc-dev" in blockers[0]
+    assert "scheduler:host_c" in blockers[0]
 
 
 def test_unreadable_marker_keeps_mixed_registry_global(
@@ -266,7 +266,7 @@ def test_nonstring_marker_state_does_not_hide_an_applicable_hold(
     from vq import admin
 
     marker = admin.write_admin_update_marker(
-        envs=["scheduler-runtime:host_c:vibeqc-dev"],
+        envs=["scheduler:host_c"],
         host="host_c",
     )
     payload = asdict(marker)
@@ -334,15 +334,17 @@ def test_live_and_stale_durable_markers_are_both_reported(
         stale,
         path=admin.admin_update_marker_path(),
     )
-    admin.acquire_admin_update_marker(
+    live = admin.acquire_admin_update_marker(
         envs=["scheduler-runtime:host_c:vibe-view"],
         host="host_c",
     )
+    live.pause_token = "admin-update-live-receipt"
+    admin._write_admin_update_marker_atomic(live)
     monkeypatch.setattr(
         admin,
         "admin_update_marker_stale_reason",
         lambda marker: (
-            "the updater process is gone" if marker.pause_token else None
+            "the updater process is gone" if marker.pause_token == stale.pause_token else None
         ),
     )
     _cap(monkeypatch)

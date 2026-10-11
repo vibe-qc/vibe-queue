@@ -60,7 +60,9 @@ def test_long_poll_keeps_ssh_failure_reason_and_transport_contract(monkeypatch, 
     assert "Connection timed out during banner exchange" in diagnostic
     assert len(diagnostic) <= 240
     assert seen[0][0] is host and seen[0][1] == tuple(argv)
-    assert seen[0][2]["retry_transient"] == (2 if command == "qstat" else 0)
+    # Both dialects' coarse live poll is a replay-safe read and carries the same
+    # retry budget (#51); the bounded accounting query keeps its own.
+    assert seen[0][2]["retry_transient"] == (0 if command == "sacct" else 2)
     assert seen[0][2]["check"] is False
 
 

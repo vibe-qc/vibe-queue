@@ -26,6 +26,7 @@ from vq.report_paths import REPORT_DIRECTORY as REPORT_DIRECTORY
 from vq.report_paths import is_report_path as is_report_path
 from vq.report_paths import report_paths_for as report_paths_for
 from vq.report_paths import same_report as same_report
+from vq.source_projects import PIN_SOURCES, legacy_source
 
 REPORT_SCHEMA = "vq.fleet.release_report/3"
 """Schema newly generated reports carry.
@@ -42,7 +43,7 @@ LEGACY_REPORT_SCHEMAS = ("vq.fleet.release_report/2",)
 
 Reports already committed under ``/2`` stay deployable: a rollout that
 could not read its own history could not prove a supersession chain.
-``/2`` pins are read as monorepo pins -- see ``MONOREPO_PIN_SOURCE``.
+``/2`` pins are read as monorepo pins -- see ``source_projects.legacy_source``.
 """
 
 SUPPORTED_REPORT_SCHEMAS = (REPORT_SCHEMA, *LEGACY_REPORT_SCHEMAS)
@@ -57,26 +58,6 @@ Every component tags its release from its own mainline, so ``origin/main``
 is the one ref that means the same thing in all three repositories.
 """
 
-MONOREPO_PIN_SOURCE = ("mpei/vibeqc", 19)
-"""Where a ``/2`` pin came from: the pre-split monorepo, now the archive.
-
-A ``/2`` report carries no per-pin origin, so every pin in one is
-attributed here rather than guessed from the pin name. Project 19 is
-frozen; this is a statement about history, not a deploy target.
-"""
-
-PIN_SOURCES = {
-    "release": ("mpei/vibe-qc", 34),
-    "dev": ("mpei/vibe-qc", 34),
-    "vq": ("mpei/vibe-queue", 36),
-    "vibe_view": ("mpei/vibe-view", 35),
-}
-"""Repository each ``/3`` pin resolves in, after the 2026-09-08 split.
-
-``release`` and ``dev`` are two refs of one repository; ``vq`` and
-``vibe_view`` are separate projects. Path-based GitLab lookups 404 on
-this instance, so the numeric id -- not the slug -- is what callers use.
-"""
 def _detect_layout() -> tuple[Path, str]:
     """Return (repo root, repo-relative report directory) for this install.
 
@@ -323,7 +304,7 @@ def _pin_source(
     ``/3`` states this per pin. ``/2`` predates the split and states it
     nowhere, so its pins are attributed to the monorepo rather than
     guessed from the pin name -- a ``/2`` ``vq`` pin genuinely came from
-    project 19, not from the vibe-queue repository that did not yet exist.
+    the historical project, not from the vibe-queue repository that did not yet exist.
 
     A ``/3`` pin is required to carry both fields and to agree with
     ``PIN_SOURCES``. A report that named a different project for a pin
@@ -331,7 +312,7 @@ def _pin_source(
     does not exist or, worse, names an unrelated commit.
     """
     if schema in LEGACY_REPORT_SCHEMAS:
-        return MONOREPO_PIN_SOURCE
+        return legacy_source()
 
     expected_repo, expected_project_id = PIN_SOURCES[name]
     repo = pin_obj.get("repo")
@@ -559,7 +540,7 @@ def _repo_for_pin(
         # one beyond rollback -- without it the fleet cannot authenticate its
         # own history. Falls back to the runtime clone when unconfigured, so a
         # driver still on the monorepo behaves exactly as before.
-        legacy = pin_repos.get(MONOREPO_PIN_SOURCE[0])
+        legacy = pin_repos.get(legacy_source()[0])
         if legacy is None:
             from vq import config
 
@@ -1217,6 +1198,127 @@ def git_is_pin_ancestor(
         source_path=report.source_path,
     )
     return git_is_ancestor(repo, older, newer)
+
+
+@dataclass(frozen=True)
+class BranchHead:
+    """One branch head resolved in the checkout its report pin resolves in."""
+
+    pin_name: str
+    branch: str
+    sha: str
+    committed_at: int | None
+
+
+def pin_repo(
+    report: FleetReleaseReport,
+    pin_name: str,
+    runtime_repo_path: Path,
+    *,
+    pin_repos: Mapping[str, Path | str] | None = None,
+) -> Path:
+    """The checkout the named report pin's provenance is verified in."""
+    try:
+        pin = report.pins[pin_name]
+    except KeyError as exc:
+        raise FleetReleaseError(
+            f"{report.source_path}: unknown pin {pin_name!r}"
+        ) from exc
+    return _repo_for_pin(
+        pin,
+        schema=report.raw.get("schema"),
+        runtime_repo_path=runtime_repo_path,
+        pin_repos=resolve_pin_repos(pin_repos),
+        source_path=report.source_path,
+    )
+
+
+def git_commit_time(
+    repo: Path, sha: str, *, runner: Runner = subprocess.run,
+) -> int | None:
+    """Committer time of ``sha`` in ``repo``, or ``None`` when unresolvable."""
+    proc = runner(
+        ["git", "-C", str(repo), "show", "-s", "--format=%ct", f"{sha}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    value = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not value.isdigit():
+        return None
+    return int(value)
+
+
+def resolve_branch_heads(
+    report: FleetReleaseReport,
+    branches: Mapping[str, str],
+    runtime_repo_path: Path,
+    *,
+    pin_repos: Mapping[str, Path | str] | None = None,
+    runner: Runner = subprocess.run,
+) -> dict[str, BranchHead]:
+    """Fetch and resolve each tracked branch head, keyed by report pin name.
+
+    ``branches`` maps a report pin name to the branch its lanes follow. Each
+    branch is fetched into ``refs/remotes/origin/<branch>`` of the pin's own
+    checkout under that checkout's lifecycle fence, exactly as report
+    discovery refreshes ``main``; the fetch changes refs only. A failed fetch
+    is fatal rather than a fallback to a cached head. The head must descend
+    from the report pin: a tracked lane never moves behind what was released.
+    """
+    from vq import admin
+
+    repos = {
+        pin_name: pin_repo(report, pin_name, runtime_repo_path, pin_repos=pin_repos)
+        for pin_name in branches
+    }
+    sources = sorted({path.resolve() for path in repos.values()})
+    heads: dict[str, BranchHead] = {}
+    try:
+        resources = tuple(
+            ("checkout", str(admin._canonical_lifecycle_checkout(source)))
+            for source in sources
+        )
+        with admin.toolset_lifecycle_lock(
+            [], action="vq-tracking-fetch", extra_resources=resources,
+        ):
+            for pin_name, branch in sorted(branches.items()):
+                repo = repos[pin_name]
+                ref = f"refs/remotes/origin/{branch}"
+                try:
+                    _git(
+                        repo, "fetch", "--quiet", "--no-tags", "origin",
+                        f"+refs/heads/{branch}:{ref}", runner=runner,
+                    )
+                    sha = _git(
+                        repo, "rev-parse", "--verify", "--quiet",
+                        f"{ref}^{{commit}}", runner=runner,
+                    )
+                except (FleetReleaseError, OSError, subprocess.SubprocessError) as exc:
+                    raise FleetReleaseError(
+                        f"could not resolve tracked branch {branch!r} for pin "
+                        f"{pin_name!r} in {repo}: {exc}"
+                    ) from exc
+                sha = _require_sha(sha, field=f"tracked branch {branch} head")
+                pin_sha = report.pins[pin_name].sha
+                contains = git_is_ancestor(repo, pin_sha, sha, runner=runner)
+                if contains is not True:
+                    raise FleetReleaseError(
+                        f"tracked branch {branch!r} head {sha[:12]} does not "
+                        f"contain the report's {pin_name} pin {pin_sha[:12]}"
+                        + ("" if contains is False else " (ancestry unknown)")
+                        + "; a tracked lane never moves behind its pin"
+                    )
+                heads[pin_name] = BranchHead(
+                    pin_name=pin_name,
+                    branch=branch,
+                    sha=sha,
+                    committed_at=git_commit_time(repo, sha, runner=runner),
+                )
+    except admin.AdminError as exc:
+        raise FleetReleaseError(f"could not fence tracked branch fetch: {exc}") from exc
+    return heads
 
 
 def git_is_ancestor(
