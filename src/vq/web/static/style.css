@@ -256,16 +256,16 @@ td.jobid a, .jobid       { font-family: ui-monospace, "SF Mono", Menlo, monospac
   color: white;
   text-transform: uppercase;
 }
-.state-running       { background: var(--running); }
-.state-pending       { background: var(--pending); }
-.state-completed     { background: var(--completed); }
-.state-failed        { background: var(--failed); }
-.state-killed        { background: var(--killed); }
-.state-interrupted   { background: var(--interrupted); }
-.state-aborted_by_queue  { background: var(--aborted); }
-.state-oom_killed    { background: var(--watchdog); }
-.state-starved       { background: var(--watchdog); }
-.state-time_exceeded { background: var(--watchdog); }
+.state.state-running       { background: var(--running); }
+.state.state-pending       { background: var(--pending); }
+.state.state-completed     { background: var(--completed); }
+.state.state-failed        { background: var(--failed); }
+.state.state-killed        { background: var(--killed); }
+.state.state-interrupted   { background: var(--interrupted); }
+.state.state-aborted_by_queue  { background: var(--aborted); }
+.state.state-oom_killed    { background: var(--watchdog); }
+.state.state-starved       { background: var(--watchdog); }
+.state.state-time_exceeded { background: var(--watchdog); }
 
 dl.spec, .spec dl {
   display: grid;

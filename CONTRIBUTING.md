@@ -6,7 +6,7 @@ other command-line workload, onto a local machine, a remote host over SSH, or
 a cluster scheduler backend. It is useful on its own and does not build or
 install vibe-qc.
 
-The distribution is named `vq`; the repository is named `vibe-queue`.
+The distribution, like the repository, is named `vibe-queue`; the command and the import package are `vq`.
 
 ## Where to report what
 
@@ -63,7 +63,7 @@ need. `[dev]` adds ruff and mypy.
 
 ## Running the tests
 
-Run pytest from the repository root with this checkout's source first on the
+For a full validation run, invoke pytest from the repository root with this checkout's source first on the
 import path, and clear inherited pytest options so a parent shell cannot
 disable the nested conftest:
 
@@ -87,28 +87,13 @@ daemon or writing live state. If you find yourself reaching for
 For ordinary work, run the lanes your change touches and name them in the
 commit message.
 
-### Known-red lanes
+### Keep checks proportional
 
-**There are none, as of 2026-09-09.** The suite is fully green: 8309 passed,
-36 skipped, 0 failed locally, and green in CI on the v0.26.0 release
-candidate (pipeline 5084).
-
-Three lanes used to be listed here -- `test_scheduler_admin_update` (x2, CI),
-`test_admin_lifecycle_transaction` and `test_multi_user_refresh_helper` (x2,
-local). The first was retired by `670d255` / `dcd01dc`, which dropped a stale
-stage-prune contract; the other two pass on a clean run. They were carried as
-"known red" long enough that the label outlived the failures.
-
-So a red suite is now a real signal. If something fails, it is either yours or
-new -- do not assume it is background noise. Two things that look like
-failures but are not:
-
-* **Editing a source file while the suite runs.**
-  `test_read_vq_version_from_source_for_live_install` compares the *imported*
-  `vq.__version__` against a *fresh read* of `vq/__init__.py`, so bumping the
-  version mid-run reports genuine drift. It is doing its job.
-* **Two chats in one working tree.** A test file changing under a running
-  suite produces failures that vanish on re-run. Check `git status`.
+Run focused tests once for the changed behavior. Prefer an existing regression
+or one representative new case over another matrix. Do not expand a passing run
+without a concrete concern. Documentation-only edits need documentation/privacy
+checks, not runtime suites. Full validation is explicitly opt-in; see
+[testing policy](docs/testing.md).
 
 ## The daemon is stateful, and the tests know it
 
@@ -173,7 +158,7 @@ why in the commit message.
 - **Python 3.12+.** PEP 8, four-space indent. Start every module with
   `from __future__ import annotations`. Type hints on public API.
 - `ruff check src/vq tests` with the config in `pyproject.toml`, line length
-  100. CI runs it as a blocking job; keep the tree clean.
+  100. Run it on edited Python files; keep the tree clean.
 - `mypy` is configured `strict`. Not yet a CI gate; do not add new failures.
 - Prefer editing existing modules over introducing new ones. `src/vq/` is
   already wide; a new file needs a reason beyond "this felt separate".
@@ -193,11 +178,36 @@ why in the commit message.
 - Do not tag `vX.Y.Z` and do not push to `release`; releases are cut
   separately.
 
+## Changelog fragments
+
+`CHANGELOG.md` is written by the release cut, not by the change. For anything
+a user or an operator would notice, add one file under `changelog.d/`:
+
+```
+changelog.d/<issues>-<topic>.<kind>.md
+```
+
+`<issues>` is the tracker issue number (several joined with `-`, as in
+`77-79-readiness-uncertainty`), `<topic>` a short kebab-case name, and
+`<kind>` the Keep a Changelog section in lower case: `added`, `changed`,
+`deprecated`, `removed`, `fixed` or `security`. The file holds **one** entry
+as it will read under `[Unreleased]`: a bold lead sentence, the body, and the
+issue number at the end. Write it as prose, with no list marker and no
+heading; the fold adds the `- ` and indents the rest, so a nested list inside
+the entry is written flush left and comes out nested. A change that needs an
+entry in two sections writes two files.
+
+A fragment is a file of its own, so two changes landing at once never
+conflict on the ledger. `python scripts/fold_changelog.py --check` validates
+the names, and the test suite runs it; the release cut folds the fragments
+into `CHANGELOG.md` with the same script.
+
 ## Before you open a merge request
 
 - Run the affected lanes locally and name them.
 - Keep `main` release-ready: no half-finished code paths, docs in parity,
-  `CHANGELOG.md` `[Unreleased]` reflecting what you actually landed.
+  and a changelog fragment for anything a user or an operator would notice
+  (see "Changelog fragments").
 - **vq versions are load-bearing for the fleet.** Private operations storage
   holds fleet release reports and runtime pins reference them by version. A change to the
   version scheme, the report schema, or `vq --version` output is a
@@ -255,3 +265,12 @@ privacy tests load the same external policy when configured.
 Site wrappers and deployment configuration are maintained separately in private
 operations storage. Product changes must use portable examples and preserve the
 existing generic installation and configuration APIs.
+
+### CI test scope
+
+Development builds, ordinary MRs and pushes neither launch nor wait for CI.
+Manual, scheduled and API requests on development refs also create no pipeline.
+Run one bounded local check for the changed behavior. Release candidates always
+run the full suite, including web coverage; `release` builds docs for optional
+manual publication. Locally use `python scripts/run_ci_tests.py`, or pytest with
+explicit paths. See [testing policy](docs/testing.md).

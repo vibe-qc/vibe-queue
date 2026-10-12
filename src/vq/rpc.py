@@ -86,6 +86,11 @@ to reason about, no protocol state to track. Clients open + send
   memory ceilings. Open to any caller; these are operator-visible scheduling
   facts, not secrets.
 
+* ``get_admission_snapshot()`` *(#64)* — returns the main loop's latest
+  published admission facts (dispatch holds, caps, local usage including
+  orphans and surviving killed jobs, pending local jobs), or ``None``. Open
+  to any caller, read-only; ``vq broker capacity`` reads it.
+
 * ``set_throttle_state(state, token=None)`` *(v0.8.1)* — write a
   throttle state dict. ``state=None`` clears persistent throttle.
   Multi-user requires the admin token.
@@ -949,6 +954,25 @@ def register_set_admin_status_method(
                 )
         replace_record(env, record)
         return {"env": env, "ok": True}
+
+
+def register_get_admission_snapshot_method(
+    rpc: RPCServer,
+    read_snapshot: Callable[[], dict[str, Any] | None],
+) -> None:
+    """Expose the main loop's latest published admission snapshot (#64).
+
+    Read-only and open to any caller, like ``get_daemon_capacity``: the
+    values are operator-visible scheduling facts (holds, caps, usage, the
+    count of pending local jobs), never job content. The main loop publishes
+    one immutable dict per tick; this handler only returns that reference,
+    so it reads no state the loop is mutating. ``None`` means none yet.
+    """
+
+    @rpc.register("get_admission_snapshot")
+    def _get_admission_snapshot() -> dict[str, Any] | None:
+        snapshot = read_snapshot()
+        return dict(snapshot) if snapshot is not None else None
 
 
 def register_capacity_methods(rpc: RPCServer, advertised: Any) -> None:

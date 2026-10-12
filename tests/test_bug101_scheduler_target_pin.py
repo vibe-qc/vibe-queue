@@ -57,19 +57,21 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _registry_answers(monkeypatch: pytest.MonkeyPatch, binary: str) -> None:
-    """The target's helper reports one registered immutable wrapper."""
+    """A target helper with no default host reports its local wrapper (#172)."""
     import subprocess as _subprocess
 
     payload = json.dumps(
         [{"name": "vibeqc-release", "kind": "binary", "status": "OK",
           "binary": binary}]
     )
-    monkeypatch.setattr(
-        "vq.cli.transport.run_remote_vq",
-        lambda *a, **k: _subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=payload, stderr=""
-        ),
-    )
+    def helper(_host, *args, **kwargs):
+        if args != ("programs", "localhost", "--json"):
+            return _subprocess.CompletedProcess(
+                args=args, returncode=2, stdout="", stderr="HOST is required"
+            )
+        return _subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr("vq.cli.transport.run_remote_vq", helper)
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -264,6 +266,35 @@ def _submit_directory_unpinned(tmp_path: Path, target: str):  # type: ignore[no-
 
 def _queued_specs() -> list[JobSpec]:
     return [JobSpec.read(p) for p in sorted(paths.queue_dir().glob("*.json"))]
+
+
+@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_scheduler_only_registration_preserves_target_identity(
+    state_dir: Path, tmp_path: Path, verified: bool, matching: bool,
+) -> None:
+    _write_config(
+        state_dir / "cfg",
+        driver_program_block='[programs.vibeqc-release]\nkind = "scheduler"',
+    )
+    if verified:
+        _record_host_c_runtime()
+    result = _submit(tmp_path, "host_c", host_c_SHA if matching else "f" * 40)
+    if not verified or not matching:
+        assert result.exit_code != 0
+        assert not _queued_specs()
+        return
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    assert spec.command == [host_c_WRAPPER, "run.py"]
+    assert spec.program_runtime_pin is not None
+    assert spec.program_runtime_pin.expected_git_sha == host_c_SHA
+    assert spec.program_runtime_pin.scheduler_host == "host_c"
+    from vq.daemon import _program_runtime_pin_dispatch_resolution
+
+    resolution = _program_runtime_pin_dispatch_resolution(spec)
+    assert resolution.failure is None
+    assert resolution.resolved_git_sha == host_c_SHA
 
 
 def test_matching_target_sha_submits_despite_driver_drift(

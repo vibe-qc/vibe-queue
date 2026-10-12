@@ -1,6 +1,7 @@
 """Tests for v0.5.18 program registry + `vq programs` verb."""
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -12,6 +13,99 @@ from click.testing import CliRunner
 
 from vq import config, host_status, paths, transport
 from vq.cli import _program_requirement_failures, main
+
+
+@pytest.fixture(params=[("pbs", "torque"), ("slurm", "slurm")])
+def scheduler_registry(cfg_dir: Path, request: pytest.FixtureRequest) -> config.Config:
+    scheduler, dialect = request.param
+    (cfg_dir / "config.toml").write_text(
+        '[programs.orca]\nkind = "scheduler"\n'
+        '[programs.vibe-view]\nkind = "scheduler"\n'
+        '[hosts.cluster]\nssh = "cluster.invalid"\n'
+        f'scheduler = "{scheduler}"\nscheduler_dialect = "{dialect}"\n'
+        'scratch_root = "/scratch"\nscheduler_driver = "localhost"\n'
+        '[hosts.cluster.scheduler_program_hooks.orca]\n'
+        'command_wrapper = ["/opt/site/orca-wrapper"]\n'
+        '[hosts.cluster.scheduler_program_hooks.vibe-view]\n'
+        'command_wrapper = ["/opt/site/viewer-wrapper"]\n'
+    )
+    return config.load_config()
+
+
+def test_scheduler_registry_reports_no_local_installation(
+    scheduler_registry: config.Config,
+) -> None:
+    from vq import doctor
+
+    result = CliRunner().invoke(main, ["programs", "localhost", "--json"])
+    assert result.exit_code == 0, result.output
+    for record in json.loads(result.output):
+        assert record["kind"] == "scheduler"
+        assert record["status"] == "SCHEDULER_ONLY"
+        assert "python" not in record and "binary" not in record
+        assert "not probed" in record["reason"]
+    report = doctor.scheduler_program_hooks_check(
+        scheduler_registry, scheduler_registry.host("cluster"),
+    )
+    assert report["ok"], report
+    required = CliRunner().invoke(
+        main, ["programs", "localhost", "--require", "orca"],
+    )
+    assert required.exit_code != 0  # Registration is not local readiness.
+
+
+@pytest.mark.parametrize("program", ["orca", "vibe-view"])
+@pytest.mark.parametrize("target", ["localhost", "cluster", "hidden"])
+def test_scheduler_registry_submit_boundary(
+    scheduler_registry: config.Config, cfg_dir: Path, target: str, program: str,
+) -> None:
+    from vq.spec import JobSpec
+
+    payload = cfg_dir / "payload"
+    payload.mkdir()
+    (payload / "input.inp").write_text("test input\n")
+    argv = ["submit", "localhost" if target == "hidden" else target]
+    if target == "hidden":
+        argv += ["--scheduler-target", "cluster"]
+    result = CliRunner().invoke(
+        main, [*argv, "--program", program, "-d", str(payload), "--", "echo", "input.inp"],
+    )
+    specs = list((cfg_dir.parent / "state" / "queue").glob("*.json"))
+    if target == "localhost":
+        assert result.exit_code != 0
+        assert "scheduler-only" in result.output
+        assert not specs
+    else:
+        assert result.exit_code == 0, result.output
+        assert len(specs) == 1
+        spec = JobSpec.read(specs[0])
+        assert spec.program == program
+        assert spec.scheduler_target == "cluster"
+        assert spec.command == ["echo", "input.inp"]
+        assert spec.program_runtime_pin is None
+        from vq.scheduler_dispatch import scheduler_dispatcher_for
+
+        dispatcher = scheduler_dispatcher_for(scheduler_registry.host("cluster"))
+        script = dispatcher.build_job_script(
+            job_id=spec.id, command=spec.command,
+            remote_workspace=dispatcher.remote_workspace(spec.id),
+            cpus=spec.cpus, program=spec.program,
+        )
+        wrapper = scheduler_registry.host("cluster").scheduler_program_hooks[program]
+        assert f"-- {wrapper.command_wrapper[0]} echo input.inp" in script
+
+
+def test_scheduler_registry_rechecks_local_dispatch(
+    scheduler_registry: config.Config, tmp_path: Path,
+) -> None:
+    from vq.daemon import _program_runtime_pin_dispatch_failure
+    from vq.spec import JobSpec
+
+    spec = JobSpec(id="abcdef123456", command=["echo", "test"], cwd=str(tmp_path),
+                   cpus=1, program="orca")
+    assert "scheduler-only" in (_program_runtime_pin_dispatch_failure(spec) or "")
+    spec.scheduler_target = "cluster"
+    assert _program_runtime_pin_dispatch_failure(spec) is None
 
 
 @pytest.fixture
@@ -1870,6 +1964,44 @@ class TestProgramsJsonOutput:
         assert rec["current_git_dirty"] is None
         # binary field absent on venv kind
         assert "binary" not in rec
+
+    def test_venv_program_record_exposes_the_build_route_fields(
+        self, cfg_dir: Path, tmp_path: Path
+    ) -> None:
+        """`install_script` and `extras` are in the audit output (#84).
+
+        `install_script` became a load-bearing build route when a provision
+        started applying a declared `extras` floor, and `extras` says what the
+        venv is *for*. An operator debugging a venv missing its declared
+        runtime reaches for `vq programs --json`, and neither field was there:
+        the listing showed `update_script` alone, which is the one route that
+        program might not have.
+        """
+        import json as _json
+        venv_py = tmp_path / "venv" / "bin" / "python"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("#!/bin/sh\n")
+        venv_py.chmod(0o755)
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (cfg_dir / "config.toml").write_text(
+            'default_host = "localhost"\n'
+            "[programs.console]\n"
+            'kind = "venv"\n'
+            f'python = "{venv_py}"\n'
+            f'git_dir = "{repo}"\n'
+            'install_script = "scripts/install.sh --editable"\n'
+            'extras = ["web"]\n'
+        )
+
+        result = CliRunner().invoke(main, ["programs", "localhost", "--json"])
+
+        assert result.exit_code == 0, result.output
+        rec = _json.loads(result.output)[0]
+        assert rec["install_script"] == "scripts/install.sh --editable"
+        assert rec["extras"] == ["web"]
+        # The shape this program has: one build route, and it fires once.
+        assert rec["update_script"] is None
 
     def test_venv_program_record_exposes_runtime_identity(
         self, cfg_dir: Path, tmp_path: Path

@@ -26,6 +26,7 @@ import contextlib
 import logging
 import math
 import os
+import re
 import selectors
 import shlex
 import signal
@@ -56,6 +57,9 @@ DEFAULT_REMOTE_VQ_TIMEOUT_SECONDS = 600.0
 # Keep ten minutes beyond the default four-hour update_script cap for git,
 # process-group cleanup, activation, verification, and daemon restart work.
 DEFAULT_REMOTE_ADMIN_UPDATE_TIMEOUT_SECONDS = 15000.0
+
+_FORWARDED_BUILD_PARALLELISM = "CMAKE_BUILD_PARALLEL_LEVEL"
+"""The one non-timeout name a remote admin update may carry (#133)."""
 
 _REMOTE_ADMIN_TIMEOUT_ENV_RULES = {
     "VQ_UPDATE_SCRIPT_TIMEOUT": False,
@@ -515,10 +519,11 @@ def _remote_admin_timeout_env_prefix(
     """
     expected = set(_REMOTE_ADMIN_TIMEOUT_ENV_RULES)
     actual = set(remote_env)
-    if actual != expected:
+    if actual - {_FORWARDED_BUILD_PARALLELISM} != expected:
         raise ValueError(
             "remote admin timeout environment must contain exactly "
-            f"{sorted(expected)!r}"
+            f"{sorted(expected)!r}, plus optionally "
+            f"{_FORWARDED_BUILD_PARALLELISM!r}"
         )
 
     canonical: dict[str, str] = {}
@@ -540,6 +545,15 @@ def _remote_admin_timeout_env_prefix(
                 f"{name} value"
             )
         canonical[name] = str(value)
+    if _FORWARDED_BUILD_PARALLELISM in remote_env:
+        # #133: an operator's cap set on the driver; ssh would not carry it.
+        level = remote_env[_FORWARDED_BUILD_PARALLELISM]
+        if not isinstance(level, str) or re.fullmatch(r"[1-9][0-9]{0,3}", level) is None:
+            raise ValueError(
+                "remote admin timeout environment contains an invalid "
+                f"{_FORWARDED_BUILD_PARALLELISM} value"
+            )
+        canonical[_FORWARDED_BUILD_PARALLELISM] = level
 
     return [
         "/usr/bin/env",
@@ -898,6 +912,11 @@ def run_remote_shell(
     remote ``cat > <path>`` (or ``qsub`` reading the script on stdin)
     without materialising a local temp file or quoting a multi-line
     script through the argv.
+
+    ``retry_transient`` opts into replay after exit 255 or timeout. Callers
+    must establish that their command is replay-safe (for example, a read-only
+    probe); ambiguous mutations keep the default zero retries. Each retry
+    bypasses SSH multiplexing without changing or retiring the shared master.
     """
     if retry_transient < 0:
         raise ValueError("retry_transient must be >= 0")
@@ -906,9 +925,9 @@ def run_remote_shell(
     ):
         raise ValueError("bounded remote-shell output requires owned_process_group")
     remote_cmd = shlex.join(shell_args)
-    cmd = [*_ssh_base(host_cfg), remote_cmd]
-    log.debug("run_remote_shell: %s", shlex.join(cmd))
     for attempt in range(retry_transient + 1):
+        cmd = [*_ssh_base(host_cfg, fresh_connection=attempt > 0), remote_cmd]
+        log.debug("run_remote_shell: %s", shlex.join(cmd))
         try:
             if owned_process_group:
                 if timeout is None:
@@ -939,6 +958,11 @@ def run_remote_shell(
                 )
         except subprocess.TimeoutExpired as e:
             if attempt < retry_transient:
+                log.warning(
+                    "run_remote_shell: timeout after %ss on %s; retrying %d/%d "
+                    "on a fresh connection",
+                    timeout, host_cfg.ssh, attempt + 1, retry_transient,
+                )
                 time.sleep(_SSH_RETRY_BACKOFF_SECONDS * (attempt + 1))
                 continue
             raise RemoteOutcomeUnknown(
@@ -968,9 +992,11 @@ def run_remote_shell(
                 f"local ssh observer failed for {host_cfg.ssh}: {e}"
             ) from e
         if proc.returncode == 255 and attempt < retry_transient:
-            log.debug(
-                "run_remote_shell: transient ssh exit 255 on %s (retry %d/%d)",
+            log.warning(
+                "run_remote_shell: ssh exit 255 on %s (%s); retrying %d/%d "
+                "on a fresh connection",
                 host_cfg.ssh,
+                proc.stderr.strip() or "no stderr",
                 attempt + 1,
                 retry_transient,
             )

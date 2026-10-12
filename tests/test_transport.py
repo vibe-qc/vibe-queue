@@ -450,6 +450,73 @@ class TestRunRemoteVQ:
 
         assert captured == []
 
+    def test_a_forwarded_build_parallelism_reaches_the_remote_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#133: the driver's CMAKE_BUILD_PARALLEL_LEVEL crosses ssh as env."""
+        cfg = HostConfig(ssh="x", remote_vq="vq")
+        captured: list[list[str]] = []
+        monkeypatch.setattr(transport.subprocess, "run", _fake_run_factory(captured))
+        transport.run_remote_vq(
+            cfg, "admin", "update", "vibeqc-dev", "localhost",
+            remote_env={
+                "VQ_UPDATE_SCRIPT_TIMEOUT": "7200.0",
+                "VQ_BUILD_STALL_TIMEOUT": "0.0",
+                "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+            },
+        )
+        assert shlex.split(captured[0][-1])[:4] == [
+            "/usr/bin/env",
+            "CMAKE_BUILD_PARALLEL_LEVEL=2",
+            "VQ_BUILD_STALL_TIMEOUT=0.0",
+            "VQ_UPDATE_SCRIPT_TIMEOUT=7200.0",
+        ]
+
+    @pytest.mark.parametrize("level", ["0", "two", "2; rm -rf x", "2.5", 2])
+    def test_a_malformed_forwarded_build_parallelism_is_refused(
+        self, host_cfg: HostConfig, monkeypatch: pytest.MonkeyPatch, level: object,
+    ) -> None:
+        captured: list[list[str]] = []
+        monkeypatch.setattr(transport.subprocess, "run", _fake_run_factory(captured))
+        with pytest.raises(ValueError, match="CMAKE_BUILD_PARALLEL_LEVEL"):
+            transport.run_remote_vq(
+                host_cfg, "admin", "update", "vibeqc-dev", "localhost",
+                remote_env={
+                    "VQ_UPDATE_SCRIPT_TIMEOUT": "7200",
+                    "VQ_BUILD_STALL_TIMEOUT": "900",
+                    "CMAKE_BUILD_PARALLEL_LEVEL": level,
+                },
+            )
+        assert captured == []
+
+    def test_the_remote_process_observes_the_forwarded_level(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through the real env prefix and a real shell."""
+        monkeypatch.setattr(transport, "_ssh_base", lambda _host_cfg: ["/bin/sh", "-c"])
+        cfg = HostConfig(ssh="remote", remote_vq=sys.executable)
+        proc = transport.run_remote_vq(
+            cfg, "-c", "import os; print(os.getenv('CMAKE_BUILD_PARALLEL_LEVEL'))",
+            remote_env={
+                "VQ_UPDATE_SCRIPT_TIMEOUT": "7200.0",
+                "VQ_BUILD_STALL_TIMEOUT": "0.0",
+                "CMAKE_BUILD_PARALLEL_LEVEL": "2",
+            },
+        )
+        assert proc.stdout.strip() == "2"
+
+    def test_the_cli_forwarded_environment_passes_the_transport_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#133 regression: the CLI built a dict the transport then refused."""
+        from vq import cli
+
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "2")
+        prefix = transport._remote_admin_timeout_env_prefix(
+            cli._remote_admin_update_environment()
+        )
+        assert "CMAKE_BUILD_PARALLEL_LEVEL=2" in prefix
+
     def test_non_zero_exit_raises_remote_error_with_stderr(
         self, host_cfg: HostConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -618,14 +685,32 @@ class TestRunRemoteShell:
     def test_ssh_255_is_outcome_unknown_when_checking_mutation(
         self, host_cfg: HostConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        captured = []
         monkeypatch.setattr(
             transport.subprocess,
             "run",
-            _fake_run_factory([], returncode=255, stderr="connection lost"),
+            _fake_run_factory(captured, returncode=255, stderr="connection lost"),
         )
 
         with pytest.raises(transport.RemoteOutcomeUnknown, match="exit 255"):
             transport.run_remote_shell(host_cfg, "mutate")
+        assert len(captured) == 1
+        assert "ControlPath=none" not in captured[0]
+
+    def test_fresh_connection_retries_remain_bounded(
+        self, host_cfg: HostConfig, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured = []
+        monkeypatch.setattr(
+            transport.subprocess, "run",
+            _fake_run_factory(captured, returncode=255, stderr="still unreachable"),
+        )
+        monkeypatch.setattr(transport.time, "sleep", lambda _seconds: None)
+        with pytest.raises(transport.RemoteOutcomeUnknown, match="still unreachable"):
+            transport.run_remote_shell(host_cfg, "read-only-probe", retry_transient=1)
+        assert len(captured) == 2
+        assert "ControlPath=none" not in captured[0]
+        assert "ControlPath=none" in captured[1]
 
     def test_retries_transient_ssh_exit_255(
         self, host_cfg: HostConfig, monkeypatch: pytest.MonkeyPatch
@@ -1072,7 +1157,7 @@ class TestOwnedSubprocessTimeout:
                     pytest.fail(f"process-tree fixture exited early: {proc.communicate()}")
                 if time.monotonic() >= deadline:
                     os.killpg(proc.pid, signal.SIGKILL)
-                    proc.communicate(timeout=1.0)
+                    proc.communicate(timeout=_LIVENESS_SECONDS)
                     pytest.fail("process-tree fixture never became ready")
                 time.sleep(0.01)
             ready_at.append(time.monotonic())
@@ -1283,7 +1368,7 @@ class TestOwnedSubprocessTimeout:
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=_LIVENESS_SECONDS)
 
 
 def _process_exists(pid: int) -> bool:

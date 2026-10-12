@@ -292,6 +292,7 @@ def test_fleet_query_row_filter_and_projection_contract() -> None:
     assert query == {
         "host": "host_a",
         "state": "running",
+        "program": "all",
         "tag": "chemistry",
         "submitter": "alice",
         "q": "WATER",
@@ -308,7 +309,11 @@ def test_fleet_query_row_filter_and_projection_contract() -> None:
     assert view_context.fleet_row_matches(
         {**row, "queue_host": "host_f"}, query
     ) is False
-    assert view_context.fleet_row_view(row) == {
+    view = view_context.fleet_row_view(row)
+    # #168's calculation columns have their own tests; here only that the
+    # row carries them. No scheduler target, so its raw state decides.
+    assert view.pop("calc")["activity"] == "running"
+    assert view == {
         "id": "job-a",
         "host": "host_a",
         "state": "running",
@@ -356,6 +361,7 @@ def test_fleet_snapshot_context_contract() -> None:
     assert context["query"] == {
         "host": "all",
         "state": "all",
+        "program": "all",
         "tag": "",
         "submitter": "",
         "q": "",

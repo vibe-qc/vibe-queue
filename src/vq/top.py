@@ -53,6 +53,9 @@ class TopRow:
     wall_time_seconds: int | None
     wall_percent: float | None
     sample_stale: bool
+    #: The latest sample's own ``ts``, so a consumer that renders it later
+    #: (the fleet console) can state its age instead of implying it is live.
+    sample_at: str | None = None
 
 
 def _read_latest_sample(workspace: Path) -> dict | None:
@@ -86,7 +89,7 @@ def _parse_iso(ts: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
-def _sample_nonnegative_float(value: object) -> float | None:
+def sample_nonnegative_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -118,13 +121,15 @@ def gather_top_rows(
         cpu_percent: float | None = None
         rss_mb: float | None = None
         sample_stale = False
+        sample_at: str | None = None
         if sample is not None:
-            cpu_percent = _sample_nonnegative_float(sample.get("cpu_percent"))
-            rss_mb = _sample_nonnegative_float(sample.get("rss_mb"))
+            cpu_percent = sample_nonnegative_float(sample.get("cpu_percent"))
+            rss_mb = sample_nonnegative_float(sample.get("rss_mb"))
             sample_dt = _parse_iso(sample.get("ts"))
             if sample_dt is not None:
                 age = (now - sample_dt).total_seconds()
                 sample_stale = age > _STALE_SAMPLE_SECONDS
+                sample_at = sample_dt.isoformat()
         started = _parse_iso(spec.started_at)
         elapsed = (now - started).total_seconds() if started is not None else None
         active_elapsed = (
@@ -161,6 +166,7 @@ def gather_top_rows(
                 wall_time_seconds=spec.wall_time_seconds,
                 wall_percent=wall_percent,
                 sample_stale=sample_stale,
+                sample_at=sample_at,
             )
         )
     rows.sort(key=lambda r: (r.cpu_percent if r.cpu_percent is not None else -1.0), reverse=True)
@@ -240,29 +246,29 @@ def format_top_table(rows: list[TopRow]) -> str:
     return "\n".join(lines)
 
 
+def top_row_payload(r: TopRow) -> dict[str, object]:
+    """One row of `vq top --json`; also what the fleet console stores."""
+    return {
+        "jobid": r.jobid,
+        "name": r.name,
+        "queue_handle": r.queue_handle,
+        "cpus": r.cpus,
+        "cpu_percent": r.cpu_percent,
+        "rss_mb": r.rss_mb,
+        "mem_mb": r.mem_mb,
+        "mem_percent": r.mem_percent,
+        "active_elapsed_seconds": r.active_elapsed_seconds,
+        "elapsed_seconds": r.elapsed_seconds,
+        "wall_time_seconds": r.wall_time_seconds,
+        "wall_percent": r.wall_percent,
+        "sample_stale": r.sample_stale,
+        "sample_at": r.sample_at,
+    }
+
+
 def format_top_json(rows: list[TopRow]) -> str:
     """Render rows as a JSON array, for `vq top --json` (dashboards / scripts)."""
-    return json.dumps(
-        [
-            {
-                "jobid": r.jobid,
-                "name": r.name,
-                "queue_handle": r.queue_handle,
-                "cpus": r.cpus,
-                "cpu_percent": r.cpu_percent,
-                "rss_mb": r.rss_mb,
-                "mem_mb": r.mem_mb,
-                "mem_percent": r.mem_percent,
-                "active_elapsed_seconds": r.active_elapsed_seconds,
-                "elapsed_seconds": r.elapsed_seconds,
-                "wall_time_seconds": r.wall_time_seconds,
-                "wall_percent": r.wall_percent,
-                "sample_stale": r.sample_stale,
-            }
-            for r in rows
-        ],
-        indent=2,
-    )
+    return json.dumps([top_row_payload(r) for r in rows], indent=2)
 
 
 def show_top_local(

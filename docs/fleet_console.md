@@ -1,5 +1,7 @@
 # The vq fleet console
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 A read-only web dashboard for a vq fleet: one card per configured host,
 a cross-host job table, and a doctor board. It runs on one machine -- the
 *coordinator* -- and reaches the rest of the fleet over the SSH you have
@@ -8,7 +10,7 @@ port anywhere but the coordinator.
 
 This page is for someone setting it up on **their own** fleet. If you
 want to know how the console is put together, see
-[`fleet_dashboard_design.md`](fleet_dashboard_design.md).
+[`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md).
 
 ---
 
@@ -17,11 +19,12 @@ want to know how the console is put together, see
 | | |
 |---|---|
 | `/fleet` | One card per configured host: daemon health, queue counts, CPU and memory, deployed program versions, and the machine's own name for itself. Plus a fleet roll-up -- how many hosts, how many running, how many unreachable, and **how many distinct vq versions**, which is the number you watch during a rolling update. |
-| `/fleet/jobs` | Every job on every host in one filterable, sortable table. |
-| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve -- fetched live, not from the cached snapshot. |
+| `/fleet/jobs` | Every job on every host in one filterable, sortable table, read as a calculation overview: running jobs first, how long each has run and waited, declared versus measured CPU and memory, where it executes, its program version, and how fresh each measurement is. Totals above the table keep allocation and measurement apart and say when they are partial. |
+| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve -- fetched live, not from the cached snapshot. For vibe-qc and ORCA jobs, a "calculation" section: system, method/basis, energies, optimisation state and an SCF convergence plot, parsed from the same output tail. |
 | `/fleet/doctor` | `vq doctor` across the fleet, on demand. |
 | `/fleet/audit` | Who did what through the console (admins only). |
 | `/api/v1/fleet` | The whole snapshot as JSON. |
+| `/api/v1/fleet/jobs/<id>/preview?host=H` | A calculation preview parsed from the job's stdout tail: formula, method/basis, the latest SCF series, per-step energies, total energy and gap, optimisation summary, fatal error. vibe-qc and ORCA jobs; `preview` is `null` for other programs. The job's stdout is read, except that an ORCA job run through `contrib/run-orca.sh` is read from the one output file the wrapper writes (its output argument, or `<input>.out`); `source` in the response names which. |
 
 The host grid is served from a snapshot that a background thread
 refreshes on a timer (30 s by default). The job drill-down is not -- it
@@ -140,6 +143,17 @@ be owned by the console account and mode 0700; the database must be an owned
 regular file at mode 0600. Both are created automatically. All workers of one
 console must use the same local configuration directory. Separate replicas
 with separate disks do not share revocation or login budgets.
+
+SQLite serializes writers, so on a busy console the workers contend for the
+store: they are separate processes, and the most contended moment is several of
+them racing to create the store's tables on first use. A statement waits up to
+**15 seconds** for another worker before giving up with `database is locked`.
+That budget was 2 seconds, which a loaded CI runner exceeded, failing a request
+that would have succeeded a moment later. Raising it costs latency only while
+the lock is actually held, and the work runs in a worker thread rather than on
+the event loop. A store that is genuinely wedged still surfaces an error rather
+than hanging. `scripts/measure_session_lock_budget.py` measures what a given
+host needs if the default ever has to be revisited.
 
 Upgrading from stateless sessions signs every browser out once. Log in again;
 the existing account format remains valid. Login and account creation limit
@@ -288,6 +302,14 @@ loopback, do **both** of:
 `--i-understand-public-bind` or set `public_bind_ack = true`. The
 warning is about exposure, not about the bind being unsupported.
 
+**To show fleet status to the public, do not bind the console publicly.**
+Write a static snapshot with `vq web public-snapshot --out DIR`, and serve
+`DIR` from a separate unprivileged account. Only hosts you give a public
+display name appear, and only calculations submitted with a `public.<alias>`
+tag. The console stays on loopback. See
+[`web.md`, "Public fleet snapshot (#66)"](web.md#public-fleet-snapshot-66)
+and the [operator deployment runbook](public_snapshot_deployment.md).
+
 ---
 
 ## Keeping it current
@@ -370,6 +392,48 @@ every 10 s regardless, so it keeps animating even when the background
 sweep has died -- age is the only honest signal. The threshold follows
 your configured interval.
 
+## Reading the jobs table
+
+`/fleet/jobs` answers which calculations run where, for how long, and with
+what resources. Three kinds of value never share a cell: what a job
+**declared** (`cpus`, `mem MB`, its time limit), what was **measured**, and
+what is **unknown**. A missing measurement shows `-` with the reason in the
+sample column; it is never a zero and never the declared value.
+
+| Column | Meaning |
+|---|---|
+| runtime | Execution time. A direct job: since dispatch, minus paused time; the final duration once finished. A scheduler job: the walltime the scheduler reported, unknown until it reports one, because vq's start time for it is the hand-off to the scheduler and can include the cluster's queue wait. After a `/` the limit: the scheduler's, else the declared `wall_time_seconds`. |
+| wait | Queue wait, never counted as runtime. `waiting` and growing while the job is queued; submission to dispatch for a started direct job; unknown for a started scheduler job, whose wait inside the cluster queue is not recorded. |
+| cpus / cpu used | Declared cpus, then measured core-equivalents: the job's whole process group CPU% over the last watchdog interval, divided by 100. An 8-core job at full use reads about 8. |
+| mem MB / rss MB | Declared memory limit, then the resident memory of the job's processes in the latest watchdog sample. |
+| nodes | Where it executes: a direct job's host, or the compute node(s) the scheduler reported (unknown until it starts). `via` names the scheduler driver that owns the job, which is not where it runs. |
+| software | The program, with its recorded version or build when the job pinned one. |
+| sample | The measurement's age, or why there is none: `stale` (over 30 s old when collected), `no sample` (none yet, or the host cannot sample, e.g. no `/proc`), `not sampled` (scheduler jobs; their accounting arrives with the results), `collector error`, `unknown` (an older snapshot without measurements). |
+
+Default order is running jobs first, then live scheduler jobs whose phase is
+unconfirmed, then held or paused, then queued, then finished; newest first
+within each. A scheduler job vq has handed off but the cluster still queues
+counts as queued, not running. Filters (host, state, program, tag,
+submitter, text) and sorting are in the URL, so they survive the refresh.
+
+The totals cover every job matching the filters, not just the visible
+page. Allocated sums what running jobs declared. Used sums only fresh
+samples, marked `*` and itemised when some running job contributed none.
+RSS totals add each job's resident memory, so pages shared between jobs
+count once per job. GPUs are not shown: vq records no GPU allocation and
+has no GPU collector yet.
+
+A red banner names each host whose queue could not be read this sweep. Its
+jobs are missing from the table and every total until a sweep reads it
+again. An amber banner names a driver whose resource samples could not be
+read; its jobs are listed with `collector error`.
+
+Measurements come from the same rows as `vq top --json`, read once per
+driver per sweep, and only from a driver that runs a direct job: locally on
+the console host, `vq top localhost --json` over SSH elsewhere. There is no
+request per job. The watchdog samples about every 5 s on the daemon host;
+the displayed age is relative to the page render, not to the sweep.
+
 ---
 
 ## Troubleshooting
@@ -433,8 +497,8 @@ was installed by hand, before `vq web install` existed. Re-run
 
 ## See also
 
-* [`fleet_dashboard_design.md`](fleet_dashboard_design.md) -- architecture and milestones.
-* [`web.md`](web.md) -- the single-host dashboard.
+* [`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md) -- what a console must preserve.
+* [`web.md`](web.md) -- the single-host dashboard, and the public fleet snapshot.
 * [`hosts.md`](hosts.md) -- configuring the fleet the console displays.
 * [`operations.md`](operations.md) -- day-to-day fleet operation.
 

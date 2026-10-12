@@ -93,21 +93,30 @@ class TestPaths:
     def test_single_user_workdir_layout(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # #63: under the scratch root, not the state root.
         monkeypatch.setenv(paths.ENV_STATE_DIR, str(tmp_path / "state"))
-        assert paths.workdir_root() == tmp_path / "state" / "workdirs"
+        monkeypatch.setenv(paths.ENV_SCRATCH_DIR, str(tmp_path / "scratch"))
+        assert paths.workdir_root() == tmp_path / "scratch" / "workdirs"
         assert paths.workdir_for("abc123") == (
-            tmp_path / "state" / "workdirs" / "abc123"
+            tmp_path / "scratch" / "workdirs" / "abc123"
         )
+        assert paths.state_workdir_root() == tmp_path / "state" / "workdirs"
 
     def test_multi_user_workdir_layout(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(tmp_path / "mu"))
+        monkeypatch.setenv(
+            paths.ENV_MULTI_USER_SCRATCH_ROOT, str(tmp_path / "mu-scratch")
+        )
         assert paths.user_workdir_root(1000) == (
-            tmp_path / "mu" / "users" / "1000" / "workdirs"
+            tmp_path / "mu-scratch" / "users" / "1000" / "workdirs"
         )
         assert paths.user_workdir(1000, "abc123") == (
-            tmp_path / "mu" / "users" / "1000" / "workdirs" / "abc123"
+            tmp_path / "mu-scratch" / "users" / "1000" / "workdirs" / "abc123"
+        )
+        assert paths.user_state_workdir_root(1000) == (
+            tmp_path / "mu" / "users" / "1000" / "workdirs"
         )
 
 
@@ -158,7 +167,7 @@ class TestDaemonDispatch:
         captured: dict[str, object] = {}
 
         class FakePopen:
-            def __init__(self, *args, **kwargs):  # noqa: ANN
+            def __init__(self, *args, **kwargs):
                 captured["kwargs"] = kwargs
                 self.pid = 12345
 

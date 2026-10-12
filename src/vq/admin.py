@@ -34,6 +34,7 @@ import base64
 import binascii
 import codecs
 import contextlib
+import contextvars
 import copy
 import fcntl
 import hashlib
@@ -48,6 +49,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -58,15 +60,19 @@ import time
 import uuid
 import zipfile
 import zipimport
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import NoReturn
 from urllib.parse import unquote, urlsplit
 
 from vq import (
+    DISTRIBUTION_NAME,
+    LEGACY_DISTRIBUTION_NAME,
     admin_detached,
+    bulk_delete,
     config,
     drain,
     fleet_operation,
@@ -254,6 +260,21 @@ _SCHEDULER_STAGE_GENERATION_RE = re.compile(
     r"[0-9a-fA-F]{40}-[0-9a-fA-F]{32}"
 )
 SCHEDULER_STAGE_GENERATIONS_TO_KEEP = 5
+
+RUNTIME_SOURCE_STAGES_TO_KEEP = 3
+"""How many runtime-source upload stages a program keeps on a build host.
+
+Unlike a helper staging generation, one of these belongs to exactly one deploy:
+the driver re-archives the exact SHA from git on demand, and nothing reads a
+stage once the build has consumed it. So a successful deploy reclaims its own,
+and this bounds what failed deploys leave behind for forensics. Before #61 a
+slurm host held 235 of them, 26 GB, one per deploy since July, and the home
+they share went over quota.
+
+This is NOT the retention rule for ``STAGE_ROOT/generations`` helper stages,
+which stay: another deployment, possibly on another host, may still be using an
+older one. See docs/operations.md, "Managed helper updates retain staging
+generations"."""
 
 
 def source_sha_marker_path() -> Path:
@@ -803,13 +824,16 @@ def update_remote_managed_env_with_driver_runtime(
     supplies vq. Ordinary update owns service, checkout and receipt transitions.
     A lost observer never retries the mutation or removes its executing code.
     """
+    # Name the command the operator actually ran (#123): the bootstrap shares
+    # these checks but has no --with-driver-runtime flag.
+    label = "bootstrap-self-update" if self_update else "--with-driver-runtime"
     try:
         host_cfg = cfg.host(host)
     except config.ConfigError as exc:
         raise AdminError(str(exc)) from exc
     if not posixpath.isabs(host_cfg.remote_vq):
         raise AdminError(
-            "--with-driver-runtime requires an absolute configured remote_vq "
+            f"{label} requires an absolute configured remote_vq "
             "path so the old interpreter identity is explicit"
         )
     # Snapshot routing and credential selection before any transport. A caller
@@ -824,9 +848,13 @@ def update_remote_managed_env_with_driver_runtime(
     from .host import is_local_host
 
     if is_local_host(host) or is_local_host(host_cfg.ssh):
-        raise AdminError("--with-driver-runtime requires a non-local direct host")
+        raise AdminError(f"{label} requires a non-local direct host")
     if host_cfg.scheduler != "local":
-        raise AdminError("--with-driver-runtime is not a scheduler-runtime update")
+        raise AdminError(
+            f"{label} requires a direct host with scheduler = \"local\""
+            if self_update
+            else f"{label} is not a scheduler-runtime update"
+        )
     if self_update and (
         env != "vibeqc-queue" or expected_tag is not None
         or update_script_args or show_output
@@ -837,19 +865,24 @@ def update_remote_managed_env_with_driver_runtime(
         if not self_update and (driver == host or (
             driver in cfg.hosts and cfg.hosts[driver].ssh == host_cfg.ssh
         )):
-            raise AdminError("--with-driver-runtime refuses a scheduler_driver")
+            raise AdminError(f"{label} refuses a scheduler_driver")
     if host_cfg.fleet_role in {"alias", "excluded"}:
-        raise AdminError("--with-driver-runtime requires a canonical admitted host")
+        raise AdminError(f"{label} requires a canonical admitted host")
     if host_cfg.fleet_role == "vq-only" and env != "vibeqc-queue":
         raise AdminError("a vq-only host may update only vibeqc-queue")
     if not env or env.startswith("-"):
-        raise AdminError("--with-driver-runtime requires one managed environment")
+        raise AdminError(f"{label} requires one managed environment")
     if type(expected_sha) is not str or _FULL_SHA_RE.fullmatch(expected_sha) is None:
-        raise AdminError("--with-driver-runtime requires --expected-sha FULL_SHA")
+        raise AdminError(f"{label} requires --expected-sha FULL_SHA")
     allowed_timeouts = {"VQ_UPDATE_SCRIPT_TIMEOUT", "VQ_BUILD_STALL_TIMEOUT"}
-    if set(remote_timeout_env) - allowed_timeouts:
+    if set(remote_timeout_env) - allowed_timeouts - {"CMAKE_BUILD_PARALLEL_LEVEL"}:
         raise AdminError("unsupported staged update timeout environment")
-    for value in remote_timeout_env.values():
+    level = remote_timeout_env.get("CMAKE_BUILD_PARALLEL_LEVEL")
+    if level is not None and re.fullmatch(r"[1-9][0-9]{0,3}", level) is None:
+        raise AdminError("invalid forwarded CMAKE_BUILD_PARALLEL_LEVEL")
+    for name, value in remote_timeout_env.items():
+        if name not in allowed_timeouts:
+            continue
         try:
             valid = math.isfinite(float(value)) and float(value) > 0
         except (ValueError, TypeError):
@@ -1037,11 +1070,31 @@ def prune_scheduler_stage_generations(
     )
     if generations.is_symlink():
         raise AdminError("scheduler generations root must not be a symlink")
-    if not generations.is_dir():
-        return result
+    _prune_stage_directory(
+        generations, keep=keep, preserve=preserve_path, result=result,
+    )
+    return result
+
+
+def _prune_stage_directory(
+    parent: Path,
+    *,
+    keep: int,
+    preserve: Path | None,
+    result: SchedulerStagePruneResult,
+) -> None:
+    """Keep the newest ``keep`` recognized stages directly under ``parent``.
+
+    "Recognized" is the exact ``<40 hex>-<32 hex>`` directory name both stage
+    layouts use. Everything else under ``parent`` -- other files, other
+    directories, and any symlink whatever its name -- is reported as skipped and
+    left alone.
+    """
+    if not parent.is_dir():
+        return
 
     recognized: list[Path] = []
-    for candidate in generations.iterdir():
+    for candidate in parent.iterdir():
         if (
             candidate.is_symlink()
             or not candidate.is_dir()
@@ -1056,8 +1109,8 @@ def prune_scheduler_stage_generations(
     )
 
     retained: set[Path] = set()
-    if preserve_path is not None and preserve_path in recognized:
-        retained.add(preserve_path)
+    if preserve is not None and preserve in recognized:
+        retained.add(preserve)
     for candidate in recognized:
         if len(retained) >= keep:
             break
@@ -1068,6 +1121,67 @@ def prune_scheduler_stage_generations(
             continue
         shutil.rmtree(candidate)
         result.removed.append(str(candidate))
+
+
+RUNTIME_SOURCE_STAGE_DIR_NAME = "runtime-source"
+"""Basename of the runtime-source stage root, under ``<scratch>/.vq-admin/``."""
+
+
+def prune_runtime_source_stages(
+    stage_root: Path,
+    *,
+    keep: int = RUNTIME_SOURCE_STAGES_TO_KEEP,
+    preserve: Path | None = None,
+) -> SchedulerStagePruneResult:
+    """Prune runtime-source upload stages, which have no ``generations`` level.
+
+    ``stage_root`` is the ``runtime-source`` directory itself
+    (``<scratch_root>/.vq-admin/runtime-source``); its children are one
+    directory per program, each holding that program's stages. That layout is
+    why :func:`prune_scheduler_stage_generations` could not see these and
+    reported ``removed=0`` for them (#61).
+
+    A deploy that verifies now reclaims its own stage, so this is the supported
+    way to reclaim what older vq left behind, or what failed deploys kept. It
+    does not touch helper staging generations, which are retained deliberately.
+    """
+    if not stage_root.is_absolute():
+        raise AdminError("runtime source stage root must be an absolute path")
+    if stage_root.name != RUNTIME_SOURCE_STAGE_DIR_NAME:
+        raise AdminError(
+            "runtime source stage root must be the "
+            f"{RUNTIME_SOURCE_STAGE_DIR_NAME!r} directory itself, "
+            f"got {stage_root.name!r}"
+        )
+    if keep < 1:
+        raise AdminError("runtime source stage retention must be at least 1")
+    if preserve is not None and not preserve.is_absolute():
+        raise AdminError("preserved runtime source stage must be an absolute path")
+    if preserve is not None and preserve.parent.parent != stage_root:
+        raise AdminError(
+            "preserved runtime source stage is outside the stage root"
+        )
+    result = SchedulerStagePruneResult(
+        stage_root=str(stage_root),
+        keep=keep,
+        preserve=str(preserve) if preserve is not None else None,
+    )
+    if stage_root.is_symlink():
+        raise AdminError("runtime source stage root must not be a symlink")
+    if not stage_root.is_dir():
+        return result
+    for program_dir in sorted(stage_root.iterdir()):
+        if program_dir.is_symlink() or not program_dir.is_dir():
+            result.skipped_unrecognized.append(str(program_dir))
+            continue
+        _prune_stage_directory(
+            program_dir,
+            keep=keep,
+            preserve=preserve if (
+                preserve is not None and preserve.parent == program_dir
+            ) else None,
+            result=result,
+        )
     return result
 
 
@@ -1735,6 +1849,20 @@ class SchedulerRuntimeUpdateResult:
     mirror_fed: bool = False
     """True when this update pushed the exact pin into the target's push-fed
     source mirror (``feed_source_mirror``), replacing the manual feed step."""
+    mirror_feed_refspecs: list[str] = field(default_factory=list)
+    """Exactly what the mirror feed pushed, in the order it was pushed.
+
+    Recorded before the push rather than after it, so a refused feed still
+    shows what was attempted. Every entry is unforced -- no leading ``+`` can
+    appear here -- and the push carrying them is ``--atomic``: this list is
+    the evidence that a deployment fed one pin and left everything else
+    byte-identical (#81)."""
+    mirror_pin_ref: str | None = None
+    """The immutable per-pin ref this feed wrote, ``refs/vq/pins/<sha>``.
+
+    Its name is the commit it names, so it can never need a force and can
+    never come to mean a different tree. It keeps the accepted pin
+    addressable in the mirror however the mutable lane branches move."""
     prepare_rc: int | None = None
     """Exit code of the login-host ``prepare_command``, when configured."""
     prepare_output: str = ""
@@ -1749,6 +1877,26 @@ class SchedulerRuntimeUpdateResult:
     shelling in and re-running the preparer by hand."""
     staged_source_archive: str | None = None
     staged_source_sha256: str | None = None
+    staged_source_stage: str | None = None
+    """Remote directory this deploy uploaded its source archive into.
+
+    Set as soon as the directory exists, so a deploy that fails partway through
+    the upload still names the stage its own cleanup has to bound (#61)."""
+    staged_source_stage_reclaimed: bool = False
+    """True when this deploy removed its own upload staging.
+
+    Only a successful deploy does: a failed one keeps its stage for forensics,
+    bounded by :data:`RUNTIME_SOURCE_STAGES_TO_KEEP`."""
+    staged_source_stages_reclaimed: int = 0
+    """Stages removed for this program on the build host, this one included."""
+    staged_source_stages_retained: int = 0
+    """Stages left behind for this program after the reclaim."""
+    staged_source_reclaim_error: str | None = None
+    """Why the reclaim did not run or did not finish.
+
+    Never a ``work_error``: failing to reclaim disk does not undo a deploy that
+    verified, and turning a good deploy into a failed one over cleanup would be
+    a worse outcome than the disk it leaves."""
     run_log_path: str | None = None
     """Transcript of this operation: phase narration, heartbeats, and the full
     build output. Retrieve with ``vq admin logs``."""
@@ -1833,6 +1981,17 @@ class SchedulerRuntimeUpdateRecord:
     """Deploy metrics of the recorded attempt (see
     :func:`parse_deploy_metrics`): dependency-cache decision, ccache hit
     rate, phase durations, native-rebuild flag."""
+    migration: dict[str, object] | None = None
+    """Runtime migration recorded for this lane by
+    ``vq admin runtime-bindings HOST --record-migration`` (#72): plan and
+    ready ids, the participant receipt digest, store and launcher schema.
+    Carried forward by ordinary updates; never evidence of health."""
+    inventory: dict[str, object] | None = None
+    """Last runtime participant inventory summary for this lane (#72): store
+    (canonical, mirror or none), current, previous, launcher schema, cache,
+    the workspace lease expiry and when it was observed. Written during a
+    migration's prepare and apply only; carried forward by ordinary updates;
+    status, never evidence of health (LAST OK comes from the verifier)."""
 
 
 def scheduler_runtime_status_path() -> Path:
@@ -1912,6 +2071,8 @@ def record_scheduler_runtime_outcome(result: SchedulerRuntimeUpdateResult) -> No
         last_ok_at=last_ok_at,
         last_ok_active_path=last_ok_active_path,
         metrics=dict(result.metrics),
+        migration=previous.migration if previous is not None else None,
+        inventory=previous.inventory if previous is not None else None,
     )
     _write_scheduler_runtime_status(records)
 
@@ -2057,6 +2218,8 @@ def record_scheduler_helper_outcome(result: SchedulerHostUpdateResult) -> None:
             else (previous.activation_command if previous is not None else None)
         ),
         metrics=dict(result.metrics),
+        migration=previous.migration if previous is not None else None,
+        inventory=previous.inventory if previous is not None else None,
     )
     _write_scheduler_runtime_status(records)
 
@@ -2077,6 +2240,11 @@ def _resolve_venv_program(env: str, cfg: config.Config) -> config.VenvProgram:
             f"can be refreshed via admin update (binary and import "
             f"programs are not git-backed)."
         )
+    if prog.runtime_slot_build_input == "current":
+        # The registered checkout is only a compatibility path here; the
+        # active verified generation is what the next one is built from.
+        _runtime_build_source(prog)
+        return prog
     git_dir = Path(prog.git_dir)
     if not git_dir.is_dir():
         raise AdminError(
@@ -2091,6 +2259,128 @@ def _resolve_venv_program(env: str, cfg: config.Config) -> config.VenvProgram:
 
 
 
+_SLOT_REQUIRED_ANCESTOR: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "vq_slot_required_ancestor", default=None,
+)
+
+
+@contextlib.contextmanager
+def slot_build_requires_ancestor(sha: str):
+    """Require slot builds in this context to descend from ``sha``.
+
+    The no-downgrade proof for an unattended branch update. It runs inside the
+    new, unpublished generation after materialization and before its build,
+    so no published generation is written to prove it (#72).
+    """
+    token = _SLOT_REQUIRED_ANCESTOR.set(sha.strip().lower())
+    try:
+        yield
+    finally:
+        _SLOT_REQUIRED_ANCESTOR.reset(token)
+
+
+def _slot_ancestry_refusal(
+    root: str, sha: str, required: str, *, published: bool,
+) -> str | None:
+    """Why ``sha``'s generation cannot be proven to descend from ``required``.
+
+    An unpublished generation may fetch a missing baseline from its origin; a
+    published one is only read, never written.
+    """
+    source = runtime_slots.slot_source(root, sha)
+
+    def read(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(source), *args], capture_output=True, text=True,
+            timeout=60, check=False, stdin=subprocess.DEVNULL,
+        )
+
+    try:
+        if read("cat-file", "-e", f"{required}^{{commit}}").returncode != 0:
+            if published:
+                return (
+                    f"cannot prove {sha[:12]} descends from {required[:12]}: "
+                    "the verified generation lacks the baseline commit"
+                )
+            fetched = _mutating_git_run(
+                ["git", "-C", str(source), "-c", "gc.auto=0", "-c",
+                 "maintenance.auto=false", "fetch", "--no-tags",
+                 "--no-recurse-submodules", "origin", required],
+                capture_output=True, text=True, check=False, timeout=GIT_PULL_TIMEOUT_SECONDS,
+            )
+            if fetched.returncode != 0:
+                detail = (fetched.stderr or fetched.stdout or "").strip()
+                return (
+                    f"cannot prove {sha[:12]} descends from {required[:12]}: "
+                    f"baseline fetch failed: {detail}"
+                )
+        proof = read("merge-base", "--is-ancestor", required, sha)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"cannot prove {sha[:12]} descends from {required[:12]}: {exc}"
+    if proof.returncode == 0:
+        return None
+    if proof.returncode == 1:
+        return (
+            f"target {sha[:12]} is not a descendant of baseline "
+            f"{required[:12]}; refusing an unattended downgrade or sideways move"
+        )
+    return (
+        f"cannot prove {sha[:12]} descends from {required[:12]}: "
+        + (proof.stderr or "git merge-base failed").strip()
+    )
+
+
+def _runtime_build_source(prog: config.VenvProgram) -> Path:
+    """The checkout the next runtime generation is cloned from.
+
+    ``runtime_slot_build_input = "current"`` builds from the active verified
+    generation, so the registered checkout can be retired (#72). Its origin is
+    the configured upstream, preserved when the generation was materialized.
+    """
+    if prog.runtime_slot_build_input != "current":
+        return Path(prog.git_dir)
+    assert prog.runtime_slot_root is not None  # enforced by the config model
+    try:
+        root = runtime_slots.layout(prog.runtime_slot_root).root
+        active = runtime_slots.resolve_current(root)
+        if active is None:
+            raise AdminError(
+                f"no active runtime generation at {root} to build from; "
+                'runtime_slot_build_input = "current" needs one'
+            )
+        if not runtime_slots._verified_markers_match(root, active):
+            raise AdminError(
+                f"active runtime generation {active[:12]} is not verified; "
+                "refusing to build from it"
+            )
+    except runtime_slots.RuntimeSlotError as exc:
+        raise AdminError(str(exc)) from exc
+    return runtime_slots.slot_source(root, active)
+
+
+@contextlib.contextmanager
+def self_update_ancestry_source(prog: config.VenvProgram, sha: str) -> Iterator[Path]:
+    """Fetch proof objects without writing into a retained runtime generation."""
+    if prog.runtime_slot_root is not None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="vq-self-update-proof-") as raw:
+                yield runtime_slots.materialize_source(
+                    _runtime_build_source(prog), Path(raw).resolve() / "runtime", sha,
+                    runner=_mutating_git_run,
+                )
+        except (runtime_slots.RuntimeSlotError, OSError, subprocess.SubprocessError) as exc:
+            raise AdminError(str(exc)) from exc
+    else:
+        repo = Path(prog.git_dir)
+        fetch_rc, fetch_output = _run_git_fetch_sha(repo, sha, prog.branch)
+        if fetch_rc != 0:
+            raise AdminError(
+                "could not fetch the exact self-update target before "
+                f"ancestry validation: {fetch_output[-1000:]}"
+            )
+        yield repo
+
+
 def _do_slot_update_work(
     env: str,
     prog: config.VenvProgram,
@@ -2098,6 +2388,8 @@ def _do_slot_update_work(
     expected_tag: str | None = None,
     expected_sha: str | None = None,
     update_script_args: list[str] | None = None,
+    prepare_only: bool = False,
+    managed_daemon_prepare: bool = False,
 ) -> UpdateResult:
     """Update a slot-enabled venv program without touching the live runtime.
 
@@ -2112,6 +2404,19 @@ def _do_slot_update_work(
     A failed build leaves ``current`` where it was. There is no rollback step
     because there is no forward step to undo: the flip is the last thing that
     happens, and a half-built slot is simply never published.
+
+    ``prepare_only`` seals the generation without changing either pointer;
+    the migration transaction owns the later reviewed binding switch.
+
+    Every build this starts is a generation's first: a reused slot is verified
+    already, and a failed one is cleaned before it is rebuilt. So a registration
+    with an ``install_script`` builds the generation through it (#104), with the
+    declared extras floor and without a ref selector (the slot source is already
+    pinned); ``update_script`` refreshes an existing environment and a strict
+    one refuses in a fresh tree. Without an installer the updater still builds,
+    as before. The serving daemon's own prepare keeps its canonical route.
+    ``update_script_args`` reach the installer too, without source selectors
+    and without ``--recreate-venv``.
     """
     result = UpdateResult(
         env=env,
@@ -2140,23 +2445,48 @@ def _do_slot_update_work(
     assert configured_root is not None  # caller checked; narrows the type
     try:
         root = str(runtime_slots.layout(configured_root).root)
+        slot_prog = runtime_slots.slot_local_program(prog, root, sha)
+        # Resolve the installer before reserving the slot, so a registration
+        # whose installer cannot be source-bound never leaves a half-built
+        # generation behind (#104).
+        install_script = (
+            runtime_slots.slot_install_script(prog)
+            if prog.install_script and not managed_daemon_prepare else None
+        )
         transaction_id = secrets.token_hex(16)
         build_required = runtime_slots.begin_slot_build(
             root,
             sha,
             transaction_id=transaction_id,
             in_use=lambda: _runtime_slot_in_use_snapshot(root),
+            venv_subdir=runtime_slots.program_venv_subdir(prog),
         )
         if build_required:
             runtime_slots.materialize_source(
-                prog.git_dir, root, sha, runner=_mutating_git_run,
+                _runtime_build_source(prog), root, sha, runner=_mutating_git_run,
             )
-    except runtime_slots.RuntimeSlotError as exc:
+    except (runtime_slots.RuntimeSlotError, AdminError) as exc:
         result.work_errors.append(f"{env}: {exc}")
         return result
 
-    slot_prog = runtime_slots.slot_local_program(prog, root, sha)
+    required = _SLOT_REQUIRED_ANCESTOR.get()
+    if required is not None:
+        refusal = _slot_ancestry_refusal(
+            root, sha, required, published=not build_required,
+        )
+        if refusal is not None:
+            result.work_errors.append(f"{env}: {refusal}; live runtime unchanged")
+            return result
+
+    if slot_prog.import_check is None and slot_prog.vibeqc_source_root() is not None:
+        # Slots formerly normalized every venv to .venv, which implicitly
+        # selected the structural native probe. Preserve that gate when the
+        # registered venv has a custom name, including verified-slot reuse.
+        slot_prog = slot_prog.model_copy(update={"import_check": "vibeqc"})
     if not build_required:
+        # The outcome record reads its SHA from here: name the reused
+        # generation, not the untouched build checkout (#72).
+        result.git_dir = str(runtime_slots.slot_source(root, sha))
         result.git_pull_rc = 0
         if prog.update_script is not None:
             result.update_script_rc = 0
@@ -2198,7 +2528,10 @@ def _do_slot_update_work(
                 )
                 return result
         try:
-            previous = runtime_slots.activate(root, sha)
+            previous = (
+                runtime_slots.resolve_current(root) if prepare_only
+                else runtime_slots.activate(root, sha)
+            )
         except runtime_slots.RuntimeSlotError as exc:
             result.work_errors.append(
                 f"{env}: verified slot reuse failed: {exc}"
@@ -2215,13 +2548,19 @@ def _do_slot_update_work(
     # Reuse the ordinary update path verbatim inside the slot: fetch, checkout,
     # tag verification, update script, import check. Forking that logic for
     # slots would be two code paths to keep honest instead of one.
+    build_prog = (
+        slot_prog.model_copy(update={"update_script": install_script})
+        if install_script is not None else slot_prog
+    )
     inner = _do_update_work(
         env,
-        slot_prog,
+        build_prog,
         expected_tag=expected_tag,
         expected_sha=sha,
         update_script_args=update_script_args,
         _fresh_runtime=True,
+        **({"_script_source_fixed": True} if managed_daemon_prepare else {}),
+        **({"_first_build": True} if install_script is not None else {}),
     )
     if not inner.success:
         inner.work_errors.append(
@@ -2237,12 +2576,15 @@ def _do_slot_update_work(
             transaction_id=transaction_id,
             runner=_mutating_git_run,
         )
-        previous = runtime_slots.activate(root, sha)
+        previous = (
+            runtime_slots.resolve_current(root) if prepare_only
+            else runtime_slots.activate(root, sha)
+        )
     except runtime_slots.RuntimeSlotError as exc:
         inner.work_errors.append(f"{env}: slot built but activation failed: {exc}")
         return inner
     log.info(
-        "env %s: activated runtime slot %s (previous=%s)",
+        "env %s: verified runtime slot %s (previous=%s)",
         env,
         sha[:12],
         (previous or "none")[:12],
@@ -2252,6 +2594,11 @@ def _do_slot_update_work(
 
 def _runtime_slot_in_use_snapshot(root: str) -> set[str]:
     """Read a complete, lock-consistent spec census for destructive cleanup."""
+    return runtime_slots.slots_in_use(root, _runtime_slot_spec_snapshot())
+
+
+def _runtime_slot_spec_snapshot() -> list[JobSpec]:
+    """Every visible spec, read under its lock, from one unchanged spec set."""
     specs: list[JobSpec] = []
     multi_user = config.system_multi_user_enabled()
     snapshot_paths = _visible_spec_paths(multi_user=multi_user)
@@ -2269,7 +2616,7 @@ def _runtime_slot_in_use_snapshot(root: str) -> set[str]:
             "cannot prove runtime-slot liveness because the visible spec set "
             "changed during its locked snapshot"
         )
-    return runtime_slots.slots_in_use(root, specs)
+    return specs
 
 
 def _do_update_work(
@@ -2281,6 +2628,8 @@ def _do_update_work(
     update_script_args: list[str] | None = None,
     managed_daemon_restart: bool = False,
     _fresh_runtime: bool = False,
+    _script_source_fixed: bool = False,
+    _first_build: bool = False,
 ) -> UpdateResult:
     """Run the git refresh + optional tag check + optional update_script
     for ONE env. Untagged updates run ``git pull``; tagged updates fetch and
@@ -2320,6 +2669,28 @@ def _do_update_work(
         fail_on_dirty_in_effect=prog.fail_on_dirty,
     )
     immutable_selector = bool(expected_tag is not None or expected_sha is not None)
+    # A runtime slot's first build runs the installer in ``update_script``'s
+    # place (#104). It installs the pinned tree as it stands: no ref selector,
+    # the configured source flags untouched. The operator's per-update flags
+    # still reach it, as they reach the updater on every other update, minus
+    # source selectors (the slot is pinned) and ``--recreate-venv`` (every
+    # generation is a fresh environment already); the declared extras floor is
+    # then applied against that request, which it may raise but a
+    # contradicting request is refused. Dropping them silently built a
+    # different profile from the one asked for and reported success.
+    first_build_args: list[str] = []
+    if _first_build:
+        operator_args = [
+            arg for arg in _strip_update_script_ref_args(list(update_script_args or []))
+            if arg != "--recreate-venv"
+        ]
+        try:
+            first_build_args = [*operator_args, *_declared_extras_install_args(
+                env, prog, supplied=operator_args, supplied_source="--update-script-arg",
+            )]
+        except AdminError as exc:
+            result.work_errors.append(f"{env}: {exc}")
+            return result
     import_check = prog.effective_import_check()
     vibeqc_source_root = (
         prog.vibeqc_source_root() if import_check == "vibeqc" else None
@@ -2602,6 +2973,7 @@ def _do_update_work(
     elif result.expected_sha is not None:
         result.git_pull_rc, result.git_pull_output = _run_git_fetch_sha(
             git_dir, result.expected_sha, prog.branch,
+            local_first=_fresh_runtime,
         )
         if result.git_pull_rc == 0:
             checkout_rc, checkout_output = _run_git_checkout_detached(
@@ -2694,14 +3066,26 @@ def _do_update_work(
         ) = _run_update_script(
             git_dir, prog.update_script,
             work_errors=result.work_errors,
-            extra_args=_update_script_args_for_ref(
-                update_script_args, expected_tag, result.expected_sha,
+            label="install_script" if _first_build else "update_script",
+            # A managed daemon slot is already pinned by this transaction.
+            # Its canonical script creates a fresh venv without owning source
+            # changes or a daemon restart; direct --recreate-venv therefore
+            # requires --skip-git instead of another --ref selector.
+            extra_args=(
+                (first_build_args or None) if _first_build else
+                [*_strip_update_script_ref_args(update_script_args or []), "--skip-git"]
+                if _script_source_fixed and _fresh_runtime else
+                _update_script_args_for_ref(
+                    update_script_args, expected_tag, result.expected_sha,
+                )
             ),
             strip_config_ref_args=(
-                expected_tag is not None or result.expected_sha is not None
+                not _first_build
+                and (expected_tag is not None or result.expected_sha is not None)
             ),
             managed_daemon_restart=managed_daemon_restart,
             lifecycle_target=Path(prog.python).parent.parent,
+            source_bound=_fresh_runtime,
         )
         result.metrics.update(
             parse_deploy_metrics(result.update_script_output)
@@ -2730,6 +3114,7 @@ def _do_update_work(
             work_errors=result.work_errors,
             label="post_update_script",
             lifecycle_target=Path(prog.python).parent.parent,
+            source_bound=_fresh_runtime,
         )
         result.metrics.update(
             parse_deploy_metrics(result.post_update_script_output)
@@ -2891,23 +3276,68 @@ def _verify_expected_sha_after_script(
 def _warn_if_declared_extras_are_inert(env: str, prog: config.VenvProgram) -> None:
     """Say so when a declared capability is not this update's to apply.
 
-    ``extras`` reaches pip only through the managed daemon transaction, which
-    is the one path that has proved the updater is vq's own
-    ``scripts/update.sh`` and that it may name the install target outright. An
-    ordinary update runs whatever ``update_script`` the program configures --
-    for vibe-qc and vibe-view programs, a script that has never heard of
-    ``--extras`` -- so it cannot honour the declaration and must not pretend
-    to.
+    ``extras`` reaches pip only where vq itself builds the venv, and only
+    through vq's own ``scripts/install.sh`` or ``scripts/update.sh``: the
+    managed daemon transaction (:func:`_managed_update_script_args`), the
+    provision that creates the environment
+    (:func:`_declared_extras_install_args`), and an ordinary update whose
+    ``update_script`` passes that same proof
+    (:func:`_declared_extras_on_ordinary_update`). This note is for the shapes
+    that are left.
 
-    Silence here would rebuild exactly the belief this feature exists to
-    correct: config that looks applied and is not.
+    It asks the proof itself rather than trusting a caller to have asked it,
+    so a program whose updater *is* vq's own can never be told its declaration
+    was skipped by an update that applied it. That is not defensiveness: this
+    function is the one place in the feature whose whole job is to be true,
+    and a note whose truth depends on its caller is the failure mode one level
+    up.
+
+    Silence here would rebuild exactly the belief the key exists to correct --
+    config that looks applied and is not -- and so would naming a route that
+    does nothing, which is why the note is worded per shape rather than once.
+    A provision is not offered as a way out of any of them: this environment's
+    checkout exists (we are updating it) and :func:`_refuse_occupied_git_dir`
+    refuses to provision over one. A program with no ``update_script`` is not
+    merely having its declaration skipped by *this* update; it has no rebuild
+    route at all, which is the one thing an operator staring at the note needs
+    to know. And a program whose ``update_script`` is its own script is not
+    offered the per-update ``--extras`` request either: that request reaches
+    the same free-text script, which has never heard of the flag.
     """
-    if prog.extras:
+    if not prog.extras:
+        return
+    route, detail = _declared_extras_route(prog, prog.update_script)
+    if route == ExtrasRoute.VQ:
+        return
+    if route == ExtrasRoute.ABSENT:
         output.narrate(
-            f"note: {env} declares extras {list(prog.extras)}, which only a "
-            "managed daemon update applies. This update rebuilds the "
-            "environment with the profile its .vq-install-metadata records."
+            f"note: {env} declares extras {list(prog.extras)}, which this "
+            "update does not apply and could not: the program configures no "
+            "update_script, so this update pulls the checkout and rebuilds "
+            "nothing. The provision that created this environment applied the "
+            "declaration; nothing since has, and nothing will until "
+            "update_script points at the checkout's own scripts/update.sh."
         )
+        return
+    if route == ExtrasRoute.UNKNOWN:
+        output.narrate(
+            f"note: {env} declares extras {list(prog.extras)}, and vq cannot "
+            f"tell whether this update applies it: {detail}. The floor "
+            "reaches pip only through the checkout's own scripts/install.sh "
+            "or scripts/update.sh, and which script update_script names "
+            "could not be read here."
+        )
+        return
+    output.narrate(
+        f"note: {env} declares extras {list(prog.extras)}, which this update "
+        f"does not apply: update_script {prog.update_script!r} is not the "
+        f"checkout's own scripts/install.sh or scripts/update.sh ({detail}), "
+        "and what a program's own updater rebuilds is that script's decision. "
+        "The managed daemon transaction is not a way round it -- that path "
+        "requires the same canonical script and refuses without it. Point "
+        "update_script at the checkout's own scripts/update.sh and every "
+        "update applies the declaration."
+    )
 
 
 def _new_pause_token() -> str:
@@ -3005,8 +3435,669 @@ def _resolve_extras_profile(recorded: str, required: Sequence[str]) -> str:
     )
 
 
+def _dist_info_prefix(distribution: str) -> str:
+    """The ``.dist-info`` directory prefix for *distribution* (PEP 427).
+
+    The name is normalized as PEP 503 describes and its separators become
+    underscores: ``vibe-queue`` -> ``vibe_queue``.
+    """
+    return re.sub(r"[-_.]+", "_", distribution).lower()
+
+
+_PEP610_DISTRIBUTIONS = (DISTRIBUTION_NAME, LEGACY_DISTRIBUTION_NAME)
+"""Every distribution name a vq venv's PEP 610 record may be filed under.
+
+The current one, and the one a release before the rename (#68) wrote. Both are
+read; neither outranks the other. ``scripts/_venv_helpers.sh`` spells the same
+pair for the same readers, and ``tests/test_distribution_name.py`` keeps the
+two lists in step.
+"""
+
+
+def _venv_entries(directory: Path) -> list[Path]:
+    """List *directory*, or refuse.
+
+    ``Path.glob`` swallows a ``PermissionError`` and reports "no match", which
+    in a reader whose whole job is to prove what a venv contains turns an
+    unreadable tree into a confident empty answer. Walking the levels
+    explicitly lets the error reach the caller instead, so an unreadable
+    ``.dist-info`` fails closed exactly as an unreadable ``direct_url.json``
+    already did one level down.
+    """
+    try:
+        return sorted(directory.iterdir())
+    except OSError as exc:
+        raise AdminError(
+            f"cannot read {directory} while reading this venv's PEP 610 "
+            f"metadata: {exc}"
+        ) from exc
+
+
+def _pep610_records(venv: Path) -> list[Path]:
+    """Every ``direct_url.json`` pip wrote for vq in *venv*, under either name.
+
+    Both spellings are read and the results are **unioned**; neither name is
+    preferred. A venv last installed by a release before the rename (#68) has
+    its record under the previous name only, and that record is read so the
+    venv still proves its mode; the next install removes it
+    (``vq_install_environment``), after which only the current name is found.
+
+    A venv holding one record under *each* name is two independent installs
+    recording two different origins, and this must not pick between them.
+    Preferring the current name looked like "the install pip performed last",
+    and was not: a legacy record written an hour later still lost, and the
+    caller then reported the wrong checkout and the wrong mode while the
+    venv's live record said otherwise. Returning both instead lets the
+    caller's anti-ambiguity guard refuse and name the stale ``.dist-info`` --
+    the same answer it already gives for two payloads under one name.
+
+    The ``lib64 -> lib`` alias a Linux virtualenv commonly carries still
+    yields the same record twice, under two paths; the caller collapses that
+    by inode, which is why this returns paths rather than a set of records.
+    """
+    prefixes = {_dist_info_prefix(name) for name in _PEP610_DISTRIBUTIONS}
+    records: list[Path] = []
+    for lib in _venv_entries(venv):
+        if not lib.name.startswith("lib") or not lib.is_dir():
+            continue
+        for interpreter in _venv_entries(lib):
+            if not interpreter.name.startswith("python") or not interpreter.is_dir():
+                continue
+            site = interpreter / "site-packages"
+            if not site.is_dir():
+                continue
+            for entry in _venv_entries(site):
+                if not entry.name.endswith(".dist-info"):
+                    continue
+                stem = entry.name[: -len(".dist-info")]
+                if stem.partition("-")[0] not in prefixes:
+                    continue
+                if any(
+                    child.name == "direct_url.json"
+                    for child in _venv_entries(entry)
+                ):
+                    records.append(entry / "direct_url.json")
+    return sorted(records)
+
+
+_VQ_OWN_VENV_SCRIPTS = ("install.sh", "update.sh")
+"""vq's own venv-building scripts, the only commands vq names a profile on.
+
+``install.sh`` builds an environment that does not exist and ``update.sh``
+rebuilds one that does. Both are vq's, both take ``--extras PROFILE``, and both
+therefore may be told what a serving venv is *for*. A program's own installer
+may not: it is free text that has never heard of the flag.
+"""
+
+
+def _vq_own_script_proof(
+    prog: config.VenvProgram, configured: str, *, names: Sequence[str],
+) -> tuple[Path, bool]:
+    """Where a configured command points, and whether it is vq's own script.
+
+    This is the one proof that lets vq name an install target on a command
+    line: the script is ``scripts/<name>`` of the vq checkout the *program*
+    points at -- not a script that merely has that name, and not vq's own copy
+    somewhere else on the host. Both paths that apply a declared
+    :attr:`~vq.config.VenvProgram.extras` floor ask exactly this question: the
+    managed daemon transaction (:func:`_managed_update_script_args`) and a
+    fresh provision (:func:`_declared_extras_install_args`).
+
+    Returns the resolved path -- which a refusal needs either way, to say what
+    it found -- and whether the proof holds. It is deliberately not a refusal
+    of its own: the two callers refuse for different reasons and name
+    different remedies.
+
+    The script has to exist to be identified, so this can only be asked once
+    the checkout does. A provision asks it after the clone, which is why it
+    also refuses before one, on the name alone
+    (:func:`_refuse_install_that_cannot_apply_declared_extras`).
+    """
+    project_root = _vq_project_root_for_program(prog)
+    resolved = (Path(prog.git_dir) / configured).resolve(strict=True)
+    for name in names:
+        try:
+            canonical = (project_root / "scripts" / name).resolve(strict=True)
+        except OSError:
+            # A checkout missing one of vq's own scripts cannot be proved by
+            # it. Keep looking rather than failing: the answer is "not this
+            # one", and the caller's refusal says what it did find.
+            continue
+        if resolved == canonical:
+            return resolved, True
+    return resolved, False
+
+
+class ExtrasRoute(StrEnum):
+    """What a configured command is, as a declared extras floor sees it."""
+
+    ABSENT = "absent"
+    """Nothing is configured, so there is no command to prove."""
+
+    VQ = "vq"
+    """vq's own installer or updater, inside this program's own checkout."""
+
+    FOREIGN = "foreign"
+    """Something else, proved: no script of vq's is going to run."""
+
+    UNKNOWN = "unknown"
+    """The question could not be reached; nothing is proved either way."""
+
+
+def _declared_extras_route(
+    prog: config.VenvProgram, configured: str | None,
+) -> tuple[ExtrasRoute, str]:
+    """Whether one configured command is a route a declared floor can take.
+
+    :func:`_vq_own_script_proof` answers "is this vq's own script"; this wraps
+    that answer in the four verdicts a caller outside a build has to tell
+    apart, and raises none of the ways the question can fail:
+
+    ``absent``
+        nothing is configured, so there is no command to prove.
+    ``vq``
+        vq's own ``scripts/install.sh`` or ``scripts/update.sh``, inside the
+        checkout this program points at. An install target may be named on it.
+    ``foreign``
+        something else: a program's own installer, a checkout that is not a vq
+        tree at all, a script that is not there. All three are answers -- no
+        script of vq's is going to run -- so the floor cannot be applied.
+    ``unknown``
+        the question could not be reached, because the checkout does not exist
+        yet or cannot be read. Not the same as ``foreign`` and never reported
+        as one: a check that cannot answer says so (#84), and an update says
+        the same rather than calling a configuration wrong on no evidence.
+
+    The second element is that evidence: the resolved script where one was
+    identified, and what stopped the answer otherwise.
+    """
+    parts = shlex.split(configured or "")
+    if not parts:
+        return ExtrasRoute.ABSENT, ""
+    git_dir = Path(prog.git_dir)
+    if prog.runtime_slot_build_input == "current":
+        try:
+            git_dir = _runtime_build_source(prog)
+        except AdminError as exc:
+            return ExtrasRoute.UNKNOWN, str(exc)
+        prog = prog.model_copy(update={"git_dir": str(git_dir)})
+    if not git_dir.is_dir():
+        return (
+            ExtrasRoute.UNKNOWN,
+            f"checkout {git_dir} is not a readable directory",
+        )
+    try:
+        empty = not any(git_dir.iterdir())
+    except OSError as exc:
+        return ExtrasRoute.UNKNOWN, f"checkout {git_dir}: {exc}"
+    if empty:
+        # A mount point an operator created for the provision, which
+        # `_refuse_occupied_git_dir` accepts. There is no checkout in it yet,
+        # so the question is unreachable -- not answered "foreign" because
+        # the empty directory is not a vq tree.
+        return ExtrasRoute.UNKNOWN, f"checkout {git_dir} is empty"
+    try:
+        resolved, proven = _vq_own_script_proof(
+            prog, parts[0], names=_VQ_OWN_VENV_SCRIPTS,
+        )
+    except AdminError as exc:
+        # A checkout that is not a vq tree holds none of vq's scripts. That is
+        # an answer -- "not this one" -- not a failure to reach one.
+        return ExtrasRoute.FOREIGN, str(exc)
+    except FileNotFoundError:
+        return ExtrasRoute.FOREIGN, f"{git_dir / parts[0]} does not exist"
+    except OSError as exc:
+        return ExtrasRoute.UNKNOWN, f"{git_dir / parts[0]}: {exc}"
+    if proven:
+        return ExtrasRoute.VQ, str(resolved)
+    return ExtrasRoute.FOREIGN, str(resolved)
+
+
+@dataclass(frozen=True)
+class DeclaredExtrasRoutes:
+    """Which of a venv program's configured scripts can carry its floor.
+
+    Read-only, and answered from the filesystem rather than from the spelling
+    of a command. ``vq doctor`` reports it (#84) and the ordinary update path
+    decides on it (#85), so both speak from the same evidence.
+    """
+
+    install: ExtrasRoute
+    update: ExtrasRoute
+    install_detail: str
+    update_detail: str
+
+    @property
+    def applied_at_install(self) -> bool:
+        """A fresh ``vq admin install`` would apply the declaration."""
+        return self.install == ExtrasRoute.VQ
+
+    @property
+    def applied_on_update(self) -> bool:
+        """``vq admin update`` would apply it, ordinary or managed."""
+        return self.update == ExtrasRoute.VQ
+
+    @property
+    def any_route(self) -> bool:
+        """Some build vq performs would apply the declaration."""
+        return self.applied_at_install or self.applied_on_update
+
+    @property
+    def undetermined(self) -> bool:
+        """No route was proved, and at least one question went unanswered."""
+        return not self.any_route and ExtrasRoute.UNKNOWN in (
+            self.install, self.update,
+        )
+
+
+def declared_extras_routes(prog: config.VenvProgram) -> DeclaredExtrasRoutes:
+    """Resolve both of a program's configured scripts against vq's own."""
+    install, install_detail = _declared_extras_route(prog, prog.install_script)
+    update, update_detail = _declared_extras_route(prog, prog.update_script)
+    return DeclaredExtrasRoutes(
+        install=install,
+        update=update,
+        install_detail=install_detail,
+        update_detail=update_detail,
+    )
+
+
+def _declared_extras_refusal_at_install(
+    env: str,
+    prog: config.VenvProgram,
+    *,
+    found: str,
+    detail: str = "",
+    vq_tree: bool = True,
+) -> str:
+    """Why a provision was refused, and the ways out that exist for *prog*.
+
+    Worded once for both halves of the check, because an operator who hits the
+    cheap one must not have to hit the expensive one to learn the remedy. A
+    rejection that names no supported route is what sent the coordinator's
+    console down a two-day dead end.
+
+    The second route -- provision without the declaration and set the profile
+    afterwards -- exists only where an ordinary update can apply the floor,
+    which since #85 means the program's ``update_script`` is vq's own script.
+    A program with none, or with a foreign one, is told what the missing piece
+    is instead: on those an update pulls the checkout, reports success and
+    rebuilds nothing, and printing it would be a remedy that reports success
+    and fixes nothing, the same dead end one level further on.
+
+    That second route is plain ``vq admin update ENV``, with no flags. It used
+    to be spelled with ``--update-script-arg --recreate-venv``, copied from
+    the managed plan, and that command **exits 1**: ``scripts/update.sh``
+    refuses a direct ``--recreate-venv`` unless ``--skip-git`` comes with it,
+    so outside a managed transaction it never ran. Since #85 the flags are not
+    needed either, because an ordinary update applies the declared floor by
+    itself wherever it is allowed to.
+
+    It applies the floor only while the declaration is there to apply, so the
+    route is: drop the declaration, provision, **restore it**, update. Worded
+    as "drop the declaration, provision, and apply the profile with ``vq admin
+    update ENV``" it was a remedy that exits 0 and installs nothing, because
+    an update of a program declaring nothing appends no ``--extras``.
+
+    And it needs ``scripts/update.sh`` to accept the venv the provision
+    built, which it does only for one ``scripts/install.sh`` created: it
+    refuses an unmarked virtualenv. So the second route is real for an
+    installer that builds through vq's own ``scripts/install.sh`` -- a
+    wrapper, which the pre-clone name check cannot tell from a foreign one --
+    and the refusal says so rather than promising it to every installer.
+
+    ``vq_tree=False`` is a checkout that holds no vq at all. Neither route
+    exists there, since both end in one of vq's scripts, and naming them
+    would send the operator to edit ``install_script`` towards a file that is
+    not in the checkout. The declaration does not fit such a program.
+
+    What a refusal *after the clone* leaves behind -- the checkout, which
+    refuses the next provision; it clears its own admin-update marker -- is
+    said by :func:`provision_env`, which knows it cloned, for every refusal
+    raised there rather than for this one alone.
+    """
+    accepted = (
+        " (scripts/update.sh refuses a venv vq's own scripts did not build, "
+        "so this route needs install_script to build through the checkout's "
+        "scripts/install.sh)"
+    )
+    route, _detail = _declared_extras_route(prog, prog.update_script)
+    if not vq_tree:
+        ways_out = (
+            f"The checkout at {prog.git_dir} is not a vq tree, so neither of "
+            "vq's scripts is in it and no route can apply the declaration "
+            "to this program: drop the declaration, or point upstream at a "
+            "vq checkout"
+        )
+    elif route is ExtrasRoute.VQ:
+        ways_out = (
+            "Point install_script at the checkout's own scripts/install.sh, "
+            "or drop the declaration, provision, then restore it and apply it "
+            f"with: vq admin update {env}" + accepted
+        )
+    elif route is ExtrasRoute.UNKNOWN:
+        # The checkout is not there to read yet, which is the ordinary case
+        # before a provision. Name both routes without asserting which one
+        # this program has, rather than calling its configuration wrong.
+        ways_out = (
+            "Point install_script at the checkout's own scripts/install.sh. "
+            "If update_script is the checkout's own scripts/update.sh, you "
+            "can instead drop the declaration, provision, then restore it and "
+            f"apply it with: vq admin update {env}" + accepted
+        )
+    else:
+        missing = (
+            "it configures no update_script"
+            if route is ExtrasRoute.ABSENT
+            else "its update_script is not one of vq's own scripts either"
+        )
+        ways_out = (
+            "Point install_script at the checkout's own scripts/install.sh, "
+            f"which is the only route this program has: {missing}, so "
+            f"`vq admin update {env}` runs what is configured and applies no "
+            "declaration, and dropping the declaration would leave the "
+            "profile with no way in. Pointing update_script at the "
+            "checkout's own scripts/update.sh makes that second route real: "
+            "drop the declaration, provision, then restore it and apply it "
+            f"with plain `vq admin update {env}`" + accepted
+        )
+    return (
+        f"env {env!r} declares extras {list(prog.extras)}, which a fresh "
+        "install applies only through vq's own scripts/install.sh or "
+        f"scripts/update.sh. Its install_script is {found!r}"
+        + (f" ({detail})" if detail else "")
+        + ", so this "
+        "provision would build the venv without the runtime the program "
+        "declares -- refusing instead of installing it. " + ways_out
+    )
+
+
+def _refuse_install_that_cannot_apply_declared_extras(
+    env: str, prog: config.VenvProgram,
+) -> None:
+    """Refuse a provision whose installer could not apply the declaration.
+
+    The courtesy half, and the only half that can run before the clone: the
+    proof reads the script, and there is no script until the checkout exists.
+    A declaration reaches pip through vq's own ``scripts/install.sh`` or
+    ``scripts/update.sh``, so a command that does not even name one of those
+    cannot be it, and saying so before anything is created costs a config edit
+    instead of a checkout the operator then has to remove.
+
+    A program that declares nothing is not consulted here at all.
+    """
+    if not prog.extras:
+        return
+    parts = shlex.split(prog.install_script or "")
+    named = PurePosixPath(parts[0]).parts[-2:] if parts else ()
+    if named not in {("scripts", name) for name in _VQ_OWN_VENV_SCRIPTS}:
+        raise AdminError(
+            _declared_extras_refusal_at_install(
+                env, prog, found=prog.install_script or "",
+            )
+        )
+
+
+def _requested_extras_profile(
+    env: str, args: Sequence[str], *, source: str,
+) -> str | None:
+    """The profile an installer command line asks for, or ``None``.
+
+    ``install.sh`` keeps the last ``--extras`` it is given, so that is the one
+    this reads. An unknown profile name is refused here rather than left to
+    the shell: ``vq_extras_to_spec`` rejects it after the clone, and a typo
+    that decides what a fleet host installs is worth catching before that.
+    """
+    profile: str | None = None
+    for index, arg in enumerate(args):
+        if arg != "--extras":
+            continue
+        if index + 1 >= len(args):
+            raise AdminError(
+                f"env {env!r}: {source} ends with --extras and no profile"
+            )
+        profile = args[index + 1]
+    if profile is not None and profile not in _MANAGED_UPDATE_PROFILE_NAMES:
+        raise AdminError(
+            f"env {env!r}: {source} names extras profile {profile!r}; vq "
+            "publishes " + ", ".join(name for name, _ in _EXTRAS_PROFILES)
+        )
+    return profile
+
+
+def _declared_extras_install_args(
+    env: str, prog: config.VenvProgram, *, supplied: Sequence[str],
+    supplied_source: str = "--install-script-arg",
+) -> list[str]:
+    """The declared extras floor, as arguments for a fresh install.
+
+    A program that declares nothing gets ``[]``, and an install identical to
+    every earlier one. A program that declares extras gets ``--extras
+    PROFILE`` appended after everything else, so it decides: the same "last
+    flag wins" convention :func:`_run_update_script` already forwards
+    per-invocation flags under, and what ``install.sh`` itself implements.
+    It is appended only when it *raises* the profile the command line already
+    selects, so a declaration the installer already satisfies leaves the argv
+    an operator wrote exactly as they wrote it.
+
+    The floor belongs here for the reason it belongs on a managed update. The
+    declaration says what the venv is *for*, and while install ignored it a
+    fresh provision built the venv without it -- the console venv declared
+    ``extras = ["web"]`` and provisioned without uvicorn, whose unit failed on
+    every start until some later managed update happened to converge it. An
+    accepted key that changes nothing is the failure mode this feature exists
+    to correct, so an install that cannot apply the declaration is **refused**
+    rather than noted: a notice nobody reads produces exactly that venv, while
+    a refusal costs a config edit before anything is built.
+
+    It is applied only on the proof the managed update rests on
+    (:func:`_vq_own_script_proof`), which is what makes applying it safe at
+    all: vq may name an install target on its own script and on no other.
+
+    Three things may decide the profile, and the shape mirrors the managed
+    update's deliberately. The configured ``install_script --extras P`` is the
+    baseline, as ``.vq-install-metadata`` is there; an operator's
+    ``--install-script-arg --extras P`` replaces it, as #11's per-update
+    request does; and the declaration is a floor under both
+    (:func:`_resolve_extras_profile`). Only the operator's request is an
+    instruction, so only it is checked against the declaration instead of
+    being widened: two contradicting instructions are something to say out
+    loud, not to reconcile silently.
+    """
+    if not prog.extras:
+        return []
+    parts = shlex.split(prog.install_script or "")
+    if not parts:  # pragma: no cover - the pre-clone refusal catches this
+        raise AdminError(
+            _declared_extras_refusal_at_install(
+                env, prog, found=prog.install_script or "",
+            )
+        )
+    try:
+        configured, proven = _vq_own_script_proof(
+            prog, parts[0], names=_VQ_OWN_VENV_SCRIPTS,
+        )
+    except (AdminError, OSError) as exc:
+        # The checkout cannot answer: it is not a vq tree (AdminError, the
+        # only one the proof raises), or the configured installer is not in
+        # it. The declaration is unappliable either way, so it is the same
+        # refusal, carrying what the checkout said. Without this it would be a
+        # layout complaint or a traceback, neither of which names a route out.
+        raise AdminError(
+            _declared_extras_refusal_at_install(
+                env, prog, found=prog.install_script or "", detail=str(exc),
+                vq_tree=not isinstance(exc, AdminError),
+            )
+        ) from exc
+    if not proven:
+        raise AdminError(
+            _declared_extras_refusal_at_install(
+                env, prog, found=str(configured),
+            )
+        )
+    selected = _requested_extras_profile(
+        env, supplied, source=supplied_source,
+    )
+    if selected is None:
+        selected = _requested_extras_profile(
+            env, parts[1:], source="install_script",
+        )
+    else:
+        # An operator asking for a profile that does not cover what the
+        # program declares is a contradiction between two things vq was told,
+        # not a floor to quietly raise: say which two. Word for word the
+        # managed update's rule, because it is the same contradiction.
+        missing = sorted(set(prog.extras) - dict(_EXTRAS_PROFILES)[selected])
+        if missing:
+            raise AdminError(
+                f"env {env!r}: requested profile {selected!r} does not "
+                "install " + ", ".join(missing) + f", which {list(prog.extras)} "
+                "on this program declares. Ask for a profile that covers it, "
+                "or change the declaration"
+            )
+    # ``install.sh`` builds ``core`` when it is told nothing.
+    resolved = _resolve_extras_profile(selected or "core", prog.extras)
+    if resolved == selected:
+        # The command line already installs the declaration. Appending it
+        # again would change nothing and make the argv in the run log read
+        # like two instructions where there is one.
+        return []
+    return ["--extras", resolved]
+
+
+def _recorded_extras_profile(prog: config.VenvProgram) -> str | None:
+    """The profile this venv's ``.vq-install-metadata`` records, if readable.
+
+    The managed transaction requires that note and refuses without it, because
+    it is about to replace an environment that is serving. An ordinary update
+    is not entitled to the same strictness: a venv built by the plain ``pip
+    install -e`` that ``CONTRIBUTING.md`` documents carries no note, and
+    refusing every update of one would be a new failure for a shape that
+    works. So this answers ``None`` instead and the caller falls back to what
+    ``update.sh`` itself falls back to -- ``core`` -- which keeps the floor a
+    floor: it can only raise the profile above the one the script would have
+    chosen on its own.
+    """
+    try:
+        return _read_managed_install_metadata(
+            Path(prog.python).parent.parent,
+        )["extras"]
+    except (AdminError, OSError):
+        return None
+
+
+def _declared_extras_update_args(
+    env: str, prog: config.VenvProgram, *, supplied: Sequence[str],
+) -> list[str]:
+    """The declared extras floor, as arguments for an ordinary update.
+
+    The caller has already proved that ``update_script`` is vq's own script
+    (:func:`_declared_extras_route`), which is the only thing that makes
+    naming an install target on it safe.
+
+    What the floor is resolved over is whatever ``update.sh`` would have
+    chosen without vq's help, in that script's own order of precedence: the
+    last ``--extras`` on the argv it is about to receive -- an operator's
+    ``--update-script-arg --extras PROFILE`` first, because that lands after
+    the configured command's own arguments -- then the profile
+    ``.vq-install-metadata`` records, then ``core``. Resolving over that is
+    what makes this a floor rather than a setting: it cannot narrow what the
+    update was going to install anyway.
+
+    Unlike the managed transaction it names no ``--recreate-venv``. That flag
+    replaces the virtualenv, which an ordinary update has no business doing --
+    ``update.sh`` refuses it outright outside a managed transaction unless
+    ``--skip-git`` comes with it -- and reinstalling into the existing venv
+    with a wider extras spec is what puts the declared runtime into it.
+    """
+    selected = _requested_extras_profile(
+        env, supplied, source="--update-script-arg",
+    )
+    if selected is None:
+        selected = _requested_extras_profile(
+            env,
+            shlex.split(prog.update_script or "")[1:],
+            source="update_script",
+        )
+    else:
+        # Word for word the install path's rule, because it is the same
+        # contradiction: an operator asking for a profile that does not carry
+        # what the program declares is two instructions, not a floor to raise.
+        missing = sorted(set(prog.extras) - dict(_EXTRAS_PROFILES)[selected])
+        if missing:
+            raise AdminError(
+                f"env {env!r}: requested profile {selected!r} does not "
+                "install " + ", ".join(missing) + f", which {list(prog.extras)} "
+                "on this program declares. Ask for a profile that covers it, "
+                "or change the declaration"
+            )
+    if selected is None:
+        selected = _recorded_extras_profile(prog) or "core"
+    resolved = _resolve_extras_profile(selected, prog.extras)
+    if resolved == selected:
+        # Whatever decided the profile already installs the declaration.
+        # Appending it again would change nothing and make the argv in the run
+        # log read like two instructions where there is one.
+        return []
+    return ["--extras", resolved]
+
+
+def _declared_extras_on_ordinary_update(
+    env: str, prog: config.VenvProgram, *, supplied: Sequence[str],
+) -> list[str]:
+    """What an ordinary update does about a declared floor, and says about it.
+
+    Returns the arguments to append to the update script's argv, and narrates
+    exactly one note either way, because both answers are things an operator
+    has to be able to read off a run log.
+
+    The rule is the one the other two build paths already follow: vq applies a
+    declared floor wherever vq itself builds the environment, and it may name
+    an install target only on its own ``scripts/install.sh`` or
+    ``scripts/update.sh``, inside the checkout the program points at. Until
+    this existed, an ordinary update applied it nowhere, so a program that
+    declared ``extras = ["web"]``, was not the env serving this host's daemon
+    and configured vq's own updater was rebuilt without uvicorn by the very
+    verb an operator reaches for to fix that -- the failure the key exists to
+    prevent, surviving on the one path that had no reason an operator could
+    predict from the outside (#85).
+
+    The proof decides, and nothing else. A program whose ``update_script`` is
+    its own script keeps exactly the behaviour it has always had, and is told
+    so (:func:`_warn_if_declared_extras_are_inert`).
+    """
+    if not prog.extras:
+        return []
+    route, detail = _declared_extras_route(prog, prog.update_script)
+    if route != ExtrasRoute.VQ:
+        _warn_if_declared_extras_are_inert(env, prog)
+        return []
+    args = _declared_extras_update_args(env, prog, supplied=supplied)
+    if not args:
+        output.narrate(
+            f"note: {env} declares extras {list(prog.extras)}, which the "
+            f"profile this update already installs covers; {detail} is run "
+            "with the command line as configured"
+        )
+        return []
+    output.narrate(
+        f"note: {env} declares extras {list(prog.extras)}, and this update "
+        f"applies it: update_script resolves to {detail}, the checkout's own, "
+        f"so vq appends --extras {args[1]} to it"
+    )
+    return args
+
+
 def _prove_legacy_managed_install(venv: Path, project_root: Path) -> bool:
-    """Read PEP 610 without executing an unowned environment (#577)."""
+    """Read PEP 610 without executing an unowned environment (#577).
+
+    Adoption is the one path that has to read a venv nobody built for vq, so
+    every way the evidence can be ambiguous refuses here rather than picking a
+    reading. Two records under one distribution name and one record under each
+    of vq's two names (#68) are the same ambiguity, and get the same answer: a
+    refusal that names the ``.dist-info`` directories it found, because the
+    operator's next move is deleting the stale one.
+    """
     for name in (".vq-install-metadata", ".vq-checkout-owner"):
         if os.path.lexists(venv / name):
             raise AdminError("legacy adoption requires an entirely unmarked venv")
@@ -3014,7 +4105,7 @@ def _prove_legacy_managed_install(venv: Path, project_root: Path) -> bool:
         raise AdminError("legacy adoption requires a real virtualenv")
     if (venv / "pyvenv.cfg").is_symlink():
         raise AdminError("legacy adoption refuses a symlinked pyvenv.cfg")
-    matches = sorted(venv.glob("lib*/python*/site-packages/vq-*.dist-info/direct_url.json"))
+    matches = _pep610_records(venv)
     safe = []
     for candidate in matches:
         if not candidate.is_file():
@@ -3023,7 +4114,14 @@ def _prove_legacy_managed_install(venv: Path, project_root: Path) -> bool:
                    if p != venv and venv in p.parents):
             safe.append(candidate)
     if len(safe) != 1 or any(not p.samefile(safe[0]) for p in matches):
-        raise AdminError("legacy adoption requires one unambiguous PEP 610 record")
+        found = ", ".join(sorted({str(record.parent.name) for record in matches}))
+        raise AdminError(
+            "legacy adoption requires one unambiguous PEP 610 record, found: "
+            + (found or "none")
+            + ". Remove the stale .dist-info -- the distribution was renamed "
+            f"from {LEGACY_DISTRIBUTION_NAME} to {DISTRIBUTION_NAME} (#68) and "
+            "pip does not know the two names are one project"
+        )
     try:
         payload = json.loads(safe[0].read_text(encoding="utf-8"))
         url = urlsplit(payload["url"])
@@ -3101,9 +4199,8 @@ def _managed_update_script_args(
     if not parts:
         raise AdminError("managed daemon update script is empty")
     project_root = _vq_project_root_for_program(prog)
-    canonical = (project_root / "scripts" / "update.sh").resolve(strict=True)
-    configured = (Path(prog.git_dir) / parts[0]).resolve(strict=True)
-    if configured != canonical:
+    configured, proven = _vq_own_script_proof(prog, parts[0], names=("update.sh",))
+    if not proven:
         raise AdminError(
             "managed daemon update requires the checkout's canonical "
             f"scripts/update.sh, got {configured}"
@@ -3331,6 +4428,10 @@ def already_current(
     """
     if expected_sha is None:
         return False, "no --expected-sha: an untargeted update has no target"
+    if prog.runtime_slot_root is not None:
+        return _slot_already_current(
+            prog, expected_sha=expected_sha, expected_tag=expected_tag,
+        )
     head = prog.current_git_sha(full=True)
     if head != expected_sha:
         return False, (
@@ -3348,6 +4449,49 @@ def already_current(
     if not healthy:
         return False, f"at the target commit but not healthy: {reason}"
     return True, f"already at {expected_sha}"
+
+
+def _slot_already_current(
+    prog: config.VenvProgram,
+    *,
+    expected_sha: str,
+    expected_tag: str | None,
+) -> tuple[bool, str]:
+    """Idempotence for a slot-rooted program: the active generation decides.
+
+    A slot update builds and activates ``releases/<sha>`` and never moves the
+    registered checkout, so that checkout's HEAD says nothing about what the
+    update would change. Reading it instead let a rollback to the commit the
+    legacy checkout happened to sit on report "nothing to do" (#72). A verified
+    generation is sealed, so there is no working-tree dirtiness to consult.
+    """
+    assert prog.runtime_slot_root is not None
+    sha = expected_sha.lower()
+    try:
+        root = runtime_slots.layout(prog.runtime_slot_root).root
+        active = runtime_slots.resolve_current(root)
+        if active is None:
+            return False, f"no active runtime generation at {root}"
+        if active != sha:
+            return False, f"active runtime generation is {active}, not {sha}"
+        if not runtime_slots._verified_markers_match(root, active):
+            return False, f"active runtime generation {active[:12]} is not verified"
+        slot_prog = runtime_slots.slot_local_program(prog, root, active)
+    except (runtime_slots.RuntimeSlotError, OSError) as exc:
+        return False, f"runtime store cannot be read: {exc}"
+    if slot_prog.import_check is None and slot_prog.vibeqc_source_root() is not None:
+        slot_prog = slot_prog.model_copy(update={"import_check": "vibeqc"})
+    if expected_tag is not None:
+        _rc, actual_tag = _run_git_tag_check(Path(slot_prog.git_dir))
+        if actual_tag != expected_tag:
+            return False, (
+                f"active generation is tagged {actual_tag or '(none)'}, "
+                f"not {expected_tag}"
+            )
+    healthy, reason = slot_prog.availability()
+    if not healthy:
+        return False, f"active generation is the target but not healthy: {reason}"
+    return True, f"active runtime generation already at {sha}"
 
 
 def _shas_agree(first: str, second: str) -> bool:
@@ -4029,9 +5173,13 @@ def _update_env_owned(
         prog.runtime_slot_root is not None
         and (require_self_update or initial_self_update_probe.is_self_update)
     ):
-        raise AdminError(
-            "a vq daemon self-update cannot activate a runtime slot: the "
-            "service definition is bound to the currently serving virtualenv"
+        from vq import runtime_daemon
+
+        return runtime_daemon.update(
+            env, cfg, prog, initial_self_update_probe, host=host,
+            expected_sha=expected_sha, expected_tag=expected_tag,
+            supplied=update_script_args, restart_daemon=restart_daemon,
+            admin_token=admin_token, force=force, forward_only=require_self_update,
         )
     if require_self_update:
         if not restart_daemon:
@@ -4059,8 +5207,25 @@ def _update_env_owned(
     )
     managed_request_args = list(update_script_args) if update_script_args else None
     profile_change_needed = False
+    extras_notes: list[str] = []
     if not managed_daemon_restart:
-        _warn_if_declared_extras_are_inert(env, prog)
+        # The declared floor applies wherever vq builds the environment, on
+        # the same proof the managed lane and the provision rest on (#85).
+        # Appending it is a profile change like #11's, so it passes the same
+        # idempotence gate below: a checkout already at the target commit is
+        # not evidence that its venv carries what the program declares, which
+        # is the state the console host sat in for two days.
+        # Admission precedes the run log. Retain its explanation until a
+        # channel can deliver it to both the transcript and the CLI.
+        with output.channel(level=output.Level.VERBOSE, sink=extras_notes.append):
+            declared_extras_args = _declared_extras_on_ordinary_update(
+                env, prog, supplied=update_script_args or [],
+            )
+        if declared_extras_args:
+            update_script_args = [
+                *(update_script_args or []), *declared_extras_args,
+            ]
+            profile_change_needed = True
     if managed_daemon_restart:
         # Fast-path rejection before marker acquisition and queue pause. The
         # same proofs run again at the exact service-stop boundary to close the
@@ -4094,7 +5259,7 @@ def _update_env_owned(
         )
         if current:
             output.narrate(f"{env}: {why}; nothing to do")
-            return UpdateResult(
+            result = UpdateResult(
                 env=env,
                 git_dir=prog.git_dir,
                 branch=prog.branch,
@@ -4105,6 +5270,16 @@ def _update_env_owned(
                 expected_tag=expected_tag,
                 actual_tag=expected_tag,
             )
+            if extras_notes:
+                with admin_run_log(
+                    env, what=f"admin update {env}",
+                    multi_user=cfg.multi_user.enabled or config.system_multi_user_enabled(),
+                ) as run_log:
+                    for note in extras_notes:
+                        output.narrate(note)
+                    if run_log.available:
+                        result.run_log_path = str(run_log.path)
+            return result
     _refuse_atomic_update_from_uninstalled_checkout(
         env, prog, expected_sha=expected_sha,
     )
@@ -4114,6 +5289,8 @@ def _update_env_owned(
     with admin_run_log(
         env, what=f"admin update {env}", multi_user=multi_user
     ) as run_log:
+        for note in extras_notes:
+            output.narrate(note)
         output.run_log_write(
             "# effective update timeouts: "
             f"wall={_update_script_timeout():g}s "
@@ -4141,6 +5318,31 @@ def _update_env_owned(
         return result
 
 
+def _raise_update_cleanup_error(
+    error: BaseException, *, marker_acquired: bool,
+    primary_error: BaseException | None,
+) -> NoReturn:
+    """Retain failed recovery authority and both causes before unwinding."""
+    reason = f"update cleanup unresolved: {type(error).__name__}: {error}"
+    if primary_error is not None:
+        reason += (
+            f"; original update failure: {type(primary_error).__name__}: "
+            f"{primary_error}"
+        )
+    if marker_acquired:
+        try:
+            transition_admin_update_state(
+                ADMIN_UPDATE_STATE_FAILED, failure_reason=reason,
+            )
+        except BaseException as persistence_error:
+            # Do not lose either failure if even the diagnostic rewrite fails.
+            # The existing pause/transaction marker is deliberately not cleared.
+            error.add_note(f"could not record cleanup failure: {persistence_error}")
+    if primary_error is not None:
+        raise error from primary_error
+    raise error
+
+
 def _update_env_logged(
     env: str,
     cfg: config.Config,
@@ -4158,6 +5360,8 @@ def _update_env_logged(
     initial_self_update_probe: _SelfUpdateProbe,
     update_script_args: list[str] | None,
     managed_request_args: list[str] | None = None,
+    slot_transaction: dict[str, object] | None = None,
+    prepared_result: UpdateResult | None = None,
 ) -> UpdateResult:
     """The body of :func:`update_env`, run inside its transcript.
 
@@ -4172,7 +5376,14 @@ def _update_env_logged(
     # after pause. The pre-pause guard call here is kept as the
     # fast-path "fail before pausing" check — but the authoritative
     # race-free claim is in acquire_admin_update_marker.
-    _guard_admin_update_marker(force=force, envs=[env], host=host)
+    # Only execution-bound slots leave the serving generation untouched.
+    # A serving daemon transaction still needs its pause/service recovery fence.
+    background_build = bool(
+        prog.runtime_slot_execution and prog.runtime_slot_root is not None
+        and not managed_daemon_restart and slot_transaction is None
+    )
+    marker_env = f"runtime-slot:{env}" if background_build else env
+    _guard_admin_update_marker(force=force, envs=[marker_env], host=host)
 
     # 1. Prove the pause scope quiescent FIRST so the rebuild doesn't
     # race a running job. v0.5.47: when prog.provides_branches is set
@@ -4219,27 +5430,30 @@ def _update_env_logged(
     marker_acquired = False
     paused_summary = "pause not started"
     try:
-        acquire_admin_update_marker(envs=[env], host=host, force=force)
+        acquire_admin_update_marker(envs=[marker_env], host=host, force=force)
         marker_acquired = True
-        _record_admin_update_pause_scope(
-            pause_token=pause_token,
-            paused_jobids=[],
-            # Recovery uses the token even for branch-scoped pauses so a death
-            # between two SIGSTOPs can resume exactly the completed subset.
-            surgical=False,
-            multi_user=multi_user,
-        )
-        pause_proof = pause_token_scope_with_proof(
-            host,
-            pause_token,
-            branches=(prog.provides_branches or []) if surgical else None,
-            multi_user=multi_user,
-            queue_root=pause_queue_root,
-            exclude_jobids=exclude,
-        )
-        pause_proof.require_quiescent()
-        paused_summary = pause_proof.summary
-        transition_admin_update_state(ADMIN_UPDATE_STATE_PAUSED)
+        if background_build:
+            paused_summary = "not paused: building an immutable replacement runtime"
+        else:
+            _record_admin_update_pause_scope(
+                pause_token=pause_token,
+                paused_jobids=[],
+                # Recovery uses the token even for branch-scoped pauses so a death
+                # between two SIGSTOPs can resume exactly the completed subset.
+                surgical=False,
+                multi_user=multi_user,
+            )
+            pause_proof = pause_token_scope_with_proof(
+                host,
+                pause_token,
+                branches=(prog.provides_branches or []) if surgical else None,
+                multi_user=multi_user,
+                queue_root=pause_queue_root,
+                exclude_jobids=exclude,
+            )
+            pause_proof.require_quiescent()
+            paused_summary = pause_proof.summary
+            transition_admin_update_state(ADMIN_UPDATE_STATE_PAUSED)
         # v0.6.0: PULLING phase covers _do_update_work's git pull +
         # optional tag check + optional update_script. The
         # transition fires once at entry; the per-step phases
@@ -4254,13 +5468,14 @@ def _update_env_logged(
             try:
                 daemon_lifecycle = _begin_managed_daemon_update(
                     prog, initial_self_update_probe, env=env,
+                    **({"slot_transaction": slot_transaction} if slot_transaction else {}),
                 )
             except _ManagedGitAdmissionError:
                 managed_git_admission_failed = True
                 raise
         transition_admin_update_state(ADMIN_UPDATE_STATE_PULLING)
         effective_script_args = list(update_script_args or [])
-        result = _do_update_work(
+        result = prepared_result or _do_update_work(
             env, prog,
             expected_tag=expected_tag,
             expected_sha=expected_sha,
@@ -4269,7 +5484,10 @@ def _update_env_logged(
         )
         result.paused_summary = paused_summary
         if daemon_lifecycle is not None:
-            _complete_managed_daemon_update(prog, result, daemon_lifecycle)
+            completion_prog = prog
+            if slot_transaction is not None:
+                completion_prog = config.VenvProgram.model_validate(slot_transaction["target"])
+            _complete_managed_daemon_update(completion_prog, result, daemon_lifecycle)
     finally:
         cleanup_error: BaseException | None = None
         # A service stopped by outer admin must be restored before jobs resume,
@@ -4299,15 +5517,18 @@ def _update_env_logged(
             # Every newly paused job, including a branch-scoped surgical
             # pause, carries this token. Resume by token so a mid-scan error or
             # SIGKILL cannot strand the subset paused before the exception.
-            resume_proof = resume_token_scope_with_proof(
-                host,
-                pause_token,
-                multi_user=multi_user,
-                queue_root=pause_queue_root,
-            )
-            resume_proof.require_clear()
-            resumed_summary = resume_proof.summary
-            _disarm_proven_pause_scope_without_managed_receipt()
+            if background_build:
+                resumed_summary = "not resumed: current runtime remained available"
+            else:
+                resume_proof = resume_token_scope_with_proof(
+                    host,
+                    pause_token,
+                    multi_user=multi_user,
+                    queue_root=pause_queue_root,
+                )
+                resume_proof.require_clear()
+                resumed_summary = resume_proof.summary
+                _disarm_proven_pause_scope_without_managed_receipt()
             if marker_acquired and managed_git_admission_failed:
                 # The late Git recheck is before receipt/service/file mutation.
                 # Once the exact pause token is proven clear there is no
@@ -4319,7 +5540,10 @@ def _update_env_logged(
         except BaseException as exc:
             cleanup_error = cleanup_error or exc
         if cleanup_error is not None:
-            raise cleanup_error
+            _raise_update_cleanup_error(
+                cleanup_error, marker_acquired=marker_acquired,
+                primary_error=sys.exception(),
+            )
 
     if not managed_daemon_restart:
         _maybe_restart_daemon(
@@ -4328,6 +5552,11 @@ def _update_env_logged(
             restart_daemon=restart_daemon,
             require_self_update=require_self_update,
         )
+    console_prog = (
+        config.VenvProgram.model_validate(slot_transaction["target"])
+        if slot_transaction is not None else prog
+    )
+    _maybe_refresh_console(prog, console_prog, result)
     transition_admin_update_state(ADMIN_UPDATE_STATE_VERIFYING)
 
     # Persist the verified outcome before releasing the update marker.
@@ -4427,10 +5656,17 @@ def _resolve_provisionable_program(
             f"how to build it. Add `install_script = \"...\"` to "
             f"[programs.{env}]."
         )
+    # A declaration this installer could not apply is refused before the
+    # marker and before the clone, so the operator's fix is a config edit and
+    # there is nothing to clean up first. The proof needs the checkout and
+    # runs after it (:func:`_declared_extras_install_args`).
+    _refuse_install_that_cannot_apply_declared_extras(env, prog)
     return prog
 
 
-def _refuse_occupied_git_dir(env: str, git_dir: Path) -> None:
+def _refuse_occupied_git_dir(
+    env: str, git_dir: Path, *, python: Path | None = None,
+) -> None:
     """Refuse to provision over anything already at ``git_dir``.
 
     An existing checkout is somebody's work, possibly with local commits, and
@@ -4457,11 +5693,29 @@ def _refuse_occupied_git_dir(env: str, git_dir: Path) -> None:
             f"env {env!r}: cannot read git_dir {str(git_dir)!r}: {exc}"
         ) from exc
     if occupied:
-        detail = (
-            "it is already a git checkout; refresh it with `vq admin update`"
-            if (git_dir / ".git").exists()
-            else "it is not empty"
-        )
+        if not (git_dir / ".git").exists():
+            detail = "it is not empty"
+        elif python is not None and not python.exists():
+            # A checkout with no venv is what a refused provision leaves: it
+            # clones, then refuses before building. `vq admin update` there
+            # builds from scratch through update_script, which for a program
+            # whose declared extras could not be applied is exactly the build
+            # the refusal existed to prevent -- and it reports success. But
+            # it is also what an operator's own fresh clone looks like, and
+            # that may carry local commits, so emptying it is said only for
+            # the case vq can name, never as the one way out.
+            detail = (
+                f"it is already a git checkout, with no venv at {python}. If "
+                "a refused `vq admin install` left it, empty it and provision "
+                "again: `vq admin update` would build that venv through "
+                "update_script, which applies a declared extras floor only "
+                "where the refusal said it could. If it is your own checkout, "
+                "`vq admin update` builds its venv"
+            )
+        else:
+            detail = (
+                "it is already a git checkout; refresh it with `vq admin update`"
+            )
         raise AdminError(
             f"env {env!r}: refusing to provision into {str(git_dir)!r} -- "
             f"{detail}"
@@ -4570,8 +5824,10 @@ def provision_env(
         expected_tag=expected_tag,
     )
     with admin_update_ownership():
-        _refuse_occupied_git_dir(env, git_dir)
-        acquire_admin_update_marker(envs=[env], host=host, force=force)
+        _refuse_occupied_git_dir(env, git_dir, python=Path(prog.python))
+        own_marker = acquire_admin_update_marker(
+            envs=[env], host=host, force=force,
+        )
         try:
             transition_admin_update_state(ADMIN_UPDATE_STATE_PULLING)
             # Re-checked under the marker: the first check is a courtesy that
@@ -4581,10 +5837,15 @@ def provision_env(
             # happened -- and a marker left behind for an operation that did
             # nothing is one an operator has to clear by hand to learn that.
             # Clear it and let the refusal speak for itself.
+            #
+            # This provision's own marker, by identity. The bare call finds it
+            # through the thread-local lease this process holds, which is
+            # right here too; naming it keeps that true without depending on
+            # the lease bookkeeping.
             try:
-                _refuse_occupied_git_dir(env, git_dir)
+                _refuse_occupied_git_dir(env, git_dir, python=Path(prog.python))
             except AdminError:
-                clear_admin_update_marker()
+                clear_admin_update_marker(own_marker)
                 raise
             output.narrate(f"cloning {prog.upstream} into {git_dir}")
             if not _clone_at_exact_sha(
@@ -4595,6 +5856,38 @@ def provision_env(
                 result.tag_check_rc, result.actual_tag = _run_git_tag_check(
                     git_dir
                 )
+            # The clone is the first moment the installer exists, so it is
+            # the first moment the declaration can be proved appliable. The
+            # check before the clone is the courtesy; this one is the
+            # guarantee, and it still runs before anything is built.
+            try:
+                extras_args = _declared_extras_install_args(
+                    env, prog, supplied=list(install_script_args or []),
+                )
+            except AdminError as exc:
+                # Every refusal from here on comes after the clone and before
+                # anything is built. The checkout it leaves is the one thing
+                # in the way of the next provision, and the refusal says so.
+                #
+                # Its marker is cleared rather than left FAILED, as the
+                # occupied-git_dir refusal above clears its own, because a
+                # remedy for that marker could not be stated: install and
+                # clear-update-marker route a scheduler cluster differently,
+                # a forwarded install runs as "localhost" on the far side, and
+                # `clear-update-marker --yes` takes whichever failed marker is
+                # listed first -- another env's, on a machine that has one
+                # (seventh and eighth reviews of #47). What stops a second
+                # provision racing onto this clone is the clone itself, which
+                # a provision refuses.
+                clear_admin_update_marker(own_marker)
+                raise AdminError(
+                    f"{exc}. Before any of that: this provision had already "
+                    f"cloned into {git_dir} on {socket.gethostname()} when it "
+                    "refused, and left that checkout there. A provision "
+                    f"refuses an occupied git_dir, so first empty {git_dir} "
+                    "there. Nothing was built, and it has left no "
+                    "admin-update marker"
+                ) from exc
             with toolset_lifecycle_lock([prog], action="vq-admin-install"):
                 transition_admin_update_state(ADMIN_UPDATE_STATE_BUILDING)
                 output.narrate(f"running {prog.install_script} in {git_dir}")
@@ -4602,7 +5895,7 @@ def provision_env(
                     git_dir,
                     prog.install_script or "",
                     work_errors=result.work_errors,
-                    extra_args=list(install_script_args or []),
+                    extra_args=[*(install_script_args or []), *extras_args],
                     label="install_script",
                 )
                 result.update_script_rc = rc
@@ -4770,8 +6063,8 @@ def _update_all_owned(
         if prog.runtime_slot_root is not None:
             raise AdminError(
                 f"batch target {name!r} is the serving daemon and uses "
-                "runtime_slot_root; first-class self-update requires the "
-                "canonical serving virtualenv transaction"
+                "runtime_slot_root; update it separately with `vq self-update "
+                "--expected-sha FULL_SHA`, then retry the remaining batch targets"
             )
     managed_daemon_restarts = {
         name: bool(
@@ -4785,9 +6078,17 @@ def _update_all_owned(
     if update_script_args and "--adopt-legacy" in update_script_args:
         raise AdminError("legacy adoption requires a single managed environment update")
     managed_script_args_by_name: dict[str, list[str]] = {}
+    # A batch has one operator argv and one declaration per program, so the
+    # floor is per env exactly as the managed plan is (#85).
+    ordinary_script_args_by_name: dict[str, list[str]] = {}
     for name, prog in progs:
         if not managed_daemon_restarts[name]:
-            _warn_if_declared_extras_are_inert(name, prog)
+            ordinary_script_args_by_name[name] = [
+                *(update_script_args or []),
+                *_declared_extras_on_ordinary_update(
+                    name, prog, supplied=update_script_args or [],
+                ),
+            ]
             continue
         if prog.post_update_script:
             raise AdminError(
@@ -4871,7 +6172,7 @@ def _update_all_owned(
             per_env_args = (
                 list(managed_script_args_by_name[name])
                 if managed_daemon_restarts[name]
-                else list(update_script_args or [])
+                else list(ordinary_script_args_by_name[name])
             )
             result = _do_update_work(
                 name, prog,
@@ -4922,7 +6223,10 @@ def _update_all_owned(
         except BaseException as exc:
             cleanup_error = cleanup_error or exc
         if cleanup_error is not None:
-            raise cleanup_error
+            _raise_update_cleanup_error(
+                cleanup_error, marker_acquired=marker_acquired,
+                primary_error=sys.exception(),
+            )
 
     # v0.5.42: at most one env in the batch can be a vq self-update
     # (only one venv contains the running daemon). Walk results, and
@@ -4941,6 +6245,7 @@ def _update_all_owned(
                 restart_result,
                 restart_daemon=restart_daemon,
             )
+        _maybe_refresh_console(prog, prog, restart_result)
     transition_admin_update_state(ADMIN_UPDATE_STATE_VERIFYING)
 
     # Record every result before deciding whether the batch marker can be
@@ -5322,6 +6627,18 @@ def _update_scheduler_host_guarded(
             )
 
 
+ALLOCATION_LOG_CAP_BYTES = 100 * 1024 * 1024
+"""Disk the retained allocation deploy logs of one program may use (#105).
+
+Each allocation attempt keeps its ``deploy.*/`` directory under
+``<scratch_root>/.vq-admin/runtime-deploy/<program>/``. After a run, the
+wrapper walks the attempts newest first, adding up their sizes (``du -sk``)
+from the current attempt's. The first attempt that would take the total past
+this cap is removed, and so is every older one. The current attempt is never
+removed, even when it alone is larger. Maintainer decision, 2026-09-26:
+100 MiB."""
+
+
 def _slurm_allocation_argv(
     allocation: config.SchedulerBuildAllocation,
     deploy_argv: list[str],
@@ -5334,8 +6651,14 @@ def _slurm_allocation_argv(
     submitted to the scheduler from the login host. ``sbatch --wait`` runs the
     job server-side and exits with the job's own return code, so a multi-hour
     cold build survives an SSH blip that a foreground ``srun`` would not. Job
-    stdout/stderr land in per-deployment log files under ``scratch_root`` that
-    the wrapper streams back, so the build log survives on failure. The
+    stdout/stderr land in unique per-attempt log files under ``scratch_root``.
+    After completion, the wrapper waits for three identical nonempty transcript
+    observations, at one-second intervals (at most ten), before streaming them.
+    Missing or unsettled output is explicitly marked incomplete; logs survive
+    both deployment and observation failures. This bounds shared-filesystem
+    visibility delay, not a guarantee against arbitrary delayed writes.
+    Retained attempts are capped at :data:`ALLOCATION_LOG_CAP_BYTES` per
+    program, oldest removed first, after the current run is streamed. The
     deployment command must be a valid batch script (shebang); ``sbatch``
     passes the identity args to it and the configured ``sbatch_args`` (account,
     partition, resources) select the allocation.
@@ -5346,16 +6669,59 @@ def _slurm_allocation_argv(
     script = (
         "set -uo pipefail\n"
         f"log_dir={shlex.quote(log_dir)}\n"
-        'mkdir -p "$log_dir"\n'
-        'out="$log_dir/deploy.out"\n'
-        'err="$log_dir/deploy.err"\n'
-        'rm -f "$out" "$err"\n'
+        'mkdir -p "$log_dir" || exit 1\n'
+        'attempt_dir=$(mktemp -d "$log_dir/deploy.XXXXXXXX") || exit 1\n'
+        'out="$attempt_dir/deploy.out"\n'
+        'err="$attempt_dir/deploy.err"\n'
         f"sbatch --parsable --wait {shlex.join(allocation.sbatch_args)} "
         '--output="$out" --error="$err" '
         f"{shlex.join(deploy_argv)}\n"
         "rc=$?\n"
+        'previous=""; stable=0; settled=0\n'
+        'for attempt in {1..10}; do\n'
+        '  sleep 1\n'
+        '  current=$(cksum "$out" "$err" 2>/dev/null) || current=""\n'
+        '  if [ -n "$current" ] && [ "$current" = "$previous" ] '
+        '&& { [ -s "$out" ] || [ -s "$err" ]; }; then\n'
+        '    stable=$((stable + 1))\n'
+        '    if [ "$stable" -ge 2 ]; then settled=1; break; fi\n'
+        '  else\n'
+        '    stable=0\n'
+        '  fi\n'
+        '  previous="$current"\n'
+        'done\n'
+        'if [ "$settled" -ne 1 ]; then\n'
+        '  printf "VQ: deployment transcript incomplete (empty, unavailable, '
+        'or not stable after 10 observations); retained logs: %s\\n" "$attempt_dir" >&2\n'
+        'fi\n'
         '[ -f "$out" ] && cat "$out"\n'
         '[ -f "$err" ] && cat "$err" >&2\n'
+        # Cap the retained attempts (#105): newest first, the current one
+        # counted first and never removed; once the cap is passed, that
+        # attempt and every older one go. Symlinks are never followed.
+        'rm -f "$log_dir/deploy.out" "$log_dir/deploy.err"\n'
+        f"cap_kib={ALLOCATION_LOG_CAP_BYTES // 1024}\n"
+        'kept_kib=$(du -sk "$attempt_dir" 2>/dev/null | cut -f1)\n'
+        'ls -1td "$log_dir"/deploy.* 2>/dev/null | {\n'
+        '  kept=${kept_kib:-0}; full=0\n'
+        '  while IFS= read -r old; do\n'
+        # `ls` prints a name holding a newline as several lines (#113): act
+        # only on a line naming a `deploy.*` entry of $log_dir. A name holds no
+        # `/`, so a continuation line is always a path relative to the cwd.
+        '    case "$old" in "$log_dir"/deploy.*) ;; *) continue ;; esac\n'
+        '    [ "$old" = "$attempt_dir" ] && continue\n'
+        '    [ "$old" -ef "$attempt_dir" ] && continue\n'
+        '    { [ -d "$old" ] && [ ! -L "$old" ]; } || continue\n'
+        '    size=$(du -sk "$old" 2>/dev/null | cut -f1)\n'
+        '    [ -n "$size" ] || continue\n'
+        '    if [ "$full" -eq 0 ] && [ $((kept + size)) -le "$cap_kib" ]; then\n'
+        '      kept=$((kept + size))\n'
+        '    else\n'
+        '      full=1\n'
+        '      rm -rf -- "$old"\n'
+        '    fi\n'
+        '  done\n'
+        '}\n'
         'exit "$rc"\n'
     )
     return ["bash", "-c", script]
@@ -5437,22 +6803,25 @@ def update_scheduler_runtime(
             )
         )
         source_resources = (("checkout", source_checkout),)
-    with admin_update_ownership(), toolset_lifecycle_lock(
-        [],
-        action=f"update scheduler runtime {host}:{program}",
-        extra_resources=source_resources,
-    ):
-        return _update_scheduler_runtime_owned(
-            host,
-            program,
-            cfg,
-            expected_sha=expected_sha,
-            expected_tag=expected_tag,
-            install=install,
-            force=force,
-            update_script_args=update_script_args,
-            drain_wait_seconds=drain_wait_seconds,
-        )
+    with contextlib.ExitStack() as ownership:
+        ownership.enter_context(admin_update_ownership())
+        with toolset_lifecycle_lock(
+            [],
+            action=f"update scheduler runtime {host}:{program}",
+            extra_resources=source_resources,
+        ):
+            return _update_scheduler_runtime_owned(
+                host,
+                program,
+                cfg,
+                expected_sha=expected_sha,
+                expected_tag=expected_tag,
+                install=install,
+                force=force,
+                update_script_args=update_script_args,
+                drain_wait_seconds=drain_wait_seconds,
+                ownership=ownership,
+            )
 
 
 def _update_scheduler_runtime_owned(
@@ -5466,6 +6835,7 @@ def _update_scheduler_runtime_owned(
     force: bool = False,
     update_script_args: list[str] | None = None,
     drain_wait_seconds: float = 0.0,
+    ownership: contextlib.ExitStack | None = None,
 ) -> SchedulerRuntimeUpdateResult:
     """Build, atomically activate, and verify one scheduler-host runtime.
 
@@ -5571,13 +6941,331 @@ def _update_scheduler_runtime_owned(
             force=force,
             drain_wait_seconds=drain_wait_seconds,
             operation_context=operation_context,
+            ownership=ownership,
         )
 
 
-PROGRAM_REPO_SLUGS = {
-    "vibe-view": "mpei/vibe-view",
-    "vibeview-dev": "mpei/vibe-view",
-    "vibeqc-queue": "mpei/vibe-queue",
+@dataclass
+class DetachedOperationReconciliation:
+    """What ``vq admin reconcile-operation`` found and did (#115)."""
+
+    operation_id: str
+    host: str
+    program: str
+    dry_run: bool
+    remote_run_dir: str
+    update: SchedulerRuntimeUpdateResult
+    marker_cleared: bool = False
+    recorded: bool = False
+
+    def to_json_payload(self) -> dict[str, object]:
+        return {
+            "operation_id": self.operation_id,
+            "host": self.host,
+            "program": self.program,
+            "dry_run": self.dry_run,
+            "remote_run_dir": self.remote_run_dir,
+            "remote_returncode": self.update.command_rc,
+            "verify_rc": self.update.verify_rc,
+            "expected_sha": self.update.expected_sha,
+            "actual_sha": self.update.actual_sha,
+            "expected_tag": self.update.expected_tag,
+            "actual_tag": self.update.actual_tag,
+            "active_path": self.update.active_path,
+            "verified": self.update.success,
+            "errors": list(self.update.work_errors),
+            "marker_cleared": self.marker_cleared,
+            "recorded": self.recorded,
+        }
+
+
+def _drain_retained_detached_run(
+    host_cfg: config.HostConfig,
+    request: Mapping[str, object],
+) -> tuple[_DetachedSchedulerObservation, bytes]:
+    """Read a bound run's whole retained output and its terminal receipt.
+
+    Read-only and bounded: it follows the run's output from offset zero
+    until it has every stored byte, and refuses when the spool changes
+    between reads or the bytes do not match the stored digest.
+    """
+    offset = 0
+    chunks: list[bytes] = []
+    first: _DetachedSchedulerObservation | None = None
+    while True:
+        observed = _observe_detached_scheduler_command(host_cfg, request, offset=offset)
+        if first is None:
+            first = observed
+        elif (observed.stored_bytes, observed.stored_sha256, observed.state) != (
+            first.stored_bytes, first.stored_sha256, first.state,
+        ):
+            raise transport.RemoteError(
+                "the retained run changed while it was being read; retry"
+            )
+        chunks.append(observed.output)
+        offset = observed.next_offset
+        if offset >= observed.stored_bytes:
+            break
+        if not observed.output:
+            raise transport.RemoteError("the retained output stopped short of its size")
+    output = b"".join(chunks)
+    if hashlib.sha256(output).hexdigest() != observed.stored_sha256:
+        raise transport.RemoteError(
+            "the retained output does not match its stored digest"
+        )
+    return observed, output
+
+
+def _argv_has_pair(argv: Sequence[str], flag: str, value: str) -> bool:
+    return any(
+        argv[index] == flag and argv[index + 1] == value
+        for index in range(len(argv) - 1)
+    )
+
+
+def reconcile_detached_scheduler_operation(
+    operation_id: str,
+    cfg: config.Config,
+    *,
+    dry_run: bool = False,
+) -> DetachedOperationReconciliation:
+    """Settle a rollout operation whose driver died during a detached build.
+
+    The durable operation stays outcome-unknown when its recorder dies, even
+    when the build it bound finished (#115). This owner-side path never
+    relaunches or replays anything. It requires:
+
+    - the local operation to be outcome-unknown, for a scheduler-runtime
+      action, with its create-once detached binding;
+    - the build host to still hold that exact bound run, whose retained
+      request rebuilds byte for byte from the binding;
+    - the run's terminal receipt to report success (rc 0, not timed out),
+      with its whole retained output matching the stored digest;
+    - no live admin update for this runtime, and no pause scope on its marker;
+    - the same independent login-host verification the live action runs,
+      passing for the operation's own SHA and tag.
+
+    Only then does it record LAST OK, clear the dead child's marker, and
+    write the operation's reconciliation evidence and terminal success. The
+    next ``vq admin rollout-latest`` harvests that result and releases the
+    hold as for any completed operation. ``dry_run`` gathers and checks the
+    same evidence, including the verification, and writes nothing.
+    """
+    try:
+        observed_op = fleet_operation.observe_operation(operation_id)
+    except fleet_operation.OperationError as exc:
+        raise AdminError(f"cannot read operation {operation_id}: {exc}") from exc
+    if observed_op.state != "outcome-unknown":
+        raise AdminError(
+            f"operation {operation_id} is {observed_op.state}; only an "
+            "outcome-unknown operation can be reconciled"
+        )
+    identity = observed_op.identity
+    if identity.phase != "scheduler-runtime":
+        raise AdminError(
+            f"operation {operation_id} is a {identity.phase} action; only a "
+            "scheduler-runtime action with a fixed-host detached build can be "
+            "reconciled from remote evidence"
+        )
+    try:
+        binding = fleet_operation.read_detached_scheduler_binding(operation_id)
+    except fleet_operation.OperationError as exc:
+        raise AdminError(f"cannot read the detached binding: {exc}") from exc
+    if binding is None:
+        raise AdminError(
+            f"operation {operation_id} has no detached build binding, so no "
+            "remote run can prove its outcome; it stays blocked"
+        )
+    host, program = identity.host, identity.program
+    host_cfg = _resolve_scheduler_update_host(host, cfg, require_managed=True)
+    deployment = host_cfg.scheduler_runtime_deployments.get(program)
+    if deployment is None or not deployment.detached_build or not deployment.update_host:
+        raise AdminError(
+            f"scheduler runtime {host}:{program} is no longer configured as a "
+            "fixed-host detached build; restore that configuration to reconcile"
+        )
+    command_host_cfg = host_cfg.model_copy(update={"ssh": deployment.update_host})
+    mode_prefix = f"runtime {program} "
+    mode = binding.mode.removeprefix(mode_prefix)
+    if (
+        binding.target != command_host_cfg.ssh
+        or binding.program != program
+        or not binding.mode.startswith(mode_prefix)
+        or mode not in {"install", "update"}
+    ):
+        raise AdminError(
+            "the detached binding names another build host or runtime than the "
+            f"current configuration of {host}:{program}; it stays blocked"
+        )
+    expected_sha = identity.target_sha
+    expected_tag = identity.target_tag
+    if expected_tag is None and program == "vibeqc-release":
+        expected_tag = _resolve_tag_for_deploy(cfg, expected_sha)
+    try:
+        verify_argv = [
+            *shlex.split(deployment.verify_command),
+            "--program", program,
+            "--expected-sha", expected_sha,
+            *(["--tag", expected_tag] if expected_tag is not None else []),
+        ]
+    except ValueError as exc:
+        raise AdminError(f"scheduler runtime verify command parse failed: {exc}") from exc
+    marker_env = f"scheduler-runtime:{host}:{program}"
+    source_resources: tuple[tuple[str, str], ...] = ()
+    if cfg.vibeqc_source_repo is not None:
+        source_resources = ((
+            "checkout",
+            str(_canonical_lifecycle_checkout(Path(cfg.vibeqc_source_repo).expanduser())),
+        ),)
+    with admin_update_ownership(), toolset_lifecycle_lock(
+        [],
+        action=f"reconcile scheduler runtime operation {host}:{program}",
+        extra_resources=source_resources,
+    ):
+        stale_markers: list[AdminUpdateMarker] = []
+        for _path, marker in _admin_update_marker_entries():
+            if marker is None:
+                raise AdminError(
+                    "an unreadable admin-update marker is present; inspect it "
+                    "with `vq admin status` before reconciling"
+                )
+            if not admin_update_scopes_conflict(marker.envs, marker.host, [marker_env], host):
+                continue
+            # No age backstop: only a writer that is provably gone counts.
+            stale = admin_update_marker_stale_reason(marker, max_age_seconds=math.inf)
+            if stale is None:
+                raise AdminError(
+                    f"an admin update for {host}:{program} is still running "
+                    f"(pid {marker.pid}); wait for it rather than reconciling"
+                )
+            if (
+                marker.pause_token
+                or marker.paused_jobids
+                or marker.managed_transaction is not None
+            ):
+                raise AdminError(
+                    "the conflicting admin-update marker records paused jobs or "
+                    "a managed transaction; recover it with `vq admin "
+                    "recover-update` first"
+                )
+            stale_markers.append(marker)
+
+        try:
+            request = _retained_detached_request(command_host_cfg, binding)
+            remote, output_bytes = _drain_retained_detached_run(command_host_cfg, request)
+        except transport.RemoteError as exc:
+            raise AdminError(
+                f"the bound run {binding.remote_run_dir} cannot prove the "
+                f"outcome: {exc}"
+            ) from exc
+        if remote.state != "completed" or remote.result is None:
+            raise AdminError(
+                f"the bound run {binding.remote_run_dir} is {remote.state}, not "
+                "completed; reconcile only after its recorder has finished"
+            )
+        if remote.timed_out or remote.returncode != 0:
+            raise AdminError(
+                f"the bound run {binding.remote_run_dir} ended with "
+                f"rc={remote.returncode}"
+                + (" after its self-timeout" if remote.timed_out else "")
+                + "; only a proven success can be reconciled, so it stays blocked"
+            )
+        identity_request = request["request_identity"]
+        assert isinstance(identity_request, dict)
+        retained_argv = identity_request["argv"]
+        assert isinstance(retained_argv, list)
+        if not (
+            _argv_has_pair(retained_argv, "--program", program)
+            and _argv_has_pair(retained_argv, "--expected-sha", expected_sha)
+            and (
+                _argv_has_pair(retained_argv, "--tag", expected_tag)
+                if expected_tag is not None
+                else "--tag" not in retained_argv
+            )
+        ):
+            raise AdminError(
+                "the retained build command does not carry this operation's "
+                f"program, SHA and tag ({expected_tag!r}); it stays blocked"
+            )
+
+        update = SchedulerRuntimeUpdateResult(
+            host=host,
+            program=program,
+            mode=mode,
+            command=shlex.join(retained_argv),
+            command_ssh=command_host_cfg.ssh,
+            verify_command=shlex.join(verify_argv),
+            verify_ssh=host_cfg.ssh,
+            expected_sha=expected_sha,
+            expected_tag=expected_tag,
+            command_rc=0,
+            command_output=output_bytes.decode("utf-8", "replace"),
+        )
+        update.metrics.update(parse_deploy_metrics(update.command_output))
+        reconciliation = DetachedOperationReconciliation(
+            operation_id=observed_op.operation_id,
+            host=host,
+            program=program,
+            dry_run=dry_run,
+            remote_run_dir=binding.remote_run_dir,
+            update=update,
+        )
+        try:
+            verify = transport.run_remote_shell(
+                host_cfg,
+                *verify_argv,
+                check=False,
+                timeout=_scheduler_verify_timeout(deployment),
+            )
+        except transport.RemoteError as exc:
+            update.work_errors.append(f"runtime verification failed: {exc}")
+            return reconciliation
+        update.verify_rc = verify.returncode
+        update.verify_output = _combined_output(verify.stdout, verify.stderr)
+        if verify.returncode != 0:
+            update.work_errors.append(f"verification command rc={verify.returncode}")
+            return reconciliation
+        _apply_scheduler_runtime_receipt(update, verify.stdout)
+        if not update.success or dry_run:
+            return reconciliation
+
+        record_scheduler_runtime_outcome(update)
+        for marker in stale_markers:
+            clear_admin_update_marker(marker)
+            reconciliation.marker_cleared = True
+        evidence = {
+            "remote_run_id": binding.run_id,
+            "remote_request_sha256": binding.remote_request_sha256,
+            "remote_result": dict(remote.result),
+            "verification": {
+                "command": update.verify_command,
+                "host": update.verify_ssh,
+                "returncode": update.verify_rc,
+                "source_sha": update.actual_sha,
+                "tag": update.actual_tag,
+                "active_path": update.active_path,
+            },
+        }
+        try:
+            fleet_operation.record_reconciled_result(
+                observed_op.operation_id,
+                expected_request_sha256=observed_op.request_sha256,
+                binding=binding,
+                evidence=evidence,
+            )
+        except fleet_operation.OperationError as exc:
+            raise AdminError(
+                "LAST OK was recorded, but the operation result could not be "
+                f"written: {exc}; run the reconciliation again"
+            ) from exc
+        reconciliation.recorded = True
+        return reconciliation
+
+
+PROGRAM_REPO_NAMES = {
+    "vibe-view": "vibe-view",
+    "vibeview-dev": "vibe-view",
+    "vibeqc-queue": "vibe-queue",
 }
 """Repository each managed program is built from, after the 2026-09-08 split.
 
@@ -5587,7 +7275,7 @@ site-provided source stagers make, so the driver
 and the host agree on which upstream a program belongs to.
 """
 
-DEFAULT_PROGRAM_REPO_SLUG = "mpei/vibe-qc"
+DEFAULT_PROGRAM_REPO_NAME = "vibe-qc"
 
 
 def program_source_repo(cfg: config.Config, program: str) -> Path:
@@ -5605,11 +7293,12 @@ def program_source_repo(cfg: config.Config, program: str) -> Path:
     resolve through :attr:`config.Config.vibeqc_source_repo`, which is also
     where the two are required to agree.
     """
-    slug = PROGRAM_REPO_SLUGS.get(program, DEFAULT_PROGRAM_REPO_SLUG)
+    product = PROGRAM_REPO_NAMES.get(program, DEFAULT_PROGRAM_REPO_NAME)
+    slug = config.source_repo_key(cfg.pin_source_repos, product)
     configured = cfg.pin_source_repos.get(slug)
     if configured:
         return Path(configured).expanduser()
-    if slug == DEFAULT_PROGRAM_REPO_SLUG and cfg.vibeqc_source_repo:
+    if product == DEFAULT_PROGRAM_REPO_NAME and cfg.vibeqc_source_repo:
         return Path(cfg.vibeqc_source_repo).expanduser()
     raise AdminError(
         f"program {program!r} is built from {slug!r}, but no local checkout "
@@ -5673,6 +7362,7 @@ def _verify_push_fed_mirror(
         host_cfg, "sh", "-c", _PUSH_FED_MIRROR_PROBE, "vq-mirror-probe", mirror,
         check=False,
         timeout=transport.DEFAULT_REMOTE_SHELL_TIMEOUT_SECONDS,
+        retry_transient=1,  # Read-only inspection is safe to repeat on a fresh SSH connection.
     )
     where = f"{host_cfg.ssh}:{mirror}"
     if probe.returncode != 0:
@@ -5749,6 +7439,254 @@ def _verify_push_fed_mirror(
     return True
 
 
+RUNTIME_PIN_REF_PREFIX = "refs/vq/pins/"
+"""Namespace of the immutable per-pin ref every mirror feed also writes.
+
+The ref name carries the commit it names, so feeding one is either a creation
+or a no-op against the identical value: it can never ask for a force, and no
+later feed can make it name a different tree. It is the durable half of the
+feed contract -- the exact accepted pin stays addressable in the mirror under
+a name the mutable lane branches cannot take away, and the objects stay
+anchored against a later ``git gc`` on the mirror.
+
+The site preparer still reads the lane branch pair; moving it onto this ref
+is a cross-component contract change and not vq's alone to make (#81).
+"""
+
+
+def _runtime_feed_lane_branch(program: str) -> str:
+    """The mutable branch a program's mirror feed keeps in step with the pin.
+
+    Feed only the authority for this lane. A release feed must not move
+    ``main`` behind the accepted dev pin, and a branch-tip feed must not move
+    ``release``; each preparer fails closed unless both refs of its own lane
+    agree exactly.
+    """
+    return "release" if program == "vibeqc-release" else "main"
+
+
+def _local_tags_at(repo: str, sha: str) -> list[str]:
+    """Tag names in the driver's clone that point exactly at ``sha``.
+
+    This is the requested release identity and nothing else. The feed used to
+    mirror ``+refs/tags/*:refs/tags/*``, which forced every tag the driver
+    happened to carry over every tag the mirror happened to hold -- far
+    broader than the one identity a deployment is about (#81).
+    """
+    try:
+        proc = _mutating_git_run(
+            ["git", "-C", repo, "tag", "--points-at", sha],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return sorted(
+        {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    )
+
+
+def _git_ref_value(repo: str, ref: str) -> str | None:
+    """What ``ref`` names in the driver's clone, or None when it has none.
+
+    For an annotated tag this is the tag object, which is what a push compares
+    against the mirror's ref -- two tag objects wrapping the same commit are
+    still a disagreement, and a non-forced push refuses one.
+    """
+    try:
+        proc = _mutating_git_run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet", ref],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _git_is_ancestor(repo: str, ancestor: str, descendant: str) -> bool | None:
+    """True, False, or None when the driver's clone cannot answer.
+
+    None is not "no": it is "this clone does not have the commit the mirror is
+    on", which is the case where the driver has no standing to judge whether
+    feeding the pin would drop history. Callers must treat it as a refusal,
+    not as a fast-forward.
+    """
+    try:
+        proc = _mutating_git_run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor",
+             ancestor, descendant],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def _ls_remote_refs(
+    repo: str,
+    remote: str,
+    refnames: list[str],
+    result: SchedulerRuntimeUpdateResult,
+    *,
+    where: str,
+) -> dict[str, str] | None:
+    """What the mirror currently holds for ``refnames``; None after refusing.
+
+    Read-only, and deliberately separate from the push: a refusal has to name
+    the mirror's own values to be actionable, and the middle of a push is the
+    wrong place to discover that it would have needed a force. Peeled
+    ``^{}`` lines are dropped -- a push compares ref values, not peeled ones.
+    """
+    try:
+        proc = _mutating_git_run(
+            ["git", "-C", repo, "ls-remote", remote, *refnames],
+            capture_output=True, text=True, timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        result.work_errors.append(
+            f"mirror feed: reading the refs of {where} timed out"
+        )
+        return None
+    if proc.returncode != 0:
+        combined = _combined_output(proc.stdout, proc.stderr)
+        _run_log_command_output("mirror feed ls-remote", proc.returncode, combined)
+        detail = _last_output_line(combined)
+        result.work_errors.append(
+            f"mirror feed: could not read the refs of {where}: "
+            + (detail or f"rc={proc.returncode}")
+        )
+        return None
+    refs: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        value, sep, name = line.partition("\t")
+        name = name.strip()
+        if not sep or not name or name.endswith("^{}"):
+            continue
+        refs[name] = value.strip()
+    return refs
+
+
+def _plan_runtime_mirror_feed(
+    *,
+    repo: str,
+    remote: str,
+    where: str,
+    branch: str,
+    expected_sha: str,
+    expected_tag: str | None,
+    result: SchedulerRuntimeUpdateResult,
+) -> list[str] | None:
+    """Unforced refspecs that feed exactly this pin, or None after refusing.
+
+    Nothing this returns carries a leading ``+``, and the push that carries
+    them is ``--atomic``, so the mirror either gains exactly this pin or is
+    left byte-identical. Every update that would need a force is refused
+    *here*, before the push, with the mirror's own values in the message.
+
+    The refusals matter as much as the refspecs. The mirror is a private
+    deployment mirror rather than upstream, but it is still Git history, and
+    the standing rule is never to force-push. Mechanically dropping the ``+``
+    would leave one bad outcome behind: a legitimate *older* accepted pin,
+    after the mirror has advanced, is no longer a fast-forward. That must fail
+    visibly and say so. It must never be resolved by picking up whatever newer
+    tree the mirror has drifted to (#81).
+    """
+    tags = _local_tags_at(repo, expected_sha)
+    if expected_tag and expected_tag not in tags:
+        result.work_errors.append(
+            f"mirror feed: tag {expected_tag!r} does not name "
+            f"{expected_sha[:12]} in the driver's clone {repo}, so this "
+            f"deployment's tag and commit disagree at the source. Nothing "
+            f"was written to the mirror. Fetch the tag into that clone, or "
+            f"deploy the commit the tag really names."
+        )
+        return None
+    branch_refs = [f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"]
+    tag_refs = [f"refs/tags/{tag}" for tag in tags]
+    pin_ref = f"{RUNTIME_PIN_REF_PREFIX}{expected_sha}"
+    remote_refs = _ls_remote_refs(
+        repo, remote, [*branch_refs, *tag_refs, pin_ref], result, where=where,
+    )
+    if remote_refs is None:
+        return None
+
+    for ref in branch_refs:
+        current = remote_refs.get(ref)
+        if current is None or current == expected_sha:
+            continue
+        if _git_is_ancestor(repo, current, expected_sha) is True:
+            continue
+        if _git_is_ancestor(repo, expected_sha, current) is True:
+            detail = (
+                "the mirror has already moved past this pin, so feeding it "
+                "would rewind that branch"
+            )
+            remedy = (
+                "Deploy the commit the mirror already carries, or have the "
+                "mirror's owner move that branch back deliberately"
+            )
+        elif _git_is_ancestor(repo, current, expected_sha) is None:
+            detail = (
+                "the driver's clone does not contain the mirror's commit, so "
+                "it cannot tell what feeding this pin would drop"
+            )
+            remedy = (
+                "Fetch the mirror's history into the driver's clone and "
+                "re-read the disagreement"
+            )
+        else:
+            detail = "the two have diverged"
+            remedy = (
+                "Reconcile the mirror with the source of truth for this lane"
+            )
+        result.work_errors.append(
+            f"mirror feed: {where} has {ref} at {current[:12]}, the "
+            f"requested pin is {expected_sha[:12]}, and {detail}. vq never "
+            f"force-pushes, so the feed is refused and the mirror is "
+            f"unchanged. {remedy}, then re-run. The pin itself stays "
+            f"addressable as {pin_ref} once a feed of it succeeds."
+        )
+        return None
+
+    for tag, ref in zip(tags, tag_refs, strict=True):
+        current = remote_refs.get(ref)
+        if current is None or current == _git_ref_value(repo, ref):
+            continue
+        result.work_errors.append(
+            f"mirror feed: {where} already has {ref} at {current[:12]}, which "
+            f"is not the tag object the driver's clone carries for {tag!r}. A "
+            f"tag is an identity, not a pointer to update: vq neither moves "
+            f"nor forces one. The feed is refused and the mirror is "
+            f"unchanged. Resolve the disagreement at the source and re-run."
+        )
+        return None
+
+    current_pin = remote_refs.get(pin_ref)
+    if current_pin is not None and current_pin != expected_sha:
+        # Only reachable if something outside vq wrote into the namespace;
+        # the ref name is the commit, so vq itself cannot produce this.
+        result.work_errors.append(
+            f"mirror feed: {where} has {pin_ref} at {current_pin[:12]}, which "
+            f"contradicts its own name. The per-pin namespace is immutable by "
+            f"construction, so vq refuses rather than forcing it. The feed is "
+            f"refused and the mirror is unchanged."
+        )
+        return None
+
+    return [
+        f"{expected_sha}:{pin_ref}",
+        *(f"{expected_sha}:{ref}" for ref in branch_refs),
+        *(f"{ref}:{ref}" for ref in tag_refs),
+    ]
+
+
 def _feed_and_prepare_runtime_source(
     host: str,
     cfg: config.Config,
@@ -5762,13 +7700,23 @@ def _feed_and_prepare_runtime_source(
 ) -> bool:
     """Automate offline-build-node source feed and preparation.
 
-    pbs-cluster's runbook required two manual commands before every runtime
-    update: push the exact pin into the login host's push-fed mirror, then
-    run the preparer. Both are mechanical and driver-executable, so when
+    The offline-build runbook required two manual commands before every
+    runtime update: push the exact pin into the login host's push-fed mirror,
+    then run the preparer. Both are mechanical and driver-executable, so when
     the deployment profile opts in they run here — after quiescence,
     before the build, failing closed with the current runtime intact.
     Returns True to proceed with the build, False after appending the
     failure to ``result.work_errors``.
+
+    The feed **never forces anything** (#81). It pushes, unforced and
+    atomically: the immutable per-pin ref (:data:`RUNTIME_PIN_REF_PREFIX`),
+    this lane's branch pair, and the tags that name this pin in the driver's
+    clone. Anything that would need a force -- a mirror branch that has moved
+    past the accepted pin, a diverged branch, a tag the mirror already holds
+    at another object -- is refused by :func:`_plan_runtime_mirror_feed`
+    before the push, so the mirror is left byte-identical and the operator
+    gets the mirror's own values in the error. Unrelated refs and tags are
+    never named by a refspec and so are never touched at all.
     """
     if deployment.feed_source_mirror:
         try:
@@ -5784,7 +7732,8 @@ def _feed_and_prepare_runtime_source(
         ):
             return False
         output.narrate(
-            f"feeding source mirror {remote} with {expected_sha[:12]}"
+            f"feeding source mirror {remote} with {expected_sha[:12]} "
+            f"(unforced)"
         )
         try:
             fetch = _mutating_git_run(
@@ -5806,24 +7755,35 @@ def _feed_and_prepare_runtime_source(
                    if fetch.stderr.strip() else f"rc={fetch.returncode}")
             )
             return False
-        # Feed only the authority for this lane. A release feed must not move
-        # main behind the accepted dev pin, and a branch-tip feed must not
-        # move release. Each preparer fails closed unless both refs for its
-        # lane agree exactly; tags carry the immutable release identity.
-        if program == "vibeqc-release":
-            refspecs = [
-                f"+{expected_sha}:refs/heads/release",
-                f"+{expected_sha}:refs/remotes/origin/release",
-            ]
-        else:
-            refspecs = [
-                f"+{expected_sha}:refs/heads/main",
-                f"+{expected_sha}:refs/remotes/origin/main",
-            ]
-        refspecs.append("+refs/tags/*:refs/tags/*")
+        # Plan the feed before touching the mirror: unforced refspecs for this
+        # lane only, or an explicit refusal naming what the mirror holds.
+        refspecs = _plan_runtime_mirror_feed(
+            repo=repo,
+            remote=remote,
+            where=f"{host_cfg.ssh}:{deployment.feed_source_mirror}",
+            branch=_runtime_feed_lane_branch(program),
+            expected_sha=expected_sha,
+            expected_tag=expected_tag,
+            result=result,
+        )
+        if refspecs is None:
+            return False
+        result.mirror_feed_refspecs = list(refspecs)
+        result.mirror_pin_ref = f"{RUNTIME_PIN_REF_PREFIX}{expected_sha}"
+        output.run_log_write(
+            "--- mirror feed refspecs (unforced, atomic) ---\n"
+            + "\n".join(refspecs)
+        )
         try:
+            # --atomic so a refused ref leaves the mirror byte-identical
+            # rather than half-fed: refs/heads/* and refs/remotes/* are both
+            # fast-forward-checked, but they are checked independently, and a
+            # lane whose branch and remote-tracking ref disagree is exactly
+            # what every preparer fails closed on. Needs git >= 2.4 on the
+            # receiving end; an older one refuses the push outright, which is
+            # the correct failure for a feed that must be all-or-nothing.
             push = _mutating_git_run(
-                ["git", "-C", repo, "push", remote, *refspecs],
+                ["git", "-C", repo, "push", "--atomic", remote, *refspecs],
                 capture_output=True, text=True, timeout=900,
             )
         except subprocess.TimeoutExpired:
@@ -5834,8 +7794,13 @@ def _feed_and_prepare_runtime_source(
             _combined_output(push.stdout, push.stderr),
         )
         if push.returncode != 0:
+            # The plan above already refused everything it could see, so a
+            # rejection here is a race with another writer, or a receiving
+            # git too old for --atomic. Either way the push was unforced and
+            # atomic, so the mirror is unchanged; never retry with force.
             result.work_errors.append(
-                "mirror feed: git push failed: "
+                "mirror feed: git push failed (unforced, atomic; the mirror "
+                "is unchanged): "
                 + (push.stderr.strip().splitlines()[-1]
                    if push.stderr.strip() else f"rc={push.returncode}")
             )
@@ -5892,12 +7857,14 @@ def _update_scheduler_runtime_guarded(
     force: bool,
     drain_wait_seconds: float,
     operation_context: fleet_operation.OperationExecutionContext | None,
+    ownership: contextlib.ExitStack | None = None,
 ) -> SchedulerRuntimeUpdateResult:
     """The marker-holding body of :func:`update_scheduler_runtime`.
 
     Split out so the run log wraps the whole operation including marker
     acquire/release; see :func:`_update_scheduler_host_guarded`.
     """
+    state_binding = _capture_admin_state_binding()
     acquire_admin_update_marker(envs=[marker_env], host=host, force=force)
     transition_admin_update_state(ADMIN_UPDATE_STATE_PAUSED)
     command_started = False
@@ -6002,25 +7969,26 @@ def _update_scheduler_runtime_guarded(
             command_argv = deploy_argv
 
         transition_admin_update_state(ADMIN_UPDATE_STATE_BUILDING)
-        command_started = True
         try:
-            if deployment.detached_build:
-                proc = _run_detached_scheduler_command(
-                    command_host_cfg,
-                    command_argv,
-                    scratch_root=host_cfg.scratch_root or "/tmp",
-                    program=program,
-                    timeout=deployment.timeout_seconds,
-                    mode=f"runtime {program} {mode}",
-                    operation_context=operation_context,
-                )
-            else:
-                proc = _run_scheduler_update_command_with_heartbeat(
-                    command_host_cfg,
-                    command_argv,
-                    timeout=deployment.timeout_seconds,
-                    mode=f"runtime {program} {mode}",
-                )
+            with _scheduler_runtime_remote_wait(ownership):
+                command_started = True
+                if deployment.detached_build:
+                    proc = _run_detached_scheduler_command(
+                        command_host_cfg,
+                        command_argv,
+                        scratch_root=host_cfg.scratch_root or "/tmp",
+                        program=program,
+                        timeout=deployment.timeout_seconds,
+                        mode=f"runtime {program} {mode}",
+                        operation_context=operation_context,
+                    )
+                else:
+                    proc = _run_scheduler_update_command_with_heartbeat(
+                        command_host_cfg,
+                        command_argv,
+                        timeout=deployment.timeout_seconds,
+                        mode=f"runtime {program} {mode}",
+                    )
         except transport.RemoteError as exc:
             result.work_errors.append(str(exc))
             return result
@@ -6064,7 +8032,24 @@ def _update_scheduler_runtime_guarded(
         _apply_scheduler_runtime_receipt(result, verify.stdout)
         return result
     finally:
+        if ownership is not None:
+            # A failed reacquisition must leave the original recovery marker
+            # intact, rather than finalizing in an unowned or rebound registry.
+            _validate_admin_state_binding(state_binding)
+            if not getattr(_admin_update_ownership_local, "depth", 0):
+                raise AdminUpdateInProgress("scheduler result awaits admin-update ownership")
         _release_scheduler_drain_lane(host, drain_lease_id)
+        # Before the outcome is persisted, so the receipt records what was
+        # reclaimed. A deploy that verified drops its own upload staging; one
+        # that did not keeps it for forensics, and older stages are trimmed so
+        # failures cannot accumulate without limit (#61).
+        if deployment.stage_source:
+            _reclaim_runtime_source_stage(
+                host,
+                command_host_cfg,
+                result,
+                remove_current=result.success,
+            )
         try:
             record_scheduler_runtime_outcome(result)
         except OSError as exc:
@@ -6442,6 +8427,50 @@ def source_tree_sha256_at_git_commit(
         ) from exc
 
 
+_RUNTIME_SOURCE_STAGE_SEGMENT = "/.vq-admin/runtime-source/"
+"""The path segment every runtime-source stage root contains.
+
+:func:`_reclaim_runtime_source_stage` refuses to delete anything under a root
+without it. The root is built from ``scratch_root``, which is operator config,
+and the reclaim is an ``rm -rf`` on a remote host: this keeps a mistyped or
+hostile ``scratch_root`` from turning it into one somewhere else."""
+
+_RUNTIME_SOURCE_RECLAIM_SCRIPT = bulk_delete.RMTREE_SHELL + """\
+set -eu
+root=$1
+keep=$2
+remove=$3
+[ -d "$root" ] || { printf 'reclaimed=0 retained=0\\n'; exit 0; }
+cd "$root"
+names=$(ls -1t 2>/dev/null | grep -E '^[0-9a-fA-F]{40}-[0-9a-fA-F]{32}$' || true)
+reclaimed=0
+retained=0
+for name in $names; do
+    if [ -L "$name" ] || [ ! -d "$name" ]; then
+        continue
+    fi
+    if [ -n "$remove" ] && [ "$name" = "$remove" ]; then
+        __vq_rmtree "$name"
+        reclaimed=$((reclaimed + 1))
+        continue
+    fi
+    if [ "$retained" -lt "$keep" ]; then
+        retained=$((retained + 1))
+    else
+        __vq_rmtree "$name"
+        reclaimed=$((reclaimed + 1))
+    fi
+done
+printf 'reclaimed=%s retained=%s\\n' "$reclaimed" "$retained"
+"""
+"""Reclaim one program's runtime-source stages on the build host.
+
+``ls -1t`` orders by mtime, newest first, and the ``grep`` keeps only the exact
+``<40 hex>-<32 hex>`` stage shape, so nothing else in the directory is
+considered. An in-flight upload from a concurrent deploy is the newest entry
+and is therefore inside ``keep``. Symlinks and non-directories are skipped
+rather than followed."""
+
 _RUNTIME_SOURCE_STAGE_ATTEMPTS = 6
 """Upload+verify passes for a runtime source stage before giving up.
 
@@ -6537,6 +8566,99 @@ def _resolve_tag_for_deploy(cfg: config.Config, sha: str) -> str | None:
     return _resolve_unique_tag_for_sha(Path(repo).expanduser(), sha)
 
 
+def _reclaim_runtime_source_stage(
+    host: str,
+    command_host_cfg: config.HostConfig,
+    result: SchedulerRuntimeUpdateResult,
+    *,
+    remove_current: bool,
+    keep: int = RUNTIME_SOURCE_STAGES_TO_KEEP,
+) -> None:
+    """Reclaim this deploy's upload staging and bound what the program keeps.
+
+    A runtime-source stage is upload staging for exactly one deploy: the driver
+    re-archives the same SHA from git on demand, and nothing reads a stage once
+    the build has consumed the archive. So a deploy that verified removes its
+    own, and older stages are trimmed to ``keep`` so failures cannot accumulate
+    without limit. Before #61 nothing removed them at all.
+
+    This is deliberately **not** the helper-generation rule. Those stay, because
+    another deployment may still be using an older one; see docs/operations.md.
+    Nothing here calls the ``source-stage-prune`` verb on the host either: it
+    removes exactly the directory this deploy created, by name, plus that one
+    program's own older stages.
+
+    Cleanup never fails a deploy. Any problem is recorded on the result and
+    logged, and the caller's outcome is untouched.
+    """
+    stage_path = result.staged_source_stage
+    if stage_path is None:
+        return
+    root = posixpath.dirname(stage_path)
+    current = posixpath.basename(stage_path)
+    if (
+        not stage_path.startswith("/")
+        or _RUNTIME_SOURCE_STAGE_SEGMENT not in stage_path
+        or not _SCHEDULER_STAGE_GENERATION_RE.fullmatch(current)
+    ):
+        # Fail closed: the root comes from operator config and the script runs
+        # `rm -rf` on a remote host.
+        result.staged_source_reclaim_error = (
+            f"refusing to reclaim an unrecognized stage path: {stage_path}"
+        )
+        log.error(
+            "scheduler runtime deploy on %s: %s",
+            host,
+            result.staged_source_reclaim_error,
+        )
+        return
+    try:
+        proc = transport.run_remote_shell(
+            command_host_cfg,
+            "sh", "-c", _RUNTIME_SOURCE_RECLAIM_SCRIPT, "vq-runtime-src-reclaim",
+            root, str(keep), current if remove_current else "",
+            check=False,
+            timeout=transport.DEFAULT_REMOTE_SHELL_TIMEOUT_SECONDS,
+        )
+    except transport.RemoteError as exc:
+        result.staged_source_reclaim_error = f"reclaim could not run: {exc}"
+        log.warning(
+            "scheduler runtime deploy on %s: could not reclaim source staging "
+            "under %s: %s",
+            host,
+            root,
+            exc,
+        )
+        return
+    if proc.returncode != 0:
+        detail = _combined_output(proc.stdout, proc.stderr).strip()
+        result.staged_source_reclaim_error = (
+            f"reclaim rc={proc.returncode}: {detail or '(no output)'}"
+        )
+        log.warning(
+            "scheduler runtime deploy on %s: source staging under %s was not "
+            "reclaimed (%s)",
+            host,
+            root,
+            result.staged_source_reclaim_error,
+        )
+        return
+    for token in proc.stdout.split():
+        key, _, value = token.partition("=")
+        if not value.isdigit():
+            continue
+        if key == "reclaimed":
+            result.staged_source_stages_reclaimed = int(value)
+        elif key == "retained":
+            result.staged_source_stages_retained = int(value)
+    result.staged_source_stage_reclaimed = remove_current
+    output.run_log_write(
+        f"--- runtime source staging: reclaimed "
+        f"{result.staged_source_stages_reclaimed}, retained "
+        f"{result.staged_source_stages_retained} under {root} ---"
+    )
+
+
 def _stage_scheduler_runtime_source(
     host: str,
     command_host_cfg: config.HostConfig,
@@ -6628,6 +8750,9 @@ def _stage_scheduler_runtime_source(
                 "could not create runtime source stage: "
                 + (_combined_output(mkdir.stdout, mkdir.stderr).strip() or "mkdir failed")
             )
+        # From here the directory exists on the host, so it is this deploy's to
+        # clean up even if the upload below never finishes (#61).
+        result.staged_source_stage = stage_path
         verify_script = (
             "set -eu\n"
             'stage=$1\n'
@@ -7186,6 +9311,8 @@ _DETACHED_OBSERVATION_SCHEMA = "vq.admin.detached_scheduler_observation/1"
 _DETACHED_LEASE_SCHEMA = "vq.admin.detached_scheduler_lease/1"
 _DETACHED_ACTIVATION_SCHEMA = "vq.admin.detached_scheduler_activation/1"
 _DETACHED_RESULT_SCHEMA = "vq.admin.detached_scheduler_result/1"
+_DETACHED_RETAINED_QUERY_SCHEMA = "vq.admin.detached_scheduler_retained_query/1"
+_DETACHED_RETAINED_SCHEMA = "vq.admin.detached_scheduler_retained_request/1"
 _DETACHED_OUTPUT_LIMIT = 4 * 1024 * 1024
 _DETACHED_OBSERVATION_CHUNK = 64 * 1024
 _DETACHED_REQUEST_LIMIT = 512 * 1024
@@ -7222,6 +9349,8 @@ OBSERVATION_SCHEMA = "vq.admin.detached_scheduler_observation/1"
 LEASE_SCHEMA = "vq.admin.detached_scheduler_lease/1"
 ACTIVATION_SCHEMA = "vq.admin.detached_scheduler_activation/1"
 RESULT_SCHEMA = "vq.admin.detached_scheduler_result/1"
+RETAINED_QUERY_SCHEMA = "vq.admin.detached_scheduler_retained_query/1"
+RETAINED_SCHEMA = "vq.admin.detached_scheduler_retained_request/1"
 MAX_JSON = 1024 * 1024
 MAX_OUTPUT = 4 * 1024 * 1024
 MAX_CHUNK = 64 * 1024
@@ -7397,6 +9526,20 @@ def read_json(dir_fd, name):
     return strict_load(read_bytes(dir_fd, name, MAX_JSON), name)
 
 
+def list_entries(dir_fd):
+    # btrfs may hide late entries through an older open file description.
+    # Reopen the held inode, never its potentially replaced pathname (#140).
+    fresh = os.open(".", DIR_FLAGS, dir_fd=dir_fd)
+    try:
+        held = os.fstat(dir_fd)
+        opened = os.fstat(fresh)
+        if (held.st_dev, held.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("run directory changed while reopening")
+        return os.listdir(fresh)
+    finally:
+        os.close(fresh)
+
+
 def optional_json(dir_fd, name):
     try:
         info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -7410,7 +9553,7 @@ def optional_json(dir_fd, name):
     if (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
             and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 2
             and 0 < info.st_size <= MAX_JSON):
-        for temporary in os.listdir(dir_fd):
+        for temporary in list_entries(dir_fd):
             if (not temporary.startswith("." + name + ".")
                     or TEMP.fullmatch(temporary) is None):
                 continue
@@ -7544,7 +9687,7 @@ def binding_sha(request):
 def validate_entries(run_fd):
     allowed = {"request.json", "lease.lock", "lease.json", "activation.json",
                "result.json", "output.log"}
-    for name in os.listdir(run_fd):
+    for name in list_entries(run_fd):
         if name in allowed:
             continue
         if TEMP.fullmatch(name) is None:
@@ -7851,6 +9994,38 @@ def observe(query):
         os.close(run_fd)
 
 
+def retained(query):
+    # Read-only: return the request a bound run retained, so an owner whose
+    # recorder died can rebuild the exact observation query from its local
+    # binding alone.  Never creates, launches or changes anything.
+    if (set(query) != {"schema", "binding"}
+            or query.get("schema") != RETAINED_QUERY_SCHEMA):
+        raise ValueError("invalid retained-request query")
+    binding = query.get("binding")
+    if not isinstance(binding, dict):
+        raise ValueError("invalid retained-request binding")
+    validate_binding(binding)
+    suffix = ("/.vq-admin-r4b1-" + binding["run_id"]
+              + "/detached/run-" + binding["run_id"])
+    run_dir = binding["remote_run_dir"]
+    if not run_dir.endswith(suffix) or len(run_dir) == len(suffix):
+        raise ValueError("binding run directory is not a managed run")
+    base_fd = open_base(run_dir[:-len(suffix)], binding["run_id"], False)
+    try:
+        run_fd = open_run(base_fd, "run-" + binding["run_id"])
+    finally:
+        os.close(base_fd)
+    try:
+        validate_entries(run_fd)
+        request = read_json(run_fd, "request.json")
+        validate_request(request)
+        if request["binding"] != binding:
+            raise ValueError("retained request belongs to another binding")
+    finally:
+        os.close(run_fd)
+    return {"schema": RETAINED_SCHEMA, "request": request}
+
+
 def main():
     action = sys.argv[1] if len(sys.argv) == 2 else ""
     payload = stdin_object()
@@ -7861,6 +10036,8 @@ def main():
         return
     elif action == "observe":
         result = observe(payload)
+    elif action == "retained":
+        result = retained(payload)
     else:
         raise ValueError("invalid helper action")
     sys.stdout.buffer.write(canonical(result) + b"\n")
@@ -7897,6 +10074,8 @@ class _DetachedSchedulerObservation:
     next_offset: int
     stored_bytes: int
     stored_sha256: str
+    result: Mapping[str, object] | None = None
+    """The validated remote result receipt, once one exists."""
 
 
 def _canonical_detached_json(payload: Mapping[str, object]) -> bytes:
@@ -8403,6 +10582,7 @@ def _parse_detached_observation(
         next_offset=next_offset,
         stored_bytes=stored_bytes,
         stored_sha256=output_sha,
+        result=result,
     )
 
 
@@ -8444,6 +10624,61 @@ def _observe_detached_scheduler_command(
         raise transport.RemoteError(
             f"detached scheduler remote outcome unknown: {exc}"
         ) from exc
+
+
+def _retained_detached_request(
+    host_cfg: config.HostConfig,
+    binding: fleet_operation.DetachedSchedulerCommandBinding,
+) -> dict[str, object]:
+    """The exact request a bound run retained, verified against the binding.
+
+    The local binding keeps only digests of the argv and remote request. An
+    owner reconciling a run whose recorder died reads the retained request
+    back (read-only) and accepts it only when rebuilding it from the local
+    binding reproduces it byte for byte, both digests included.
+    """
+    proc = _detached_helper_call(
+        host_cfg,
+        "retained",
+        {"schema": _DETACHED_RETAINED_QUERY_SCHEMA, "binding": binding.as_dict()},
+    )
+    if proc.returncode == 255 or proc.returncode < 0:
+        raise _DetachedObservationUnavailable(
+            f"SSH read of the retained request returned rc={proc.returncode}: "
+            f"{proc.stderr.strip()}"
+        )
+    if proc.returncode != 0:
+        raise transport.RemoteError(
+            "the bound run's retained request could not be read "
+            f"(rc={proc.returncode}): {proc.stderr.strip()}"
+        )
+    payload = _strict_detached_response(proc.stdout, label="retained request")
+    request = payload.get("request")
+    if (
+        set(payload) != {"schema", "request"}
+        or payload.get("schema") != _DETACHED_RETAINED_SCHEMA
+        or not isinstance(request, dict)
+    ):
+        raise transport.RemoteError("retained request response has invalid fields")
+    identity = request.get("request_identity")
+    if not isinstance(identity, dict):
+        raise transport.RemoteError("retained request lacks its identity")
+    argv = identity.get("argv")
+    scratch_root = identity.get("scratch_root")
+    timeout = identity.get("timeout_seconds")
+    if not isinstance(scratch_root, str):
+        raise transport.RemoteError("retained request has an invalid scratch root")
+    rebuilt = _detached_request_for_binding(
+        binding,
+        argv,  # type: ignore[arg-type]  # validated by the rebuild
+        scratch_root=scratch_root,
+        timeout=timeout,  # type: ignore[arg-type]
+    )
+    if rebuilt != request:
+        raise transport.RemoteError(
+            "retained request does not match the local binding"
+        )
+    return rebuilt
 
 
 def _run_bound_detached_scheduler_command(
@@ -8698,8 +10933,8 @@ def _run_legacy_detached_scheduler_command(
 
     Returns a synthetic ``CompletedProcess`` whose stdout is the accumulated
     build output. Raises :class:`transport.RemoteError` when the wall timeout
-    expires (the process group is killed first) or when observation fails for
-    :data:`DETACHED_BUILD_OBSERVATION_GRACE_SECONDS` straight.
+    expires (remote termination is attempted but unconfirmed) or observation
+    fails for :data:`DETACHED_BUILD_OBSERVATION_GRACE_SECONDS` straight.
     """
     run_dir = (
         f"{scratch_root.rstrip('/')}/.vq-admin/detached/"
@@ -8739,10 +10974,21 @@ def _run_legacy_detached_scheduler_command(
     offset = 0
     start = time.monotonic()
     last_observed = start
+    observation_error: str | None = None
     while True:
         time.sleep(DETACHED_BUILD_POLL_INTERVAL_SECONDS)
         elapsed = time.monotonic() - start
         if timeout and elapsed >= timeout:
+            if observation_error is not None:
+                # The deadline can arrive before the observation grace expires.
+                # Losing contact is not evidence that the build still needs
+                # termination; preserve the retained run for reconciliation.
+                raise transport.RemoteOutcomeUnknown(
+                    f"detached {mode} command is unobservable at its {timeout:.0f}s "
+                    f"deadline ({observation_error}); no termination was attempted. "
+                    f"Reconcile the retained run and process state before retrying. "
+                    f"The build may still be running on {host_cfg.ssh}; run dir: {run_dir}"
+                )
             with contextlib.suppress(transport.RemoteError):
                 transport.run_remote_shell(
                     host_cfg, "bash", "-s", check=False,
@@ -8752,8 +10998,10 @@ def _run_legacy_detached_scheduler_command(
                     ),
                 )
             raise transport.RemoteError(
-                f"detached {mode} command exceeded {timeout:.0f}s; process "
-                f"group killed. Partial output is in the transcript; the run "
+                f"detached {mode} command exceeded {timeout:.0f}s; remote "
+                f"termination was attempted but remains unconfirmed. Reconcile "
+                f"the retained run and process state before retrying. Partial "
+                f"output is in the transcript; the run "
                 f"dir {run_dir} is retained on {host_cfg.ssh} for forensics."
             )
         poll_script = "\n".join(
@@ -8773,10 +11021,25 @@ def _run_legacy_detached_scheduler_command(
             poll = transport.run_remote_shell(
                 host_cfg, "bash", "-s", check=False, stdin_data=poll_script,
             )
+            if poll.returncode != 0:
+                raise transport.RemoteError(
+                    f"detached poll rc={poll.returncode}: "
+                    f"{_combined_output(poll.stdout, poll.stderr).strip()}"
+                )
+            head, marker, chunk = poll.stdout.partition(
+                f"{_DETACHED_OUTPUT_MARKER}\n"
+            )
+            lines = head.splitlines()
+            if (not marker or len(lines) != 2
+                    or re.fullmatch(r"RC=(none|[0-9]+)", lines[0]) is None
+                    or re.fullmatch(r"SIZE=[0-9]+", lines[1]) is None):
+                raise transport.RemoteError("malformed detached poll response")
+            rc_line, size_line = lines[0][3:], lines[1][5:]
         except transport.RemoteError as exc:
+            observation_error = str(exc)
             if (time.monotonic() - last_observed
                     ) >= DETACHED_BUILD_OBSERVATION_GRACE_SECONDS:
-                raise transport.RemoteError(
+                raise transport.RemoteOutcomeUnknown(
                     f"detached {mode} command unobservable for "
                     f"{DETACHED_BUILD_OBSERVATION_GRACE_SECONDS:.0f}s "
                     f"({exc}). The build may still be running on "
@@ -8785,15 +11048,7 @@ def _run_legacy_detached_scheduler_command(
             log.warning("detached poll failed (tolerated): %s", exc)
             continue
         last_observed = time.monotonic()
-        head, _, chunk = poll.stdout.partition(
-            f"{_DETACHED_OUTPUT_MARKER}\n"
-        )
-        rc_line = size_line = ""
-        for line in head.splitlines():
-            if line.startswith("RC="):
-                rc_line = line[3:].strip()
-            elif line.startswith("SIZE="):
-                size_line = line[5:].strip()
+        observation_error = None
         if chunk:
             chunks.append(chunk)
             output.run_log_write(chunk)
@@ -9536,7 +11791,7 @@ def _run_git_pull(
 
 
 def _run_git_fetch_sha(
-    git_dir: Path, sha: str, branch: str | None,
+    git_dir: Path, sha: str, branch: str | None, *, local_first: bool = False,
 ) -> tuple[int | None, str]:
     """Fetch refs likely to contain ``sha`` before detached checkout.
 
@@ -9546,9 +11801,25 @@ def _run_git_fetch_sha(
     plain origin fetch for legacy envs without a configured branch. A pin on
     another branch is then fetched by its exact object ID from canonical
     origin; neither checkout nor the configured branch is moved (#677).
+
+    ``local_first`` is for an unpublished runtime generation. Materialization
+    has already fetched an absent exact commit, and a commit already present
+    needs no network. Since generations keep the real upstream as ``origin``
+    (#72), an unconditional fetch here would fail the build of a local commit
+    whenever that upstream is unreachable.
     """
     if not isinstance(sha, str) or _FULL_SHA_RE.fullmatch(sha) is None:
         return 2, "exact source fetch requires a full 40-hex commit SHA"
+    if local_first:
+        try:
+            present = subprocess.run(
+                ["git", "-C", str(git_dir), "cat-file", "-e", f"{sha}^{{commit}}"],
+                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return None, str(e)
+        if present.returncode == 0:
+            return 0, f"{sha} is already present; no origin fetch needed\n"
     args = ["git", "-C", str(git_dir), "fetch", "origin"]
     if branch:
         args.append(f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
@@ -10707,6 +12978,7 @@ def _run_import_check(
                     f"{native_core_path or '(not reported)'}"
                 )
             relative = native_core.relative_to(required_root)
+            venv_subdir = Path(python).parent.parent.name
             excluded = {
                 ".git",
                 "__pycache__",
@@ -10716,8 +12988,8 @@ def _run_import_check(
                 not relative.parts
                 or any(part in excluded for part in relative.parts)
                 or (
-                    ".venv" in relative.parts
-                    and relative.parts[0] != ".venv"
+                    venv_subdir in relative.parts
+                    and relative.parts[0] != venv_subdir
                 )
                 or relative.suffix in {".pyc", ".pyo"}
             ):
@@ -11135,62 +13407,6 @@ def _finalize_immutable_checkout(
         )
 
 
-def _safe_build_parallelism() -> int | None:
-    """v0.5.40 + v0.5.41: compute a safe CMAKE_BUILD_PARALLEL_LEVEL for
-    the update_script's build step, or None when host RAM is unknown.
-
-    Heuristic: ``min(nproc, max(2, ram_mb // 15000), 6)`` — each cc1plus
-    on vibe-qc's heaviest template-instantiation TUs (libint integral
-    headers, ``periodic_*.cpp``, ``guess.cpp``, ``gradient.cpp``) can
-    peak at **8–10 GB resident**. v0.5.40 budgeted 10 GB/worker with no
-    hard cap, which still let workstation run 12 cc1plus instances in
-    parallel — the box stayed up but became unresponsive (kernel
-    scheduling thrashed against ~100 GB of resident compiler heap, and
-    the shell froze for tens of seconds at a time). v0.5.41 budgets
-    **15 GB/worker** with a hard cap of **6** to prefer
-    responsiveness-during-build over wall-time. Concrete numbers for
-    the current fleet:
-
-    * workstation (32 threads, 125 GB RAM) → 6 workers (≤60 GB peak, ≥65 GB host headroom)
-    * compute-a    (16 threads,  62 GB RAM) → 4 workers (≤40 GB peak, ≥22 GB host headroom)
-    * macbook (10 threads,  32 GB RAM) → 2 workers (≤20 GB peak, ≥12 GB host headroom)
-
-    Why a hard cap of 6: on monster machines (≥100 GB), the bottleneck
-    stops being cc1plus memory and becomes ninja link/serialization +
-    filesystem write contention. Above 6 workers, you spend more time
-    in ld + buffered IO than in compile, and the only thing the extra
-    parallelism buys is more pressure on the page cache. The vq
-    daemon's job is to refresh the env safely, not to win a wall-time
-    contest — let the system stay usable while it runs.
-
-    Why this matters: the OOM-induced workstation hang on 2026-05-16
-    happened during an interactive ``bash scripts/update-dev.sh`` run
-    where ninja used all 32 threads on cc1plus and peaked beyond
-    125 GB resident. The vq-cgroup-controlled job path is protected
-    (per-job MemoryMax), but the daemon-side ``update_script`` runs
-    outside that scope — this env cap is the watchdog for build
-    parallelism specifically. v0.5.41 is the followup: 12 workers
-    didn't crash the box but did wedge interactive use, which the user
-    flagged as a regression vs v0.5.40's intent.
-
-    macOS dev / hosts without /proc/meminfo: returns None; the caller
-    leaves the env untouched so the system / user default wins.
-    """
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            mem_mb: int | None = None
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_mb = int(line.split()[1]) // 1024  # kB → MB
-                    break
-    except (OSError, ValueError):
-        return None
-    if mem_mb is None:
-        return None
-    nproc = os.cpu_count() or 1
-    return min(nproc, max(2, mem_mb // 15000), 6)
-
-
 def _build_niceness_prefix() -> list[str]:
     """v0.5.41: argv prefix that deprioritizes the update_script's CPU +
     IO so an in-flight build can't starve the foreground shell.
@@ -11416,6 +13632,7 @@ def _run_update_script(
     strip_config_ref_args: bool = False,
     managed_daemon_restart: bool = False,
     lifecycle_target: Path | None = None,
+    source_bound: bool = False,
 ) -> tuple[int | None, str, float | None]:
     """Run ``bash <script> [args...]`` from ``git_dir``.
 
@@ -11434,13 +13651,11 @@ def _run_update_script(
     Empty / whitespace-only ``script_cmd`` is treated as "no script
     configured" (returns None with a work_errors entry).
 
-    v0.5.40: ``CMAKE_BUILD_PARALLEL_LEVEL`` is injected into the
-    subprocess env based on host RAM/CPU (see
-    :func:`_safe_build_parallelism`). This caps ninja parallelism for
-    vibe-qc-style template-heavy builds and prevents the global-OOM
-    failure mode that hung workstation on 2026-05-16. If the caller's env
-    already sets the var, it's preserved verbatim — explicit user
-    intent wins.
+    ``CMAKE_BUILD_PARALLEL_LEVEL`` is not injected (#133): the product's
+    build helper sizes parallelism from available memory, and a value the
+    operator set is passed through verbatim. (v0.5.40-0.26.x injected a
+    MemTotal-based level that overrode the helper and OOM-killed a
+    host's build.)
 
     v0.5.41: argv is additionally prefixed with ``nice -n 19 ionice -c
     3`` on Linux (see :func:`_build_niceness_prefix`) so the in-flight
@@ -11459,6 +13674,18 @@ def _run_update_script(
     if strip_config_ref_args:
         script_args = _strip_update_script_ref_args(script_args)
     script_path = git_dir / script_rel
+    if source_bound:
+        try:
+            contained = script_path.resolve().is_relative_to(git_dir.resolve())
+        except (OSError, RuntimeError) as exc:
+            work_errors.append(f"{label} cannot resolve runtime-slot script: {exc}")
+            return None, "", None
+        if not contained:
+            work_errors.append(
+                f"{label} escapes the runtime-slot source tree; refusing to execute "
+                "an updater from another generation"
+            )
+            return None, "", None
     if not script_path.exists():
         work_errors.append(
             f"{label} not found: {script_path}"
@@ -11500,10 +13727,9 @@ def _run_update_script(
     if managed_daemon_restart:
         env["VQ_ADMIN_MANAGED_DAEMON_RESTART_PID"] = str(os.getpid())
         env.pop("VQ_VENV", None)
-    if "CMAKE_BUILD_PARALLEL_LEVEL" not in env:
-        cap = _safe_build_parallelism()
-        if cap is not None:
-            env["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cap)
+    # Build parallelism belongs to the product's own build helper, which sizes
+    # it from available memory per build phase (#133). vq no longer injects a
+    # level; an operator-set CMAKE_BUILD_PARALLEL_LEVEL passes through as is.
     # Cold-build robustness: put Arch/Manjaro perl dirs (pod2man) on PATH so
     # the libecpint/libcerf man-page step doesn't fail "command not found".
     _augment_build_path(env)
@@ -11807,6 +14033,7 @@ class _ManagedDaemonUpdate:
     target_source_sha: str | None = None
     target_source_tree_sha256: str | None = None
     terminal_verified: bool = False
+    slot_transaction: dict[str, object] | None = None
 
 
 LAUNCHD_DAEMON_LABEL = "com.vq.daemon"
@@ -12187,6 +14414,8 @@ def _verify_preupdate_daemon_identity(
         lifecycle.pre_source_sha,
         expected_tree_sha256=lifecycle.pre_source_tree_sha256,
         require_exact_identity=True,
+        wait_for_identity_change=False,
+        daemon_alive=_service_daemon_alive_probe(lifecycle.manager),
     )
     return provenance.verified, provenance.detail
 
@@ -12237,6 +14466,10 @@ def _restore_managed_update_files(
     lifecycle: _ManagedDaemonUpdate,
 ) -> tuple[bool, str]:
     """Restore the exact clean checkout and serving venv captured at begin."""
+    if lifecycle.slot_transaction is not None:
+        from vq import runtime_daemon
+
+        return runtime_daemon.restore(prog, lifecycle)
     if (
         lifecycle.pre_source_sha is None
         or lifecycle.pre_source_tree_sha256 is None
@@ -12371,6 +14604,14 @@ def _commit_managed_update_files(
     prog: config.VenvProgram,
     lifecycle: _ManagedDaemonUpdate,
 ) -> tuple[bool, str]:
+    if lifecycle.slot_transaction is not None:
+        from vq import runtime_daemon
+
+        runtime_daemon.require_binding_state(lifecycle.slot_transaction, target=True)
+        lifecycle.receipt_phase = "target_committed"
+        _persist_managed_update_receipt(prog, lifecycle)
+        lifecycle.terminal_verified = True
+        return True, "verified slot committed; prior generation and legacy paths retained"
     backup = lifecycle.venv_backup
     if not lifecycle.backup_moved:
         lifecycle.terminal_verified = True
@@ -12456,6 +14697,7 @@ def _begin_managed_daemon_update(
     probe: _SelfUpdateProbe,
     *,
     env: str = "vibeqc-queue",
+    slot_transaction: dict[str, object] | None = None,
 ) -> _ManagedDaemonUpdate:
     """Stop the proven serving daemon before checkout/install mutation."""
     if not probe.is_self_update or not probe.manager_available:
@@ -12489,6 +14731,17 @@ def _begin_managed_daemon_update(
         raise AdminError(
             "serving daemon systemd command is not canonical before update"
         )
+    if slot_transaction is not None:
+        from vq import runtime_daemon
+
+        binding = slot_transaction["service"]
+        _data, expected_command = runtime_daemon.service_bytes(
+            runtime_daemon.runtime_migration._bytes(binding["before"]["entry"]),
+            manager, prog, prog,
+        )
+        runtime_daemon.check_bindings(slot_transaction)
+        if not _service_command_identities_match(manager, state.command_identity, expected_command):
+            raise AdminError("serving daemon command changed after immutable binding planning")
     pre_pid = state.pid
     was_running = bool(state.running or pre_pid is not None)
     pre_source_sha, pre_branch = _capture_checkout_state(Path(prog.git_dir))
@@ -12576,7 +14829,11 @@ def _begin_managed_daemon_update(
         owner_uid=venv_info.st_uid,
         service_command=state.command_identity,
         transaction_id=transaction_id,
+        slot_transaction=slot_transaction,
     )
+    if slot_transaction is not None:
+        slot_transaction["old_service_command"] = list(state.command_identity)
+        slot_transaction["old_service_executable"] = state.executable
 
     # The durable receipt precedes the first service or filesystem mutation.
     # A SIGKILL after this point is recovered by exact paths/identities, never
@@ -12584,6 +14841,10 @@ def _begin_managed_daemon_update(
     _persist_managed_update_receipt(prog, lifecycle)
 
     try:
+        if slot_transaction is not None:
+            from vq import runtime_daemon
+
+            runtime_daemon.stage_bindings(prog, lifecycle)
         if manager is _DaemonServiceManager.SYSTEMD:
             argv = ["systemctl", "--user", "stop", "vq-daemon"]
             display = "systemctl --user stop vq-daemon"
@@ -12638,12 +14899,18 @@ def _begin_managed_daemon_update(
         # is atomic and preserves the exact old environment for outer rollback;
         # the canonical update script will build a replacement at the original
         # absolute path so console-script shebangs remain valid.
-        os.replace(venv_path, backup)
-        _fsync_directory_path(venv_path.parent)
-        if backup.parent != venv_path.parent:
-            _fsync_directory_path(backup.parent)
-        lifecycle.backup_moved = True
-        lifecycle.receipt_phase = "backup_moved"
+        if slot_transaction is not None:
+            runtime_daemon.replace_bindings(prog, lifecycle, rollback=False)
+            runtime_daemon.reload_service(manager)
+            runtime_daemon.select_lifecycle_binding(lifecycle, target=True)
+            lifecycle.receipt_phase = "slot_activated"
+        else:
+            os.replace(venv_path, backup)
+            _fsync_directory_path(venv_path.parent)
+            if backup.parent != venv_path.parent:
+                _fsync_directory_path(backup.parent)
+            lifecycle.backup_moved = True
+            lifecycle.receipt_phase = "backup_moved"
         _persist_managed_update_receipt(prog, lifecycle)
     except BaseException as exc:
         # A stop operation can take effect and still time out or return an
@@ -12654,7 +14921,7 @@ def _begin_managed_daemon_update(
         current = _query_daemon_service_state(manager)
         recovered = False
         recovery_detail = current.diagnostic
-        if lifecycle.backup_moved:
+        if lifecycle.backup_moved or slot_transaction is not None:
             recovered, recovery_detail = _recover_managed_daemon_after_exception(
                 prog, lifecycle,
             )
@@ -12800,6 +15067,21 @@ def _detect_vq_self_update(prog: config.VenvProgram) -> _SelfUpdateProbe:
     ``sys.executable`` is only a fail-closed self-update hint: it can trigger an
     actionable failure, but never authorizes a restart or successful update.
     """
+    if prog.runtime_slot_execution:
+        legacy = _detect_vq_self_update(
+            prog.model_copy(update={"runtime_slot_execution": False})
+        )
+        if legacy.is_self_update or not legacy.manager_available:
+            return legacy
+        try:
+            selected = prog.execution_program()
+        except config.ConfigError as exc:
+            return _SelfUpdateProbe(
+                is_self_update=False, daemon_running=legacy.daemon_running,
+                service_manager=legacy.service_manager, manager_available=False,
+                diagnostic=str(exc),
+            )
+        return _detect_vq_self_update(selected)
     # v0.5.43: .parent BEFORE .resolve() — the venv's bin/python is a
     # symlink to the system interpreter; .resolve() on the file would
     # dereference it out of the venv and parent would be /usr/bin.
@@ -12884,11 +15166,9 @@ def resolve_vq_self_update_target(
             f"restart path [{probe.diagnostic}]"
         )
     if prog.runtime_slot_root is not None:
-        raise AdminError(
-            "the serving vq environment uses runtime_slot_root; first-class "
-            "self-update requires the canonical serving virtualenv "
-            "transaction and refuses before report fetch or ref mutation"
-        )
+        from vq import runtime_daemon
+
+        runtime_daemon.admit(cfg, prog, probe)
     return name, prog, probe
 
 
@@ -12898,21 +15178,175 @@ DAEMON_HEALTH_TIMEOUT_SECONDS = 60
 :func:`_daemon_health_timeout` scales it up with the state dir size."""
 
 DAEMON_HEALTH_SECONDS_PER_SPEC = 0.025
-"""Readiness allowance per queued job spec. The daemon's startup resume
-pass reads every ``queue/*.json`` before RPC answers, so a flat window
-that is generous for an idle host is far too short for a driver
+"""Readiness allowance per queued job spec.
+
+Headroom, not the critical path, since #67: a daemon from v0.26.10 onwards
+publishes its RPC socket *before* the startup resume pass, so readiness and
+provenance no longer wait for a walk whose cost grows with the queue and
+with the number of live scheduler jobs. The allowance is kept because the
+restart this poll watches is not always a new daemon -- a managed rollback
+restarts the previous install, which does scan before answering, and mixed
+versions are normal mid-roll.
+
+Until then the pass read every ``queue/*.json`` before RPC answered, so a
+flat window that is generous for an idle host was far too short for a driver
 carrying thousands of jobs. In #53 a 21,683-spec queue took more than
 242 s cold and 210 s warm under load. The old 30 s + 10 ms/spec
 allowance expired at 247 s and rolled back a valid install. A 60 s
-base plus 25 ms/spec gives that queue the full 600 s ceiling, with
-headroom over the measured lower bound rather than assuming a cold
-scan runs at the warm rate. This is a bounded allowance, not a startup
+base plus 25 ms/spec gives that queue about 602 s -- the whole of the
+600 s ceiling of the day, and under the 1800 s ceiling #67 raised it
+is simply the formula's own number -- with headroom over the measured
+lower bound rather than assuming a cold scan runs at the warm rate.
+This is a bounded allowance, not a startup
 duration guarantee; operators can still override it. The poll returns
 as soon as exact readiness is verified."""
 
-DAEMON_HEALTH_TIMEOUT_MAX_SECONDS = 600
+DAEMON_HEALTH_SECONDS_PER_SCHEDULER_JOB = 2.5
+"""Readiness allowance per live scheduler job the daemon must reattach.
+
+The startup pass rebuilds each cluster job's handle one at a time, and
+each rebuild costs a round trip to the scheduler host. On the driver in
+#67 that was 175 jobs in about 5 min 20 s -- roughly 1.8 s apiece, and
+more than the entire per-spec allowance for the same host's 18,013
+queue records. Those jobs were invisible to the old model, which
+counted ``queue/*.json`` and nothing else, so the machine that most
+needs a long window was the one whose window was sized as if it were
+idle. 2.5 s keeps the same headroom over the measured rate that
+:data:`DAEMON_HEALTH_SECONDS_PER_SPEC` keeps over its own."""
+
+DAEMON_HEALTH_TIMEOUT_MAX_SECONDS = 1800
 """Ceiling on the scaled readiness window so a corrupt or gigantic
-state dir cannot stretch the verification poll unboundedly."""
+state dir cannot stretch the verification poll unboundedly.
+
+A hard cap can only be safe while readiness is not a function of fleet
+size: no formula-derived allowance can exceed it, so before #67 a driver
+whose honest startup ran past it could not be updated at all without the
+``VQ_DAEMON_HEALTH_TIMEOUT`` override -- and a busy driver is exactly the
+machine that most needs updating. The daemon now answers from process
+start (``Daemon._start_rpc_server`` precedes its reattachment pass), which
+is what keeps this ceiling a guard against pathology rather than a limit
+on scale.
+
+Raised from 600 to 1800 in #67 all the same, because that ordering fix is
+not always the code doing the waiting. ``vq admin update`` never re-execs
+-- its detached child is spawned before any install -- so the window in
+force is whichever version is already in memory, and a managed rollback
+restarts the *previous* install, which still scans before it answers. For
+that residual path the old 600 s was below the driver's real cold start of
+9 min 51 s; the formula for that host lands near 1040 s, which this bounds
+with room for the queue growth #22 describes."""
+
+DAEMON_HEALTH_ALIVE_EXTENSION_FACTOR = 3.0
+"""How far past its own allowance a *running* daemon may be waited for.
+
+:func:`_verify_restarted_daemon` extends its deadline past the scaled
+window only while a liveness probe says the restarted daemon process
+exists and it has never answered RPC at all: a startup that is merely
+slow is not an unhealthy daemon (#67).
+
+The extension is a multiple of that host's own window rather than a
+flat number of seconds, because the window is already the best estimate
+of how long this host's startup takes. A host whose allowance is
+seconds is one that has nothing to scan, so an expiry there is real and
+must not be stretched; a driver whose allowance is seventeen minutes is
+one where being wrong by a few minutes is ordinary."""
+
+DAEMON_HEALTH_ALIVE_LIVENESS_CHECKS = 10
+"""How many times liveness is re-asked across the whole extension.
+
+The probe runs again at every step, so a daemon that dies after the
+scaled window expires ends the poll within a tenth of the extension
+instead of holding the update open for all of it."""
+
+DAEMON_HEALTH_TIMEOUT_ALIVE_MAX_SECONDS = 3600
+"""Absolute ceiling on the extended window, however large the host.
+
+A wedged daemon is still a bounded wait: the update gives up here even
+if the scaled window multiplied out to more."""
+
+SCHEDULER_STARTUP_SCAN_BUDGET_SECONDS = 5.0
+"""Wall-clock budget for counting live scheduler jobs on disk.
+
+Reading every spec is the very walk whose slowness this window is
+sizing, so content reads are bounded. Unread records contribute a conservative
+upper allowance, never a ratio extrapolated from an ordered prefix."""
+
+_SCHEDULER_STARTUP_STATES = frozenset(
+    {
+        JobState.RUNNING.value,
+        JobState.SUSPENDED.value,
+        JobState.SUBMITTING.value,
+        JobState.SUBMIT_OUTCOME_UNKNOWN.value,
+    }
+)
+"""Spec states whose scheduler binding costs the startup pass a round trip.
+
+Mirrors :meth:`vq.daemon.Daemon._reattach_or_interrupt_at_startup`:
+RUNNING/SUSPENDED specs are reattached, and an unconfirmed submit is
+reconciled against the remote. PENDING is deliberately excluded -- it
+has no remote allocation to find, so counting it would inflate the
+window on a host that is merely backlogged."""
+
+
+@dataclass(frozen=True)
+class _SchedulerStartupScan:
+    """Observed live jobs and unread records in one inventory, not a sample."""
+
+    live: int
+    seen: int
+    total: int
+    complete: bool
+    unreadable: int = 0
+
+    @property
+    def allowance_jobs(self) -> int:
+        # Every unread record could need a remote probe. This is an upper
+        # bound for this inventory, not an estimated live-job population.
+        unseen = max(0, self.total - self.seen) if not self.complete else 0
+        return self.live + self.unreadable + unseen
+
+
+def _count_live_scheduler_jobs(
+    spec_count: int, *, entries: Iterable[Path] | None = None,
+) -> _SchedulerStartupScan:
+    """Bound content reads without inferring a population from glob order.
+
+    The caller supplies the same inventory it counted. A budget expiry or
+    walk failure leaves the unread records explicitly unknown. Malformed
+    records remain excluded, as in the daemon's startup pass. No exception
+    from reading/parsing/walking may escape into an update or recovery lane.
+    The budget bounds reads between records, not a single filesystem call.
+    """
+    if spec_count <= 0:
+        return _SchedulerStartupScan(0, 0, 0, True)
+    deadline = time.monotonic() + SCHEDULER_STARTUP_SCAN_BUDGET_SECONDS
+    seen = live = unreadable = 0
+    try:
+        if entries is None:
+            entries = (p for p in paths.queue_dir().iterdir() if p.name.endswith(".json"))
+        for path in entries:
+            if time.monotonic() >= deadline:
+                return _SchedulerStartupScan(live, seen, spec_count, False, unreadable)
+            seen += 1
+            try:
+                raw = path.read_bytes()
+            except Exception:  # noqa: BLE001 — unreadable does not mean inactive
+                unreadable += 1
+                continue
+            try:
+                record = json.loads(raw)
+            except Exception:  # noqa: BLE001 — malformed records cannot reattach
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("scheduler_target") is not None
+                and record.get("state") in _SCHEDULER_STARTUP_STATES
+            ):
+                live += 1
+    except Exception:  # noqa: BLE001 — retain uncertainty on a broken walk
+        log.debug("bounded scheduler-job scan interrupted", exc_info=True)
+        return _SchedulerStartupScan(live, seen, spec_count, False, unreadable)
+    return _SchedulerStartupScan(live, seen, spec_count, True, unreadable)
 
 
 def _daemon_health_timeout() -> float:
@@ -12920,9 +15354,11 @@ def _daemon_health_timeout() -> float:
 
     Honors ``VQ_DAEMON_HEALTH_TIMEOUT`` (seconds, must be > 0) as an
     operator override, read at call time like the other admin timeout
-    knobs. Otherwise scales the base window with the number of job
-    specs in the single-user queue dir — the population the restarted
-    daemon must scan before its RPC socket answers — capped at
+    knobs. Otherwise scales the base window with the two populations a
+    pre-v0.26.10 daemon, or one restored by a rollback, works through
+    before its RPC socket answers — every job spec in the single-user
+    queue dir, and the live scheduler jobs among them, each of which
+    costs a round trip to its scheduler host — capped at
     :data:`DAEMON_HEALTH_TIMEOUT_MAX_SECONDS`.
     """
     raw = os.environ.get("VQ_DAEMON_HEALTH_TIMEOUT", "").strip()
@@ -12935,10 +15371,32 @@ def _daemon_health_timeout() -> float:
             return val
     base = float(DAEMON_HEALTH_TIMEOUT_SECONDS)
     try:
-        spec_count = sum(1 for _ in paths.queue_dir().glob("*.json"))
-    except OSError:
-        return base
-    scaled = base + spec_count * DAEMON_HEALTH_SECONDS_PER_SPEC
+        # Path.glob can suppress directory read errors, making an unavailable
+        # inventory look empty. iterdir propagates them instead.
+        queue = paths.queue_dir()
+        try:
+            queue.stat()
+        except FileNotFoundError:
+            return base  # An absent queue is empty, unlike a failed walk.
+        entries = tuple(path for path in queue.iterdir()
+                        if path.name.endswith(".json"))
+    except Exception:  # noqa: BLE001 — no reliable inventory, not an idle host
+        log.warning("readiness inventory unavailable; using capped allowance", exc_info=True)
+        return float(DAEMON_HEALTH_TIMEOUT_MAX_SECONDS)
+    spec_count = len(entries)
+    scan = _count_live_scheduler_jobs(spec_count, entries=entries)
+    scheduler_jobs = scan.allowance_jobs
+    if not scan.complete or scan.unreadable:
+        log.warning(
+            "readiness scan incomplete: %s live in %s/%s records, %s unreadable; "
+            "allowing up to %s scheduler jobs in this inventory",
+            scan.live, scan.seen, scan.total, scan.unreadable, scheduler_jobs,
+        )
+    scaled = (
+        base
+        + spec_count * DAEMON_HEALTH_SECONDS_PER_SPEC
+        + scheduler_jobs * DAEMON_HEALTH_SECONDS_PER_SCHEDULER_JOB
+    )
     return min(scaled, float(DAEMON_HEALTH_TIMEOUT_MAX_SECONDS))
 
 
@@ -13031,11 +15489,88 @@ class DaemonProvenance:
     detail: str
 
 
+def _no_rpc_response_detail(
+    limit: float, *, still_running: bool = False, liveness_unknown: bool = False,
+) -> str:
+    """The "RPC never answered" verdict, naming the window it actually used."""
+    detail = (
+        f"daemon RPC did not respond within {limit:.0f}s. A daemon from "
+        "v0.26.10 answers before it reattaches surviving jobs, so silence "
+        "this long usually means it did not start at all -- check the daemon "
+        "log and the service manager. An older daemon, including one a "
+        "rollback restored, scans every queued spec and reattaches every "
+        "live scheduler job first; raise VQ_DAEMON_HEALTH_TIMEOUT if that "
+        "is what this restart is waiting for"
+    )
+    if liveness_unknown:
+        detail += (
+            ". Service-manager liveness was unavailable during the extended "
+            "wait; neither a running nor a stopped daemon was established"
+        )
+    elif still_running:
+        detail += (
+            ". The service-manager probes reported a running daemon during "
+            "the extended wait; this does not establish startup progress"
+        )
+    return detail
+
+
+def _daemon_absent_detail(limit: float) -> str:
+    """A successful manager query positively reported an inactive daemon."""
+    return (
+        f"daemon RPC did not respond within {limit:.0f}s and the service "
+        "manager reports no running daemon process. Check the daemon log; "
+        "raising VQ_DAEMON_HEALTH_TIMEOUT will not help a stopped daemon"
+    )
+
+
+def _daemon_process_is_alive(
+    probe: Callable[[], bool | None],
+) -> bool | None:
+    """Keep unavailable liveness evidence distinct from confirmed death."""
+    try:
+        return probe()
+    except Exception:  # noqa: BLE001 — a broken probe is not evidence of death
+        log.debug("daemon liveness probe failed; state unknown", exc_info=True)
+        return None
+
+
+def _service_daemon_alive_probe(
+    manager: _DaemonServiceManager,
+) -> Callable[[], bool | None]:
+    """Read authoritative state; the best-effort PID display loses unknowns."""
+    def probe() -> bool | None:
+        if manager is _DaemonServiceManager.SYSTEMD:
+            state = _query_daemon_service_state(manager)
+            # An activating service without a MainPID is not a confirmed
+            # live process. It still deserves the bounded unknown extension.
+            if state.running is True and state.pid is None:
+                return None
+            return state.running
+        rc, raw = _query_launchd_daemon()
+        if rc != 0:
+            # Only launchctl's explicit missing-service response proves
+            # absence. Invocation, transport and arbitrary diagnostic text
+            # failures must not be interpreted as a stopped daemon.
+            return False if rc == 113 else None
+        pid, _executable = _parse_launchd_service_state(raw)
+        if pid is not None:
+            return True
+        states = re.findall(r"^\s*state = (.+?)\s*$", raw, re.MULTILINE)
+        if states == ["not running"]:
+            return False
+        return None
+
+    return probe
+
+
 def _verify_restarted_daemon(
     expected_source_sha: str,
     *,
     expected_tree_sha256: str | None = None,
     require_exact_identity: bool = False,
+    daemon_alive: Callable[[], bool | None] | None = None,
+    wait_for_identity_change: bool = True,
 ) -> DaemonProvenance:
     """Wait for daemon RPC and require exact startup source provenance.
 
@@ -13062,27 +15597,90 @@ def _verify_restarted_daemon(
     Hence :func:`rpc.ping_user_daemon`, plus the ``multi_user`` assertion
     below: a daemon that says it is the multi-user one can never be the
     daemon this lane restarted, whatever socket carried the answer.
+
+    ``daemon_alive``, when a caller supplies one, is an OS-level "is the
+    restarted daemon process there" probe — independent of RPC, because RPC
+    is the thing that has not come up yet. With it the scaled window stops
+    being the whole verdict (#67): a daemon that is running and has never
+    answered is waited for up to
+    :data:`DAEMON_HEALTH_ALIVE_EXTENSION_FACTOR` times its own window
+    (never past :data:`DAEMON_HEALTH_TIMEOUT_ALIVE_MAX_SECONDS`), re-asking
+    the probe :data:`DAEMON_HEALTH_ALIVE_LIVENESS_CHECKS` times along the
+    way, while a daemon that is *not* running fails the moment the window
+    expires instead of being waited out. Unknown status may extend within
+    the same ceiling, but is never reported as a confirmed running process.
+    Without a probe the behaviour is exactly the fixed window it has always
+    been. Observation-only callers set ``wait_for_identity_change=False``:
+    no restart is pending, so an answering mismatch is final. Restart callers
+    retain the full settling window for the outgoing daemon's last answer.
     """
     from vq import rpc  # local import avoids the module-level admin/RPC cycle
 
     window = _daemon_health_timeout()
-    deadline = time.monotonic() + window
-    no_response = (
-        f"daemon RPC did not respond within {window:.0f}s. A daemon on a "
-        "large state dir scans every queued spec before RPC answers; "
-        "raise VQ_DAEMON_HEALTH_TIMEOUT if this window is still too short"
+    started = time.monotonic()
+    deadline = started + window
+    alive_limit = max(
+        window,
+        min(
+            window * DAEMON_HEALTH_ALIVE_EXTENSION_FACTOR,
+            float(DAEMON_HEALTH_TIMEOUT_ALIVE_MAX_SECONDS),
+        ),
     )
-    last_detail = no_response
+    hard_deadline = started + alive_limit
+    alive_step = (alive_limit - window) / DAEMON_HEALTH_ALIVE_LIVENESS_CHECKS
+    ever_answered = False
+    liveness_unknown = False
+    last_detail = _no_rpc_response_detail(window)
     actual_sha: str | None = None
     actual_tree: str | None = None
     expected_tree = (
         expected_tree_sha256.lower() if expected_tree_sha256 else None
     )
-    while time.monotonic() < deadline:
+    while True:
+        if time.monotonic() >= deadline:
+            # #67: the scaled window is an allowance, not a measurement, and
+            # on the driver it was short by minutes. Expiry is only proof of
+            # a failed restart when the daemon is not there; a process that
+            # exists and has never answered is one that is still starting.
+            # Extend in steps so a daemon that dies after the window still
+            # ends the poll promptly, and only while nothing has answered at
+            # all -- once the socket is up, a wrong or missing SHA is an
+            # answer, and no amount of waiting changes what that process
+            # reports.
+            extendable = (
+                daemon_alive is not None
+                and not ever_answered
+                and alive_step > 0
+                and deadline < hard_deadline
+                and time.monotonic() < hard_deadline
+            )
+            if not extendable:
+                break
+            assert daemon_alive is not None
+            alive = _daemon_process_is_alive(daemon_alive)
+            if alive is False:
+                last_detail = _daemon_absent_detail(deadline - started)
+                break
+            liveness_unknown = liveness_unknown or alive is None
+            deadline = (
+                hard_deadline if time.monotonic() >= hard_deadline
+                else min(hard_deadline, deadline + alive_step)
+            )
+            last_detail = _no_rpc_response_detail(
+                deadline - started, still_running=not liveness_unknown,
+                liveness_unknown=liveness_unknown,
+            )
+            continue
         envelope = rpc.ping_user_daemon()
         if envelope is None:
-            last_detail = no_response
+            if not ever_answered:
+                last_detail = _no_rpc_response_detail(
+                    deadline - started,
+                    still_running=deadline > started + window and not liveness_unknown,
+                    liveness_unknown=liveness_unknown,
+                )
         elif envelope.get("multi_user"):
+            ever_answered = True
             # Answered by the root system daemon, which this lane never
             # restarts. Its provenance says nothing about the user daemon, so
             # treat it as a routing fault rather than a provenance mismatch --
@@ -13094,6 +15692,7 @@ def _verify_restarted_daemon(
                 "multi-user root"
             )
         else:
+            ever_answered = True
             raw_sha = envelope.get("source_sha")
             actual_sha = str(raw_sha).lower() if raw_sha else None
             raw_tree = envelope.get("source_tree_sha256")
@@ -13124,6 +15723,8 @@ def _verify_restarted_daemon(
                         f"{expected_source_sha.lower()}), source tree "
                         f"{actual_tree or 'missing'} (expected {expected_tree})"
                     )
+                if not wait_for_identity_change:
+                    break
                 time.sleep(0.1)
                 continue
             if actual_sha == expected_source_sha.lower():
@@ -13180,6 +15781,8 @@ def _verify_restarted_daemon(
                 f"expected {expected_source_sha.lower()}"
                 + _tree_mismatch_detail(expected_tree, actual_tree)
             )
+        if ever_answered and not wait_for_identity_change:
+            break
         time.sleep(0.1)
     return DaemonProvenance(
         verified=False,
@@ -13289,6 +15892,7 @@ def _complete_managed_daemon_update(
         expected_sha,
         expected_tree_sha256=expected_tree,
         require_exact_identity=True,
+        daemon_alive=_service_daemon_alive_probe(lifecycle.manager),
     )
     result.daemon_actual_source_sha = provenance.actual_sha
     result.daemon_actual_source_tree_sha256 = provenance.actual_tree_sha256
@@ -13346,6 +15950,7 @@ def _recover_managed_daemon_after_exception(
         lifecycle.pre_source_sha,
         expected_tree_sha256=lifecycle.pre_source_tree_sha256,
         require_exact_identity=True,
+        daemon_alive=_service_daemon_alive_probe(lifecycle.manager),
     )
     if not provenance.verified:
         return False, f"{restore_detail}; {detail}; {provenance.detail}"
@@ -13372,6 +15977,77 @@ def _recover_managed_daemon_after_exception(
     return True, (
         f"{restore_detail}; {detail}; {provenance.detail}; {service_detail}"
     )
+
+
+def _maybe_refresh_console(
+    previous: config.VenvProgram,
+    target: config.VenvProgram,
+    result: UpdateResult,
+) -> None:
+    """Rebind an existing console only after a verified queue update.
+
+    Run the installer from the new interpreter: this updater still imports
+    the old package, and immutable runtime generations have different paths.
+    A failed console refresh is recorded without rolling back a healthy daemon.
+    """
+    if not (result.success and result.daemon_restart_succeeded is True
+            and result.daemon_health_verified is True):
+        return
+    from vq.web import install as web_install  # noqa: PLC0415
+
+    marker = web_install.read_install_marker()
+    if marker is None:
+        return
+    recorded_python = marker.get("python")
+    # Compare the venv directory, not python.resolve(): different virtualenvs
+    # commonly symlink their interpreter to the same system Python binary.
+    if not isinstance(recorded_python, str) or not Path(recorded_python).is_absolute():
+        result.work_errors.append("console refresh failed: invalid recorded interpreter")
+        return
+    recorded_env = Path(recorded_python).parent.parent.resolve()
+    if recorded_env not in {
+        Path(previous.python).parent.parent.resolve(),
+        Path(target.python).parent.parent.resolve(),
+    }:
+        return
+    manager = marker.get("manager")
+    name = marker.get("unit_name")
+    try:
+        if manager not in {"systemd-user", "launchd-user"}:
+            raise ValueError("console manager requires an explicit operator reinstall")
+        if not isinstance(name, str):
+            raise ValueError("console marker has no service name")
+        web_install.validate_unit_name(name)
+        command = [str(target.python), "-m", "vq", "web"]
+        installed = subprocess.run(
+            [*command, "install", "--manager", manager, "--unit-name", name],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120,
+        )
+        _run_log_command_output(
+            "console refresh", installed.returncode,
+            _combined_output(installed.stdout, installed.stderr),
+        )
+        if installed.returncode:
+            raise ValueError(_last_output_line(installed.stderr or installed.stdout)
+                             or f"installer exit {installed.returncode}")
+        checked = subprocess.run(
+            [*command, "status", "--json"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=30,
+        )
+        if checked.returncode:
+            raise ValueError("could not read refreshed console service status")
+        status = json.loads(checked.stdout)
+        if not isinstance(status, dict) or not (
+            status.get("installed") is True and status.get("active") is True
+            and status.get("drifted") is False and status.get("runtime_ok") is True
+            and status.get("manager") == manager and status.get("unit_name") == name
+        ):
+            raise ValueError("refreshed console is not active with current runtime provenance")
+    except (OSError, subprocess.SubprocessError, ValueError, web_install.InstallError) as exc:
+        result.work_errors.append(
+            f"console refresh failed: {exc}; run the updated vq web install "
+            "and verify vq web status before clearing the failed update"
+        )
 
 
 def _maybe_restart_daemon(
@@ -13480,6 +16156,7 @@ def _maybe_restart_daemon(
     provenance = _verify_restarted_daemon(
         expected_sha,
         expected_tree_sha256=expected_tree,
+        daemon_alive=_service_daemon_alive_probe(manager),
     )
     result.daemon_actual_source_sha = provenance.actual_sha
     result.daemon_actual_source_tree_sha256 = provenance.actual_tree_sha256
@@ -13686,15 +16363,23 @@ def format_scheduler_runtime_status(host: str, cfg: config.Config) -> str:
         return "\n".join(lines)
     lines.append(
         "PROGRAM                 LAST UPDATED                 LAST OK  "
-        "SHA          TAG       LAST GOOD"
+        "SHA          TAG       STORE     PREVIOUS     SCHEMA LAST GOOD"
     )
     for program in sorted(host_cfg.scheduler_runtime_deployments):
         record = records.get(f"{host}:{program}")
         if record is None:
             lines.append(
-                f"{program:<23} {'never':<28} {'-':<8} {'-':<12} {'-':<9} -"
+                f"{program:<23} {'never':<28} {'-':<8} {'-':<12} {'-':<9} "
+                f"{'-':<9} {'-':<12} {'-':<6} -"
             )
             continue
+        # STORE/PREVIOUS/SCHEMA come from the last participant inventory a
+        # runtime migration observed (#72); '-' for a lane never inventoried.
+        inventory = record.inventory or {}
+        store = str(inventory.get("store") or "-")
+        previous = str(inventory.get("previous") or "-")[:12]
+        schema = inventory.get("launcher_schema")
+        schema_text = "-" if schema is None else str(schema)
         # LAST GOOD survives a failed attempt: it names the identity an
         # operator can redeploy to roll back, instead of leaving only '-'.
         if record.last_ok_sha:
@@ -13708,6 +16393,7 @@ def format_scheduler_runtime_status(host: str, cfg: config.Config) -> str:
             f"{str(record.last_success):<8} "
             f"{(record.actual_sha or '-')[:12]:<12} "
             f"{record.actual_tag or '-':<9} "
+            f"{store:<9} {previous:<12} {schema_text:<6} "
             f"{last_good}"
         )
     return "\n".join(lines)
@@ -14561,7 +17247,7 @@ _FLEET_LIFECYCLE_HANDOFF_SCHEMA = "vq.toolset.lifecycle_handoff/1"
 _MULTI_USER_MIGRATION_RECEIPT_NAME = "vq-multi-user-bootstrap.json"
 
 
-def _canonical_lifecycle_checkout(git_dir: Path) -> Path:
+def _canonical_lifecycle_checkout(git_dir: Path, *, allow_retired: bool = False) -> Path:
     try:
         proc = subprocess.run(
             ["git", "-C", str(git_dir), "rev-parse", "--show-toplevel"],
@@ -14573,6 +17259,15 @@ def _canonical_lifecycle_checkout(git_dir: Path) -> Path:
     except (subprocess.TimeoutExpired, OSError) as exc:
         raise AdminError(f"cannot resolve lifecycle checkout: {exc}") from exc
     if proc.returncode != 0:
+        # A current-slot build can outlive its old checkout. Keep a fence on
+        # the remaining directory, but never treat broken Git metadata as a
+        # retired checkout. This fallback selects a lock, not a build source;
+        # _runtime_build_source still authenticates the active generation.
+        physical = git_dir.resolve()
+        if (allow_retired and proc.returncode == 128
+                and not any(os.path.lexists(parent / ".git")
+                            for parent in (physical, *physical.parents))):
+            return _physical_lifecycle_directory(git_dir)
         raise AdminError(
             "cannot resolve lifecycle checkout: "
             + ((proc.stderr or proc.stdout or "git failed").strip())
@@ -14717,13 +17412,14 @@ def _runtime_slot_lifecycle_resources(
         return ()
     try:
         root = runtime_slots.layout(prog.runtime_slot_root).root
+        venv_subdir = runtime_slots.program_venv_subdir(prog)
     except runtime_slots.RuntimeSlotError as exc:
         raise AdminError(str(exc)) from exc
     source = _canonical_future_lifecycle_path(
         runtime_slots.slot_source(root, sha),
     )
     target = _canonical_future_lifecycle_path(
-        runtime_slots.slot_python(root, sha).parent.parent,
+        runtime_slots.slot_source(root, sha) / venv_subdir,
     )
     return (
         ("checkout", str(source)),
@@ -14786,7 +17482,9 @@ def _toolset_lock_identity(scope: str, resource: str) -> tuple[int, Path]:
     return resource_uid, root / f"{scope}-{digest}.lock"
 
 
-def _open_toolset_lock(scope: str, resource: str) -> tuple[int, Path]:
+def _open_toolset_lock(
+    scope: str, resource: str, *, shared: bool = False,
+) -> tuple[int, Path]:
     resource_uid, path = _toolset_lock_identity(scope, resource)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     old_umask = os.umask(0o077)
@@ -14812,7 +17510,8 @@ def _open_toolset_lock(scope: str, resource: str) -> tuple[int, Path]:
             or current.st_nlink != 1
         ):
             raise AdminError(f"lifecycle lock pathname changed: {path}")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(fd, mode | fcntl.LOCK_NB)
         return fd, path
     except BlockingIOError as exc:
         os.close(fd)
@@ -15037,6 +17736,46 @@ def _adopt_rollout_toolset_lifecycle_handoff(
                 os.close(fd)
 
 
+def toolset_lifecycle_resources(
+    progs: list[config.VenvProgram], *,
+    extra_resources: tuple[tuple[str, str], ...] = (),
+) -> tuple[tuple[str, str], ...]:
+    """The exact sorted resource keys :func:`toolset_lifecycle_lock` takes.
+
+    A rollout re-entry handoff is validated against exactly this set, so the
+    controller derives it here rather than restating the rules (#146).
+    """
+    requested: list[tuple[str, str]] = []
+    for prog in progs:
+        # With build input "current" the registered checkout may be retired.
+        # Keep fencing it while it exists: older processes and direct scripts
+        # still lock on it. The runtime root below is the stable identity.
+        if (
+            prog.runtime_slot_build_input != "current"
+            or Path(prog.git_dir).is_dir()
+        ):
+            requested.append(
+                ("checkout", str(_canonical_lifecycle_checkout(
+                    Path(prog.git_dir), allow_retired=prog.runtime_slot_build_input == "current",
+                )))
+            )
+            requested.append(
+                ("target", str(_canonical_lifecycle_target(Path(prog.python).parent.parent)))
+            )
+        if prog.runtime_slot_root is not None:
+            # The store is the identity that survives retiring the build
+            # checkout (#72). It is spelled as a checkout-scope resource
+            # because older rollout controllers validate handoffs against
+            # exactly the checkout and target scopes.
+            try:
+                root = runtime_slots.layout(prog.runtime_slot_root).root
+            except runtime_slots.RuntimeSlotError as exc:
+                raise AdminError(str(exc)) from exc
+            requested.append(("checkout", str(_canonical_future_lifecycle_path(root))))
+    requested.extend(extra_resources)
+    return tuple(sorted(set(requested)))
+
+
 @contextlib.contextmanager
 def toolset_lifecycle_lock(
     progs: list[config.VenvProgram], *, action: str,
@@ -15048,16 +17787,7 @@ def toolset_lifecycle_lock(
     File descriptors are inherited by the monitored updater so a killed parent
     cannot expose a still-running install to another lifecycle operation.
     """
-    requested: list[tuple[str, str]] = []
-    for prog in progs:
-        requested.append(
-            ("checkout", str(_canonical_lifecycle_checkout(Path(prog.git_dir))))
-        )
-        requested.append(
-            ("target", str(_canonical_lifecycle_target(Path(prog.python).parent.parent)))
-        )
-    requested.extend(extra_resources)
-    keys = tuple(sorted(set(requested)))
+    keys = toolset_lifecycle_resources(progs, extra_resources=extra_resources)
     active: _ToolsetLifecycleLock | None = getattr(
         _toolset_lifecycle_local, "active", None,
     )
@@ -15190,7 +17920,7 @@ def _current_toolset_lock_handoff(
 
 
 @contextlib.contextmanager
-def admin_update_ownership():
+def admin_update_ownership(*, wait: bool = False):
     """Hold the local ref/checkout mutation boundary for one update.
 
     This lock is deliberately broader than the durable update marker.  A
@@ -15200,6 +17930,8 @@ def admin_update_ownership():
     thread-exclusive, non-blocking (matching the marker's refusal semantics),
     and reentrant only for the owning thread so ``self-update`` can span report
     discovery and then call the ordinary ``update_env`` implementation.
+    ``wait`` is reserved for resuming an already admitted remote operation,
+    which must serialize its result write without repeating the remote build.
     """
     binding = _capture_admin_state_binding()
     depth = getattr(_admin_update_ownership_local, "depth", 0)
@@ -15220,7 +17952,7 @@ def admin_update_ownership():
             _admin_update_ownership_local.depth -= 1
         return
 
-    if not _admin_update_ownership_process_lock.acquire(blocking=False):
+    if not _admin_update_ownership_process_lock.acquire(blocking=wait):
         raise AdminUpdateInProgress(
             "this checkout is being mutated by another admin operation; "
             "wait for it to finish, then retry"
@@ -15229,7 +17961,7 @@ def admin_update_ownership():
     try:
         fd, path = _open_admin_update_ownership_lock(binding)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as exc:
             raise AdminUpdateInProgress(
                 "this checkout is being mutated by another admin operation; "
@@ -15257,6 +17989,53 @@ def admin_update_ownership():
         if fd >= 0:
             _close_admin_lock_fd(fd)
         _admin_update_ownership_process_lock.release()
+
+
+def _scheduler_runtime_driver_resources() -> tuple[tuple[str, str], ...]:
+    """Identify the running driver's mutable files, or retain global ownership."""
+    try:
+        project = _scheduler_helper_project_root()
+        anchor = Path(__file__).resolve()
+        tracked = _anchor_is_tracked(anchor.parent, anchor)
+        return (
+            ("checkout", str(_canonical_lifecycle_checkout(project))),
+            ("target", str(_canonical_lifecycle_target(Path(sys.prefix)))),
+        ) if tracked else ()
+    except AdminError:
+        return ()
+
+
+@contextlib.contextmanager
+def _scheduler_runtime_remote_wait(ownership: contextlib.ExitStack | None):
+    """Let disjoint updates proceed while an admitted remote build runs.
+
+    Keep source/store lifecycle locks and the exact marker lease. Shared
+    driver locks exclude self-update or direct checkout/venv mutation without
+    serializing readers. These read descriptors are never mutation handoffs.
+    Nested report/self-update ownership and unidentifiable installations keep
+    the original global fence.
+    """
+    if ownership is None or getattr(_admin_update_ownership_local, "depth", 0) != 1:
+        yield
+        return
+    driver = _scheduler_runtime_driver_resources()
+    if not driver:
+        yield
+        return
+    binding = _capture_admin_state_binding()
+    held = set(_active_toolset_lifecycle_resources())
+    with contextlib.ExitStack() as readers:
+        for scope, resource in driver:
+            if (scope, resource) not in held:
+                fd, _path = _open_toolset_lock(scope, resource, shared=True)
+                readers.callback(os.close, fd)
+        ownership.close()
+        try:
+            yield
+        finally:
+            _validate_admin_state_binding(binding)
+            ownership.enter_context(admin_update_ownership(wait=True))
+            _validate_admin_state_binding(binding)
 
 
 _admin_update_marker_local = threading.local()
@@ -16038,6 +18817,7 @@ MANAGED_UPDATE_RECEIPT_PHASES = frozenset(
         "armed", "backup_moved", "target_ready", "target_verified",
         "restoring_old", "files_restored", "old_restored",
         "target_committed", "target_cleanup_pending",
+        "slot_activated",
     }
 )
 
@@ -16180,7 +18960,7 @@ def _managed_update_receipt_payload(
         )
     if lifecycle.venv_backup is None:
         raise AdminError("managed update receipt has no rollback virtualenv path")
-    return {
+    payload = {
         "schema": MANAGED_UPDATE_RECEIPT_SCHEMA,
         "transaction_id": lifecycle.transaction_id,
         "owner_uid": lifecycle.owner_uid,
@@ -16202,6 +18982,22 @@ def _managed_update_receipt_payload(
         "target_source_tree_sha256": lifecycle.target_source_tree_sha256,
         "updated_at": utcnow_iso(),
     }
+    if lifecycle.slot_transaction is not None:
+        from vq import runtime_daemon
+
+        payload["schema"] = runtime_daemon.SCHEMA
+        payload["slot_transaction"] = lifecycle.slot_transaction
+    return payload
+
+
+def _managed_receipt_checkout(
+    prog: config.VenvProgram, lifecycle: _ManagedDaemonUpdate,
+) -> Path:
+    """Bind slot receipts to retained source, even after checkout retirement."""
+    source = prog.git_dir
+    if lifecycle.slot_transaction is not None:
+        source = lifecycle.slot_transaction["serving"]["git_dir"]
+    return _canonical_lifecycle_checkout(Path(source))
 
 
 def _persist_managed_update_receipt(
@@ -16220,7 +19016,7 @@ def _persist_managed_update_receipt(
             f"managed transaction env {lifecycle.env!r} is outside marker scope"
         )
     payload = _managed_update_receipt_payload(lifecycle)
-    payload["git_dir"] = str(_canonical_lifecycle_checkout(Path(prog.git_dir)))
+    payload["git_dir"] = str(_managed_receipt_checkout(prog, lifecycle))
     marker.managed_transaction = payload
     _write_admin_update_marker_atomic(marker, path=entry[0])
 
@@ -16272,6 +19068,10 @@ def _parse_managed_update_receipt(
     cfg: config.Config,
 ) -> tuple[config.VenvProgram, _ManagedDaemonUpdate]:
     raw = marker.managed_transaction
+    if isinstance(raw, dict) and raw.get("schema") == "vq-managed-daemon-slots-v1":
+        from vq import runtime_daemon
+
+        return runtime_daemon.parse_receipt(marker, cfg)
     if not isinstance(raw, dict) or raw.get("schema") != MANAGED_UPDATE_RECEIPT_SCHEMA:
         raise AdminError("admin marker has no recognized managed update receipt")
     _require_admin_update_pause_queue_scope(marker)
@@ -17544,8 +20344,14 @@ def recover_managed_update(
     if not isinstance(env_hint, str) or not env_hint:
         raise AdminError("managed update receipt has no valid environment")
     prog_hint = _resolve_venv_program(env_hint, cfg)
+    slot_resources = ()
+    if raw.get("schema") == "vq-managed-daemon-slots-v1":
+        from vq import runtime_daemon
+
+        slot_resources = runtime_daemon.recovery_resources(prog_hint, raw)
     with admin_update_ownership(), toolset_lifecycle_lock(
         [prog_hint], action="recover managed daemon update",
+        **({"extra_resources": slot_resources} if slot_resources else {}),
     ):
         # Re-read under both checkout/venv fences and bind the exact marker ID.
         current = _read_admin_update_marker_path(path)
@@ -17593,6 +20399,8 @@ def recover_managed_update(
                     expected_sha,
                     expected_tree_sha256=expected_tree,
                     require_exact_identity=True,
+                    wait_for_identity_change=False,
+                    daemon_alive=_service_daemon_alive_probe(lifecycle.manager),
                 )
                 recovered = service_ok and provenance.verified
                 detail = f"{provenance.detail}; {service_detail}"
@@ -17606,7 +20414,7 @@ def recover_managed_update(
                     )
                     recovered = committed
                     detail = f"{detail}; {commit_detail}"
-                if recovered and lifecycle.receipt_phase in {
+                if recovered and lifecycle.slot_transaction is None and lifecycle.receipt_phase in {
                     "target_committed", "target_cleanup_pending",
                 }:
                     cleanup = lifecycle.venv_backup.parent / (
@@ -17654,7 +20462,7 @@ def recover_managed_update(
                 lifecycle,
             )
             current.managed_transaction["git_dir"] = str(
-                _canonical_lifecycle_checkout(Path(prog.git_dir))
+                _managed_receipt_checkout(prog, lifecycle)
             )
             current.state = ADMIN_UPDATE_STATE_FAILED
             current.failure_reason = "durable managed recovery failed: " + detail
@@ -17672,7 +20480,7 @@ def recover_managed_update(
         lifecycle.backup_moved = False
         current.managed_transaction = _managed_update_receipt_payload(lifecycle)
         current.managed_transaction["git_dir"] = str(
-            _canonical_lifecycle_checkout(Path(prog.git_dir))
+            _managed_receipt_checkout(prog, lifecycle)
         )
         _write_admin_update_marker_atomic(current, path=path)
         assert current.pause_token is not None  # parser validated exact format
@@ -18019,6 +20827,11 @@ def _admin_update_resources(
             ):
                 return None
             resources.add(("scheduler-runtime", parts[1], parts[2]))
+        elif env.startswith("runtime-slot:"):
+            parts = env.split(":")
+            if len(parts) != 2 or not parts[1]:
+                return None
+            resources.add(("local-runtime", LOCAL_DISPATCH_SCOPE, parts[1]))
         elif env.startswith("scheduler:"):
             parts = env.split(":")
             if len(parts) != 2 or not parts[1] or parts[1] != host:
@@ -18079,7 +20892,9 @@ def admin_update_marker_scope(
     already name exactly what is being protected; this parses them:
 
     * ``scheduler:<host>`` (helper update) → holds ``<host>``
-    * ``scheduler-runtime:<host>:<program>`` → holds ``<host>``
+    * ``scheduler-runtime:<host>:<program>`` and ``runtime-slot:<env>``
+      serialize immutable builds without holding dispatch. Each job still
+      resolves and validates its own runtime before execution.
     * a plain env name (venv update on this daemon's host) → holds local
       execution only
     """
@@ -18091,9 +20906,16 @@ def admin_update_marker_scope(
             return None
         if env.startswith("scheduler-runtime:"):
             parts = env.split(":")
-            if len(parts) != 3 or not parts[1]:
+            if len(parts) != 3 or not parts[1] or not parts[2] or parts[1] != marker.host:
                 return None
-            held.add(parts[1])
+            if marker.managed_transaction is not None or marker.owns_pause_scope:
+                held.add(parts[1])
+        elif env.startswith("runtime-slot:"):
+            parts = env.split(":")
+            if len(parts) != 2 or not parts[1]:
+                return None
+            if marker.managed_transaction is not None or marker.owns_pause_scope:
+                held.add(LOCAL_DISPATCH_SCOPE)
         elif env.startswith("scheduler:"):
             host = env.split(":", 1)[1]
             if not host:
@@ -19104,6 +21926,23 @@ def query_env_status(name: str, prog: config.VenvProgram) -> EnvStatus:
     persisted admin-update record."""
     records = read_admin_status()
     last = records.get(name)
+    if prog.runtime_slot_execution:
+        # Report what executes, as `vq programs` does. Slot updates never move
+        # the registered build checkout, so its HEAD is not the deployed SHA
+        # that fleet rollout verification compares (#72).
+        try:
+            prog = prog.execution_program()
+        except config.ConfigError as exc:
+            return EnvStatus(
+                name=name,
+                git_dir=prog.git_dir,
+                branch=prog.branch,
+                current_sha=None,
+                current_describe=None,
+                is_dirty=None,
+                last_record=last,
+                error=str(exc),
+            )
     git_dir = Path(prog.git_dir)
     if not git_dir.is_dir():
         return EnvStatus(

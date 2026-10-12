@@ -1,5 +1,7 @@
 # vq web dashboard -- access + auth
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 ## Quick reference
 
 | Endpoint | Auth | Default access |
@@ -31,7 +33,11 @@ dashboard. Installing, configuring and operating it is
   admin-update badges. Administratively-down hosts (`vq host down`)
   render as unprobed `admin down` cards, matching `vq overview`.
 * `/fleet/jobs` -- every job across the fleet in one table, filterable
-  by host, state, tag, submitter, and free text.
+  by host, state, program, tag, submitter, and free text: runtime and
+  queue wait, declared versus measured CPU and memory, execution nodes,
+  program version and measurement freshness, with allocation and usage
+  totals that say when they are partial. See
+  [Reading the jobs table](fleet_console.md#reading-the-jobs-table).
 * `/fleet/jobs/<jobid>` -- per-job drill-down (spec, decoded exit,
   stdout/stderr tails, event timeline, recent watchdog resource
   samples), fetched **live** from the host that owns the spec at
@@ -46,7 +52,9 @@ dashboard. Installing, configuring and operating it is
 The data comes from a **background sweep thread** in the web process:
 per configured host, the `vq overview` gather plus the queue listing
 (local reads on the console host, `vq queue localhost --json` over SSH
-elsewhere, scheduler hosts read on their `scheduler_driver`). Pages
+elsewhere, scheduler hosts read on their `scheduler_driver`), plus one
+`vq top localhost --json` per driver that runs a direct job, for the
+jobs' latest resource samples. Pages
 serve from the cached snapshot (its `gathered_at` is shown), so a slow
 or hung SSH fan-out never blocks a request; `VQ_WEB_FLEET_INTERVAL`
 (seconds, default 30, floor 5) sets the sweep cadence.
@@ -100,8 +108,9 @@ open tunnel posture), and a plain single-host sidecar started without
 gating it would lock the operator out with no way back in.
 
 Fleet reads remain safe to expose only behind a tunnel or a
-TLS-terminating reverse proxy; account gating is a step toward the
-public deployment (M3), not a license to bind publicly without TLS.
+TLS-terminating reverse proxy; account gating is not a license to bind publicly without TLS, and it
+is not the public view: that is the static snapshot described under
+"Public fleet snapshot (#66)" below.
 
 Default bind is `127.0.0.1:8765`. The port moved from 8080 in v0.5.0 to
 8765 in v0.5.1 because 8080 is too crowded; pick any free port via
@@ -254,14 +263,118 @@ vq admin update --token-file ~/.config/vq/web-token vibeqc-dev --all-hosts
 vq admin update --token "$VQ_TOKEN" vibeqc-dev --all-hosts
 ```
 
-## Public exposure -- caddy reverse proxy + TLS (still not shipped as of v0.6.18)
+## Public fleet snapshot (#66)
 
-If you want the dashboard reachable from a domain (e.g.
-`vq.example.com`), put a TLS-terminating reverse proxy in front. vq
-does NOT bundle this; the recipe below was originally pitched for
-v0.5.2 but the priority kept being deferred for higher-impact verbs
-(resubmit, wait, auto-update, scheduled submits). It's documented in
-advance for operators who want it now.
+The public face of a fleet is a **static snapshot**, not the console. An
+operator-side process that holds the fleet credentials writes it; a separate
+unprivileged account with no fleet credentials serves the files; the console
+itself stays on loopback behind authentication. vq never serves the public
+page. `SECURITY.md`, "Public fleet snapshot", is the security record.
+
+The snapshot follows the schema `vq.public-fleet/1`
+(`vq.web.public_snapshot.PUBLIC_SNAPSHOT_JSON_SCHEMA`), and that schema is the
+complete list of what it may contain:
+
+```json
+{
+  "schema": "vq.public-fleet/1",
+  "generated_at": "2026-09-25T12:00:00+00:00",
+  "stale_after": "2026-09-25T12:15:00+00:00",
+  "title": "Example fleet",
+  "hosts": [
+    {"name": "Cluster A", "state": "up", "load": "busy"},
+    {"name": "Workstation", "state": "down", "load": "unknown"}
+  ],
+  "calculations": [
+    {"alias": "water-dimer-scan", "state": "running", "host": "Cluster A"}
+  ]
+}
+```
+
+| field | values |
+|---|---|
+| host `state` | `up` (answered the sweep), `down` (administratively down or unreachable), `unknown` (a display name for a key the sweep did not cover) |
+| host `load` | `idle`, `light` (< 50 % of the configured CPU budget running), `busy` (< 90 %), `full`, `active` (work present, budget unknown), `unknown` (host not up) |
+| calculation `state` | `queued`, `running`, `paused`, `finished`, `failed`, `cancelled`, `unknown` |
+| calculation `host` | the host's display name, or `null` when it has none |
+
+**Hosts are named by the operator, and only those appear.** Configure a
+public display name per `[hosts.<key>]` key:
+
+```toml
+[public_snapshot]
+title = "Example fleet"
+stale_after_seconds = 900
+
+[public_snapshot.hosts]
+cluster-a = "Cluster A"
+workstation = "Workstation"
+```
+
+A host with no entry is left out of the snapshot entirely; it is never shown
+under its config key. Display names must be unique, printable and at most 64
+characters. `stale_after_seconds` (at least 60, default 900) sets how long
+after the sweep the page calls itself stale.
+
+**Calculations opt in at submit time, one by one.** Nothing is public by
+default. Add a tag of the form `public.<alias>`:
+
+```bash
+vq submit cluster-a --tag public.water-dimer-scan -- vibe-qc run input.py
+```
+
+The alias is what the page shows, so make it something you are content to
+publish. It uses the tag charset (letters, digits, `.`, `_`, `-`) and is at
+most 43 characters, since a tag is at most 50. The prefix is exact and
+lowercase, and a job with two different `public.` tags stays private. (The
+decision on #66 named a `public=<alias>` form; `=` is not a legal tag
+character, so the separator is `.`.)
+
+### Writing the snapshot
+
+```bash
+vq web public-snapshot --out /srv/vq-public
+```
+
+This sweeps the fleet with the operator's own credentials, exactly as the
+console does, projects the result through the schema, and writes two files
+into the directory, creating it if needed:
+
+* `fleet.json`, the `vq.public-fleet/1` document;
+* `index.html`, a static page with no script and no external resource.
+
+Before anything is written, the document is checked once more against the
+schema: the key set of every object, and every value's type, allowed values,
+pattern, length and timestamp format. A document that fails that check is
+not written, and the error names the offending field, not its value.
+
+Each file is replaced atomically (written to a temporary file beside it,
+fsynced, then renamed), so a server never hands out a half-written file. The
+two are replaced one after the other, JSON first. Both are mode 0644 so that
+a separate serving account can read them. `--stale-after SECONDS` overrides
+`stale_after_seconds`, and `--json` prints a summary.
+
+The command starts no server and opens no listener. If the sweep or the
+projection fails, nothing is written: the previous files stay in place and,
+once their `stale_after` time passes, say so themselves. A static page cannot notice
+its own age when it is viewed, so it prints both times and tells the reader
+what a passed `stale_after` means.
+
+The command warns when `[public_snapshot.hosts]` is empty and when it names
+a key that is not a configured host. Those warnings go to the operator's
+terminal, never into the files.
+
+The [public snapshot deployment runbook](public_snapshot_deployment.md) covers
+the writer timer, serving permissions and isolation, exact-file TLS serving,
+freshness monitoring, backup and rollback. Deployment remains an operator action.
+
+## Authenticated console behind a reverse proxy + TLS
+
+This section is about reaching the **authenticated** console from a domain.
+It is not the public view: anonymous visitors get the static snapshot above,
+and the console itself is never the public face. vq does not bundle a proxy;
+the sketch below is for operators who put one in front of a console that
+has accounts configured.
 
 ### Sketch (caddy on the same host as vq-web)
 
