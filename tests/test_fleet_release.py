@@ -112,13 +112,13 @@ def _split_discovery_repos(tmp_path: Path) -> tuple[Path, dict[str, Path], dict[
     for component in ("vibe-qc", "vibe-queue", "vibe-view"):
         parent = tmp_path / component
         parent.mkdir()
-        origins[f"mpei/{component}"] = _init_repo(parent)
+        origins[f"example-org/{component}"] = _init_repo(parent)
 
     def publish(tag: str) -> None:
         shas = {slug: _git(repo, "rev-parse", "HEAD") for slug, repo in origins.items()}
-        qc = origins["mpei/vibe-qc"]
+        qc = origins["example-org/vibe-qc"]
         _git(qc, "tag", tag)
-        payload = _report(tag, shas["mpei/vibe-qc"])
+        payload = _report(tag, shas["example-org/vibe-qc"])
         for name, pin in payload["pins"].items():
             sha = shas[pin["repo"]]
             pin["sha"] = sha
@@ -127,7 +127,7 @@ def _split_discovery_repos(tmp_path: Path) -> tuple[Path, dict[str, Path], dict[
                 ["--tag", tag, "--expected-sha", sha]
                 if name == "release" else ["--expected-sha", sha]
             )
-        reports = origins["mpei/vibe-queue"]
+        reports = origins["example-org/vibe-queue"]
         path = reports / "releases" / f"{tag}.json"
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(payload))
@@ -143,7 +143,7 @@ def _split_discovery_repos(tmp_path: Path) -> tuple[Path, dict[str, Path], dict[
         (origin / "README").write_text("next release\n")
         _commit(origin, "next release")
     publish("v0.15.60")
-    driver = clones["mpei/vibe-queue"]
+    driver = clones["example-org/vibe-queue"]
     _git(driver, "fetch", "origin", "main", "--tags")
     return driver, clones, before
 
@@ -163,7 +163,7 @@ def test_discovery_refreshes_split_pin_sources_without_changing_worktrees(
         (clone / "README").write_text("operator edits\n")
     # One checkout can appear under more than one configured slug or a symlink.
     alias = tmp_path / "qc-alias"
-    alias.symlink_to(clones["mpei/vibe-qc"], target_is_directory=True)
+    alias.symlink_to(clones["example-org/vibe-qc"], target_is_directory=True)
     clones["retained-alias"] = alias
     fetched = []
 
@@ -206,7 +206,7 @@ def test_discovery_refuses_cached_pins_when_a_source_fetch_fails(
     attempted = []
 
     def run(argv, **kwargs):
-        if argv[3] == "fetch" and Path(argv[2]) == clones["mpei/vibe-qc"]:
+        if argv[3] == "fetch" and Path(argv[2]) == clones["example-org/vibe-qc"]:
             attempted.append(argv)
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(argv, 120)
@@ -295,7 +295,7 @@ def test_parse_report_still_reads_committed_v2_reports() -> None:
     # actually came from -- not guessed from the pin name. project 36 did
     # not exist when this report was written.
     for name in fleet_release.PIN_NAMES:
-        assert report.pins[name].repo == "mpei/vibeqc"
+        assert report.pins[name].repo == "example-org/vibeqc"
         assert report.pins[name].project_id == 19
 
 
@@ -335,8 +335,10 @@ def test_parse_report_rejects_a_pin_pointing_at_the_wrong_project() -> None:
     """
     payload = _report("v0.15.60", "e" * 40)
     payload["pins"]["vq"]["project_id"] = 34  # type: ignore[index]
-    payload["pins"]["vq"]["repo"] = "mpei/vibe-qc"  # type: ignore[index]
-    with pytest.raises(fleet_release.FleetReleaseError, match="resolves in 'mpei/vibe-queue'"):
+    payload["pins"]["vq"]["repo"] = "example-org/vibe-qc"  # type: ignore[index]
+    with pytest.raises(
+        fleet_release.FleetReleaseError, match="resolves in 'example-org/vibe-queue'"
+    ):
         fleet_release.parse_report(
             payload,
             source_ref="origin/main",
@@ -1021,7 +1023,7 @@ def test_a_pin_repo_that_lacks_the_commit_is_rejected(tmp_path: Path) -> None:
     _git(unrelated, "update-ref", "refs/remotes/origin/main", "HEAD")
 
     mapping = dict(_pin_repos(anchor))
-    mapping["mpei/vibe-queue"] = unrelated  # the vq pin now points somewhere wrong
+    mapping["example-org/vibe-queue"] = unrelated  # the vq pin now points somewhere wrong
 
     with pytest.raises(fleet_release.FleetReleaseError, match="not an ancestor"):
         fleet_release.discover_latest_report(anchor, fetch=False, pin_repos=mapping)
@@ -1033,7 +1035,7 @@ def test_missing_pin_repo_names_the_slug_and_how_to_fix_it(tmp_path: Path) -> No
     pin = fleet_release.FleetPin(
         name="vq", sha=sha, version="0.26.0", deploy_flags=(),
         gating_job="test", pipeline_id=1, evidence_sha=sha,
-        acceptance_rule="A", repo="mpei/vibe-queue", project_id=36,
+        acceptance_rule="A", repo="example-org/vibe-queue", project_id=36,
     )
     with pytest.raises(fleet_release.FleetReleaseError) as excinfo:
         fleet_release._repo_for_pin(
@@ -1041,7 +1043,7 @@ def test_missing_pin_repo_names_the_slug_and_how_to_fix_it(tmp_path: Path) -> No
             pin_repos={}, source_path="releases/v0.17.0.json",
         )
     msg = str(excinfo.value)
-    assert "mpei/vibe-queue" in msg
+    assert "example-org/vibe-queue" in msg
     assert "pin_source_repos" in msg
 
 
@@ -1061,7 +1063,7 @@ def test_v2_reports_still_validate_against_the_runtime_clone(tmp_path: Path) -> 
     selected = fleet_release.discover_latest_report(repo, fetch=False)
 
     assert selected.source_path.endswith("v0.15.60.json")
-    assert all(p.repo == "mpei/vibeqc" for p in selected.pins.values())
+    assert all(p.repo == "example-org/vibeqc" for p in selected.pins.values())
 
 
 def test_historical_blob_is_found_under_either_layout(tmp_path: Path) -> None:
@@ -1118,7 +1120,7 @@ def test_v2_pins_resolve_in_a_retained_monorepo_checkout(tmp_path: Path) -> None
 
     A /2 pin is a monorepo commit and its tag is a monorepo tag. The runtime
     clone answered both before the split because it WAS the monorepo;
-    vibe-queue's fresh history carries neither. Pointing "mpei/vibeqc" at a
+    vibe-queue's fresh history carries neither. Pointing "example-org/vibeqc" at a
     retained checkout restores that, which is why the rollback trees matter
     beyond rollback.
     """
@@ -1147,10 +1149,10 @@ def test_v2_pins_resolve_in_a_retained_monorepo_checkout(tmp_path: Path) -> None
         fleet_release.discover_latest_report(reports, fetch=False)
 
     selected = fleet_release.discover_latest_report(
-        reports, fetch=False, pin_repos={"mpei/vibeqc": monorepo}
+        reports, fetch=False, pin_repos={"example-org/vibeqc": monorepo}
     )
     assert selected.release.sha == sha
-    assert all(p.repo == "mpei/vibeqc" for p in selected.pins.values())
+    assert all(p.repo == "example-org/vibeqc" for p in selected.pins.values())
 
 
 class TestRuntimeRepoRefusal:

@@ -27,6 +27,25 @@ from vq.daemon import BUILD_JOB_PRIORITY, Daemon, _TerminalSurvivor
 from vq.spec import JobSpec, JobState
 from vq.submit import submit_local
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a teardown reap of whatever the daemon left running.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 1 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# **It has a ceiling here.** The processes these tests spawn are `sleep 30`,
+# which then exit by themselves. A budget at or above that would let a
+# `wait()` after `kill()` return because the sleep ended rather than because
+# the kill landed, so a kill that never worked would report success. Ten
+# seconds stays a third of the self-exit and keeps discriminating; raising it
+# means raising those sleeps first.
+_LIVENESS_SECONDS = 10.0
+
+
 # ----------------------------------------------------------------------
 # JobSpec.refresh_before field
 # ----------------------------------------------------------------------
@@ -295,7 +314,7 @@ def _drain_daemon_running(daemon: Daemon) -> None:
     for rj in daemon._running.values():
         try:
             rj.popen.kill()
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         except Exception:
             pass
         rj.close_logs()

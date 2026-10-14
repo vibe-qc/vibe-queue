@@ -13,16 +13,24 @@ release rollout needs no per-release human steps on host_f.
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from vq import admin, config, paths
+from vq import admin, config, paths, transport
 from vq.scheduler_dialect import SchedulerPhase
 
 SHA = "d" * 40
 TAG = "v0.15.58"
+TAG_OBJECT = "e" * 40
+"""The annotated tag object ``TAG`` resolves to in the driver's clone.
+
+The feed compares ref values rather than peeled commits, so the scripted git
+has to answer ``rev-parse refs/tags/<TAG>`` with something stable and
+distinct from ``SHA``. Real-git coverage of the feed's ref arithmetic lives
+in ``test_mirror_feed_no_force_v0_26_10``; this module scripts git."""
 MIRROR = ".local/share/vq-host_f/vibeqc.git"
 PREPARER = "~/.local/libexec/vq-host_f/bin/prepare-host_f-runtime-source"
 MIRROR_ABS = f"/home/USER/{MIRROR}"
@@ -87,7 +95,7 @@ def _write_config(
         # is exactly the bug this mapping prevents. The fixture points every
         # slug at one path because it only scripts git, never reads a tree.
         lines.insert(2, "[pin_source_repos]")
-        for slug in ("mpei/vibe-qc", "mpei/vibe-view", "mpei/vibe-queue"):
+        for slug in ("example-org/vibe-qc", "example-org/vibe-view", "example-org/vibe-queue"):
             lines.insert(3, f'"{slug}" = "{source_repo}"')
     (cfg_dir / "config.toml").write_text("\n".join(lines))
 
@@ -104,6 +112,7 @@ class _Fleet:
         prepare_rc: int = 0,
         prepare_stderr: str = "main moved",
         mirror_probe: str | None = None,
+        mirror_refs: str = "",
     ) -> None:
         self.mirror_probe = (
             _MIRROR_PROBE_OK if mirror_probe is None else mirror_probe
@@ -115,10 +124,30 @@ class _Fleet:
         self.push_rc = push_rc
         self.prepare_rc = prepare_rc
         self.prepare_stderr = prepare_stderr
+        self.mirror_refs = mirror_refs
+        """``git ls-remote`` output for the mirror; empty = an empty mirror,
+        where every ref the feed names is a creation."""
 
     def run_git(self, argv, **kwargs):  # type: ignore[no-untyped-def]
         assert argv[0] == "git", argv
         self.git_calls.append(list(argv))
+        if "--points-at" in argv:
+            # The tags naming this pin in the driver's clone -- the release
+            # identity the feed carries, and nothing else.
+            return subprocess.CompletedProcess(
+                args=list(argv), returncode=0,
+                stdout=f"{self.tag}\n" if self.tag else "", stderr="",
+            )
+        if "ls-remote" in argv:
+            return subprocess.CompletedProcess(
+                args=list(argv), returncode=0,
+                stdout=self.mirror_refs, stderr="",
+            )
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(
+                args=list(argv), returncode=0,
+                stdout=f"{TAG_OBJECT}\n", stderr="",
+            )
         rc = self.push_rc if "push" in argv else 0
         return subprocess.CompletedProcess(
             args=list(argv), returncode=rc,
@@ -189,11 +218,15 @@ def test_feed_and_prepare_run_before_the_build(
     assert result.mirror_fed is True
     assert result.prepare_rc == 0
     push = next(c for c in fleet.git_calls if "push" in c)
-    assert f"+{SHA}:refs/heads/main" not in push
-    assert f"+{SHA}:refs/remotes/origin/main" not in push
-    assert f"+{SHA}:refs/heads/release" in push
-    assert f"+{SHA}:refs/remotes/origin/release" in push
-    assert "+refs/tags/*:refs/tags/*" in push
+    assert f"{SHA}:refs/heads/main" not in push
+    assert f"{SHA}:refs/remotes/origin/main" not in push
+    assert f"{SHA}:refs/heads/release" in push
+    assert f"{SHA}:refs/remotes/origin/release" in push
+    assert f"{SHA}:{admin.RUNTIME_PIN_REF_PREFIX}{SHA}" in push
+    assert f"refs/tags/{TAG}:refs/tags/{TAG}" in push
+    # Never forced, and never the whole tag namespace (#81).
+    assert not any(a.startswith("+") for a in push)
+    assert "--atomic" in push
     assert f"host_f-login:{MIRROR}" in push
     prepare_idx = next(
         i for i, (ssh, argv) in enumerate(fleet.remote_calls)
@@ -242,11 +275,14 @@ def test_branch_tip_feed_does_not_clobber_release_refs(
 
     assert result.success is True, result.work_errors
     push = next(c for c in fleet.git_calls if "push" in c)
-    assert f"+{SHA}:refs/heads/main" in push
-    assert f"+{SHA}:refs/remotes/origin/main" in push
-    assert f"+{SHA}:refs/heads/release" not in push
-    assert f"+{SHA}:refs/remotes/origin/release" not in push
-    assert "+refs/tags/*:refs/tags/*" in push
+    assert f"{SHA}:refs/heads/main" in push
+    assert f"{SHA}:refs/remotes/origin/main" in push
+    assert f"{SHA}:refs/heads/release" not in push
+    assert f"{SHA}:refs/remotes/origin/release" not in push
+    assert not any(a.startswith("+") for a in push)
+    assert not any("refs/tags/" in a for a in push), (
+        "a branch-tip lane carries no release identity to feed"
+    )
 
 
 def test_prepare_failure_leaves_the_runtime_untouched(
@@ -300,7 +336,7 @@ def test_feed_without_source_repo_fails_closed(
     # The message now names the program and the repository it needs, since
     # "no source repo" is per-program rather than one global setting.
     assert any(
-        "no local checkout is configured" in e and "mpei/" in e
+        "no local checkout is configured" in e and '"vibe-qc" = "/path/to/checkout"' in e
         for e in result.work_errors
     )
     assert fleet.git_calls == []
@@ -498,7 +534,7 @@ class TestPushFedMirrorPrecondition:
     ) -> None:
         """An origin elsewhere is a different valid arrangement, not damage:
         vq reports the contradiction rather than converting it."""
-        upstream = "https://gitlab.example.com/mpei/vibe-qc.git"
+        upstream = "https://gitlab.example.com/example-org/vibe-qc.git"
         _fleet, result = self._run(
             state_dir,
             monkeypatch,
@@ -605,6 +641,41 @@ class TestMirrorProbeAgainstRealRepositories:
             self._git(path, "remote", "add", "origin", origin)
         return path
 
+    @pytest.mark.parametrize("failure", ["exit255", "timeout"])
+    def test_stalled_multiplex_read_recovers_on_a_fresh_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ) -> None:
+        mirror = self._bare(tmp_path, "mirror.git", ".")
+        before = {p.relative_to(mirror): p.read_bytes() for p in mirror.rglob("*") if p.is_file()}
+        real_run = subprocess.run
+        calls = []
+
+        def ssh(cmd, **kwargs):
+            calls.append(cmd)
+            assert cmd[0] == "ssh"
+            if "ControlPath=none" not in cmd:
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+                return subprocess.CompletedProcess(cmd, 255, "", "banner exchange stalled")
+            assert "ControlMaster=no" in cmd
+            return real_run(shlex.split(cmd[-1]), **kwargs)
+
+        monkeypatch.setattr(transport.subprocess, "run", ssh)
+        monkeypatch.setattr(transport.time, "sleep", lambda _seconds: None)
+        result = admin.SchedulerRuntimeUpdateResult(
+            host="target", program="demo", mode="update", command="unused",
+            command_ssh="target.invalid", verify_command="unused",
+            verify_ssh="target.invalid", expected_sha=SHA,
+        )
+        assert admin._verify_push_fed_mirror(
+            config.HostConfig(ssh="target.invalid"), str(mirror), result,
+        ), result.work_errors
+        assert len(calls) == 2
+        assert calls[0][-1] == calls[1][-1]
+        assert before == {
+            p.relative_to(mirror): p.read_bytes() for p in mirror.rglob("*") if p.is_file()
+        }
+
     @pytest.mark.parametrize("spelling", [".", "{abs}", "../{name}"])
     def test_every_self_referential_spelling_reads_as_push_fed(
         self, tmp_path: Path, spelling: str,
@@ -642,7 +713,7 @@ class TestMirrorProbeAgainstRealRepositories:
         self, tmp_path: Path,
     ) -> None:
         mirror = self._bare(
-            tmp_path, "vibeqc.git", "https://gitlab.example.invalid/mpei/vibe-qc.git",
+            tmp_path, "vibeqc.git", "https://gitlab.example.invalid/example-org/vibe-qc.git",
         )
 
         fields = self._probe(mirror, cwd=tmp_path)

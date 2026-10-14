@@ -32,6 +32,15 @@
     </select>
   </label>
   <label>
+    program
+    <select name="program">
+      <option value="all" {% if query.program == "all" %}selected{% endif %}>all</option>
+      {% for program in program_options %}
+      <option value="{{ program }}" {% if query.program == program %}selected{% endif %}>{{ program }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
     tag
     <input type="text" name="tag" value="{{ query.tag }}" size="10" autocomplete="off">
   </label>
@@ -53,4 +62,43 @@
 </form>
 
 {% include "fleet_jobs_table.html" %}
+
+{% if broker is not none %}
+<h3>Broker jobs</h3>
+<p class="hint">
+  Jobs this host holds or has placed as the fleet broker (metadata only).
+  {% if broker.unreadable %}{{ broker.unreadable }} record(s) could not be read; see <code>vq broker list</code>.{% endif %}
+</p>
+{% if broker.error %}
+<p class="warn">broker records unavailable: {{ broker.error }}</p>
+{% elif not broker.jobs %}
+<p class="hint">No broker jobs.</p>
+{% else %}
+<table class="jobs broker-jobs">
+  <thead>
+    <tr><th>broker job</th><th>state</th><th>target</th><th>cpus</th><th>mem MB</th>
+        <th>name</th><th>created</th><th>updated</th><th>why</th></tr>
+  </thead>
+  <tbody>
+    {% for job in broker.jobs %}
+    <tr>
+      <td><code>{{ job.broker_job_id }}</code></td>
+      <td>{{ job.state }}</td>
+      <td>{% if job.target_host %}{{ job.target_host }}{% if job.target_job_id %} <code>{{ job.target_job_id }}</code>{% endif %}{% else %}—{% endif %}</td>
+      <td>{{ job.cpus }}</td>
+      <td>{{ job.mem_mb }}</td>
+      <td>{{ job.job_name or "—" }}</td>
+      <td>{{ (job.created_at or "")[:19] | replace("T", " ") }}</td>
+      <td>{{ (job.updated_at or "")[:19] | replace("T", " ") }}</td>
+      <td>
+        {% if job.operator_action %}<strong>OPERATOR ACTION:</strong> {{ job.operator_action }}
+        {% elif job.blockers %}{% for host, why in job.blockers|dictsort %}{{ host }}: {{ why }}{% if not loop.last %}; {% endif %}{% endfor %}
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
 {% endblock %}

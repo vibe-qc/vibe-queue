@@ -32,6 +32,25 @@ from vq.kill import kill_job
 from vq.spec import JobSpec, JobState
 from vq.status import show_status
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a `finally` reap of the process the dispatch test spawned.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 2 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# **It has a ceiling here.** The processes these tests spawn are `sleep 30`,
+# which then exit by themselves. A budget at or above that would let a
+# `wait()` after `kill()` return because the sleep ended rather than because
+# the kill landed, so a kill that never worked would report success. Ten
+# seconds stays a third of the self-exit and keeps discriminating; raising it
+# means raising those sleeps first.
+_LIVENESS_SECONDS = 10.0
+
+
 # Barrier-synchronized trials. The widened read->write window (below) makes
 # the dangerous "both read RUNNING, daemon clobbers kill's KILLED back to
 # COMPLETED" interleaving manifest on roughly half of un-locked trials, so a
@@ -247,7 +266,7 @@ class TestKillDuringPopenWindow:
             p = spawned.get("p")
             if p is not None and p.poll() is None:
                 p.kill()
-                p.wait(timeout=2)
+                p.wait(timeout=_LIVENESS_SECONDS)
 
 
 class TestDispatchFailureObservability:

@@ -48,12 +48,12 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
-from vq import transport
+from vq import bulk_delete, driver_identity, transport
 from vq.config import HostConfig, SchedulerProgramHooks
 from vq.scheduler_dialect import (
     DialectError,
@@ -66,7 +66,7 @@ from vq.scheduler_dialect import (
     enforce_scheduler_wall_time_limit,
     parse_submit_extra,
 )
-from vq.spec import JobSpec, JobState, utcnow_iso
+from vq.spec import JobSpec, JobState, utcnow_iso, validate_job_id
 
 log = logging.getLogger("vq.scheduler_dispatch")
 
@@ -263,6 +263,17 @@ SCHEDULER_SUBMIT_RECEIPT_SCHEMA = "vq.scheduler-submit-once.v1"
 SCHEDULER_SUBMIT_RECEIPT_MAX_BYTES = 4096
 SCHEDULER_SUBMIT_OUTPUT_MAX_BYTES = 64 * 1024
 SCHEDULER_JOB_ID_MAX_BYTES = 256
+# Upper bound on the rendered remote command of one batched poll. A campaign
+# with a few thousand handles in flight is ordinary use here, and naming all of
+# them in a single `qstat`/`squeue`/`sacct` invocation produces a remote command
+# line that grows without any bound the code owns: it crosses ssh, a remote
+# login shell and the scheduler client's own argument handling, none of which vq
+# controls. Splitting the poll into several bounded invocations keeps each one
+# inside a size that has been observed to work against a real login node, and
+# stops a single oversized command from being what decides whether a whole
+# host's observation succeeds. The commands are issued sequentially and the
+# first failure aborts the rest, so the split adds no concurrent connections.
+SCHEDULER_POLL_MAX_COMMAND_BYTES = 8192
 MISSING_MARKER_DIAGNOSTIC_TAIL_LINES = 120
 MISSING_MARKER_DIAGNOSTIC_MAX_CHARS = 4096
 MISSING_MARKER_DIAGNOSTIC_FILE_LIMIT = 200
@@ -806,7 +817,105 @@ class SchedulerRemoteOutcomeUnknown(SchedulerError):
     """The local observer lost a scheduler-host command's outcome."""
 
 
+class SchedulerHostUnreachable(SchedulerError):
+    """ssh never completed a connection to the scheduler host.
+
+    The narrow case where the remote *refused or never finished* the connection
+    itself: the banner exchange timed out, the peer closed or reset it, or the
+    route was unavailable. Nothing scheduler-side was reached, so nothing about
+    any job was observed — the caller keeps the same conservative unknown state
+    it keeps for any failed poll (#51).
+
+    It is deliberately narrower than "ssh exited 255". A rejected key or a
+    revoked account also exits 255 and also means no job was observed, but it
+    is a standing configuration fault: waiting changes nothing, and a caller
+    that paced itself against it would only make the fault slower to surface.
+    This class is for the load-dependent refusals, where the next attempt is
+    worth *less* than the one before it because the host is turning connections
+    away and vq's own attempts are part of what it is turning away.
+
+    Classified from the connection's own stderr, never from the command: the
+    diagnostic contract from the review of 3f5ed04 — bounded, sanitised, and
+    free of argument values — is unchanged, and so is the message text.
+
+    The classification reads the failing invocation's stderr and cannot prove
+    the phrase came from ssh rather than from a scheduler client that could not
+    reach its own server. Both mean the same two things — nothing was observed,
+    and another attempt right now is worth no more than this one — so the
+    caller's answer is the same either way.
+    """
+
+
+# ssh's own words for "the connection itself did not complete". Matched against
+# the sanitised stderr only, case-insensitively, as whole phrases: the strings
+# are OpenSSH's, so a message vq did not anticipate falls back to the ordinary
+# SchedulerError rather than being guessed into a pacing decision.
+#
+# `kex_exchange_identification` is listed because it is what a client sees when
+# sshd drops it before the banner — the exact shape a login node's MaxStartups
+# throttle produces, and the mechanism #51 hypothesised. vq cannot read that
+# throttle's value and does not claim to have observed it; the point of the
+# pattern is that vq answers the *symptom* the same way whatever produced it.
+_CONNECTION_REFUSAL_PHRASES = (
+    "timed out during banner exchange",
+    "kex_exchange_identification",
+    "connection timed out",
+    "connection refused",
+    "connection reset by peer",
+    "connection closed by remote host",
+    "no route to host",
+    "network is unreachable",
+    "operation timed out",
+)
+
+
+def _is_connection_refusal(stderr: str | None) -> bool:
+    """Whether ``stderr`` is ssh reporting a connection that never completed."""
+    if not stderr:
+        return False
+    lowered = stderr.lower()
+    return any(phrase in lowered for phrase in _CONNECTION_REFUSAL_PHRASES)
+
+
 _POLL_COMMANDS = frozenset({"qstat", "squeue", "sacct"})
+# The coarse live poll of every dialect. These share one policy — a read-only
+# observation that is safe to replay and crosses a login node that may be busy —
+# so the runner must not key that policy off one dialect's binary name.
+_LIVE_POLL_COMMANDS = frozenset({"qstat", "squeue"})
+
+
+def _chunk_poll_ids(
+    ids: Sequence[str],
+    build_command: Callable[[Sequence[str]], Sequence[str]],
+    *,
+    max_command_bytes: int = SCHEDULER_POLL_MAX_COMMAND_BYTES,
+) -> list[list[str]]:
+    """Split ``ids`` so each rendered poll command stays within the byte cap.
+
+    ``build_command`` is the dialect's own command builder, so the measurement
+    is of the argv that will actually be sent — a Torque ``qstat`` spends about
+    one id per argument while Slurm packs a whole comma-joined list into one.
+    Greedy and order-preserving: an id is added to the current chunk unless it
+    would push the rendered command over the cap, and a single id that exceeds
+    the cap on its own still goes out alone rather than being dropped.
+    """
+    if max_command_bytes <= 0:
+        raise ValueError("max_command_bytes must be > 0")
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for job_id in ids:
+        candidate = [*current, job_id]
+        rendered = len(shlex.join(build_command(candidate)).encode())
+        if current and rendered > max_command_bytes:
+            chunks.append(current)
+            current = [job_id]
+            continue
+        current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 _POLL_SECRET = re.compile(
     r'''(?i)\b(bearer|password|secret|token)\b\s*[:=]?\s*(?:"[^"]*"|'[^']*'|\S+)'''
 )
@@ -867,6 +976,56 @@ class SchedulerPollEvidence:
 
     phases: dict[str, SchedulerPhase]
     explicitly_absent_job_ids: frozenset[str] = frozenset()
+    queued_reasons: dict[str, str] = field(default_factory=dict)
+    """The scheduler's verbatim "why is this not running" per pending job.
+
+    Populated only for dialects that carry the reason on the coarse poll
+    (Slurm's ``squeue %r``); Torque reports it on the detail poll instead, so
+    this stays empty there and the reason rides on ``QstatDetail``.
+    """
+
+
+_TRANSFER_ARCHIVE_NAME = re.compile(
+    r"(?P<job>[^/]+)\.(?:upload|result-[0-9a-f]{32})\.tar"
+)
+
+_LIST_TRANSFER_ARCHIVES_SCRIPT = r"""root=$1
+[ -d "$root" ] || exit 0
+cd "$root" || exit 3
+tab=$(printf '\t')
+for f in *.upload.tar *.result-*.tar; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    m=$(stat -c %Y -- "$f" 2>/dev/null || stat -f %m -- "$f" 2>/dev/null || echo 0)
+    printf '%s%s%s\n' "$f" "$tab" "$m"
+done
+"""
+
+
+@dataclass(frozen=True)
+class RemoteJobWorkspace:
+    """One entry of a scheduler host's jobs root (see list_job_workspaces)."""
+
+    job_id: str
+    path: str
+    modified: float
+    driver_id: str | None
+    scheduler_job_ids: tuple[str, ...]
+
+
+_LIST_JOB_WORKSPACES_SCRIPT = r"""root=$1
+[ -d "$root" ] || exit 0
+cd "$root" || exit 3
+tab=$(printf '\t')
+for d in * .[!.]*; do
+    [ -d "$d" ] && [ ! -L "$d" ] || continue
+    m=$(stat -c %Y -- "$d" 2>/dev/null || stat -f %m -- "$d" 2>/dev/null || echo 0)
+    o=$(head -c 64 -- "$d/_vq/driver-id" 2>/dev/null | tr -dc '0-9a-f')
+    s=$(head -c 128 -- "$d/_vq/scheduler-job-id" 2>/dev/null | tr -dc 'A-Za-z0-9._[]-')
+    r=$(sed -n 's/.*"scheduler_job_id":"\([^"]*\)".*/\1/p' "$d.submit-once.json" \
+        2>/dev/null | head -n 1 | tr -dc 'A-Za-z0-9._[]-')
+    printf '%s%s%s%s%s%s%s%s%s\n' "$d" "$tab" "$m" "$tab" "$o" "$tab" "$s" "$tab" "$r"
+done
+"""
 
 
 @dataclass(frozen=True)
@@ -891,10 +1050,6 @@ class RemoteRunner(Protocol):
         self, argv: Sequence[str], *, stdin_data: str | None = None, check: bool = False
     ) -> RemoteResult:
         """Run ``argv`` on the scheduler host (ssh). ``check`` raises on nonzero."""
-        ...
-
-    def upload_tree(self, local_dir: Path, remote_dir: str) -> None:
-        """Copy the contents of ``local_dir`` into the existing ``remote_dir``."""
         ...
 
     def upload_file(self, local_path: Path, remote_path: str) -> None:
@@ -1054,12 +1209,186 @@ def scheduler_handle_for_spec(
     policies stay at their owning call sites. A vq array is persisted as
     independent JobSpecs, so its metadata deliberately does not become a
     native scheduler ``array_size``.
+
+    #63: the workspace comes from the job's own record when it has one. The
+    previous behaviour -- recomputing it from the dispatcher's *current*
+    ``scratch_root`` on every call -- meant changing that key silently
+    re-pointed every live job at a directory nothing had staged, so polling,
+    fetch and cleanup all addressed the wrong path. The derivation is still
+    the fallback for a job dispatched before #63; :func:`bind_remote_workspace`
+    is how that record acquires one.
     """
     return SchedulerHandle(
         job_id=job_id,
-        remote_workspace=dispatcher.remote_workspace(spec.id),
+        remote_workspace=bound_remote_workspace(dispatcher, spec),
         array_size=None,
     )
+
+
+def bound_remote_workspace(
+    dispatcher: SchedulerDispatcher, spec: JobSpec
+) -> str:
+    """The workspace path this job is bound to on its scheduler host.
+
+    The recorded binding if there is one, else the current derivation -- which
+    is the right answer for a pre-#63 record precisely because that record was
+    created when the derivation *was* the binding, and the daemon refuses to
+    adopt a changed ``scratch_root`` for a host that still has an unbound job
+    that could have been staged (:func:`unbound_staged_job_ids`).
+    """
+    return spec.scheduler_remote_workspace or dispatcher.remote_workspace(
+        spec.id
+    )
+
+
+def spec_may_be_staged(spec: JobSpec) -> bool:
+    """Whether ``spec`` can already own a directory on its scheduler host.
+
+    Dispatch is the only thing that stages one. The first step of
+    ``Daemon._start_scheduler_job`` that reaches the host is the retry
+    rotation, which runs only for a second or later attempt at the same vq id;
+    everything after it is preceded by the PENDING -> SUBMITTING write, and
+    that write records the workspace in the same durable transaction. So a
+    spec still on its first attempt and still PENDING has never been staged
+    and has nothing on the host to lose, while one that is past PENDING, or
+    PENDING again after a retry of this same id, may have.
+
+    ``retry_count`` is the durable record of "this id has been dispatched
+    before": it is incremented by the requeue that follows a failed attempt
+    and is never reset. An auto-resume sibling carries the budget forward but
+    is a different vq id with no ``scheduler_target``, so it is not on any
+    host's list to begin with.
+    """
+    return spec.state != JobState.PENDING or spec.retry_count > 0
+
+
+def unbound_staged_job_ids(specs: Iterable[JobSpec], target: str) -> list[str]:
+    """Jobs on ``target`` that may hold a workspace only the old root locates.
+
+    The transition rule for records that predate #63, stated as code: while
+    any such job exists on a host, that host's ``scratch_root`` must not
+    change, because the only thing that can still locate those workspaces is
+    the derivation from the old value. The consequence of ignoring it is the
+    stranded-workspace failure #63 was opened about.
+
+    Deliberately narrower than "every non-terminal job with no recorded
+    workspace". A job that has never been dispatched under its current id has
+    staged nothing (:func:`spec_may_be_staged`), so it cannot be stranded and
+    must not hold a host back. Counting it meant one ordinary PENDING job
+    pinned a host's ``scratch_root`` for as long as a queue kept feeding it,
+    and the operator's change never landed at all.
+
+    The window this opens is not one poll cycle. A record binds when the
+    daemon *reattaches* to it, which is a daemon start and the retries that
+    follow a failed one, so the window lasts until a start binds these jobs or
+    they drain.
+    """
+    return sorted(
+        spec.id
+        for spec in specs
+        if spec.scheduler_target == target
+        and not spec.is_terminal
+        and not spec.scheduler_remote_workspace
+        and spec_may_be_staged(spec)
+    )
+
+
+SCHEDULER_SCRATCH_ROOTS_SCHEMA = "vq.scheduler-scratch-roots/2"
+"""Schema tag of the daemon's per-host ``scratch_root`` memory (#63).
+
+See :func:`vq.paths.scheduler_scratch_roots_path`. A missing file still means
+"no memory yet".
+
+Version 2 adds one thing to version 1: a host's entry may be an object,
+``{"root": ..., "confirmed": false}``, instead of a bare string. A bare
+string is a root the daemon *adopted*, at a moment when nothing on the host
+could be stranded by it. The object is a root the daemon merely *served*,
+without being able to tell whether the jobs already on that host had been
+staged under it. A confirmed entry is still written as a bare string, so a vq
+that only knows version 1 reads every entry it could ever have written itself
+and skips only the unconfirmed ones -- of which it would have had no memory
+at all.
+"""
+
+
+class RememberedScratchRoot(NamedTuple):
+    """One host's remembered ``scratch_root`` and whether it was confirmed."""
+
+    root: str
+    confirmed: bool
+
+
+def _remembered_scratch_root_entry(value: object) -> RememberedScratchRoot | None:
+    """Parse one host's entry, in either schema shape, else ``None``."""
+    if isinstance(value, str):
+        root = value.rstrip("/")
+        return RememberedScratchRoot(root, True) if root else None
+    if isinstance(value, dict):
+        root_value = value.get("root")
+        if not isinstance(root_value, str):
+            return None
+        root = root_value.rstrip("/")
+        if not root:
+            return None
+        return RememberedScratchRoot(root, value.get("confirmed") is not False)
+    return None
+
+
+def parse_scheduler_scratch_roots(
+    payload: object,
+) -> dict[str, RememberedScratchRoot]:
+    """The remembered roots in a decoded memory file, host by host.
+
+    Anything that is not one of the two documented entry shapes reads as "no
+    memory for that host": a guard that cannot read its own note must not
+    invent one.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    roots = payload.get("roots")
+    if not isinstance(roots, dict):
+        return {}
+    memory: dict[str, RememberedScratchRoot] = {}
+    for host, value in roots.items():
+        entry = _remembered_scratch_root_entry(value)
+        if entry is not None:
+            memory[str(host)] = entry
+    return memory
+
+
+def read_scheduler_scratch_roots(
+    path: Path,
+) -> dict[str, RememberedScratchRoot]:
+    """The remembered ``scratch_root`` per scheduler host, from ``path``.
+
+    For a read-only reporter outside the daemon: a missing file, unreadable
+    bytes and malformed JSON all read as "nothing remembered", because none of
+    them is a finding about the fleet. The daemon reads the same file itself,
+    keeping the diagnostics it logs when the note it owns is unreadable.
+    """
+    try:
+        return parse_scheduler_scratch_roots(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+    except (OSError, ValueError):
+        return {}
+
+
+def scheduler_scratch_roots_payload(
+    memory: Mapping[str, RememberedScratchRoot],
+) -> dict[str, object]:
+    """The JSON body :func:`read_scheduler_scratch_roots` reads back."""
+    return {
+        "schema": SCHEDULER_SCRATCH_ROOTS_SCHEMA,
+        "roots": {
+            host: (
+                entry.root
+                if entry.confirmed
+                else {"root": entry.root, "confirmed": False}
+            )
+            for host, entry in memory.items()
+        },
+    }
 
 
 def _phase_for_polled_job(
@@ -1433,12 +1762,22 @@ class SchedulerDispatcher:
     # -- paths --------------------------------------------------------------
 
     def remote_workspace(self, job_id: str) -> str:
-        """The absolute remote workspace dir for ``job_id``."""
+        """Where a **new** job's workspace is staged, from current config.
+
+        #63: this derivation now answers "where would this job be staged if
+        it were dispatched now", and is no longer consulted for a job that
+        already has one. A dispatched job records its workspace before the
+        submission boundary and every later step reads that record -- see
+        :func:`bound_remote_workspace`.
+        """
         return f"{self.scratch_root}/{self.job_root}/{job_id}"
 
-    def _submit_receipt_path(self, job_id: str) -> str:
+    def _submit_receipt_path(
+        self, job_id: str, remote_workspace: str | None = None
+    ) -> str:
         """Return the staged-archive-external receipt adjacent to the workspace."""
-        return f"{self.remote_workspace(job_id)}.submit-once.json"
+        ws = remote_workspace or self.remote_workspace(job_id)
+        return f"{ws.rstrip('/')}.submit-once.json"
 
     def _write_submit_receipt(
         self,
@@ -1447,6 +1786,7 @@ class SchedulerDispatcher:
         status: str,
         scheduler_job_id: str | None,
         returncode: int,
+        remote_workspace: str | None = None,
     ) -> None:
         """Best-effort atomic publication of one versioned submit receipt.
 
@@ -1463,7 +1803,7 @@ class SchedulerDispatcher:
             "scheduler_returncode": returncode,
         }
         payload = json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
-        path = self._submit_receipt_path(job_id)
+        path = self._submit_receipt_path(job_id, remote_workspace)
         script = (
             "umask 077; path=$1; "
             'tmpdir=$(mktemp -d "${path}.publish.XXXXXXXX") || exit 1; '
@@ -1486,40 +1826,145 @@ class SchedulerDispatcher:
                 result.returncode,
             )
 
-    def cleanup_remote_workspace(self, handle: SchedulerHandle) -> None:
+    def cleanup_remote_workspace(
+        self, handle: SchedulerHandle, *, vq_job_id: str | None = None
+    ) -> None:
         """Remove a terminal job's scheduler-side workspace.
 
         Result fetch leaves the remote workspace intact so transient copy-back
         failures can be retried without losing data. Retention cleanup calls
         this later, after the local workspace has been archived or the job is
-        being deleted. The path guard keeps the reaper inside vq's configured
-        scheduler job root even if an old/corrupt spec carries surprising
-        metadata.
+        being deleted. The path guard keeps the reaper inside a vq scheduler
+        job root even if an old/corrupt spec carries surprising metadata.
+
+        #63: the guard checks the **shape** of the recorded path rather than
+        equality with the currently configured jobs root. It used to require
+        ``parent == <current scratch_root>/<job_root>``, which meant that
+        changing ``scratch_root`` did not merely strand a workspace -- it made
+        the reaper refuse to clean it ever again. The authority is not wider
+        for it: the path must still be absolute and normalised, its final
+        component must still be a single job id, and its parent must still end
+        in this dispatcher's ``job_root``, so the only directories reachable
+        are per-job directories inside some vq scheduler jobs root. Pass
+        ``vq_job_id`` to pin the final component to that exact job.
         """
         workspace = handle.remote_workspace.rstrip("/")
-        jobs_root = PurePosixPath(self.scratch_root) / self.job_root
         workspace_path = PurePosixPath(workspace)
-        if (
-            workspace != str(workspace_path)
-            or workspace_path.parent != jobs_root
-            or workspace_path.name in {"", ".", ".."}
-        ):
+        job_root_parts = PurePosixPath(self.job_root).parts
+        parent = workspace_path.parent
+        refusal: str | None = None
+        if workspace != str(workspace_path) or not workspace_path.is_absolute():
+            refusal = "not an absolute, normalised path"
+        elif workspace_path.name in {"", ".", ".."} or ".." in workspace_path.parts:
+            refusal = "final component is not a job directory"
+        elif vq_job_id is not None and workspace_path.name != vq_job_id:
+            refusal = f"final component does not name job {vq_job_id}"
+        elif parent.parts[-len(job_root_parts):] != job_root_parts:
+            refusal = f"parent is not a {self.job_root!r} jobs root"
+        elif len(parent.parts) <= len(job_root_parts):
+            refusal = "jobs root has no scratch root above it"
+        if refusal is not None:
             raise SchedulerError(
-                "refusing to clean scheduler workspace outside vq job root: "
-                f"{handle.remote_workspace}"
+                "refusing to clean scheduler workspace outside vq job root "
+                f"({refusal}): {handle.remote_workspace}"
             )
         # The submit-once receipt is workspace-adjacent and therefore excluded
         # from the staged archive. Retention still has to remove both exact
         # names; a wildcard would risk crossing job boundaries.
         receipt = f"{workspace}.submit-once.json"
+        # Cluster scratch is often Lustre, where rm's per-file stat loads the
+        # metadata server; the helper uses munlink there (bulk_delete).
         result = self.runner.run(
-            ["rm", "-rf", "--", workspace, receipt],
+            bulk_delete.rmtree_argv(workspace, receipt),
             check=False,
         )
         if result.returncode != 0:
             raise SchedulerError(
                 f"failed to clean remote workspace for {handle.job_id} "
                 f"at {workspace} (exit {result.returncode}): "
+                f"{result.stderr.strip() or '(empty stderr)'}"
+            )
+
+    def list_job_workspaces(self) -> list[RemoteJobWorkspace]:
+        """Every job workspace directory under this host's jobs root (#91).
+
+        One remote call. Per entry: its name, the directory mtime, the driver
+        identity stamped at staging (empty if none), and any scheduler job id
+        recorded by the job script or the submit-once receipt. Names that are
+        not valid job ids, symlinks and non-directories are ignored.
+        """
+        root = f"{self.scratch_root}/{self.job_root}"
+        result = self.runner.run(
+            ["sh", "-c", _LIST_JOB_WORKSPACES_SCRIPT, "vq-list-workspaces", root],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SchedulerError(
+                f"could not list scheduler workspaces under {root} "
+                f"(exit {result.returncode}): {result.stderr.strip() or '(empty stderr)'}"
+            )
+        entries: list[RemoteJobWorkspace] = []
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) != 5:
+                continue
+            name, mtime, owner, marker_id, receipt_id = fields
+            try:
+                validate_job_id(name)
+                modified = float(mtime)
+            except ValueError:
+                continue
+            scheduler_ids = tuple(dict.fromkeys(i for i in (marker_id, receipt_id) if i))
+            entries.append(RemoteJobWorkspace(
+                job_id=name, path=f"{root}/{name}", modified=modified,
+                driver_id=owner if driver_identity.is_driver_id(owner) else None,
+                scheduler_job_ids=scheduler_ids,
+            ))
+        return entries
+
+    def list_transfer_archives(self) -> list[tuple[str, str, float]]:
+        """``(job_id, path, mtime)`` of upload/result tars in the jobs root.
+
+        ``<job>.upload.tar`` stages a submit and ``<job>.result-<id>.tar``
+        carries a fetch; each is normally removed by the operation that wrote
+        it, and survives only its crash. One remote call.
+        """
+        root = f"{self.scratch_root}/{self.job_root}"
+        result = self.runner.run(
+            ["sh", "-c", _LIST_TRANSFER_ARCHIVES_SCRIPT, "vq-list-archives", root],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise SchedulerError(
+                f"could not list transfer archives under {root} "
+                f"(exit {result.returncode}): {result.stderr.strip() or '(empty stderr)'}"
+            )
+        found: list[tuple[str, str, float]] = []
+        for line in result.stdout.splitlines():
+            name, _sep, mtime = line.partition("\t")
+            match = _TRANSFER_ARCHIVE_NAME.fullmatch(name)
+            if match is None:
+                continue
+            try:
+                validate_job_id(match["job"])
+                found.append((match["job"], f"{root}/{name}", float(mtime)))
+            except ValueError:
+                continue
+        return found
+
+    def remove_transfer_archive(self, path: str) -> None:
+        """Remove one listed archive; refuses anything else."""
+        root = f"{self.scratch_root}/{self.job_root}"
+        candidate = PurePosixPath(path)
+        if (
+            str(candidate.parent) != root
+            or _TRANSFER_ARCHIVE_NAME.fullmatch(candidate.name) is None
+        ):
+            raise SchedulerError(f"refusing to remove non-archive path {path}")
+        result = self.runner.run(["rm", "-f", "--", path], check=False)
+        if result.returncode != 0:
+            raise SchedulerError(
+                f"failed to remove transfer archive {path} (exit {result.returncode}): "
                 f"{result.stderr.strip() or '(empty stderr)'}"
             )
 
@@ -1956,7 +2401,10 @@ class SchedulerDispatcher:
         body.append('__vq_finalize_resource_usage "$__vq_rc"')
         body.append('__vq_write_marker "$__vq_rc"')
         if self.node_scratch_dir is not None:
-            body.append('[ "${__vq_keep_scratch:-0}" = 1 ] || rm -rf "$__vq_stage"')
+            # Node scratch may itself be Lustre on some sites; the helper
+            # picks munlink there and plain rm everywhere else.
+            body.extend(bulk_delete.RMTREE_SHELL.rstrip("\n").split("\n"))
+            body.append('[ "${__vq_keep_scratch:-0}" = 1 ] || __vq_rmtree "$__vq_stage"')
         body.append('exit "$__vq_rc"')
         return self.dialect.render_job_script(directives, body)
 
@@ -1983,6 +2431,7 @@ class SchedulerDispatcher:
         local_workspace: Path | None = None,
         program: str | None = None,
         retry_attempt: bool = False,
+        remote_workspace: str | None = None,
     ) -> SchedulerHandle:
         """Stage, submit, and return a handle for one job.
 
@@ -1990,6 +2439,12 @@ class SchedulerDispatcher:
         if given; render + write the job script; ``qsub`` it; parse the scheduler
         id. Raises :class:`SchedulerError` on any transport or parse failure (the
         script never reaches the queue).
+
+        ``remote_workspace`` (#63) is the path the caller already recorded on
+        the job before this call. Passing it is what makes the record, not the
+        current config, the authority: a retry of a job staged under a former
+        ``scratch_root`` stages into the same directory it was staged into the
+        first time. Omitted, the current derivation is used.
         """
         enforce_scheduler_wall_time_limit(
             wall_time_seconds,
@@ -2029,7 +2484,7 @@ class SchedulerDispatcher:
                     "payload validation failed: staged workspace is "
                     "unavailable or unreadable before scheduler dispatch"
                 ) from exc
-        ws = self.remote_workspace(job_id)
+        ws = remote_workspace or self.remote_workspace(job_id)
         script = self.build_job_script(
             job_id=job_id,
             command=command,
@@ -2092,7 +2547,7 @@ class SchedulerDispatcher:
             if remote_receipt_owned:
                 result = submit_once(
                     submit_argv,
-                    receipt_path=self._submit_receipt_path(job_id),
+                    receipt_path=self._submit_receipt_path(job_id, ws),
                     vq_job_id=job_id,
                     dialect_name=self.dialect.name,
                     remote_workspace=ws,
@@ -2115,6 +2570,7 @@ class SchedulerDispatcher:
         if scheduler_id is not None:
             if not remote_receipt_owned:
                 self._write_submit_receipt(
+                    remote_workspace=ws,
                     job_id=job_id,
                     status="accepted",
                     scheduler_job_id=scheduler_id,
@@ -2129,6 +2585,7 @@ class SchedulerDispatcher:
         if submit_ids:
             if not remote_receipt_owned:
                 self._write_submit_receipt(
+                    remote_workspace=ws,
                     job_id=job_id,
                     status="outcome_unknown",
                     scheduler_job_id=None,
@@ -2142,6 +2599,7 @@ class SchedulerDispatcher:
         if result.returncode < 0 or result.returncode >= 128:
             if not remote_receipt_owned:
                 self._write_submit_receipt(
+                    remote_workspace=ws,
                     job_id=job_id,
                     status="outcome_unknown",
                     scheduler_job_id=None,
@@ -2155,6 +2613,7 @@ class SchedulerDispatcher:
         if result.returncode != 0:
             if not remote_receipt_owned:
                 self._write_submit_receipt(
+                    remote_workspace=ws,
                     job_id=job_id,
                     status="rejected",
                     scheduler_job_id=None,
@@ -2169,6 +2628,7 @@ class SchedulerDispatcher:
         except DialectError as exc:
             if not remote_receipt_owned:
                 self._write_submit_receipt(
+                    remote_workspace=ws,
                     job_id=job_id,
                     status="outcome_unknown",
                     scheduler_job_id=None,
@@ -2235,7 +2695,9 @@ class SchedulerDispatcher:
                 "scheduler retry evidence path is unsafe or could not be cleared"
             )
 
-    def prepare_retry_attempt(self, job_id: str) -> None:
+    def prepare_retry_attempt(
+        self, job_id: str, *, remote_workspace: str | None = None
+    ) -> None:
         """Rotate proven-terminal evidence before exposing a retry claim.
 
         The daemon calls this before it durably changes a retry from PENDING to
@@ -2243,7 +2705,9 @@ class SchedulerDispatcher:
         rotation immediately before staging, but that later defense cannot
         close the daemon-crash window between the phase-one write and submit.
         """
-        self._prepare_scheduler_retry_evidence(self.remote_workspace(job_id))
+        self._prepare_scheduler_retry_evidence(
+            remote_workspace or self.remote_workspace(job_id)
+        )
 
     def _prepare_job_start_marker(self, remote_workspace: str) -> None:
         """Require an unforgeable start-marker location before qsub/sbatch.
@@ -2323,9 +2787,11 @@ class SchedulerDispatcher:
         every path still raises :class:`SchedulerError` for this one job, so a
         staging failure lands this spec FAILED and no other.
         """
+        stamp = self._driver_stamp(ws)
         if local_workspace is None:
             self._run_checked(
-                ["sh", "-c", f"mkdir -p {shlex.quote(ws)} && cat > {shlex.quote(script_path)}"],
+                ["sh", "-c",
+                 f"mkdir -p {shlex.quote(ws)} && {stamp}cat > {shlex.quote(script_path)}"],
                 stdin_data=script,
                 what="create remote workspace and write job script",
             )
@@ -2357,13 +2823,32 @@ class SchedulerDispatcher:
             f"{{ tar -xf {shlex.quote(remote_tar)} -C {shlex.quote(ws)}; "
             f"__rc=$?; rm -f {shlex.quote(remote_tar)}; "
             f'[ "$__rc" -eq 0 ] || exit "$__rc"; }} && '
-            f"cat > {shlex.quote(script_path)}"
+            f"{stamp}cat > {shlex.quote(script_path)}"
         )
         self._run_checked(
             ["sh", "-c", setup],
             stdin_data=script,
             what="stage workspace and write job script",
         )
+
+    @staticmethod
+    def _driver_stamp(ws: str) -> str:
+        """Shell prefix recording this driver's identity in the workspace (#91).
+
+        Orphan cleanup deletes only workspaces stamped by the driver that runs
+        it. An identity that cannot be read or created leaves the workspace
+        unstamped, which only makes it harder to reclaim; submit goes on.
+        """
+        try:
+            identity = driver_identity.driver_id()
+        except OSError as exc:
+            log.warning("scheduler workspace left unstamped: %s", exc)
+            return ""
+        marker_dir = shlex.quote(f"{ws.rstrip('/')}/{EXIT_MARKER_RELDIR}")
+        marker = shlex.quote(
+            f"{ws.rstrip('/')}/{EXIT_MARKER_RELDIR}/{driver_identity.DRIVER_ID_BASENAME}"
+        )
+        return f"mkdir -p {marker_dir} && printf '%s\\n' {identity} > {marker} && "
 
     @staticmethod
     def _retry_stage_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -2395,16 +2880,40 @@ class SchedulerDispatcher:
     ) -> SchedulerPollEvidence:
         """Batched status poll for every handle → ``{job_id: phase}``.
 
-        One ``qstat <id...>`` for all ids (design doc §4 — never per-job). A
-        handle absent from the output has left the queue and is reported
-        FINISHED; the caller then reads the exit-marker for its rc. The poll
-        command is always the dialect's plain ``qstat`` — never ``qstat -f`` or a
-        custom ``-format`` — because ``parse_poll`` keys off the default table's
+        Batched ``qstat <id...>`` (design doc §4 — never per-job). A handle
+        absent from the output has left the queue and is reported FINISHED; the
+        caller then reads the exit-marker for its rc. The poll command is always
+        the dialect's plain ``qstat`` — never ``qstat -f`` or a custom
+        ``-format`` — because ``parse_poll`` keys off the default table's
         positional columns (review note 2).
+
+        The batch is split into as few invocations as
+        :data:`SCHEDULER_POLL_MAX_COMMAND_BYTES` allows, issued in order. Each
+        chunk is an independent observation with the semantics below, and the
+        first chunk that fails aborts the whole poll — so a partial result is
+        never reported as a complete one, exactly as before the split.
         """
         ids = [h.job_id for h in handles]
         if not ids:
             return SchedulerPollEvidence({})
+        chunks = _chunk_poll_ids(ids, self.dialect.poll_command)
+        if len(chunks) == 1:
+            return self._poll_chunk_with_evidence(chunks[0])
+        phases: dict[str, SchedulerPhase] = {}
+        explicitly_absent: set[str] = set()
+        queued_reasons: dict[str, str] = {}
+        for chunk in chunks:
+            evidence = self._poll_chunk_with_evidence(chunk)
+            phases.update(evidence.phases)
+            explicitly_absent.update(evidence.explicitly_absent_job_ids)
+            queued_reasons.update(evidence.queued_reasons)
+        return SchedulerPollEvidence(
+            phases, frozenset(explicitly_absent), queued_reasons
+        )
+
+    def _poll_chunk_with_evidence(self, ids: list[str]) -> SchedulerPollEvidence:
+        """One batched live poll of ``ids`` — the unit :meth:`poll_with_evidence`
+        splits a host's handles into."""
         # Torque qstat returns nonzero when some ids already left the queue while
         # still listing live ones on stdout. Slurm squeue does not provide that
         # proof: a nonzero result is an unavailable observation, never evidence
@@ -2412,6 +2921,7 @@ class SchedulerDispatcher:
         command = self.dialect.poll_command(ids)
         result = self.runner.run(command, check=False)
         live = self.dialect.parse_poll(result.stdout)
+        queued_reasons = self._poll_reasons(result.stdout)
         phases = {
             jid: _phase_for_polled_job(
                 jid,
@@ -2476,7 +2986,22 @@ class SchedulerDispatcher:
                         command, "poll failed", returncode=result.returncode, stderr=result.stderr
                     )
                 )
-        return SchedulerPollEvidence(phases, explicitly_absent)
+        return SchedulerPollEvidence(phases, explicitly_absent, queued_reasons)
+
+    def _poll_reasons(self, stdout: str) -> dict[str, str]:
+        """Pending reasons from one poll's stdout, never fatal to the poll.
+
+        Telemetry, not truth: a dialect that does not implement the hook, or
+        output this build cannot read, costs the operator an explanation but
+        must never turn a good observation into a failed one.
+        """
+        parse = getattr(self.dialect, "parse_poll_reasons", None)
+        if not callable(parse):
+            return {}
+        try:
+            return dict(parse(stdout))
+        except (DialectError, ValueError):
+            return {}
 
     def poll(self, handles: Iterable[SchedulerHandle]) -> dict[str, SchedulerPhase]:
         """Compatibility view of :meth:`poll_with_evidence`."""
@@ -2485,15 +3010,31 @@ class SchedulerDispatcher:
     def poll_detail(self, handles: Iterable[SchedulerHandle]) -> dict[str, QstatDetail]:
         """Batched ``qstat -f`` detail for live jobs → ``{job_id: QstatDetail}``.
 
-        The telemetry companion to :meth:`poll` (§18 item 2): one detailed poll
+        The telemetry companion to :meth:`poll` (§18 item 2): a detailed poll
         per host for the exec host + walltime-used/limit. Jobs that already left
         the queue are simply absent from the result (the caller knows them from
         :meth:`poll` as FINISHED). Tolerates the nonzero rc ``qstat`` returns for
         already-gone ids.
+
+        Split by :data:`SCHEDULER_POLL_MAX_COMMAND_BYTES` exactly as
+        :meth:`poll_with_evidence` is, and for the same reason. The split also
+        gives each invocation its own bounded output budget instead of pushing
+        every tracked job's accounting row through one capture.
         """
         ids = [h.job_id for h in handles]
         if not ids:
             return {}
+        chunks = _chunk_poll_ids(ids, self.dialect.poll_detail_command)
+        if len(chunks) == 1:
+            return self._poll_detail_chunk(chunks[0])
+        details: dict[str, QstatDetail] = {}
+        for chunk in chunks:
+            details.update(self._poll_detail_chunk(chunk))
+        return details
+
+    def _poll_detail_chunk(self, ids: list[str]) -> dict[str, QstatDetail]:
+        """One batched detail poll of ``ids`` — the unit :meth:`poll_detail`
+        splits a host's handles into."""
         command = self.dialect.poll_detail_command(ids)
         result = self.runner.run(command, check=False)
         if self.accounting_required_for_absent and result.returncode != 0:
@@ -2523,6 +3064,12 @@ class SchedulerDispatcher:
         if not detail.raw_state:
             return None
         return self.dialect.abnormal_termination(detail.raw_state)
+
+    def ended_on_its_own_from_detail(self, detail: QstatDetail) -> bool:
+        """Whether accounting proves the job ended by itself (#126)."""
+        if not detail.raw_state:
+            return False
+        return self.dialect.ended_on_its_own(detail.raw_state)
 
     def tail_log(
         self,
@@ -2737,6 +3284,7 @@ class SchedulerDispatcher:
         job_id: str,
         *,
         array_size: int | None = None,
+        remote_workspace: str | None = None,
     ) -> str | None:
         """The scheduler id the job recorded for itself, or ``None``.
 
@@ -2754,7 +3302,7 @@ class SchedulerDispatcher:
             # publish the single-job marker; consuming a staged parent marker
             # would manufacture acceptance evidence that no array job wrote.
             return None
-        workspace = self.remote_workspace(job_id)
+        workspace = remote_workspace or self.remote_workspace(job_id)
         marker_dir = f"{workspace}/{EXIT_MARKER_RELDIR}"
         path = (
             f"{workspace}/"
@@ -2802,14 +3350,16 @@ class SchedulerDispatcher:
             return None
         return scheduler_job_id if parsed == scheduler_job_id else None
 
-    def submit_receipt(self, job_id: str) -> SchedulerSubmitReceipt | None:
+    def submit_receipt(
+        self, job_id: str, *, remote_workspace: str | None = None
+    ) -> SchedulerSubmitReceipt | None:
         """Return one bounded, exact-job submit receipt when valid.
 
         Missing, oversized, malformed, cross-job, or dialect-invalid evidence
         is unknown rather than rejection. Native output and paths are never
         surfaced to the durable job record.
         """
-        path = self._submit_receipt_path(job_id)
+        path = self._submit_receipt_path(job_id, remote_workspace)
         script = (
             'path="$1"; [ ! -L "$path" ] && [ -f "$path" ] || exit 1; '
             f'dd if="$path" bs={SCHEDULER_SUBMIT_RECEIPT_MAX_BYTES + 1} '
@@ -3171,8 +3721,21 @@ class SchedulerDispatcher:
         finally:
             local_tar.unlink(missing_ok=True)
             # Best-effort remote cleanup of the tarball; the workspace itself is
-            # left intact (the daemon decides when to reap it).
-            self.runner.run(["rm", "-f", remote_tar], check=False)
+            # left intact (the daemon decides when to reap it). Best effort
+            # means it can fail without consequence: a cleanup that cannot
+            # reach the host must neither turn a completed transfer into a
+            # failed fetch nor replace a failed transfer's own error (#170).
+            # A leftover archive is found and removed by the transfer-archive
+            # sweep (list_transfer_archives).
+            try:
+                self.runner.run(["rm", "-f", remote_tar], check=False)
+            except SchedulerError as exc:
+                log.warning(
+                    "could not remove remote result archive %s; "
+                    "the transfer-archive sweep will find it: %s",
+                    remote_tar,
+                    exc,
+                )
         if not terminal:
             return True
         return self.record_terminal_resource_sample(handle, local_dir)
@@ -3320,9 +3883,21 @@ class SshRemoteRunner:
         except transport.RemoteError as exc:
             if argv and argv[0] in _POLL_COMMANDS:
                 failure = "remote scheduler command failed"
+                # A local ssh that never started (a missing or unexecutable
+                # binary) carries no word from the host, so it is undetermined
+                # for exactly the reason a timeout is -- the observer's account
+                # of itself (#51). Wrapping it as a plain SchedulerError said
+                # "the host answered", which cleared the poll cooldown and let
+                # vq spin at full rate against a fault that pacing is the only
+                # response to. Narrowed to the poll commands on purpose: the
+                # submit path turns SchedulerRemoteOutcomeUnknown into a
+                # quarantined transaction, which a launch that provably never
+                # happened must not produce.
+                poll_error_class: type[SchedulerError] = SchedulerError
                 if isinstance(exc, transport.RemoteLaunchError):
                     failure += " (local launch failed)"
-                raise SchedulerError(
+                    poll_error_class = SchedulerRemoteOutcomeUnknown
+                raise poll_error_class(
                     _poll_diagnostic(
                         argv, failure,
                         returncode=(
@@ -3337,14 +3912,22 @@ class SshRemoteRunner:
                 f"{shlex.join(argv)}\n  {exc}"
             ) from exc
         if proc.returncode == 255:
+            # Same messages as before; only the exception *class* narrows, so
+            # that a caller which paces itself against a host that is turning
+            # connections away can tell that case from a standing auth fault.
+            transport_error = (
+                SchedulerHostUnreachable
+                if _is_connection_refusal(proc.stderr)
+                else SchedulerError
+            )
             if argv and argv[0] in _POLL_COMMANDS:
-                raise SchedulerError(
+                raise transport_error(
                     _poll_diagnostic(
                         argv, "ssh transport failed", returncode=proc.returncode,
                         stderr=proc.stderr,
                     )
                 )
-            raise SchedulerError(
+            raise transport_error(
                 f"ssh transport failed for scheduler command on {self._host_cfg.ssh}: "
                 f"{shlex.join(argv)}\n"
                 f"  stderr: {proc.stderr.strip() or '(empty)'}"
@@ -3533,60 +4116,6 @@ exit "$rc"
             )
         return RemoteResult(proc.returncode, proc.stdout, proc.stderr)
 
-    def upload_tree(self, local_dir: Path, remote_dir: str) -> None:
-        """Stage ``local_dir`` into ``remote_dir`` via tar → scp → untar.
-
-        Mirrors the tar+scp+untar pattern vq already uses for remote submit. A
-        single tarball is one scp round-trip regardless of file count, and the
-        TORQUE login node's pure-ASCII / quoting quirks never touch the payload.
-
-        The staging tarball lands **workspace-adjacent** (``<remote_dir>.upload.tar``,
-        on the same shared cluster filesystem as ``remote_dir``), *not* under
-        node-local ``/tmp``. The ``scp`` upload and the subsequent ``tar -xf``
-        are two separate ssh connections, and a multi-login-node cluster
-        (e.g. slurm-cluster's login01/login02) can route them to different nodes. With
-        a node-local ``/tmp`` path the tarball scp'd onto one login node is then
-        invisible to the untar on the other — ``tar: …: Cannot open: No such
-        file or directory`` — which silently aborted the whole dispatch tick.
-        A shared-FS path is visible from any login node, so node rotation
-        between the two connections no longer matters. This is the same
-        workspace-adjacent placement ``fetch_results`` already uses for the
-        result tarball (``<ws>.result.tar``); ``remote_dir`` was created on the
-        shared FS by ``submit``'s ``mkdir -p`` immediately before this call.
-        """
-        import tarfile  # noqa: PLC0415
-        import tempfile  # noqa: PLC0415
-
-        remote_tar = f"{remote_dir.rstrip('/')}.upload.tar"
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=True) as tmp:
-            local_tar = Path(tmp.name)
-            with tarfile.open(local_tar, "w") as tf:
-                # Archive the directory *contents* (arcname=".") so they land
-                # directly under remote_dir, not under a nested local-name dir.
-                tf.add(local_dir, arcname=".")
-            transport.upload_file(self._host_cfg, local_tar, remote_tar)
-        try:
-            transport.run_remote_shell(
-                self._host_cfg,
-                "tar",
-                "-xf",
-                remote_tar,
-                "-C",
-                remote_dir,
-                check=True,
-                timeout=SCHEDULER_ARCHIVE_TIMEOUT_SECONDS,
-                retry_transient=1,
-            )
-        finally:
-            transport.run_remote_shell(
-                self._host_cfg,
-                "rm",
-                "-f",
-                remote_tar,
-                check=False,
-                retry_transient=1,
-            )
-
     def upload_file(self, local_path: Path, remote_path: str) -> None:
         # #736: this replays only the same immutable staging archive before
         # unpacking or scheduler submission. Never retry qsub/sbatch here.
@@ -3595,7 +4124,12 @@ exit "$rc"
         )
 
     def download_file(self, remote_path: str, local_path: Path) -> None:
-        transport.download_file(self._host_cfg, remote_path, local_path)
+        # #170: reading the immutable result archive into a fresh local path is
+        # replay-safe, so a dropped or stalled connection gets the same bounded
+        # fresh-connection retries as the staging upload.
+        transport.download_file(
+            self._host_cfg, remote_path, local_path, retry_transient=2,
+        )
 
 
 def scheduler_dispatcher_for(host_cfg: HostConfig) -> SchedulerDispatcher:
@@ -3633,7 +4167,10 @@ def scheduler_dispatcher_for(host_cfg: HostConfig) -> SchedulerDispatcher:
 def _scheduler_remote_timeout(argv: Sequence[str]) -> float | None:
     if not argv:
         return transport.DEFAULT_REMOTE_SHELL_TIMEOUT_SECONDS
-    if argv[0] == "qstat":
+    # Both dialects' coarse live poll, not just Torque's: `squeue` crosses the
+    # same busy login node with the same batch of ids and had been falling back
+    # to the generic 30 s housekeeping budget.
+    if argv[0] in _LIVE_POLL_COMMANDS:
         return SCHEDULER_POLL_TIMEOUT_SECONDS
     if argv[0] == "sacct":
         return SCHEDULER_ACCOUNTING_TIMEOUT_SECONDS
@@ -3645,7 +4182,13 @@ def _scheduler_remote_timeout(argv: Sequence[str]) -> float | None:
 def _scheduler_remote_retries(argv: Sequence[str]) -> int:
     if not argv:
         return 0
-    if argv[0] == "qstat":
+    # A coarse live poll is a read-only observation: replaying it cannot change
+    # anything on the cluster, so a transient ssh transport failure is worth one
+    # or two more attempts. Torque's `qstat` has always had this budget; Slurm's
+    # `squeue` was left on zero retries only because the policy keyed off one
+    # dialect's binary name, so a single banner-exchange failure discarded a
+    # whole Slurm host's pass with no second attempt.
+    if argv[0] in _LIVE_POLL_COMMANDS:
         return 2
     # Workspace creation is the first scheduler-submit operation and is
     # idempotent.  Retry banner-exchange/connect failures here so a transient

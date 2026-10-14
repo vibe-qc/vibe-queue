@@ -15,6 +15,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,21 +103,35 @@ class MockDispatcher:
         self.receipt: SchedulerSubmitReceipt | None = None
         self.receipt_reads = 0
         self.retry_preparations: list[str] = []
+        self.retry_workspaces: list[str | None] = []
+        self.evidence_workspaces: list[str | None] = []
 
     def remote_workspace(self, job_id: str) -> str:
         return f"/remote/{job_id}"
 
-    def recorded_job_id(self, job_id: str) -> str | None:
+    # #63: every workspace-derived read takes the caller's bound workspace.
+    # Recorded here so tests can assert the daemon passed the job's recorded
+    # path rather than the current derivation.
+    def recorded_job_id(
+        self, job_id: str, *, remote_workspace: str | None = None, **kw: object
+    ) -> str | None:
         self.recorded_reads += 1
+        self.evidence_workspaces.append(remote_workspace)
         return self.recorded
 
-    def submit_receipt(self, job_id: str) -> SchedulerSubmitReceipt | None:
+    def submit_receipt(
+        self, job_id: str, *, remote_workspace: str | None = None
+    ) -> SchedulerSubmitReceipt | None:
         self.receipt_reads += 1
+        self.evidence_workspaces.append(remote_workspace)
         return self.receipt
 
-    def prepare_retry_attempt(self, job_id: str) -> None:
+    def prepare_retry_attempt(
+        self, job_id: str, *, remote_workspace: str | None = None
+    ) -> None:
         """Model exact removal of evidence from a proven-terminal attempt."""
         self.retry_preparations.append(job_id)
+        self.retry_workspaces.append(remote_workspace)
         self.recorded = None
         self.receipt = None
 
@@ -189,10 +204,18 @@ class MockDispatcher:
             return None
         return SlurmDialect().abnormal_termination(detail.raw_state)
 
+    def ended_on_its_own_from_detail(self, detail: QstatDetail) -> bool:
+        # Same delegation: the real Slurm verdict for #126's late-kill check.
+        if not detail.raw_state:
+            return False
+        return SlurmDialect().ended_on_its_own(detail.raw_state)
+
     def cancel(self, handle: SchedulerHandle) -> None:
         self.cancelled.append(handle.job_id)
 
-    def cleanup_remote_workspace(self, handle: SchedulerHandle) -> None:
+    def cleanup_remote_workspace(
+        self, handle: SchedulerHandle, *, vq_job_id: str | None = None
+    ) -> None:
         self.cleaned.append((handle.job_id, handle.remote_workspace, handle.array_size))
 
     def exit_marker_code(
@@ -338,17 +361,29 @@ class ControlledSchedulerTransfers:
         return spec
 
     def poll(self) -> None:
-        groups: dict[object, list[tuple[str, object]]] = {}
+        # Grouped and keyed exactly as the daemon groups a pass: by configured
+        # target, so a host is one group however many dispatcher generations
+        # its jobs span (#51).
+        groups: dict[str, list[tuple[str, object]]] = {}
         for jobid, job in self.daemon._scheduler_running.items():
-            groups.setdefault(job.dispatcher, []).append((jobid, job))
-        for dispatcher, items in groups.items():
+            groups.setdefault(job.scheduler_target, []).append((jobid, job))
+        for target, items in groups.items():
             done = threading.Event()
             done.set()
-            self.daemon._scheduler_poll_flights[dispatcher] = (
+            # The observer production would pick, recorded on the flight the
+            # same way production records it (#51): the reap reads it back
+            # rather than re-deriving it.
+            observer = self.daemon._scheduler_observation_dispatcher(
+                target, items,  # type: ignore[arg-type]
+            )
+            self.daemon._scheduler_poll_flights[target] = (
                 daemon_mod._SchedulerPollFlight(
-                    tuple(items), 0, done,
-                    self.daemon._observe_scheduler_dispatcher(
-                        dispatcher, tuple(items), refresh_sequence=0,
+                    items=tuple(items),  # type: ignore[arg-type]
+                    refresh_sequence=0,
+                    done=done,
+                    observer=observer,
+                    observation=self.daemon._observe_scheduler_dispatcher(
+                        observer, tuple(items), refresh_sequence=0,  # type: ignore[arg-type]
                     ),
                 )
             )
@@ -508,7 +543,10 @@ def test_blocked_terminal_fetch_does_not_block_new_dispatch(daemon: Daemon) -> N
     class BlockingFetch(MockDispatcher):
         def fetch_results(self, handle: SchedulerHandle, local_dir: Path) -> None:
             entered.set()
-            release.wait(timeout=_BLOCKING_SECONDS)
+            # Stays blocked until the test releases it below, so "the fetch has
+            # not finished yet" is a fact this test controls rather than a race
+            # against a duration. The bound is only a liveness guard.
+            release.wait(timeout=_LIVENESS_SECONDS)
             super().fetch_results(handle, local_dir)
 
     slow = BlockingFetch(submit_id="old.cluster")
@@ -520,22 +558,22 @@ def test_blocked_terminal_fetch_does_not_block_new_dispatch(daemon: Daemon) -> N
     _submit_scheduler(daemon, "new", target="host_f")
     daemon._background_scheduler_polling = True
     try:
-        started = time.monotonic()
-        deadline = started + _LIVENESS_SECONDS
+        deadline = time.monotonic() + _LIVENESS_SECONDS
         while not entered.is_set():
             daemon._reconcile_scheduler()
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        dispatch_started = time.monotonic()
         daemon._dispatch_pending()
-        # The property under test: dispatch did not serialize behind the
-        # blocked fetch. Timed over the dispatch call alone -- measuring from
-        # `started` also charged it for the spin loop above, which is a
-        # liveness wait and not part of the claim.
-        assert time.monotonic() - dispatch_started < _BLOCKING_SECONDS / 2
+        # The property under test, stated as an ordering rather than a
+        # duration: the dispatch call has returned while the terminal fetch
+        # demonstrably has not finished. Serialized behind that fetch, dispatch
+        # could only return after it completed and recorded here. A wall-clock
+        # ceiling on the dispatch call used to carry this claim, but it only
+        # restated the same ordering as a duration, and at a fraction of the
+        # blocking window a merely slow runner failed it (issue #5).
+        assert slow.fetched == []
         assert JobSpec.read(daemon._spec_path("new")).scheduler_job_id == "new.cluster"
         assert JobSpec.read(daemon._spec_path("old")).state == JobState.RUNNING
-        assert slow.fetched == []
         for _ in range(3):
             daemon._reconcile_scheduler()
         assert len(daemon._scheduler_fetch_flights) == 1
@@ -781,37 +819,72 @@ def test_background_fetch_retry_limit_counts_completed_failures_only(daemon: Dae
     assert len(errors) == daemon_mod.SCHEDULER_FETCH_FAILURE_LIMIT
 
 
+@contextmanager
+def _scheduler_refresh_request(
+    daemon: Daemon, jobid: str,
+) -> Iterator[Callable[[], dict[str, object]]]:
+    """Publish one request and always stop/reap its waiter, including on failure."""
+    # Positive protocol steps need the same liveness allowance as publication.
+    # Keep the RPC within its real production ceiling; dedicated timeout tests
+    # below exercise expiration and invalid budgets separately.
+    budget = min(_LIVENESS_SECONDS, daemon_mod.SCHEDULER_STATUS_RPC_MAX_SECONDS)
+    results: list[dict[str, object]] = []
+    errors: list[BaseException] = []
+    published = threading.Event()
+
+    def request() -> None:
+        try:
+            results.append(daemon.request_scheduler_status_refresh(jobid, budget))
+        except BaseException as exc:  # replay worker failures in the test thread
+            errors.append(exc)
+        finally:
+            published.set()
+
+    def response() -> dict[str, object]:
+        assert published.wait(_LIVENESS_SECONDS), "refresh response was not published"
+        if errors:
+            raise errors[0]
+        assert len(results) == 1, results
+        return results[0]
+
+    with daemon._scheduler_refresh_condition:
+        request_id = daemon._scheduler_refresh_requested + 1
+        daemon._scheduler_refresh_wakeup.clear()
+    thread = threading.Thread(target=request, name="test-scheduler-status-refresh")
+    thread.start()
+    try:
+        # The production wakeup is set after registration under the same lock.
+        assert daemon._scheduler_refresh_wakeup.wait(_LIVENESS_SECONDS)
+        with daemon._scheduler_refresh_condition:
+            assert daemon._scheduler_refresh_requests.get(request_id) == jobid
+        yield response
+    finally:
+        daemon.stop()
+        thread.join(timeout=_LIVENESS_SECONDS)
+        assert not thread.is_alive(), "refresh waiter survived daemon.stop()"
+
+
 def test_scheduler_status_refresh_waits_for_a_post_request_poll(
     daemon: Daemon,
 ) -> None:
     mock = MockDispatcher(phase=SchedulerPhase.RUNNING)
     _inject(daemon, mock)
     daemon._start_scheduler_job(_submit_scheduler(daemon, "j1"))
-    results: list[dict[str, object]] = []
 
-    def request() -> None:
-        results.append(daemon.request_scheduler_status_refresh("j1", 1.0))
+    with _scheduler_refresh_request(daemon, "j1") as response:
+        with daemon._scheduler_refresh_condition:
+            assert daemon._scheduler_refresh_requests == {1: "j1"}
+            assert daemon._scheduler_refresh_results == {}
+        daemon._reconcile_scheduler()
+        result = response()
 
-    thread = threading.Thread(target=request)
-    thread.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-
-    assert thread.is_alive()
-    daemon._reconcile_scheduler()
-    thread.join(timeout=1.0)
-
-    assert not thread.is_alive()
-    assert results == [
-        {
-            "schema": "vq.scheduler.status_refresh/1",
-            "completed": True,
-            "observed_at": results[0]["observed_at"],
-        }
-    ]
-    assert isinstance(results[0]["observed_at"], str)
+    observed_at = JobSpec.read(daemon._spec_path("j1")).scheduler_poll_last_success_at
+    assert isinstance(observed_at, str)
+    assert result == {
+        "schema": "vq.scheduler.status_refresh/1",
+        "completed": True,
+        "observed_at": observed_at,
+    }
 
 
 def test_background_scheduler_poll_isolates_a_stalled_host(
@@ -969,6 +1042,42 @@ def test_background_scheduler_detail_runner_errors_are_host_local(
     assert healthy_on_disk.scheduler_state == "running"
 
 
+def test_scheduler_queued_reason_is_recorded_then_cleared_when_it_starts(
+    daemon: Daemon,
+) -> None:
+    # vibe-qc#148: the scheduler's own "why" reached vq on every detail poll
+    # and was dropped, so a request that could never be satisfied looked
+    # exactly like one merely waiting its turn -- for six days.
+    unschedulable = (
+        "Not Running: Not enough of the right type of nodes are available "
+        "to run the job"
+    )
+    mock = MockDispatcher(
+        submit_id="12345.cluster",
+        phase=SchedulerPhase.PENDING,
+        detail=QstatDetail(raw_state="Q", queued_reason=unschedulable),
+    )
+    _inject(daemon, mock)
+    daemon._start_scheduler_job(_submit_scheduler(daemon, "queued-vq"))
+
+    daemon._reconcile_scheduler()
+
+    queued = JobSpec.read(daemon._spec_path("queued-vq"))
+    assert queued.scheduler_state == "queued"
+    assert queued.scheduler_queued_reason == unschedulable
+
+    # Once the job starts, the explanation is stale: keeping it would have a
+    # running job still explaining why it is waiting.
+    mock.phase = SchedulerPhase.RUNNING
+    mock.detail = QstatDetail(raw_state="R", exec_host="node02/0-127")
+    daemon._reconcile_scheduler()
+
+    started = JobSpec.read(daemon._spec_path("queued-vq"))
+    assert started.scheduler_state == "running"
+    assert started.scheduler_exec_host == "node02/0-127"
+    assert started.scheduler_queued_reason is None
+
+
 def test_background_status_refresh_rejects_a_pre_request_flight(
     daemon: Daemon,
 ) -> None:
@@ -981,34 +1090,48 @@ def test_background_status_refresh_rejects_a_pre_request_flight(
     daemon._background_scheduler_polling = True
 
     daemon._reconcile_scheduler()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while mock.detail_polled < 1:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+    # The poll counter advances before the worker publishes its result. Wait
+    # for publication so the next reconcile really consumes the old flight.
+    assert daemon._scheduler_poll_flights["host_f"].done.wait(_LIVENESS_SECONDS)
 
+    budget = min(_LIVENESS_SECONDS, daemon_mod.SCHEDULER_STATUS_RPC_MAX_SECONDS)
     results: list[dict[str, object]] = []
     request = threading.Thread(
         target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("refresh-vq", 1.0)
+            daemon.request_scheduler_status_refresh("refresh-vq", budget)
         )
     )
     request.start()
-    while daemon._scheduler_refresh_requested < 1:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+    try:
+        deadline = time.monotonic() + budget
+        while daemon._scheduler_refresh_requested < 1:
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
 
-    daemon._reconcile_scheduler()  # consume the pre-request flight
-    assert request.is_alive()
-    daemon._reconcile_scheduler()  # start the post-request flight
-    while mock.detail_polled < 2:
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
+        daemon._reconcile_scheduler()  # consume the pre-request flight
+        # Check the acknowledgement state under its lock. Thread.is_alive()
+        # alone can pass when a wrongly acknowledged waiter has not run yet.
+        with daemon._scheduler_refresh_condition:
+            assert daemon._scheduler_refresh_requests == {1: "refresh-vq"}, results
+            assert daemon._scheduler_refresh_results == {}, results
+        daemon._reconcile_scheduler()  # start the post-request flight
+        assert daemon._scheduler_poll_flights["host_f"].done.wait(budget)
+        daemon._reconcile_scheduler()
+        request.join(timeout=budget)
+
+        assert not request.is_alive(), results
+        assert len(results) == 1, results
+        assert results == [{
+            "schema": "vq.scheduler.status_refresh/1",
+            "completed": True,
+            "observed_at": results[0].get("observed_at"),
+        }]
+        assert isinstance(results[0]["observed_at"], str)
+    finally:
+        daemon.stop()
+        request.join(timeout=budget)
 
     assert not request.is_alive()
-    assert results[0]["completed"] is True
-    assert isinstance(results[0]["observed_at"], str)
 
 
 def test_scheduler_status_refresh_times_out_without_a_new_poll(
@@ -1024,31 +1147,29 @@ def test_scheduler_status_refresh_times_out_without_a_new_poll(
     }
 
 
-def test_scheduler_status_refresh_stop_wakes_waiter(daemon: Daemon) -> None:
-    results: list[dict[str, object]] = []
-    request = threading.Thread(
-        target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("j1", 5.0)
-        )
-    )
-    request.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+def test_scheduler_status_refresh_stop_wakes_waiter(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notifications: list[bool] = []
+    original_wait = daemon._scheduler_refresh_condition.wait
 
-    daemon.stop()
-    request.join(timeout=1.0)
+    def wait(timeout: float | None = None) -> bool:
+        notified = original_wait(timeout)
+        notifications.append(notified)
+        return notified
 
-    assert not request.is_alive()
-    assert results == [
-        {
+    monkeypatch.setattr(daemon._scheduler_refresh_condition, "wait", wait)
+    with _scheduler_refresh_request(daemon, "j1") as response:
+        daemon.stop()
+        assert response() == {
             "schema": "vq.scheduler.status_refresh/1",
             "completed": False,
             "observed_at": None,
             "reason": "daemon_stopping",
         }
-    ]
+    # Natural RPC expiry also sees _stop and returns daemon_stopping. Require
+    # the real Condition wait to have been notified, not merely timed out.
+    assert notifications == [True]
 
 
 @pytest.mark.parametrize("timeout", [True, 0, -1, float("nan"), float("inf"), 31])
@@ -1069,41 +1190,55 @@ def test_scheduler_status_refresh_does_not_adopt_an_inflight_old_poll(
     daemon._start_scheduler_job(_submit_scheduler(daemon, "j1"))
     poll_started = threading.Event()
     release_poll = threading.Event()
-    original_pass = daemon._reconcile_scheduler_pass  # noqa: SLF001
+    poll_published = threading.Event()
+    poll_errors: list[BaseException] = []
+    original_pass = daemon._reconcile_scheduler_pass
+    old_observed_at = "2026-08-11T12:00:00+00:00"
 
-    def held_pass() -> dict[str, str]:
+    def held_pass() -> dict[str, tuple[str, int]]:
         poll_started.set()
-        assert release_poll.wait(1.0)
-        return {"j1": "2026-08-11T12:00:00+00:00"}
+        assert release_poll.wait(_LIVENESS_SECONDS)
+        return {"j1": (old_observed_at, 0)}
+
+    def reconcile() -> None:
+        try:
+            daemon._reconcile_scheduler()
+        except BaseException as exc:  # surface worker errors in the test thread
+            poll_errors.append(exc)
+        finally:
+            poll_published.set()
 
     monkeypatch.setattr(daemon, "_reconcile_scheduler_pass", held_pass)
-    old_poll = threading.Thread(target=daemon._reconcile_scheduler)
+    old_poll = threading.Thread(target=reconcile)
     old_poll.start()
-    assert poll_started.wait(1.0)
+    try:
+        assert poll_started.wait(_LIVENESS_SECONDS)
+        with _scheduler_refresh_request(daemon, "j1") as response:
+            release_poll.set()
+            assert poll_published.wait(_LIVENESS_SECONDS)
+            assert not poll_errors, poll_errors
+            # A wrongly acknowledged waiter can still be alive if it has not
+            # published its response. Pin the protocol state under its lock.
+            with daemon._scheduler_refresh_condition:
+                assert daemon._scheduler_refresh_requests == {1: "j1"}
+                assert daemon._scheduler_refresh_results == {}
 
-    results: list[dict[str, object]] = []
-    request = threading.Thread(
-        target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("j1", 1.0)
-        )
-    )
-    request.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
+            monkeypatch.setattr(daemon, "_reconcile_scheduler_pass", original_pass)
+            daemon._reconcile_scheduler()
+            result = response()
 
-    release_poll.set()
-    old_poll.join(timeout=1.0)
-    assert not old_poll.is_alive()
-    assert request.is_alive()
-
-    monkeypatch.setattr(daemon, "_reconcile_scheduler_pass", original_pass)
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
-
-    assert not request.is_alive()
-    assert results[0]["completed"] is True
+        observed_at = JobSpec.read(daemon._spec_path("j1")).scheduler_poll_last_success_at
+        assert isinstance(observed_at, str)
+        assert observed_at != old_observed_at
+        assert result == {
+            "schema": "vq.scheduler.status_refresh/1",
+            "completed": True,
+            "observed_at": observed_at,
+        }
+    finally:
+        release_poll.set()
+        old_poll.join(timeout=_LIVENESS_SECONDS)
+        assert not old_poll.is_alive()
 
 
 def test_scheduler_status_refresh_rejects_untracked_job_as_fresh(
@@ -1114,29 +1249,14 @@ def test_scheduler_status_refresh_rejects_untracked_job_as_fresh(
     spec.scheduler_job_id = "123"
     spec.scheduler_state = "reattach_failed"
     spec.write(daemon._spec_path(spec.id))
-    results: list[dict[str, object]] = []
-    request = threading.Thread(
-        target=lambda: results.append(
-            daemon.request_scheduler_status_refresh(spec.id, 1.0)
-        )
-    )
-    request.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
-
-    assert results == [
-        {
+    with _scheduler_refresh_request(daemon, spec.id) as response:
+        daemon._reconcile_scheduler()
+        assert response() == {
             "schema": "vq.scheduler.status_refresh/1",
             "completed": False,
             "observed_at": None,
             "reason": "job_not_observed",
         }
-    ]
     on_disk = JobSpec.read(daemon._spec_path(spec.id))
     assert on_disk.scheduler_poll_last_attempted_at is None
     assert on_disk.scheduler_poll_last_success_at is None
@@ -1146,35 +1266,19 @@ def test_scheduler_status_refresh_does_not_acknowledge_a_different_job(
     daemon: Daemon,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    results: list[dict[str, object]] = []
-    request = threading.Thread(
-        target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("requested", 1.0)
+    with _scheduler_refresh_request(daemon, "requested") as response:
+        monkeypatch.setattr(
+            daemon,
+            "_reconcile_scheduler_pass",
+            lambda: {"different": ("2026-08-11T12:00:00+00:00", 1)},
         )
-    )
-    request.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-
-    monkeypatch.setattr(
-        daemon,
-        "_reconcile_scheduler_pass",
-        lambda: {"different": "2026-08-11T12:00:00+00:00"},
-    )
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
-
-    assert not request.is_alive()
-    assert results == [
-        {
+        daemon._reconcile_scheduler()
+        assert response() == {
             "schema": "vq.scheduler.status_refresh/1",
             "completed": False,
             "observed_at": None,
             "reason": "job_not_observed",
         }
-    ]
 
 
 def test_scheduler_status_refresh_rejects_failed_poll_as_fresh(
@@ -1183,23 +1287,15 @@ def test_scheduler_status_refresh_rejects_failed_poll_as_fresh(
     mock = MockDispatcher(poll_error=SchedulerError("squeue unavailable"))
     _inject(daemon, mock)
     daemon._start_scheduler_job(_submit_scheduler(daemon, "j1"))
-    results: list[dict[str, object]] = []
-    request = threading.Thread(
-        target=lambda: results.append(
-            daemon.request_scheduler_status_refresh("j1", 1.0)
-        )
-    )
-    request.start()
-    deadline = time.monotonic() + _LIVENESS_SECONDS
-    while daemon._scheduler_refresh_requested == 0:  # noqa: SLF001
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-
-    daemon._reconcile_scheduler()
-    request.join(timeout=1.0)
-
-    assert results[0]["completed"] is False
-    assert results[0]["reason"] == "job_not_observed"
+    with _scheduler_refresh_request(daemon, "j1") as response:
+        daemon._reconcile_scheduler()
+        result = response()
+    assert result == {
+        "schema": "vq.scheduler.status_refresh/1",
+        "completed": False,
+        "observed_at": None,
+        "reason": "job_not_observed",
+    }
     on_disk = JobSpec.read(daemon._spec_path("j1"))
     assert on_disk.scheduler_state == "poll_failed"
     assert on_disk.scheduler_poll_last_success_at is None
@@ -3235,11 +3331,11 @@ def test_scheduler_target_runtime_pin_does_not_validate_driver_checkout(
         expected_git_sha="deadbeef0000",
         scheduler_host="host_f",
         resolved_executable=(
-            "/home/USER/vibeqc-runtimes/vibeqc-release-deadbeef0000"
+            "/home/USER/vibeqc-runtimes/vibeqc-release-1.0.0-deadbeef0000-python"
         ),
         program_kind="scheduler-runtime",
         artifact_identity=(
-            "/home/USER/vibeqc-runtimes/vibeqc-release-deadbeef0000"
+            "/home/USER/vibeqc-runtimes/vibeqc-release-1.0.0-deadbeef0000-python"
         ),
     )
     spec.write(daemon._spec_path(spec.id))
@@ -3269,11 +3365,11 @@ def test_scheduler_target_runtime_pin_rejects_wrong_target(
         expected_git_sha="deadbeef0000",
         scheduler_host="host_c",
         resolved_executable=(
-            "/home/USER/vibeqc-runtimes/vibeqc-release-deadbeef0000"
+            "/home/USER/vibeqc-runtimes/vibeqc-release-1.0.0-deadbeef0000-python"
         ),
         program_kind="scheduler-runtime",
         artifact_identity=(
-            "/home/USER/vibeqc-runtimes/vibeqc-release-deadbeef0000"
+            "/home/USER/vibeqc-runtimes/vibeqc-release-1.0.0-deadbeef0000-python"
         ),
     )
     spec.write(daemon._spec_path(spec.id))
@@ -4494,6 +4590,109 @@ def test_gate_max_scheduler_jobs_limits_scheduler_dispatch(
     assert JobSpec.read(d._spec_path("j2")).state == JobState.PENDING
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [{"fetch_error": SchedulerError("scp download failed (exit 255)")},
+     {"marker_error": SchedulerError("ssh: Connection timed out during banner exchange")}],
+    ids=["fetch-failed", "marker-probe-failed"],
+)
+@pytest.mark.parametrize("restart_after_poll_loss", [False, True])
+def test_finished_allocation_collecting_artifacts_releases_its_scheduler_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: dict[str, object],
+    restart_after_poll_loss: bool,
+) -> None:
+    """#170: PBS finished j1 but its artifacts cannot be collected yet. j1 stays
+    tracked with its fence, but no longer holds the only scheduler slot, so j2
+    is submitted instead of waiting on the transfer."""
+    monkeypatch.setenv(paths.ENV_STATE_DIR, str(tmp_path / "state"))
+    d = Daemon(max_cpus=4, max_scheduler_jobs=1, poll_interval=0.05,
+               queue_dir=tmp_path / "queue", jobs_dir=tmp_path / "jobs")
+    d.queue_dir.mkdir(parents=True, exist_ok=True)
+    d.jobs_dir.mkdir(parents=True, exist_ok=True)
+    mock = MockDispatcher(phase=SchedulerPhase.RUNNING, rc=0, **failure)  # type: ignore[arg-type]
+    _inject(d, mock)
+    _submit_scheduler(d, "j1")
+    _submit_scheduler(d, "j2")
+    d._dispatch_pending()
+    assert mock.submitted == ["j1"]
+
+    d._reconcile_scheduler()  # j1 still running: it keeps its slot
+    d._dispatch_pending()
+    assert mock.submitted == ["j1"]
+
+    mock.phase = SchedulerPhase.FINISHED
+    d._reconcile_scheduler()
+    j1 = JobSpec.read(d._spec_path("j1"))
+    assert j1.state == JobState.RUNNING
+    assert j1.scheduler_state in {"fetch_failed", "marker_probe_failed"}
+
+    if restart_after_poll_loss:
+        phase = j1.scheduler_state
+        mock.poll_error = SchedulerError("qstat connection lost")
+        d._reconcile_scheduler()
+        d._reconcile_scheduler()
+        retained = JobSpec.read(d._spec_path("j1"))
+        assert retained.scheduler_state == phase
+        assert retained.scheduler_poll_last_error == "qstat connection lost"
+        assert retained.scheduler_poll_last_error_at is not None
+        assert retained.scheduler_job_id == j1.scheduler_job_id
+        poll_events = [event for event in events.read_events(Path(retained.cwd))
+                       if event.get("reason") == "scheduler poll failed; daemon will retry"]
+        assert len(poll_events) == 1
+        d._queue_lock_fd.close()
+        restarted = Daemon(max_cpus=4, max_scheduler_jobs=1, poll_interval=0.05,
+                           queue_dir=d.queue_dir, jobs_dir=d.jobs_dir)
+        _inject(restarted, mock)
+        assert restarted._reattach_scheduler_job(retained)
+        d = restarted
+
+    d._dispatch_pending()
+    assert mock.submitted == ["j1", "j2"]
+    assert "j1" in d._scheduler_running  # collection is still owed
+    assert d._scheduler_running["j1"].allocation_finished is True
+
+
+def test_a_poll_that_finds_the_job_live_again_takes_its_slot_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(paths.ENV_STATE_DIR, str(tmp_path / "state"))
+    d = Daemon(max_cpus=4, max_scheduler_jobs=1, poll_interval=0.05,
+               queue_dir=tmp_path / "queue", jobs_dir=tmp_path / "jobs")
+    d.queue_dir.mkdir(parents=True, exist_ok=True)
+    d.jobs_dir.mkdir(parents=True, exist_ok=True)
+    mock = MockDispatcher(phase=SchedulerPhase.FINISHED, rc=0,
+                          marker_error=SchedulerError("marker unreadable"))
+    _inject(d, mock)
+    _submit_scheduler(d, "j1")
+    d._dispatch_pending()
+    d._reconcile_scheduler()
+    assert d._scheduler_running["j1"].allocation_finished is True
+
+    # A qstat that dropped the job briefly: it is listed running again.
+    mock.phase = SchedulerPhase.RUNNING
+    d._reconcile_scheduler()
+    assert d._scheduler_running["j1"].allocation_finished is False
+    _submit_scheduler(d, "j2")
+    d._dispatch_pending()
+    assert mock.submitted == ["j1"]
+
+
+@pytest.mark.parametrize(("phase", "released"), [
+    ("fetch_failed", True), ("finishing", True), ("marker_probe_failed", True),
+    ("artifacts_unavailable", True), ("running", False), ("poll_failed", False),
+    (None, False),
+])
+def test_reattach_seeds_the_slot_release_from_the_recorded_phase(
+    daemon: Daemon, phase: str | None, released: bool,
+) -> None:
+    """A collection phase was only recorded after a poll saw the allocation
+    finish, so a restarted daemon agrees with `vq status` at once (#170)."""
+    _inject(daemon, MockDispatcher())
+    spec = _running_scheduler_spec(daemon, "j1", scheduler_state=phase)
+    assert daemon._reattach_scheduler_job(spec) is True
+    assert daemon._scheduler_running["j1"].allocation_finished is released
+
+
 def test_scheduler_submission_does_not_starve_local_child_reaping(
     daemon: Daemon, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4902,9 +5101,9 @@ def test_scheduler_target_drain_holds_host_f_but_allows_host_c(
     host_c = MockDispatcher(submit_id="222.host_c")
     _inject(daemon, host_f, target="host_f")
     _inject(daemon, host_c, target="host_c")
-    _submit_scheduler(daemon, "twinpending1", target="host_f")
-    _submit_scheduler(daemon, "marvinrun001", target="host_c")
-    before = JobSpec.read(daemon._spec_path("twinpending1")).model_dump(mode="json")
+    _submit_scheduler(daemon, "lanepending1", target="host_f")
+    _submit_scheduler(daemon, "hostcrun0001", target="host_c")
+    before = JobSpec.read(daemon._spec_path("lanepending1")).model_dump(mode="json")
     drain.write_drain_state(
         drain.DrainState(
             scheduler_hosts=["host_f"],
@@ -4916,9 +5115,9 @@ def test_scheduler_target_drain_holds_host_f_but_allows_host_c(
     daemon._dispatch_pending()
 
     assert host_f.submitted == []
-    assert host_c.submitted == ["marvinrun001"]
-    assert JobSpec.read(daemon._spec_path("marvinrun001")).state == JobState.RUNNING
-    after = JobSpec.read(daemon._spec_path("twinpending1")).model_dump(mode="json")
+    assert host_c.submitted == ["hostcrun0001"]
+    assert JobSpec.read(daemon._spec_path("hostcrun0001")).state == JobState.RUNNING
+    after = JobSpec.read(daemon._spec_path("lanepending1")).model_dump(mode="json")
     assert after == before
 
 
@@ -4929,12 +5128,12 @@ def test_full_plus_scheduler_target_drain_holds_all_until_full_release(
     host_c = MockDispatcher(submit_id="222.host_c")
     _inject(daemon, host_f, target="host_f")
     _inject(daemon, host_c, target="host_c")
-    _submit_scheduler(daemon, "twinpending1", target="host_f")
-    _submit_scheduler(daemon, "marvinpending1", target="host_c")
-    before_host_f = JobSpec.read(daemon._spec_path("twinpending1")).model_dump(
+    _submit_scheduler(daemon, "lanepending1", target="host_f")
+    _submit_scheduler(daemon, "hostcpending01", target="host_c")
+    before_host_f = JobSpec.read(daemon._spec_path("lanepending1")).model_dump(
         mode="json"
     )
-    before_host_c = JobSpec.read(daemon._spec_path("marvinpending1")).model_dump(
+    before_host_c = JobSpec.read(daemon._spec_path("hostcpending01")).model_dump(
         mode="json"
     )
     drain.write_drain_state(
@@ -4951,11 +5150,11 @@ def test_full_plus_scheduler_target_drain_holds_all_until_full_release(
     assert host_f.submitted == []
     assert host_c.submitted == []
     assert (
-        JobSpec.read(daemon._spec_path("twinpending1")).model_dump(mode="json")
+        JobSpec.read(daemon._spec_path("lanepending1")).model_dump(mode="json")
         == before_host_f
     )
     assert (
-        JobSpec.read(daemon._spec_path("marvinpending1")).model_dump(mode="json")
+        JobSpec.read(daemon._spec_path("hostcpending01")).model_dump(mode="json")
         == before_host_c
     )
 
@@ -4963,10 +5162,10 @@ def test_full_plus_scheduler_target_drain_holds_all_until_full_release(
     daemon._dispatch_pending()
 
     assert host_f.submitted == []
-    assert host_c.submitted == ["marvinpending1"]
-    assert JobSpec.read(daemon._spec_path("marvinpending1")).state == JobState.RUNNING
+    assert host_c.submitted == ["hostcpending01"]
+    assert JobSpec.read(daemon._spec_path("hostcpending01")).state == JobState.RUNNING
     assert (
-        JobSpec.read(daemon._spec_path("twinpending1")).model_dump(mode="json")
+        JobSpec.read(daemon._spec_path("lanepending1")).model_dump(mode="json")
         == before_host_f
     )
 
@@ -5141,6 +5340,114 @@ def test_deferred_scheduler_reattach_holds_scheduler_cap(
     assert mock.submitted == []
     assert JobSpec.read(d._spec_path("lost")).state == JobState.RUNNING
     assert JobSpec.read(d._spec_path("next")).state == JobState.PENDING
+
+
+def test_scheduler_recovery_backlog_allows_completion_and_dependency_dispatch(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(daemon_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_mod, "SCHEDULER_REATTACH_QUANTUM_SECONDS", 1.0)
+    mock = MockDispatcher()
+    _inject(daemon, mock)
+    predecessor = _submit_scheduler(daemon, "predecessor")
+    assert daemon._start_scheduler_job(predecessor)
+    dependent = _submit_scheduler(daemon, "dependent")
+    dependent.depends_on = [predecessor.id]
+    dependent.write(daemon._spec_path(dependent.id))
+    for index in range(8):
+        _running_scheduler_spec(
+            daemon, f"lost{index}", scheduler_job_id=None,
+            scheduler_state="reattach_failed",
+        )
+    attempts: list[str] = []
+
+    def slow_recovery(spec: JobSpec) -> bool:
+        attempts.append(spec.id)
+        clock[0] += 0.6
+        return False
+
+    monkeypatch.setattr(daemon, "_reattach_scheduler_job", slow_recovery)
+    daemon.iterate()
+
+    assert attempts == ["lost0", "lost1"]
+    assert clock[0] == pytest.approx(101.2)
+    result = JobSpec.read(daemon._spec_path(predecessor.id))
+    assert result.state == JobState.COMPLETED
+    assert result.exit_code == 0
+    assert mock.submitted == ["predecessor", "dependent"]
+    assert JobSpec.read(daemon._spec_path("lost0")).state == JobState.RUNNING
+    daemon.iterate()
+    assert attempts == [f"lost{i}" for i in range(4)]
+    assert mock.submitted.count("dependent") == 1
+
+
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_scheduler_recovery_yields_and_rotates_before_retrying_old_jobs(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch, unconfirmed: bool,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(daemon_mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        daemon_mod, "SCHEDULER_REATTACH_QUANTUM_SECONDS", 1.0, raising=False,
+    )
+    attempts: list[str] = []
+
+    def slow_recovery(spec: JobSpec, **kwargs: object) -> bool:
+        attempts.append(spec.id)
+        # Longer than the retry interval: previously the first rows were due
+        # again before the scan finished and every tick repeated the backlog.
+        clock[0] += 70.0
+        return False
+
+    for index in range(3):
+        if unconfirmed:
+            _unconfirmed_scheduler_spec(daemon, f"lost{index}")
+        else:
+            _running_scheduler_spec(
+                daemon, f"lost{index}", scheduler_job_id=None,
+                scheduler_state="reattach_failed",
+            )
+    monkeypatch.setattr(daemon, "_reattach_scheduler_job", slow_recovery)
+    monkeypatch.setattr(daemon, "_reconcile_unconfirmed_scheduler_submit", slow_recovery)
+
+    for index in range(3):
+        daemon._scheduler_refresh_wakeup.clear()
+        daemon._retry_deferred_scheduler_reattach()
+        assert attempts == [f"lost{i}" for i in range(index + 1)]
+        assert daemon._scheduler_refresh_wakeup.is_set()
+        assert daemon._scheduler_reattach_retry_last[f"lost{index}"] == clock[0]
+    for index in range(3):
+        assert not JobSpec.read(daemon._spec_path(f"lost{index}")).is_terminal
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_scheduler_recovery_cooldown_starts_after_attempt_finishes(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch, raises: bool,
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(daemon_mod.time, "monotonic", lambda: clock[0])
+    _running_scheduler_spec(
+        daemon, "lost", scheduler_job_id=None, scheduler_state="reattach_failed",
+    )
+    attempts: list[str] = []
+
+    def slow_recovery(spec: JobSpec) -> bool:
+        attempts.append(spec.id)
+        clock[0] += 70.0
+        if raises:
+            raise OSError("remote observation unavailable")
+        return False
+
+    monkeypatch.setattr(daemon, "_reattach_scheduler_job", slow_recovery)
+    if raises:
+        with pytest.raises(OSError, match="remote observation unavailable"):
+            daemon._retry_deferred_scheduler_reattach()
+    else:
+        daemon._retry_deferred_scheduler_reattach()
+    daemon._retry_deferred_scheduler_reattach()
+    assert attempts == ["lost"]
+    assert daemon._scheduler_reattach_retry_last["lost"] == 170.0
 
 
 def test_deferred_scheduler_reattach_retries_and_clears_status(
@@ -5454,7 +5761,10 @@ def test_reconcile_failed_live_poll_never_terminalizes_from_accounting(
     on_disk = JobSpec.read(daemon._spec_path("j1"))
     assert on_disk.state == JobState.RUNNING
     assert on_disk.scheduler_state == "poll_failed"
-    assert mock.detail_polled == 1
+    # The accounting row says FAILED/55 and is still never consulted. Since #51
+    # the pass does not even ask for it: a failed live poll decides the pass, so
+    # the detail call could only add load to a host that has just failed.
+    assert mock.detail_polled == 0
     assert mock.marker_queries == []
     assert mock.fetched == []
 
