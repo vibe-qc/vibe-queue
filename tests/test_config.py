@@ -665,6 +665,49 @@ class TestSchedulerConfig:
                 scheduler_max_wall_time_seconds=28_800,
             )
 
+    def test_scheduler_max_cpus_accepts_strict_positive_integer(self) -> None:
+        h = config.HostConfig(
+            ssh="cluster",
+            scheduler="slurm",
+            scheduler_dialect="slurm",
+            scratch_root="/workspace/USER",
+            scheduler_driver="driver",
+            scheduler_max_cpus=128,
+        )
+        assert h.scheduler_max_cpus == 128
+
+    @pytest.mark.parametrize("value", [0, -1, True, 128.0, "128"])
+    def test_scheduler_max_cpus_rejects_non_strict_positive_integer(
+        self, value: object
+    ) -> None:
+        with pytest.raises(ValidationError, match="scheduler_max_cpus"):
+            config.HostConfig(
+                ssh="cluster",
+                scheduler="slurm",
+                scheduler_dialect="slurm",
+                scratch_root="/workspace/USER",
+                scheduler_driver="driver",
+                scheduler_max_cpus=value,
+            )
+
+    def test_local_host_forbids_scheduler_max_cpus(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match="scheduler_max_cpus must be unset",
+        ):
+            config.HostConfig(ssh="local", scheduler_max_cpus=128)
+
+    def test_scheduler_max_cpus_reaches_lane_metadata(self) -> None:
+        h = config.HostConfig(
+            ssh="cluster",
+            scheduler="pbs",
+            scheduler_dialect="torque",
+            scratch_root="/workspace/USER",
+            scheduler_driver="driver",
+            scheduler_max_cpus=64,
+        )
+        assert h.scheduler_lane_metadata()["max_cpus"] == 64
+
     def test_scheduler_aliases_may_have_independent_wall_time_limits(
         self, cfg_dir: Path
     ) -> None:
@@ -1409,7 +1452,7 @@ class TestConfigForwardCompatibility:
         (cfg_dir / "config.toml").write_text(
             'default_host = "host_d"\n'
             "[pin_source_repos]\n"
-            '"mpei/vibe-view" = "/home/USER/vibe-view-dev"\n'
+            '"example-org/vibe-view" = "/home/USER/vibe-view-dev"\n'
             "[future_section]\n"
             'key = "value"\n'
             "[hosts.host_d]\n"
@@ -1544,7 +1587,7 @@ class TestConfigForwardCompatibility:
 
 
 class TestVibeqcSourceRepoIsOneSetting:
-    """`scheduler_runtime_source_repo` is `pin_source_repos["mpei/vibe-qc"]`.
+    """`scheduler_runtime_source_repo` is `pin_source_repos["example-org/vibe-qc"]`.
 
     The split added the per-repository mapping beside the global one, and the
     two then described overlapping things. A driver that had migrated fully to
@@ -1555,7 +1598,7 @@ class TestVibeqcSourceRepoIsOneSetting:
     def test_the_modern_spelling_is_enough(self, cfg_dir: Path) -> None:
         (cfg_dir / "config.toml").write_text(
             "[pin_source_repos]\n"
-            '"mpei/vibe-qc" = "/srv/vibe-qc"\n'
+            '"example-org/vibe-qc" = "/srv/vibe-qc"\n'
         )
         assert config.load_config().vibeqc_source_repo == "/srv/vibe-qc"
 
@@ -1578,7 +1621,7 @@ class TestVibeqcSourceRepoIsOneSetting:
             config.load_config()
             warning = capsys.readouterr().err
             assert "scheduler_runtime_source_repo is deprecated" in warning
-            assert "mpei/vibe-qc" in warning
+            assert "vibe-qc" in warning
             # Policy is re-read per queue row (#547).
             for _ in range(20):
                 config.load_config()
@@ -1590,7 +1633,7 @@ class TestVibeqcSourceRepoIsOneSetting:
         (cfg_dir / "config.toml").write_text(
             'scheduler_runtime_source_repo = "/srv/vibe-qc"\n'
             "[pin_source_repos]\n"
-            '"mpei/vibe-qc" = "/srv/vibe-qc"\n'
+            '"example-org/vibe-qc" = "/srv/vibe-qc"\n'
         )
         assert config.load_config().vibeqc_source_repo == "/srv/vibe-qc"
 
@@ -1599,7 +1642,7 @@ class TestVibeqcSourceRepoIsOneSetting:
         (cfg_dir / "config.toml").write_text(
             'scheduler_runtime_source_repo = "/srv/old-monorepo"\n'
             "[pin_source_repos]\n"
-            '"mpei/vibe-qc" = "/srv/vibe-qc"\n'
+            '"example-org/vibe-qc" = "/srv/vibe-qc"\n'
         )
         with pytest.raises(config.ConfigError, match="different vibe-qc checkouts"):
             config.load_config()
@@ -1610,7 +1653,7 @@ class TestVibeqcSourceRepoIsOneSetting:
         """The half-unified state locked a migrated driver out of staging."""
         (cfg_dir / "config.toml").write_text(
             "[pin_source_repos]\n"
-            '"mpei/vibe-qc" = "/srv/vibe-qc"\n'
+            '"example-org/vibe-qc" = "/srv/vibe-qc"\n'
             "\n"
             "[hosts.host_f]\n"
             'ssh = "host_f"\n'
@@ -1652,7 +1695,7 @@ class TestVibeqcSourceRepoIsOneSetting:
         with pytest.raises(config.ConfigError) as excinfo:
             config.load_config()
         assert "pin_source_repos" in str(excinfo.value)
-        assert "mpei/vibe-qc" in str(excinfo.value)
+        assert "vibe-qc" in str(excinfo.value)
 
 
 @pytest.mark.parametrize('damage', [
@@ -1699,3 +1742,68 @@ def test_retirement_audit_is_separate_from_active_host_inventory():
     })
     assert set(cfg.hosts) == {'live'}
     assert set(cfg.fleet.retired_hosts) == {'retired'}
+
+
+def test_config_read_isolates_every_mutable_toml_container(cfg_dir: Path) -> None:
+    """Even arrays of tables and nested mixed arrays cannot poison the cache."""
+    from datetime import date, datetime, time
+
+    path = cfg_dir / "config.toml"
+    path.write_text(
+        'text = "policy"\ninteger = 42\nfloat = 1.25\nflag = true\n'
+        'day = 2026-09-09\nclock = 12:34:56\n'
+        'local = 2026-09-09T12:34:56\ninstant = 2026-09-09T12:34:56Z\n'
+        'matrix = [[1, 2], [{ groups = ["original"] }]]\n'
+        '[[rules]]\nnames = ["first"]\n'
+        '[[rules]]\nnames = ["second"]\n'
+    )
+    first = config._read_config_data(path)
+    expected = config.tomllib.loads(path.read_text())
+    assert first == expected
+    assert type(first["day"]) is date
+    assert type(first["clock"]) is time
+    assert type(first["local"]) is datetime
+    assert first["instant"].tzinfo is not None
+
+    first["matrix"][0].append(3)
+    first["matrix"][1][0]["groups"][0] = "changed"
+    first["rules"][0]["names"].clear()
+    first["rules"][1]["extra"] = True
+    first["rules"].append({"names": ["third"]})
+    first["extra"] = []
+    assert config._read_config_data(path) == expected
+
+
+@pytest.mark.parametrize("system", [False, True])
+def test_policy_is_revalidated_after_a_validator_mutates_and_rejects_input(
+    cfg_dir: Path, monkeypatch: pytest.MonkeyPatch, system: bool,
+) -> None:
+    """Neither failed validators nor successful callers own the parse cache."""
+    path = cfg_dir / "config.toml"
+    path.write_text(
+        '[hosts.cluster]\nssh = "cluster"\nscheduler = "slurm"\n'
+        'scheduler_dialect = "slurm"\nscratch_root = "/scratch"\n'
+        'scheduler_driver = "driver"\nsubmit_extra = ["original"]\n'
+    )
+    if system:
+        monkeypatch.setattr(config, "SYSTEM_CONFIG_PATH", path)
+    loader = config.load_system_config if system else config.load_config
+    original_validate = config.Config.model_validate
+    observed: list[list[str]] = []
+
+    def validate(cls, data):
+        extra = data["hosts"]["cluster"]["submit_extra"]
+        observed.append(list(extra))
+        if len(observed) == 2:
+            extra.append("mutated before rejection")
+            raise ValueError("validation must run on every read")
+        return original_validate(data)
+
+    monkeypatch.setattr(config.Config, "model_validate", classmethod(validate))
+    assert loader().hosts["cluster"].submit_extra == ["original"]
+    # A non-pydantic failure renders as its type name only, by the message
+    # contract that keeps config values out of error text (#38).
+    with pytest.raises(config.ConfigError, match="ValueError"):
+        loader()
+    assert loader().hosts["cluster"].submit_extra == ["original"]
+    assert observed == [["original"], ["original"], ["original"]]

@@ -33,6 +33,24 @@ _FORMATS = ("text", "json")
 # The digest covers every byte of the normalized public return, including JSON
 # indentation and key ordering. Scheduler snapshots intentionally include the
 # additive bounded-refresh audit introduced for BUG107.
+# The json digests moved once more for the additive `scheduler_queued_reason`
+# (vibe-qc#148): every payload gains exactly that one nullable key and nothing
+# else, which is why the text digests are unchanged -- the line renders only
+# for a queued job that has a reason.
+# And again for the additive `scheduler_remote_workspace` (#63), which records
+# the workspace a scheduler job was staged into before it was submitted. Same
+# additive shape: every json payload gains exactly that one nullable key, next
+# to `scheduler_remote_workspace_cleaned_at`, and nothing else, so the text
+# digests are unchanged. It belongs in the public payload rather than being
+# excluded like the `scheduler_poll_*` diagnostics, because "where is this
+# job's workspace" is the question an operator has when one looks stranded,
+# and the neighbouring `scheduler_job_id` is already there.
+# And once more for the additive `workdir_cleanup_note` (#63 follow-up): a
+# refused workdir cleanup used to be appended to `failure_reason`, which made
+# a COMPLETED job report a failure. Every json payload gains exactly that one
+# nullable key, next to `workdir_swept_at`, and nothing else; the text digests
+# are unchanged because the `workdir:` line renders only for a job that
+# carries a note, and no fixture here does.
 # To update one, temporarily replace that digest with zeros and run the focused
 # case: the assertion prints the complete normalized output and new digest for
 # review.  Never update a digest without reviewing that output diff.
@@ -44,13 +62,13 @@ _OUTPUT_SHA256 = {
     ("dependency", "text"): "fe02636c0c1059904f8327bb01cfef64adac9bc9b0ce9ab9ddb4ca51e2fb3cba",
     ("qvf", "text"): "206afbcf785783de46ee3ae4ec62a653a502d435a435dcc579d4e046a59cbf3d",
     ("terminal", "text"): "4f7442bf729216211947120167be895fee74a44c4144e394ca04f72ba7e59667",
-    ("pending", "json"): "20866e675cd35b47e1e0fa41b28b77cf889175f2a08eee3e897075390619dfa2",
-    ("running", "json"): "90c9bc4d6f45d879bbfe8a5bbb1b210f70f8ea36b557d697f1adbe47253d69f6",
-    ("scheduler", "json"): "182bc0d73dd925ede0a9a6405306df389e04278038223f8faa6b064866ac1f36",
-    ("archived", "json"): "7b67031e095a4f1903f982550f1e6eea56bb1e5a62a597e1bdf4c2a40e2880d5",
-    ("dependency", "json"): "40c16ab38127b14b48b2a3786afe4e5613e295819c1016a2cb8e4f596c747601",
-    ("qvf", "json"): "61f952e584f8058fd1957934e22ca7c2ab266ea6ae64bcbce3b2a296d482fc5e",
-    ("terminal", "json"): "c672f5bc65472c990c6d0e6c651f61b6abeabe711edc222ca697cdf4e5c36f26",
+    ("pending", "json"): "b0435f37ad9b7671a84bfa293cb0b82b25f3fa74c75148bc1a134c3b69908899",
+    ("running", "json"): "5765bb83bc65fcd6fde45b72d57ec54aacab4c63a24aa633e935fda45045649e",
+    ("scheduler", "json"): "ce27b2e966e42d9a8fbd9c2330671e3c19188aaac32444e59bac4ea084fb2ad5",
+    ("archived", "json"): "4b0148a2874691c81ba7455075f209d93b7762deec76b993469866ef83b4686e",
+    ("dependency", "json"): "facc39b64b1b770ae1f50e7401b2062f03d3281a58f2fcc0c55780c9ac01626d",
+    ("qvf", "json"): "bb61a35e7560976339c7d4a608afbc4d57ac342149b3609aa849dd07f88e5b69",
+    ("terminal", "json"): "f1189d75e36673bab902758292ebd819302460496c762d56e900c51683a44ba8",
 }
 
 

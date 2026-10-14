@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -24,6 +26,7 @@ from pathlib import Path
 from time import monotonic
 
 from vq import capacity, config, host_status, overview, transport
+from vq import top as top_mod
 from vq.host import is_local_host
 from vq.listing import (
     effective_queue_state,
@@ -37,7 +40,7 @@ from vq.listing import (
     scheduler_running_confirmed,
     scheduler_target_is_safe,
 )
-from vq.spec import JobSpec
+from vq.spec import JobSpec, JobState
 from vq.status import terminal_diagnosis_for_spec
 
 log = logging.getLogger(__name__)
@@ -94,6 +97,9 @@ class HostSnapshot:
     #: ``reachable``/``error`` state: an overview can succeed while the
     #: queue listing fails (and vice versa).
     jobs_error: str | None = None
+    #: Resource-sample collection failure on the owning driver, if any
+    #: (#168). The rows are still listed; their measurements read unknown.
+    usage_error: str | None = None
 
 
 @dataclass
@@ -156,6 +162,7 @@ class FleetSnapshot:
                     "overview": overview.format_overview_json(h.overview),
                     "job_count": len(h.jobs),
                     "jobs_error": h.jobs_error,
+                    "usage_error": h.usage_error,
                 }
                 for h in self.hosts
             ],
@@ -317,10 +324,143 @@ def _gather_host_jobs(
     ]
     invalid = sum(spec is None for _, spec in selected)
     error = observation.error or (f"{invalid} invalid queue rows" if invalid else None)
-    return _normalize_rows(
+    rows = _normalize_rows(
         [row for row, _ in selected], host,
         validated_specs=[spec for _, spec in selected],
-    ), error
+    )
+    for row in rows:
+        # The daemon that owns the spec: the host itself, or the scheduler
+        # driver for a cluster target. The console labels it separately
+        # from where the job executes.
+        row["queue_owner"] = owner
+    return rows, error
+
+
+#: Statuses of a row's ``resource_observation`` (#168). Only ``observed``
+#: and ``stale`` carry numbers; every other status says why there are none,
+#: so a missing measurement can never read as zero usage.
+USAGE_OBSERVED = "observed"
+USAGE_STALE = "stale"
+USAGE_NO_SAMPLE = "no_sample"
+USAGE_SCHEDULER = "scheduler"
+USAGE_NOT_RUNNING = "not_running"
+USAGE_COLLECTOR_ERROR = "collector_error"
+USAGE_NOT_COLLECTED = "not_collected"
+
+
+@dataclass
+class _UsageObservation:
+    """One driver's latest watchdog samples, read once per sweep."""
+
+    #: ``vq top --json`` rows keyed by job id. Job ids are unique per
+    #: driver, and each driver has its own observation.
+    by_job: dict[str, dict[str, object]] = field(default_factory=dict)
+    collected_at: str | None = None
+    error: str | None = None
+
+
+def _observe_usage(
+    owner: str,
+    cfg: config.Config,
+    queue: _QueueObservation,
+    *,
+    now: datetime,
+) -> _UsageObservation:
+    """Read the latest resource sample of every running direct job, in one go.
+
+    The same rows ``vq top --json`` prints: one local read, or one remote
+    ``vq top localhost --json`` per driver -- never one request per job.
+    Skipped entirely when the driver runs no direct job, so a fleet of
+    scheduler targets or idle hosts pays nothing for it. Scheduler jobs
+    are not sampled: the watchdog runs on the daemon host, not on the
+    compute node.
+    """
+    wanted = {
+        spec.id for spec in queue.specs
+        if spec.state == JobState.RUNNING and spec.scheduler_target is None
+    }
+    if not wanted:
+        return _UsageObservation()
+    collected_at = now.isoformat()
+    try:
+        if is_local_host(owner):
+            rows = [
+                top_mod.top_row_payload(row)
+                for row in top_mod.gather_top_rows(
+                    [spec for spec in queue.specs if spec.id in wanted],
+                    host=owner, now=now,
+                )
+            ]
+        else:
+            proc = transport.run_remote_vq(cfg.host(owner), "top", "localhost", "--json")
+            raw = json.loads(proc.stdout or "[]")
+            if not isinstance(raw, list):
+                raise ValueError("top response must be an array")
+            rows = [row for row in raw if isinstance(row, dict)]
+    except (transport.RemoteError, config.ConfigError, ValueError, OSError) as exc:
+        return _UsageObservation(
+            collected_at=collected_at, error=f"{type(exc).__name__}: {exc}",
+        )
+    by_job = {
+        row["jobid"]: row for row in rows
+        if isinstance(row.get("jobid"), str) and row["jobid"] in wanted
+    }
+    return _UsageObservation(by_job=by_job, collected_at=collected_at)
+
+
+def _sample_time(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.isoformat() if parsed.tzinfo is not None else None
+
+
+def _resource_observation(
+    row: dict[str, object], usage: _UsageObservation,
+) -> dict[str, object]:
+    """What was measured for one row this sweep, or why nothing was.
+
+    ``cpu_percent`` is the job's whole process group (an 8-core job at
+    full use reads ~800); ``rss_mb`` is the resident memory of that
+    group's processes. Both come from the watchdog's latest sample and
+    are never filled in from the job's declared ``cpus`` or ``mem_mb``.
+    """
+    observation: dict[str, object] = {
+        "status": USAGE_NOT_COLLECTED,
+        "source": None,
+        "cpu_percent": None,
+        "rss_mb": None,
+        "sample_at": None,
+        "collected_at": usage.collected_at,
+    }
+    if row.get("state") != JobState.RUNNING.value:
+        observation["status"] = USAGE_NOT_RUNNING
+    elif row.get("scheduler_target") is not None:
+        observation["status"] = USAGE_SCHEDULER
+    elif usage.error is not None:
+        observation["status"] = USAGE_COLLECTOR_ERROR
+    elif usage.collected_at is not None:
+        sample = usage.by_job.get(str(row.get("id")))
+        cpu = top_mod.sample_nonnegative_float(
+            sample.get("cpu_percent") if sample else None
+        )
+        rss = top_mod.sample_nonnegative_float(
+            sample.get("rss_mb") if sample else None
+        )
+        if sample is None or (cpu is None and rss is None):
+            observation["status"] = USAGE_NO_SAMPLE
+        else:
+            observation.update(
+                status=USAGE_STALE if sample.get("sample_stale") is True else USAGE_OBSERVED,
+                source="watchdog",
+                cpu_percent=cpu,
+                rss_mb=rss,
+                sample_at=_sample_time(sample.get("sample_at")),
+            )
+    return observation
 
 
 def _gather_host_overview(
@@ -388,12 +528,14 @@ def gather_fleet_snapshot(
         host: resolve_owner_host(cfg, host) for host in host_names if host not in down
     }
 
-    def _observe(owner: str) -> tuple[_QueueObservation, overview.HostOverview]:
+    def _observe(
+        owner: str,
+    ) -> tuple[_QueueObservation, overview.HostOverview, _UsageObservation]:
         if owner in down:
             detail = down[owner].describe()
             return _QueueObservation(error=detail), overview.HostOverview(
                 host=owner, reachable=False, admin_down=detail, error=detail,
-            )
+            ), _UsageObservation()
         queue = _observe_queue(owner, cfg, multi_user=multi_user)
         if is_local_host(owner):
             ov = overview.gather_overview_local(
@@ -404,7 +546,8 @@ def gather_fleet_snapshot(
             ov = _gather_host_overview(
                 owner, cfg, recent_window=recent_window, multi_user=multi_user,
             )
-        return queue, ov
+        usage = _observe_usage(owner, cfg, queue, now=datetime.now(UTC))
+        return queue, ov, usage
 
     unique_owners = list(dict.fromkeys(owner for owner in owners.values() if owner is not None))
     workers = min(_MAX_WORKERS, max(1, len(unique_owners)))
@@ -425,7 +568,7 @@ def gather_fleet_snapshot(
                 error="scheduler host has no scheduler_driver configured",
             ), jobs_error="scheduler host has no scheduler_driver configured"))
             continue
-        queue, driver_overview = observations[owner]
+        queue, driver_overview, usage = observations[owner]
         if host in scheduler_host_names:
             ov = overview.project_scheduler_overview(
                 host, driver_overview, queue.specs,
@@ -448,7 +591,15 @@ def gather_fleet_snapshot(
             host, cfg, multi_user=multi_user, scheduler_host_names=scheduler_host_names,
             observation=queue,
         )
-        snapshots.append(HostSnapshot(host=host, overview=ov, jobs=jobs, jobs_error=jobs_error))
+        for row in jobs:
+            row["resource_observation"] = _resource_observation(row, usage)
+        snapshots.append(HostSnapshot(
+            host=host, overview=ov, jobs=jobs, jobs_error=jobs_error,
+            # A scheduler alias shares its driver's observation but has no
+            # direct jobs to sample, so the failure is reported once, on
+            # the driver's own host.
+            usage_error=None if host in scheduler_host_names else usage.error,
+        ))
 
     return FleetSnapshot(
         gathered_at=observed_at.isoformat(),
@@ -524,6 +675,90 @@ def resolve_owner_host(cfg: config.Config, queue_host: str) -> str | None:
     if host_cfg is not None and host_cfg.scheduler != "local":
         return host_cfg.scheduler_driver
     return queue_host
+
+
+PREVIEW_TAIL_LINES = 2000
+"""Stdout lines a preview reads: the same status tail the drill-down shows, deeper."""
+
+
+def fetch_job_preview(
+    cfg: config.Config,
+    queue_host: str,
+    jobid: str,
+    *,
+    multi_user: bool = False,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Calculation preview for one job (#65, V1); ``(payload, error)``.
+
+    Reads only what the drill-down already reads, ``vq status --json`` with a
+    stdout tail, on the owning host, and parses it with :mod:`vq.previews`.
+    It opens no other file and walks no workdir. ``preview`` is ``None`` when
+    no parser knows the job's program.
+    """
+    from vq import previews
+    from vq.status import show_status_json
+
+    owner = resolve_owner_host(cfg, queue_host)
+    if owner is None:
+        return None, f"scheduler host {queue_host!r} has no scheduler_driver configured"
+    try:
+        if is_local_host(owner):
+            status_payload = json.loads(show_status_json(
+                owner, jobid, tail=PREVIEW_TAIL_LINES, multi_user=multi_user,
+            ))
+        else:
+            proc = transport.run_remote_vq(
+                cfg.host(owner), "status", "localhost", jobid, "--json",
+                "-n", str(PREVIEW_TAIL_LINES),
+            )
+            status_payload = json.loads(proc.stdout)
+    except FileNotFoundError as e:
+        return None, str(e)
+    except transport.RemoteError as e:
+        return None, str(e)
+    except (config.ConfigError, json.JSONDecodeError, ValueError, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    program = status_payload.get("program")
+    stdout = status_payload.get("stdout")
+    text = stdout[-previews.MAX_TAIL_BYTES:] if isinstance(stdout, str) else ""
+    source = "stdout"
+    output_name = (
+        previews.orca_output_name(status_payload.get("command"))
+        if previews.parser_for(program if isinstance(program, str) else None) == "orca"
+        else None
+    )
+    if output_name is not None:
+        # Maintainer decision (2026-09-25): an ORCA job run through
+        # run-orca.sh writes to one named output file; read exactly that
+        # file's bounded tail through vq tail, never a directory walk.
+        tail_args = ("tail", queue_host, jobid, "--name", output_name, "--json",
+                     "-n", str(PREVIEW_TAIL_LINES))
+        try:
+            if is_local_host(owner):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "vq.cli", *tail_args],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=60, check=False,
+                )
+                tail_text = proc.stdout if proc.returncode == 0 else ""
+            else:
+                tail_text = transport.run_remote_vq(cfg.host(owner), *tail_args).stdout
+            tailed = json.loads(tail_text).get("text") if tail_text else None
+        except (transport.RemoteError, json.JSONDecodeError, OSError,
+                subprocess.SubprocessError, AttributeError):
+            tailed = None
+        if isinstance(tailed, str):
+            text = tailed[-previews.MAX_TAIL_BYTES:]
+            source = output_name
+    return {
+        "source": source,
+        "jobid": jobid,
+        "queue_host": queue_host,
+        "owner_host": owner,
+        "state": status_payload.get("state"),
+        "program": program if isinstance(program, str) else None,
+        "preview": previews.preview(program if isinstance(program, str) else None, text),
+    }, None
 
 
 def fetch_job_detail(

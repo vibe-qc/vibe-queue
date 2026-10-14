@@ -38,6 +38,23 @@ def _add_tar_bytes(
     archive.addfile(member, io.BytesIO(contents))
 
 
+@pytest.fixture(params=[False, True], ids=["preserving-filter", "normalizing-filter"])
+def archive_name_filter(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise both stdlib behaviors, independently of the Python patch level."""
+    original = tarfile.data_filter
+
+    def filter_name(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
+        filtered = original(member, destination)
+        if ".." in member.name.split("/"):
+            name = os.path.normpath(member.name) if request.param else member.name
+            return filtered.replace(name=name)
+        return filtered
+
+    monkeypatch.setattr(tarfile, "data_filter", filter_name)
+
+
 class TestJobIDs:
     def test_new_jobid_returns_unique_short_hex(self) -> None:
         ids = {new_jobid() for _ in range(100)}
@@ -1634,7 +1651,7 @@ class TestArchiveSubmit:
         assert not jobs.exists()
 
     def test_symlink_sensitive_archive_traversal_rejected_before_mutation(
-        self, tmp_path: Path, state_dirs: tuple[Path, Path]
+        self, tmp_path: Path, state_dirs: tuple[Path, Path], archive_name_filter: None,
     ) -> None:
         queue, jobs = state_dirs
         archive = tmp_path / "symlink-traversal.tar"
@@ -1661,7 +1678,7 @@ class TestArchiveSubmit:
         assert not jobs.exists()
 
     def test_symlink_sensitive_archive_duplicate_rejected_before_mutation(
-        self, tmp_path: Path, state_dirs: tuple[Path, Path]
+        self, tmp_path: Path, state_dirs: tuple[Path, Path], archive_name_filter: None,
     ) -> None:
         queue, jobs = state_dirs
         archive = tmp_path / "symlink-duplicate.tar"

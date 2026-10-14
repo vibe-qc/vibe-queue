@@ -313,13 +313,13 @@ class TestRefusalLeavesNoMarker:
         calls: list[int] = []
         real = admin._refuse_occupied_git_dir
 
-        def racing(env: str, git_dir: Path) -> None:
+        def racing(env: str, git_dir: Path, **kw: object) -> None:
             calls.append(1)
             if len(calls) == 1:
                 return  # the pre-marker check sees an empty world
             git_dir.mkdir(parents=True, exist_ok=True)
             (git_dir / "appeared.txt").write_text("race", encoding="utf-8")
-            real(env, git_dir)
+            real(env, git_dir, **kw)  # type: ignore[arg-type]
 
         monkeypatch.setattr(admin, "_refuse_occupied_git_dir", racing)
 

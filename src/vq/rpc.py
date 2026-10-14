@@ -86,6 +86,11 @@ to reason about, no protocol state to track. Clients open + send
   memory ceilings. Open to any caller; these are operator-visible scheduling
   facts, not secrets.
 
+* ``get_admission_snapshot()`` *(#64)* — returns the main loop's latest
+  published admission facts (dispatch holds, caps, local usage including
+  orphans and surviving killed jobs, pending local jobs), or ``None``. Open
+  to any caller, read-only; ``vq broker capacity`` reads it.
+
 * ``set_throttle_state(state, token=None)`` *(v0.8.1)* — write a
   throttle state dict. ``state=None`` clears persistent throttle.
   Multi-user requires the admin token.
@@ -861,6 +866,9 @@ class RPCServer:
         if should_audit:
             args_summary = _audit.summarise_args(method, args)
         try:
+            if method == "set_scheduler_submit_recovery":
+                # The caller must never supply its own audit identity.
+                args = {**args, "_peer_uid": peer_uid}
             result = handler(**args)
         except TypeError as e:
             # Bad args (e.g. missing kwarg) — surface as a 4xx-ish
@@ -901,6 +909,31 @@ class RPCServer:
 # ----------------------------------------------------------------------
 # Admin-status methods — the canonical v0.8.0 use case
 # ----------------------------------------------------------------------
+
+
+def register_scheduler_submit_recovery_methods(
+    rpc: RPCServer, reconcile: Callable[..., dict[str, Any]],
+) -> None:
+    """No file-write fallback: private authority belongs to the running daemon."""
+    @rpc.register("get_scheduler_submit_recovery")
+    def preview(jobid: str, evidence: dict | None = None,
+                owner_uid: str | None = None) -> dict:
+        return reconcile(jobid, evidence, owner_uid=owner_uid)
+
+    @rpc.register("set_scheduler_submit_recovery")
+    def apply(jobid: str, evidence: dict, expected_plan_digest: str,
+              attest_authoritative: bool = False, owner_uid: str | None = None,
+              token: str | None = None, _peer_uid: int | None = None) -> dict:
+        if rpc.multi_user:
+            from vq import auth
+            if not auth.verify_admin_token(token or ""):
+                raise PermissionError("scheduler recovery requires the daemon admin token")
+        if attest_authoritative is not True:
+            raise PermissionError("explicit authoritative-evidence attestation required")
+        return reconcile(
+            jobid, evidence, owner_uid=owner_uid, apply=True,
+            expected_plan_digest=expected_plan_digest, operator_uid=_peer_uid,
+        )
 
 
 def register_get_admin_status_method(
@@ -949,6 +982,25 @@ def register_set_admin_status_method(
                 )
         replace_record(env, record)
         return {"env": env, "ok": True}
+
+
+def register_get_admission_snapshot_method(
+    rpc: RPCServer,
+    read_snapshot: Callable[[], dict[str, Any] | None],
+) -> None:
+    """Expose the main loop's latest published admission snapshot (#64).
+
+    Read-only and open to any caller, like ``get_daemon_capacity``: the
+    values are operator-visible scheduling facts (holds, caps, usage, the
+    count of pending local jobs), never job content. The main loop publishes
+    one immutable dict per tick; this handler only returns that reference,
+    so it reads no state the loop is mutating. ``None`` means none yet.
+    """
+
+    @rpc.register("get_admission_snapshot")
+    def _get_admission_snapshot() -> dict[str, Any] | None:
+        snapshot = read_snapshot()
+        return dict(snapshot) if snapshot is not None else None
 
 
 def register_capacity_methods(rpc: RPCServer, advertised: Any) -> None:
