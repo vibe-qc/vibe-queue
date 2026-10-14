@@ -906,14 +906,19 @@ class TestSubmitCLI:
         assert spec.program_runtime_pin is not None
         assert spec.program_runtime_pin.expected_git_sha == submitted_sha
 
+    @pytest.mark.parametrize("pin_length", [7, 20, 40])
     def test_expected_sha_snapshot_persisted_for_directory_payload(
-        self, cli_state: Path
+        self, cli_state: Path, pin_length: int,
     ) -> None:
         src_dir = cli_state / "docs-payload"
         src_dir.mkdir()
         (src_dir / "run_docs.sh").write_text("echo docs\n")
         git_dir = cli_state / "repo"
-        submitted_sha = _init_git_repo(git_dir)
+        _init_git_repo(git_dir)
+        full_sha = subprocess.check_output(
+            ["git", "-C", str(git_dir), "rev-parse", "HEAD"], text=True,
+        ).strip()
+        submitted_sha = full_sha[:max(12, pin_length)]
         (cli_state / "cfg" / "config.toml").write_text(
             "[programs.vibeqc-dev]\n"
             'kind = "venv"\n'
@@ -931,7 +936,7 @@ class TestSubmitCLI:
                 "--program",
                 "vibeqc-dev",
                 "--expected-sha",
-                submitted_sha[:7],
+                full_sha[:pin_length].upper(),
                 "--",
                 "bash",
                 "run_docs.sh",
@@ -945,6 +950,34 @@ class TestSubmitCLI:
         assert spec.program == "vibeqc-dev"
         assert spec.program_runtime_pin is not None
         assert spec.program_runtime_pin.expected_git_sha == submitted_sha
+
+    @pytest.mark.parametrize("invalid_pin", ["wrong-suffix", "too-long"])
+    def test_expected_sha_must_match_beyond_display_abbreviation(
+        self, cli_state: Path, invalid_pin: str,
+    ) -> None:
+        src = cli_state / "input.py"
+        src.write_text("print('hi')")
+        git_dir = cli_state / "repo"
+        _init_git_repo(git_dir)
+        sha = subprocess.check_output(
+            ["git", "-C", str(git_dir), "rev-parse", "HEAD"], text=True,
+        ).strip()
+        # Same first 12 characters as HEAD: comparing only its display SHA
+        # incorrectly accepts both a mismatching suffix and an oversized pin.
+        pin = (sha[:12] + ("0" if sha[12] != "0" else "1") + sha[13:20]
+               if invalid_pin == "wrong-suffix" else sha + "0")
+        (cli_state / "cfg" / "config.toml").write_text(
+            "[programs.demo]\n"
+            'kind = "venv"\n'
+            f'python = "{sys.executable}"\n'
+            f'git_dir = "{git_dir}"\n'
+        )
+        result = CliRunner().invoke(
+            main, ["submit", "localhost", "--program", "demo",
+                   "--expected-sha", pin, str(src)],
+        )
+        assert result.exit_code != 0, result.output
+        assert not list(paths.queue_dir().glob("*.json"))
 
     def test_expected_sha_too_short_rejected(self, cli_state: Path) -> None:
         src = cli_state / "input.py"
@@ -1244,6 +1277,42 @@ class TestSubmitCLI:
         from vq.spec import JobSpec
         spec = JobSpec.read(paths.queue_dir() / f"{result.output.strip()}.json")
         assert spec.command == ["/dev/py", "x.py"]
+
+    def test_branch_flag_with_dir_prepends_the_branch_interpreter(
+        self, cli_state: Path
+    ) -> None:
+        """#121: --branch is not single-file only; it routes --dir too."""
+        (cli_state / "cfg" / "config.toml").write_text(
+            '[hosts.localhost]\n'
+            'ssh = "localhost"\n'
+            '\n'
+            '[hosts.localhost.branches]\n'
+            'release = "/rel/py"\n'
+        )
+        d = cli_state / "ws"
+        d.mkdir()
+        (d / "run.py").write_text("")
+        result = CliRunner().invoke(
+            main,
+            [
+                "submit", "localhost",
+                "--branch", "release",
+                "-d", str(d), "--", "run.py",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        jobid = result.output.strip().splitlines()[-1]
+        spec = JobSpec.read(cli_state / "state" / "queue" / f"{jobid}.json")
+        assert spec.command == ["/rel/py", "run.py"]
+        assert spec.branch == "release"
+
+    def test_submit_help_does_not_call_python_or_branch_single_file_only(
+        self,
+    ) -> None:
+        """#121: both flags also prefix a --dir/--compressed command."""
+        text = " ".join(CliRunner().invoke(main, ["submit", "--help"]).output.split())
+        assert "Single-file submit only; mutually exclusive with --python" not in text
+        assert "Rejected with --dir/--compressed" not in text
 
     def test_branch_flag_resolves_alias(self, cli_state: Path) -> None:
         """Aliases route to the same interpreter as their canonical
@@ -3185,7 +3254,34 @@ class TestFetchCLI:
         assert workdir_result.exit_code == 0, workdir_result.output
         assert (cli_state / "out" / f"{jobid}-workdir" / "result.json").is_file()
 
-    def test_fetch_legacy_remote_requires_explicit_workspace(
+    @pytest.mark.parametrize("scratch", ["empty", "missing", "swept"])
+    def test_fetch_needs_no_selection_when_the_scratch_dir_is_provably_empty(
+        self, cli_state: Path, scratch: str
+    ) -> None:
+        """#120: only an empty scratch dir proves the workspace is the result."""
+        payload = cli_state / "input.py"
+        payload.write_text("print('input')")
+        jobid = CliRunner().invoke(main, ["submit", "localhost", str(payload)]).output.strip()
+        spec = JobSpec.read(paths.spec_path(jobid))
+        workdir = cli_state / "scratch"
+        if scratch != "missing":
+            workdir.mkdir()
+        if scratch == "swept":
+            spec.workdir_swept_at = "2026-09-29T12:00:00+00:00"
+        spec.workdir = str(workdir)
+        spec.state = JobState.COMPLETED
+        spec.write(paths.spec_path(jobid))
+        out = cli_state / "out"
+        result = CliRunner().invoke(main, ["fetch", "localhost", jobid, "-o", str(out)])
+        diagnosis = json.loads((out / jobid / "_vq" / "terminal-diagnosis.json").read_text())
+        if scratch == "empty":
+            assert result.exit_code == 0, result.output
+            assert diagnosis["workdir_empty"] is True
+        else:
+            assert result.exit_code == 1 and "refusing to report" in result.output
+            assert diagnosis["workdir_empty"] is None
+
+    def test_fetch_remote_without_mark_fetched_requires_explicit_workspace(
         self, cli_state: Path, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
@@ -3198,8 +3294,11 @@ class TestFetchCLI:
             "submitted_at": "2026-08-20T10:11:12+00:00", "state": "completed",
             "scheduler_target": None,
         }
+        # Fetch provenance and mark-back are separate capability contracts.
+        monkeypatch.setattr(fetch_module, "_new_fetch_protocol_token", lambda: "0" * 32)
         buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as tf:
+        with tarfile.open(fileobj=buffer, mode="w",
+                          pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in {
                 "input.py": "# submitted input\n",
                 fetch_module.TERMINAL_DIAGNOSIS_SIDECAR: json.dumps(diagnosis),
@@ -4074,6 +4173,7 @@ class TestAllHostsAggregation:
         assert payload["scheduler_lane"] == {
             "partition": "compute",
             "max_wall_time_seconds": 28_800,
+            "max_cpus": None,
             "source": "host-config",
         }
 
@@ -4109,6 +4209,7 @@ class TestAllHostsAggregation:
                 "scheduler_lane": {
                     "partition": "compute",
                     "max_wall_time_seconds": 28_800,
+                    "max_cpus": None,
                     "source": "host-config",
                 },
             }

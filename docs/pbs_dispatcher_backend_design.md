@@ -1,37 +1,17 @@
 # PBS / SGE dispatcher backend — design proposal
 
-**Status:** SUBMIT PATH AND OPERATOR SURFACES WIRED; pbs-cluster validation remains.
-Landed on `main`: the dispatcher seam (`4ff48938`), the Torque **dialect**
-(`ffa436d8`), the **`SchedulerDispatcher`** + whole-workspace copy-back +
-node-local scratch + the `scheduler_dispatcher_for` factory, **`vq
-scheduler-probe`** (`6422fb8e`, live-validated against pbs-cluster), and the **daemon
-wiring keystone** (`611c9adf`) + **reattach** (`66f76108`): the daemon now
-dispatches / reconciles / kills / reaps / reattaches scheduler-target jobs over
-SSH+qsub, parallel to the local `Popen` path (which is byte-for-byte unchanged;
-full daemon suite green). The queue-facing wire is now present:
-`vq submit --host pbs-cluster` forwards to the fixed fleet driver daemon tagged with
-`JobSpec.scheduler_target`, and `vq status` / `vq queue` / `vq logs` /
-`vq tail` / `vq fetch` / `vq admin update` all route scheduler-host operations
-through that driver. `vq overview` and `vq submit auto --pool clusters` can also
-synthesize a daemonless scheduler host from the driver's tagged specs, giving
-multi-cluster routing its first queue-depth signal. Per-program scheduler script
-hooks and wrapper argv prefixes are now present through
-`[hosts.HOST.scheduler_program_hooks.NAME]` (2026-07-05); site-specific wrapper
-binaries remain host-managed future work. Remaining work is real-pbs-cluster validation
-(blocked on the heatwave shutdown) and richer policy once a second scheduler
-site exists. **Architecture: Arch 2**
-(off-cluster, SSH-driven, stateless-on-pbs-cluster). **Scheduler dialect: TORQUE
-2.5.12** (probed on pbs-cluster 2026-06-07 — see §16).
-**Author:** vq queue chat. **Opened:** 2026-06-05.
-**Target:** v1.0 (this is the SPEC §8.2 "cluster backend" gate, see below).
-**Trigger:** the *pbs-cluster* cluster (a university group cluster reached through an SSH
-gateway, with the real host, queue, and account identifiers kept in the maintainer's
-local provisioning notes rather than this repo), to be used as a first-class fleet
-host for big parallel sweeps, heavy single jobs, and daily overflow.
+**History: a design proposal from June 2026, written at v0.9.2 and kept for its
+rationale.** The backend it proposes has shipped, with Torque/PBS and Slurm
+dialects, and this page was not brought along. Its status line below is a
+snapshot, not the state of the product. Do not use it to configure a scheduler
+host: the operator reference is [operations](operations.md) and
+[scheduler runtime deployment](scheduler_runtime_deployment.md), and what vq
+guarantees is [SPEC § 8.2](SPEC.md#82-scheduler-backends).
 
-This doc is the §9 "surface the proposal before the refactor" artifact and the
-§14 living handover for the work. It will track the design + increment status
-until the feature lands and is validated on pbs-cluster.
+The design uses an off-cluster driver and SSH to submit, monitor and retrieve
+scheduler jobs. Scheduler dialects and site policies are selected through
+configuration and verified with `vq scheduler-probe`. Deployment inventories,
+acceptance receipts and current rollout status belong in private operator records.
 
 ---
 
@@ -50,14 +30,13 @@ pbs-cluster is that workload trigger. The only deviation from the letter of the 
 abstraction is identical; only the adapter strings differ. We design the seam to
 be dialect-pluggable so SLURM remains a drop-in third dialect later.
 
-## 2. The constraint surface (pbs-cluster)
+## 2. Deployment constraints
 
-| Constraint | Consequence for vq |
+| Constraint to check | Consequence for vq |
 |---|---|
-| Reached via 2-hop SSH (`<cluster-gateway>` → `pbs-cluster`) | Collapsed to one logical host with `ProxyJump`/`ProxyCommand` in `~/.ssh/config`. vq's transport already shells out to `ssh <alias>`, which honors it. No vq code needed for the hop. |
-| Most ports closed | **Good fit.** vq's RPC is a Unix socket; all cross-host ops tunnel over SSH (port 22). Nothing needs an open inbound port. |
-| Can pull from internet / clone | Provisioning (`git clone` + build, or Apptainer image pull) works; on-demand fetchers (vqfetch/BSE/MACE) work — nothing pre-bundled, licensing-clean (root CLAUDE.md §1). |
-| Has its **own `qsub` scheduler** | The crux. vq must **submit to qsub**, not spawn `subprocess.Popen` for compute. On a shared cluster, running compute outside the scheduler violates login-node policy. |
+| SSH gateway requirements | Configure `ProxyJump` or `ProxyCommand` in the operator's SSH configuration. |
+| Network access policy | Use SSH transport; qualify source and dependency access before provisioning. |
+| Scheduler and login-node policy | Submit compute through the configured scheduler; do not run workloads on login nodes. |
 
 ## 3. The current dispatcher reality (the seam has eroded)
 
@@ -221,7 +200,7 @@ checkout — root CLAUDE.md §15's "don't touch the git trees" rule is about
 compute-d/compute-a's `vq admin update`-managed checkouts; on pbs-cluster we own provisioning,
 but if pbs-cluster becomes a daemon-managed Arch-1 host the same discipline applies.)
 
-## 12. Testing without a cluster (mandatory — I can't reach pbs-cluster)
+## 12. Testing without a cluster
 
 All logic is unit-tested against a **mock scheduler**: fake `qsub`/`qstat`/`qdel`
 shims on `PATH` (mirroring how `tests/` already fakes `systemd-run`/subprocess) that
@@ -313,25 +292,17 @@ the test matrix logs which dialects are covered.
 4. **`vq scheduler-probe`** (DONE `6422fb8e`, live-validated against pbs-cluster) + the
    user-facing docs (hosts.md, agent_interaction.md recipe row) after real-pbs-cluster
    validation.
-5. **Validate on pbs-cluster** (maintainer-run smoke, blocked on the heatwave shutdown),
+5. **Validate on pbs-cluster** (operator-run smoke),
    then CHANGELOG/SPEC §8 update (mark the v1.0 backend "shipped, PBS/SGE
    dialects").
 
-## 14. Open questions (gating — see chat)
+## 14. Site qualification
 
-1. ~~Login-node persistence policy on pbs-cluster~~ → **RESOLVED: Arch 2** (no
-   persistent process on pbs-cluster; daemon on compute-d drives qsub over SSH).
-2. ~~Scheduler dialect~~ → **RESOLVED: TORQUE 2.5.12** (probed 2026-06-07, §16).
-   Increment 2 targets the Torque dialect first (`-l nodes=1:ppn=N`, qstat Q/R/C,
-   `qstat -f` `exit_status`); PBS Pro / SGE remain future dialects.
-3. ~~Site submit requirements — queue name(s), account/project string?~~ →
-   **RESOLVED (2026-06-24, read-only probe):** the compute queue + account are
-   captured in the maintainer's local provisioning notes and carried via
-   `submit_extra` (rendered as `#PBS -q`/`-A` directives). Default walltime/mem
-   caps not yet pinned — supplied per-job for now.
-4. Apptainer available on pbs-cluster, or source-build under modules? → **source-build
-   under a private Miniforge** (no Apptainer/conda/modules on pbs-cluster; §16). Owned by
-   the `install-cluster` workstream; blocked on the GitLab read-only deploy key.
+Before deployment, verify login-node process policy, scheduler dialect, queue
+and account requirements, default resource limits, and the available build or
+container environment. Record the answers in private provisioning configuration.
+Use `submit_extra` for the site's queue and account directives and qualify the
+chosen runtime installation method before accepting work.
 
 ## 15. Risks
 
@@ -341,45 +312,12 @@ the test matrix logs which dialects are covered.
   suite + a maintainer smoke recipe + experimental gating until validated.
 - Dialect guess wrong → mis-resourced jobs; mitigated by explicit config + probe.
 
-## 16. pbs-cluster environment (probed 2026-06-07)
+## 16. Scheduler environment qualification
 
-Captured by `pbs-cluster-probe.sh` on the login node. Drives Increment 2 (dialect) and
-the separate `install-cluster` provisioning workstream.
-
-- **Scheduler:** **TORQUE 2.5.12** (`/usr/local/bin/{qsub,qstat,qdel,qhold,qalter,qmgr,pbsnodes}`;
-  `pbs_version = 2.5.12`). Map: `cpus → -l nodes=1:ppn=N`, `mem → -l mem=Nmb` (or
-  `pmem`), `wall → -l walltime=HH:MM:SS`, `queue → -q <q>`, array → `-t`, name → `-N`.
-  qstat states Q/R/C/E/H/W; rc via `qstat -f <id>` `exit_status` (lingers briefly —
-  our exit-marker file stays the rc source of truth).
-  **`-l mem=` warning (BUG 118, probed live 2026-08-06):** pbs-cluster's pbs_mom applies
-  `Resource_List.mem` as a **hard per-process `RLIMIT_DATA` + `RLIMIT_RSS`** equal
-  to the request (verified via an in-job `/proc/self/limits`: `mem=14733mb` →
-  `Max data size = 15448670208` hard). On pbs-cluster's 6.5 kernels `RLIMIT_DATA` counts
-  mmap allocations, so a tightly-sized request kills the payload with
-  `std::bad_alloc` while the node has free RAM. pbs-cluster's server/queues define no
-  `resources_max` (mem is not an admission constraint there), and local users
-  submit without `-l mem` entirely. Host config
-  `scheduler_mem_directive = "omit"` drops the directive for such sites;
-  `mem_mb` still drives vq-side accounting and `VQ_MEM_MB`.
-- **Queues:** a small default login queue plus a workhorse compute queue (multi-core
-  nodes, tens of GB RAM, no GPU), and several other site queues bound to host sets via
-  `acl_hosts`. The concrete queue and node names are configured locally, not here.
-- **Login node:** a small, older front-end (a few cores, ~15 GB, an out-of-date toolchain) — too weak for builds; submit heavy work to compute nodes via qsub.
-- **Toolchain:** gcc/g++/gfortran **7.5.0** (too old for modern libint/libecpint —
-  bring our own), cmake 3.28.3, make 4.2.1, ninja 1.10, binutils 2.43, glibc 2.38.
-- **Modules:** Lmod 8.7.34 present, **no useful modules** — don't rely on `module load`.
-- **Python:** system 3.6.15 + **3.12.11**; no 3.13/3.14. Target 3.14 via Miniforge.
-- **Pkg mgrs / containers:** none (no conda/mamba/spack/apptainer/singularity/docker).
-- **Filesystem:** `/home` **19 TB shared, 8 TB free** (assume NFS to compute nodes —
-  verify with a smoke qsub job); no dedicated `/scratch`, no `$SCRATCH`/`$TMPDIR`.
-- **Internet:** login node has **direct egress** (pypi/conda/github/`source-host.invalid`
-  reachable; `git ls-remote …/mpei/vibeqc.git` works; no proxy). **Compute nodes:
-  assume offline** — fetch on login, run offline on compute nodes reading `/home`.
-
-**Provisioning implication:** Miniforge on the login node (Python 3.14 + modern
-gcc/gfortran/cmake), git clone dev(`main`) + release(`release`) under `/home`, then
-run the existing `scripts/install.sh` **on a compute node via qsub** (login node too
-weak). Owned by the `install-cluster` / `update-cluster` workstream, not this one.
+Before provisioning, record the scheduler dialect, software modules, filesystem
+sharing, resource limits and compute-node network access in external operator
+configuration. Probe the intended site and preserve the receipt privately.
+Do not infer current capacity or installed software from this design document.
 
 ## 17. Daemon + submit integration (the wiring) — IMPLEMENTED, validation pending
 
@@ -421,8 +359,7 @@ additive and experimental-gated. Crucially it **skips** cgroup / `systemd-run` /
 priv-drop entirely (the scheduler runs the job as the user on the compute node),
 so it is fully **Mac-mockable**: new daemon tests drive `_start_job` →
 reconcile → terminal → fetch with a mock `SchedulerDispatcher` and a
-`scheduler_target` spec, no SSH/Linux/cluster. Real-pbs-cluster validation lands when
-the cluster returns from its heatwave shutdown.
+`scheduler_target` spec, no SSH/Linux/cluster. Qualify the scheduler path with an operator-run smoke test on the intended site.
 
 **The one decision (the driver-daemon model).** Where does a pbs-cluster-targeted spec
 get dispatched?

@@ -14,12 +14,15 @@ format is a breaking change.
 * [Agent interaction protocol](../agent_interaction.md) — the primary
   document. Stable JSON shapes, the verbs worth calling, and the patterns that
   survive a daemon restart.
+* [Driving vq from a script](../orchestration.md) — the contract for an
+  unattended caller of `vq admin update`: match on `outcome` and the exit code
+  it maps to, never on message text.
 * [Design invariants (SPEC)](../SPEC.md) — what vq guarantees and, as
   importantly, what it deliberately does not.
 * [Version compatibility](../version_compatibility.md) — vq to vibe-qc
   version mapping, and the state-format contract between daemon generations.
-* [Chat onboarding](../chat-onboarding.md) — the orientation an agent needs
-  before its first submission.
+* [Running jobs](../user/index.md) — the submit, watch and fetch basics, for
+  the orientation before a first submission.
 * [Prompt fragments](../agent_prompts.md) — reusable text for agents that
   drive vq.
 
@@ -53,7 +56,7 @@ for exactly this reason: absent evidence is not negative evidence.
 :hidden:
 
 ../agent_interaction
+../orchestration
 ../SPEC
-../chat-onboarding
 ../agent_prompts
 ```

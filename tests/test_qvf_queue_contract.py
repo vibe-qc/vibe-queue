@@ -408,12 +408,13 @@ def test_scheduler_qvf_auto_snapshots_registered_full_sha(
     )
     monkeypatch.setenv(config.ENV_CONFIG_DIR, str(cfg_dir))
     sha = "a" * 40
+    launcher = f"/cluster/runtime/releases/{sha}/source/.venv/bin/python"
     payload = json.dumps(
         [
             {
                 "name": "vibeqc-dev",
                 "kind": "venv",
-                "python": "/cluster/bin/vibeqc-dev-python",
+                "python": launcher,
                 "current_git_sha_full": sha,
                 "import_version": "0.15.59",
             }
@@ -433,7 +434,7 @@ def test_scheduler_qvf_auto_snapshots_registered_full_sha(
 
     assert pin is not None
     assert pin.expected_git_sha == sha
-    assert pin.resolved_executable == "/cluster/bin/vibeqc-dev-python"
+    assert pin.resolved_executable == launcher
 
 
 def test_artifact_only_fetch_returns_no_queue_sidecars(tmp_path: Path) -> None:

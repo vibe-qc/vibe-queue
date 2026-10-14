@@ -1,5 +1,7 @@
 # vq cgroup setup - delegation and fallback detection
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 Cgroups v2 provide **kernel-level enforcement** of per-job CPU and
 memory limits. When configured, each dispatched job runs inside a
 transient systemd scope (`vq-job-<jobid>.scope`) that the kernel

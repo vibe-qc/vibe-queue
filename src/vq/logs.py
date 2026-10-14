@@ -784,6 +784,8 @@ def show_events(
     jobid: str,
     *,
     multi_user: bool = False,
+    kinds: tuple[str, ...] = (),
+    tail: int = 0,
 ) -> str:
     """Render ``jobid``'s event timeline as text (one line per event)."""
     if not is_local_host(host):
@@ -793,8 +795,10 @@ def show_events(
     from vq.events import read_events  # noqa: PLC0415 — keep events.py light
 
     _spec_path, spec = _resolve_spec(jobid, multi_user=multi_user)
-    events = read_events(Path(spec.cwd))
+    events = read_events(Path(spec.cwd), kinds=kinds, tail=tail)
     if not events:
+        if kinds:
+            return f"no matching events recorded for {jobid}"
         return (
             f"no events recorded for {jobid} "
             "(pre-v0.6.54 job, or the workspace was cleaned up)"
@@ -807,6 +811,8 @@ def show_events_json(
     jobid: str,
     *,
     multi_user: bool = False,
+    kinds: tuple[str, ...] = (),
+    tail: int = 0,
 ) -> str:
     """Emit ``jobid``'s event timeline as a JSON object."""
     if not is_local_host(host):
@@ -817,7 +823,7 @@ def show_events_json(
 
     _spec_path, spec = _resolve_spec(jobid, multi_user=multi_user)
     return json.dumps(
-        {"jobid": jobid, "events": read_events(Path(spec.cwd))},
+        {"jobid": jobid, "events": read_events(Path(spec.cwd), kinds=kinds, tail=tail)},
         indent=2,
         sort_keys=True,
     )
