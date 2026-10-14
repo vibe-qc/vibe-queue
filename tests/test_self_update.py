@@ -23,7 +23,7 @@ def _exact_target_ancestry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep command-shape tests focused beyond the real Git preflight."""
-    monkeypatch.setattr(admin, "_run_git_fetch_sha", lambda *args: (0, "fetched"))
+    monkeypatch.setattr(admin, "_run_git_fetch_sha", lambda *args, **kwargs: (0, "fetched"))
     monkeypatch.setattr(admin, "current_source_sha", lambda repo: CURRENT_SHA)
     monkeypatch.setattr(
         fleet_release,
@@ -135,7 +135,7 @@ def test_resolve_self_update_target_rejects_ambiguous_matches(
         admin.resolve_vq_self_update_target(cfg)
 
 
-def test_resolve_self_update_target_rejects_runtime_slot_before_ref_mutation(
+def test_resolve_self_update_target_checks_slot_admission_before_ref_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -150,8 +150,18 @@ def test_resolve_self_update_target_rejects_runtime_slot_before_ref_mutation(
         lambda unused: _probe(self_update=True),
     )
 
-    with pytest.raises(admin.AdminError, match="runtime_slot_root"):
+    calls = []
+
+    def refuse(configured, program, probe):
+        calls.append((configured, program, probe))
+        raise admin.AdminError("slot service binding is not proven")
+
+    from vq import runtime_daemon
+
+    monkeypatch.setattr(runtime_daemon, "admit", refuse)
+    with pytest.raises(admin.AdminError, match="slot service binding"):
         admin.resolve_vq_self_update_target(cfg)
+    assert calls[0][:2] == (cfg, target)
 
 
 @pytest.mark.parametrize(

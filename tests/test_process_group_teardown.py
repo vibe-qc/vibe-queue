@@ -7,7 +7,8 @@ phase deterministically: its only remaining member is a zombie child of the
 test process, which macOS keeps answering ``EPERM`` for until the test reaps
 it. Where the kernel lets a zombie-only group be signalled (Linux), there is
 no teardown ``EPERM`` to disambiguate and those tests skip; the fake-kernel
-tests pin the mechanism everywhere.
+tests pin the mechanism everywhere. The real-kernel fixture requires
+``os.waitid`` with ``WNOWAIT`` and skips before forking where unavailable.
 """
 from __future__ import annotations
 
@@ -111,6 +112,8 @@ def _zombie_held_group() -> Iterator[tuple[int, int]]:
     Yields (pgid, zombie pid). The zombie is reaped on exit if the test did
     not reap it itself.
     """
+    if not hasattr(os, "waitid"):
+        pytest.skip("os.waitid is required to hold an unreaped zombie")
     leader = os.fork()
     if leader == 0:  # pragma: no cover - child
         os.setpgid(0, 0)
@@ -290,3 +293,14 @@ class TestPauseAndResumeOfATearingDownGroup:
 
         assert "another user" not in str(caught.value), caught.value
         assert "is gone" in str(caught.value)
+
+
+def test_real_kernel_fixture_skips_without_waitid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(os, "waitid", raising=False)
+
+    def unexpected_fork() -> int:
+        pytest.fail("unsupported fixture must skip before spawning children")
+
+    monkeypatch.setattr(os, "fork", unexpected_fork)
+    with pytest.raises(pytest.skip.Exception, match="waitid"), _zombie_held_group():
+        pytest.fail("unsupported fixture must not yield")

@@ -382,6 +382,15 @@ _FLEET_ROUTES: list[RouteContract] = [
         0,
         False,
     ),
+    (
+        ("GET",),
+        "/api/v1/fleet/jobs/{jobid}/preview",
+        "api_fleet_job_preview",
+        True,
+        "default:JSONResponse",
+        0,
+        False,
+    ),
 ]
 
 
@@ -611,6 +620,8 @@ _FLEET_TEMPLATE_CONTEXTS = {
             "interval_seconds",
             "stale_after_seconds",
             "summary",
+            # #168: daemon health, dispatch and program eligibility per target.
+            "readiness",
         },
     ),
     "/fleet/_grid": (
@@ -628,20 +639,36 @@ _FLEET_TEMPLATE_CONTEXTS = {
             "interval_seconds",
             "stale_after_seconds",
             "summary",
+            # #168: daemon health, dispatch and program eligibility per target.
+            "readiness",
         },
     ),
     # v0.25.x added sortable columns: every rendered column is clickable,
     # since a header that looks like the others but does not respond
     # reads as a broken control.
+    # #64 B7: "broker" carries this host's broker jobs, metadata only, or
+    # None when the host is not a broker. The page alone renders it.
+    # #168: "summary", "coverage" and "format_duration" feed the calculation
+    # totals and banners inside the polled table fragment; "program_options"
+    # the program filter; "last_known" and "last_known_count" an unlisted
+    # host's last successful listing, kept apart from the totals; "trend" the
+    # console's sweep history and "host_load" each host against its budget.
     "/fleet/jobs": (
         "fleet_jobs.html",
         {
+            "broker",
+            "coverage",
             "daemon_pid",
             "daemon_running",
             "filtered_count",
+            "format_duration",
             "host_options",
             "identity",
+            "host_load",
             "jobs",
+            "last_known",
+            "last_known_count",
+            "program_options",
             "query",
             "row_limit_options",
             "shown_count",
@@ -649,16 +676,24 @@ _FLEET_TEMPLATE_CONTEXTS = {
             "sort_href",
             "sort_label",
             "state_options",
+            "summary",
             "table_refresh_url",
             "total_count",
+            "trend",
         },
     ),
     "/fleet/jobs/_table": (
         "fleet_jobs_table.html",
         {
+            "coverage",
             "filtered_count",
+            "format_duration",
             "host_options",
+            "host_load",
             "jobs",
+            "last_known",
+            "last_known_count",
+            "program_options",
             "query",
             "row_limit_options",
             "shown_count",
@@ -666,21 +701,27 @@ _FLEET_TEMPLATE_CONTEXTS = {
             "sort_label",
             "snapshot",
             "state_options",
+            "summary",
             "table_refresh_url",
             "total_count",
+            "trend",
         },
     ),
     "/fleet/jobs/contractjob?host=localhost": (
         "fleet_job_detail.html",
         {
             "can_act",
+            "chart",
             "daemon_pid",
             "daemon_running",
             "detail",
             "error",
+            # #168: the finished job's measured usage, from its receipt.
+            "final_usage",
             "flash",
             "identity",
             "jobid",
+            "preview",
             "queue_host",
         },
     ),
@@ -813,6 +854,7 @@ def test_core_and_warming_fleet_response_contract(
         "warming_up": True,
         "count": 0,
         "jobs": [],
+        "last_known": [],
     }
 
 
@@ -890,6 +932,7 @@ def test_fleet_jobs_api_preserves_ignored_row_limit(
         ("get", "/api/v1/fleet/doctor"),
         ("get", "/api/v1/fleet/jobs"),
         ("get", "/api/v1/fleet/audit"),
+        ("get", "/api/v1/fleet/jobs/job000000001/preview?host=localhost"),
     ],
 )
 def test_fleet_fragment_and_api_auth_gate_contract(

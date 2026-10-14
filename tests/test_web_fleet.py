@@ -124,7 +124,7 @@ class TestFleetPages:
                 running_cpus=8,
                 max_cpus=16,
             ),
-            jobs=[_row("marsjob00001", "host_a")],
+            jobs=[_row("hostjob00001", "host_a")],
         )
         bad_host = fleet_mod.HostSnapshot(
             host="host_d",
@@ -155,7 +155,7 @@ class TestFleetPages:
                 fleet_mod.HostSnapshot(
                     host="host_a",
                     overview=HostOverview(host="host_a", vq_version="0.15.57"),
-                    jobs=[_row("marsjob00001", "host_a")],
+                    jobs=[_row("hostjob00001", "host_a")],
                 )
             )
         )
@@ -176,9 +176,9 @@ class TestFleetJobsTable:
                     host="host_a",
                     overview=HostOverview(host="host_a"),
                     jobs=[
-                        _row("marsrun00001", "host_a", state="running"),
+                        _row("hostrun00001", "host_a", state="running"),
                         _row(
-                            "marsfail0001",
+                            "hostfail0001",
                             "host_a",
                             state="failed",
                             submitter="alice",
@@ -191,7 +191,7 @@ class TestFleetJobsTable:
                     overview=HostOverview(host="host_f"),
                     jobs=[
                         _row(
-                            "twinpend0001",
+                            "hostpend0001",
                             "host_f",
                             state="pending",
                             scheduler_state="queued",
@@ -206,31 +206,31 @@ class TestFleetJobsTable:
     def test_all_jobs_render(self, seeded: TestClient) -> None:
         r = seeded.get("/fleet/jobs")
         assert r.status_code == 200
-        for jid in ("marsrun00001", "marsfail0001", "twinpend0001"):
+        for jid in ("hostrun00001", "hostfail0001", "hostpend0001"):
             assert jid in r.text
 
     def test_filter_by_host(self, seeded: TestClient) -> None:
         r = seeded.get("/fleet/jobs", params={"host": "host_f"})
-        assert "twinpend0001" in r.text
-        assert "marsrun00001" not in r.text
+        assert "hostpend0001" in r.text
+        assert "hostrun00001" not in r.text
 
     def test_filter_by_state(self, seeded: TestClient) -> None:
         r = seeded.get("/fleet/jobs", params={"state": "failed"})
-        assert "marsfail0001" in r.text
-        assert "marsrun00001" not in r.text
+        assert "hostfail0001" in r.text
+        assert "hostrun00001" not in r.text
 
     def test_filter_by_tag_and_submitter(self, seeded: TestClient) -> None:
         r = seeded.get("/fleet/jobs", params={"tag": "pr-request"})
-        assert "marsfail0001" in r.text
-        assert "twinpend0001" not in r.text
+        assert "hostfail0001" in r.text
+        assert "hostpend0001" not in r.text
         r = seeded.get("/fleet/jobs", params={"submitter": "alice"})
-        assert "marsfail0001" in r.text
-        assert "marsrun00001" not in r.text
+        assert "hostfail0001" in r.text
+        assert "hostrun00001" not in r.text
 
     def test_free_text_search(self, seeded: TestClient) -> None:
         r = seeded.get("/fleet/jobs", params={"q": "rp207"})
-        assert "twinpend0001" in r.text
-        assert "marsrun00001" not in r.text
+        assert "hostpend0001" in r.text
+        assert "hostrun00001" not in r.text
 
     def test_jobs_api_filters(self, seeded: TestClient) -> None:
         payload = seeded.get(
@@ -238,7 +238,7 @@ class TestFleetJobsTable:
         ).json()
         assert payload["count"] == 2
         ids = {row["id"] for row in payload["jobs"]}
-        assert ids == {"marsrun00001", "marsfail0001"}
+        assert ids == {"hostrun00001", "hostfail0001"}
 
 
 class TestGatherLocal:
@@ -379,7 +379,7 @@ class TestGatherLocal:
         configured scheduler host (they render under that host)."""
         _write_spec("localown0001", state=JobState.RUNNING)
         _write_spec(
-            "twinowned001", state=JobState.PENDING, scheduler_target="host_f"
+            "hostowned001", state=JobState.PENDING, scheduler_target="host_f"
         )
         jobs, err = fleet_mod._gather_host_jobs(
             "localhost",
@@ -393,7 +393,7 @@ class TestGatherLocal:
     def test_scheduler_host_reads_driver_specs(self, web_state: Path) -> None:
         _write_spec("localown0001", state=JobState.RUNNING)
         host_f_spec = _write_spec(
-            "twinowned001", state=JobState.PENDING, scheduler_target="host_f"
+            "hostowned001", state=JobState.PENDING, scheduler_target="host_f"
         )
         host_f_cfg = config.HostConfig(
             ssh="host_f-login",
@@ -819,6 +819,10 @@ def test_fleet_reads_remote_driver_once_without_collapsing_distinct_job_ids(web_
 
     def remote_vq(host, *args, **kwargs):
         reads.append(args)
+        # #168: the driver runs a direct job, so its resource samples are
+        # read too -- once for the whole driver, never once per job.
+        if args == ('top', 'localhost', '--json'):
+            return SimpleNamespace(stdout='[]')
         assert args == ('queue', 'localhost', '--json')
         return SimpleNamespace(stdout=payload)
 
@@ -833,7 +837,8 @@ def test_fleet_reads_remote_driver_once_without_collapsing_distinct_job_ids(web_
                             host=host, queue_counts={'running': 999}, running_cpus=999))
     snapshot = fleet_mod.gather_fleet_snapshot(_shared_driver_config('driver'))
     hosts = {h.host: h for h in snapshot.hosts}
-    assert len(reads) == 1 and overview_reads == ['driver']
+    assert reads == [('queue', 'localhost', '--json'), ('top', 'localhost', '--json')]
+    assert overview_reads == ['driver']
     assert len(validations) == len(remote)
     assert hosts['driver'].overview.running_cpus == 3
     assert hosts['alpha'].overview.running_cpus == 8

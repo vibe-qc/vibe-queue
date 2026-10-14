@@ -29,6 +29,26 @@ from vq import paths
 from vq.daemon import Daemon, _RunningJob
 from vq.spec import JobSpec, JobState, utcnow_iso
 
+# Budget for a wait that only has to tell "it exited" from "it is stuck": the
+# spin loops below, and every reap that follows a SIGKILL. A liveness guard. It
+# exists so a genuine hang fails the test instead of blocking the suite, and its
+# value carries no meaning beyond "longer than this is certainly broken" -- a
+# healthy run clears every one of them in milliseconds. It is not a timing
+# claim, and nothing in this module may assert on it.
+#
+# **It has a ceiling.** Every process these tests spawn sleeps 60 s and then
+# exits by itself. A budget at or above that would let a `wait()` after a
+# `kill()` return because the sleep finished rather than because the kill
+# landed, so a kill that never worked would report success -- the exact failure
+# this module exists to catch. Thirty seconds is half the self-exit and fifteen
+# times the 2 s reaping budgets it replaces (#41), so it stays generous and
+# keeps discriminating. Raising it means raising those sleeps first.
+#
+# tests/test_orphan_kill_escalation.py and
+# tests/test_scoped_admin_update_hold.py both reach for this constant by
+# name; keep it.
+_LIVENESS_SECONDS = 30.0
+
 
 # A command that installs SIG_IGN for SIGTERM, touches a readiness file, then
 # sleeps — i.e. it ignores the `vq kill` SIGTERM and only dies to SIGKILL. The
@@ -61,7 +81,7 @@ def daemon(tmp_path: Path) -> Iterator[Daemon]:
     for rj in d._running.values():
         with contextlib.suppress(Exception):
             rj.popen.kill()
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         rj.close_logs()
 
 
@@ -149,7 +169,7 @@ class TestState3KillEscalation:
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
 
     def test_running_job_not_killed_is_left_alone(
         self, daemon: Daemon, monkeypatch: pytest.MonkeyPatch
@@ -168,7 +188,7 @@ class TestState3KillEscalation:
             assert daemon._running[jobid].term_deadline is None
         finally:
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
 
 def _spawn_detached(stdout: int = subprocess.DEVNULL) -> subprocess.Popen[bytes]:
@@ -218,7 +238,7 @@ class TestState2StartupReap:
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
 
     def test_recycled_pgid_is_not_reaped(
         self, daemon: Daemon, monkeypatch: pytest.MonkeyPatch
@@ -250,7 +270,7 @@ class TestState2StartupReap:
             assert proc.poll() is None, "a recycled pgid must NOT be reaped"
         finally:
             proc.kill()
-            proc.wait(timeout=2)
+            proc.wait(timeout=_LIVENESS_SECONDS)
 
 
 class TestScopeReaping:
@@ -316,7 +336,7 @@ class TestScopeReaping:
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.wait(timeout=2)
+                proc.wait(timeout=_LIVENESS_SECONDS)
 
     def test_a_retry_reaps_the_attempts_scope(
         self, dispatching_daemon: Daemon, monkeypatch: pytest.MonkeyPatch
@@ -363,9 +383,6 @@ _SIGTERM_IGNORING_LOCK_COMMAND = (
     "held = open('held', 'w'); fcntl.flock(held, fcntl.LOCK_EX); "
     "pathlib.Path('started').touch(); time.sleep(60)"
 )
-# Bounds spin loops so a hang fails instead of blocking the suite; not a timing claim.
-_LIVENESS_SECONDS = 30.0
-
 # How far below the SIGKILL grace an ordinary kill must release its slot. The
 # boundary test's claim is "did not wait out the grace", so its ceiling is the
 # grace less this margin, not a fixed five seconds that a loaded host can miss
@@ -441,7 +458,7 @@ def dispatching_daemon(
         # cannot name anyone else.
         rj.popen.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         rj.close_logs()
 
 
@@ -452,9 +469,26 @@ def _dispatch_started(
     retry_max: int = 0,
     command: str = _LOCK_HOLDING_COMMAND,
     cpus: int = 1,
+    command_exits: bool = False,
 ) -> JobSpec:
-    """Dispatch a lock-holding command; return its RUNNING spec once the lock
-    is held, so the group has a member besides its leader."""
+    """Dispatch a lock-holding command; return its spec once the lock is held,
+    so the group has a member besides its leader.
+
+    ``started`` is touched only after the lock has been taken, so it is the
+    readiness signal for every caller. The state that accompanies it is not.
+    A command that holds the lock itself is still RUNNING when the lock
+    appears, and that is pinned.
+
+    ``command_exits`` says the caller's command releases the group to a
+    background child and then exits by design (``_BACKGROUNDING_COMMAND``).
+    The wrapper waits only for that foreground command, so the whole chain
+    -- child touches ``started``, command exits, wrapper exits -- can complete
+    inside the one ``iterate()`` that runs while the loop below is between
+    two checks of ``started``. ``_reconcile_running()`` leads that pass, so
+    the spec the loop then reads is already COMPLETED. Both orderings are
+    correct and which one a caller gets is scheduling work that widens under
+    load (#46), so this accepts either rather than pinning the coin flip.
+    """
     workspace = daemon.jobs_dir / jobid
     workspace.mkdir(parents=True, exist_ok=True)
     JobSpec(
@@ -470,7 +504,16 @@ def _dispatch_started(
         daemon.iterate()
         time.sleep(0.02)
     spec = JobSpec.read(daemon._spec_path(jobid))
-    assert spec.state == JobState.RUNNING
+    # A command that exits by design has nothing left to fail on: COMPLETED is
+    # its clean exit, and FAILED or SUSPENDED stay rejected either way.
+    started_states = (
+        (JobState.RUNNING, JobState.COMPLETED) if command_exits else (JobState.RUNNING,)
+    )
+    assert spec.state in started_states, (
+        f"job {jobid} is {spec.state.value} once the lock is held"
+    )
+    # Kept unconditional: the caller tears the group down by this pgid, and a
+    # finish records the outcome without clearing the run-instance fields.
     assert spec.pid is not None and spec.pid == spec.pgid
     return spec
 
@@ -632,7 +675,9 @@ class TestRunningGroupReap:
         outlive it."""
         daemon = dispatching_daemon
         jobid = "bgwrap01"
-        running = _dispatch_started(daemon, jobid, command=_BACKGROUNDING_COMMAND)
+        running = _dispatch_started(
+            daemon, jobid, command=_BACKGROUNDING_COMMAND, command_exits=True
+        )
         assert running.pgid is not None
         try:
             final = _drive(daemon, jobid, lambda _s: jobid not in daemon._running)
