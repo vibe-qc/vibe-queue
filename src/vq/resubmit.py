@@ -279,11 +279,9 @@ def resubmit_local(
         ),
         branch=source.branch,
         program=source.program,
+        qvf_artifact_name=source.qvf_artifact_name,
         program_runtime_pin=(
-            source.program_runtime_pin.model_copy(
-                update={"resolved_git_sha": None},
-                deep=True,
-            )
+            source.program_runtime_pin.without_resolution()
             if source.program_runtime_pin is not None
             else None
         ),

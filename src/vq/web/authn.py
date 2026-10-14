@@ -62,6 +62,32 @@ MAX_SESSIONS_PER_USER = 32
 MAX_LOGIN_USER_LENGTH = 128
 MAX_LOGIN_PASSWORD_LENGTH = 1024
 
+SESSION_DB_BUSY_TIMEOUT_SECONDS = 15.0
+"""How long a session-store statement waits for another writer to finish.
+
+``sqlite3.connect(timeout=...)`` sets the connection's ``busy_timeout``, so
+this covers every statement on it rather than only the first lock acquisition.
+
+It was 2 s, and CI exceeded it: pipeline 5703 job 12025 failed
+``test_concurrent_first_sessions_share_one_complete_secret`` with
+``database is locked`` on a commit that was otherwise healthy, and a hand retry
+of the same job at the same SHA passed. The contention is real rather than a
+test artefact -- ``vq web`` workers are separate processes, so their writers are
+not smoothed out by the GIL, and every session operation opens a fresh
+connection through :func:`_auth_db`.
+
+Measured on a 12-core development machine: the worst single call was 0.213 s
+with 12 concurrent worker processes on an idle machine and 0.884 s with 32
+under load average 64. So 2 s was only about twice the worst contention this
+machine could produce, and a busier runner crossed it; at a 0.5 s budget the
+same 32-worker run reproduces ``database is locked`` at a 1.6% rate.
+
+15 s is about 17x that worst measured wait, while staying well under the client
+and proxy timeouts that would turn a slow lock into a dropped request, so a
+genuinely wedged database still surfaces as an error rather than hanging. The
+cost is latency only when the lock is actually contended, and this blocking
+work already runs in a worker thread rather than on the event loop (#60)."""
+
 
 class LoginRateLimited(Exception):
     def __init__(self, retry_after: int) -> None:
@@ -91,7 +117,7 @@ def _auth_db() -> Iterator[sqlite3.Connection]:
             raise PermissionError("session database must be an owned private regular file (0600)")
     finally:
         os.close(fd)
-    db = sqlite3.connect(path, timeout=2)
+    db = sqlite3.connect(path, timeout=SESSION_DB_BUSY_TIMEOUT_SECONDS)
     try:
         db.execute("PRAGMA trusted_schema=OFF")
         db.execute("CREATE TABLE IF NOT EXISTS sessions "

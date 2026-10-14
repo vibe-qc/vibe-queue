@@ -471,11 +471,16 @@ class TestDaemonHook:
         )
 
         d = Daemon(max_cpus=4, max_jobs=1, max_mem_mb=None)
+        # #90: while busy the sweep runs out of process instead.
+        spawned: list[bool] = []
+        monkeypatch.setattr(d, "_spawn_auto_cleanup_child", lambda: spawned.append(True))
         active = {"live-job": object()}
         setattr(d, active_collection, active)
 
         d._maybe_auto_cleanup()
         assert calls == []
+        assert spawned == [True]
+        d._auto_cleanup_child = None
 
         active.clear()
         d._maybe_auto_cleanup()

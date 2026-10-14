@@ -27,20 +27,24 @@ _UID = 1000
 @pytest.fixture
 def storage_roots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path]:
     single_root = tmp_path / "single-state"
+    single_scratch = tmp_path / "single-scratch"
     multi_root = tmp_path / "multi-state"
+    multi_scratch = tmp_path / "multi-scratch"
     archive_root = tmp_path / "single-archive"
     monkeypatch.setenv(paths.ENV_STATE_DIR, str(single_root))
+    monkeypatch.setenv(paths.ENV_SCRATCH_DIR, str(single_scratch))
     monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(multi_root))
+    monkeypatch.setenv(paths.ENV_MULTI_USER_SCRATCH_ROOT, str(multi_scratch))
     monkeypatch.setenv(paths.ENV_ARCHIVE_DIR, str(archive_root))
-    return single_root, multi_root, archive_root
+    return single_root, single_scratch, multi_root, multi_scratch, archive_root
 
 
 @pytest.fixture(params=("single", "multi"))
 def layout_spec_path(
     request: pytest.FixtureRequest,
-    storage_roots: tuple[Path, Path, Path],
+    storage_roots: tuple[Path, Path, Path, Path, Path],
 ) -> Path:
     if request.param == "single":
         return paths.spec_path(_JOB_ID)
@@ -65,44 +69,64 @@ def _hold_lock(spec_path: Path) -> int:
 
 
 def test_single_user_path_matrix(
-    storage_roots: tuple[Path, Path, Path],
+    storage_roots: tuple[Path, Path, Path, Path, Path],
 ) -> None:
-    single_root, _multi_root, archive_root = storage_roots
+    single_root, single_scratch, _multi, _multi_scratch, archive_root = storage_roots
 
+    # #63: jobs/ and workdirs/ hang off the scratch root, queue/ and the
+    # archive off the durable state root. state_jobs_dir/state_workdir_root
+    # keep naming where they used to be, because a job that recorded a path
+    # there keeps it.
     assert {
         "queue": paths.queue_dir(),
         "spec": paths.spec_path(_JOB_ID),
+        "scratch": paths.scratch_root(),
         "jobs": paths.jobs_dir(),
         "workspace": paths.workspace_dir(_JOB_ID),
         "archive": paths.archive_dir(),
         "archive_file": paths.archive_path(_JOB_ID),
         "workdirs": paths.workdir_root(),
         "workdir": paths.workdir_for(_JOB_ID),
+        "state_jobs": paths.state_jobs_dir(),
+        "state_workdirs": paths.state_workdir_root(),
         "lock": paths.spec_lock_path(paths.spec_path(_JOB_ID)),
     } == {
         "queue": single_root / "queue",
         "spec": single_root / "queue" / f"{_JOB_ID}.json",
-        "jobs": single_root / "jobs",
-        "workspace": single_root / "jobs" / _JOB_ID,
+        "scratch": single_scratch,
+        "jobs": single_scratch / "jobs",
+        "workspace": single_scratch / "jobs" / _JOB_ID,
         "archive": archive_root,
         "archive_file": archive_root / f"{_JOB_ID}.tar.bz2",
-        "workdirs": single_root / "workdirs",
-        "workdir": single_root / "workdirs" / _JOB_ID,
+        "workdirs": single_scratch / "workdirs",
+        "workdir": single_scratch / "workdirs" / _JOB_ID,
+        "state_jobs": single_root / "jobs",
+        "state_workdirs": single_root / "workdirs",
         "lock": single_root / "queue" / f"{_JOB_ID}.json.lock",
     }
+    assert paths.managed_jobs_roots() == (
+        single_scratch / "jobs",
+        single_root / "jobs",
+    )
+    assert paths.managed_workdir_roots() == (
+        single_scratch / "workdirs",
+        single_root / "workdirs",
+    )
 
 
 @pytest.mark.parametrize("uid", (_UID, str(_UID)))
 def test_multi_user_path_matrix(
     uid: int | str,
-    storage_roots: tuple[Path, Path, Path],
+    storage_roots: tuple[Path, Path, Path, Path, Path],
 ) -> None:
-    _single_root, multi_root, _archive_root = storage_roots
+    _single, _single_scratch, multi_root, multi_scratch, _archive = storage_roots
     owner_root = multi_root / "users" / str(_UID)
+    owner_scratch = multi_scratch / "users" / str(_UID)
     spec_path = paths.user_spec_path(uid, _JOB_ID)
 
     assert {
         "user": paths.user_dir(uid),
+        "user_scratch": paths.user_scratch_dir(uid),
         "queue": paths.user_queue_dir(uid),
         "spec": spec_path,
         "jobs": paths.user_jobs_dir(uid),
@@ -111,23 +135,28 @@ def test_multi_user_path_matrix(
         "archive_file": paths.user_archive_dir(uid) / f"{_JOB_ID}.tar.bz2",
         "workdirs": paths.user_workdir_root(uid),
         "workdir": paths.user_workdir(uid, _JOB_ID),
+        "state_jobs": paths.user_state_jobs_dir(uid),
+        "state_workdirs": paths.user_state_workdir_root(uid),
         "lock": paths.spec_lock_path(spec_path),
     } == {
         "user": owner_root,
+        "user_scratch": owner_scratch,
         "queue": owner_root / "queue",
         "spec": owner_root / "queue" / f"{_JOB_ID}.json",
-        "jobs": owner_root / "jobs",
-        "workspace": owner_root / "jobs" / _JOB_ID,
+        "jobs": owner_scratch / "jobs",
+        "workspace": owner_scratch / "jobs" / _JOB_ID,
         "archive": owner_root / "archive",
         "archive_file": owner_root / "archive" / f"{_JOB_ID}.tar.bz2",
-        "workdirs": owner_root / "workdirs",
-        "workdir": owner_root / "workdirs" / _JOB_ID,
+        "workdirs": owner_scratch / "workdirs",
+        "workdir": owner_scratch / "workdirs" / _JOB_ID,
+        "state_jobs": owner_root / "jobs",
+        "state_workdirs": owner_root / "workdirs",
         "lock": owner_root / "queue" / f"{_JOB_ID}.json.lock",
     }
 
 
 def test_same_job_id_has_owner_qualified_lock_paths(
-    storage_roots: tuple[Path, Path, Path],
+    storage_roots: tuple[Path, Path, Path, Path, Path],
 ) -> None:
     _ = storage_roots
     first = paths.user_spec_path(1000, _JOB_ID)
@@ -138,9 +167,9 @@ def test_same_job_id_has_owner_qualified_lock_paths(
 
 
 def test_known_uid_zero_resolves_without_existing_tree(
-    storage_roots: tuple[Path, Path, Path],
+    storage_roots: tuple[Path, Path, Path, Path, Path],
 ) -> None:
-    _single_root, multi_root, _archive_root = storage_roots
+    _single, _single_scratch, multi_root, _multi_scratch, _archive = storage_roots
     assert paths.resolve_spec_path(_JOB_ID, multi_user=True, uid=0) == (
         multi_root / "users" / "0" / "queue" / f"{_JOB_ID}.json"
     )
@@ -260,7 +289,7 @@ def test_failed_replace_preserves_spec_and_removes_temp(
 
 
 def test_readonly_lock_fallback_is_permissionerror_only(
-    storage_roots: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+    storage_roots: tuple[Path, Path, Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _ = storage_roots
     spec_path = paths.user_spec_path(_UID, _JOB_ID)
@@ -289,7 +318,7 @@ def test_readonly_lock_fallback_is_permissionerror_only(
 
 
 def test_nonpermission_lock_open_error_propagates_without_fallback(
-    storage_roots: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+    storage_roots: tuple[Path, Path, Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _ = storage_roots
     spec_path = paths.user_spec_path(_UID, _JOB_ID)

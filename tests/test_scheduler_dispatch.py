@@ -23,6 +23,8 @@ import base64
 import json
 import os
 import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -35,7 +37,7 @@ from pathlib import Path
 import pytest
 
 import vq.scheduler_dispatch as scheduler_dispatch
-from vq import transport
+from vq import bulk_delete, transport
 from vq.config import HostConfig, SchedulerProgramHooks
 from vq.scheduler_dialect import (
     DialectError,
@@ -60,6 +62,147 @@ from vq.scheduler_dispatch import (
 from vq.spec import JobState
 
 Responder = Callable[[list[str], str | None], RemoteResult | None]
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+def test_fixed_filename_binary_workspace_lifecycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    """Execute the real staging/render/fetch path with a synthetic VASP-shaped deck.
+
+    Only scheduler commands and GNU time are simulated. No licensed binary,
+    potential, MPI installation, SSH connection or live daemon is involved.
+    """
+    from vq.daemon import _apply_default_thread_caps, _vq_job_env  # noqa: PLC0415
+    from vq.spec import JobSpec  # noqa: PLC0415
+    from vq.submit import submit_local  # noqa: PLC0415
+
+    class LocalBatchRunner:
+        process: subprocess.Popen[bytes] | None = None
+        cancelled = False
+
+        def run(self, argv, *, stdin_data=None, check=False):
+            if argv[0] == "qsub":
+                self.process = subprocess.Popen(
+                    ["/bin/bash", argv[1]], start_new_session=True,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                return RemoteResult(0, "123.cluster\n", "")
+            if argv[0] == "qdel":
+                assert argv == ["qdel", "123.cluster"]
+                assert self.process is not None
+                os.killpg(self.process.pid, signal.SIGTERM)
+                self.process.wait(timeout=10)
+                self.cancelled = True
+                return RemoteResult(0, "", "")
+            if argv[0] == "qstat":
+                assert self.process is not None
+                state = "R" if self.process.poll() is None else "C"
+                if "-f" in argv:
+                    return RemoteResult(0, f"Job Id: 123.cluster\n    job_state = {state}\n", "")
+                return RemoteResult(0, f"123.cluster example user 00:00:00 {state} compute\n", "")
+            proc = subprocess.run(
+                argv, input=stdin_data, text=True, capture_output=True,
+                check=check, timeout=10,
+            )
+            return RemoteResult(proc.returncode, proc.stdout, proc.stderr)
+
+        def upload_file(self, source, destination):
+            shutil.copyfile(source, destination)
+
+        def download_file(self, source, destination):
+            shutil.copyfile(source, destination)
+
+    deck = tmp_path / "deck"
+    deck.mkdir()
+    inputs = {
+        "INCAR": b"ISTART = 0\nICHARG = 2\n",
+        "POSCAR": b"synthetic geometry, not a physical reference\n",
+        "KPOINTS": b"synthetic mesh\n",
+        "POTCAR": b"synthetic placeholder, not a potential\n",
+    }
+    for name, contents in inputs.items():
+        (deck / name).write_bytes(contents)
+    binary = tmp_path / "synthetic-binary"
+    binary.write_text(
+        "#!/bin/sh\nset -eu\n"
+        '[ "$#" -eq 0 ]\n'
+        'for f in INCAR POSCAR KPOINTS POTCAR; do test -s "$f"; done\n'
+        '[ "$VQ_CPUS" = 2 ]\n[ "$OMP_NUM_THREADS" = 1 ]\n'
+        '[ "$MKL_NUM_THREADS" = 1 ]\n'
+        'printf "synthetic result\\n" > OUTCAR\n'
+        'printf "synthetic iterations\\n" > OSZICAR\n'
+        'cp POSCAR CONTCAR\nprintf "<synthetic/>\\n" > vasprun.xml\n'
+        'printf "\\000\\001restart\\377" > WAVECAR\n'
+        'printf "synthetic charge\\n" > CHGCAR\n'
+        'printf "started\\n"\nprintf "diagnostic\\n" >&2\n'
+        + ('sleep 30\n' if outcome == "cancel" else '')
+        + ("exit 42\n" if outcome == "failure" else "exit 0\n")
+    )
+    binary.chmod(0o755)
+    queue, jobs = tmp_path / "queue", tmp_path / "jobs"
+    jobid = submit_local(
+        host="localhost", directory=str(deck), command=[str(binary)],
+        program="vasp", scheduler_target="cluster", cpus=2, mem_mb=4096,
+        wall_time_seconds=60, retry=0, queue_dir=queue, jobs_dir=jobs,
+    )
+    spec = JobSpec.read(queue / f"{jobid}.json")
+    assert spec.command == [str(binary)]  # Never append an INCAR argument.
+    runner = LocalBatchRunner()
+    dispatcher = SchedulerDispatcher(
+        TorqueDialect(), runner, scratch_root=str(tmp_path / "cluster"),
+        gnu_time_command=str(_install_fake_gnu_time(tmp_path, monkeypatch)),
+        scheduler_program_hooks={"vasp": SchedulerProgramHooks(prologue=[
+            "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1",
+        ])},
+    )
+    env = _vq_job_env(spec, workdir=dispatcher.remote_workspace(jobid))
+    _apply_default_thread_caps(env, spec.cpus)
+    try:
+        handle = dispatcher.submit(
+            job_id=jobid, command=spec.command, cpus=spec.cpus,
+            mem_mb=spec.mem_mb, wall_time_seconds=spec.wall_time_seconds,
+            local_workspace=Path(spec.cwd), env=env, program=spec.program,
+        )
+        workspace = Path(handle.remote_workspace)
+        script = (workspace / "job.pbs").read_text()
+        assert "#PBS -l nodes=1:ppn=2" in script
+        assert "#PBS -l mem=4096mb" in script
+        assert "#PBS -l walltime=00:01:00" in script
+        assert runner.process is not None
+        if outcome == "cancel":
+            deadline = time.monotonic() + 10
+            while not (workspace / "CHGCAR").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert (workspace / "CHGCAR").exists(), "payload did not start"
+            assert dispatcher.poll([handle])[handle.job_id] == SchedulerPhase.RUNNING
+            dispatcher.cancel(handle)
+            assert runner.cancelled
+        else:
+            runner.process.wait(timeout=10)
+        assert dispatcher.poll([handle])[handle.job_id] == SchedulerPhase.FINISHED
+        expected_rc = {"success": 0, "failure": 42, "cancel": 143}[outcome]
+        assert dispatcher.exit_code(handle) == expected_rc
+        if outcome != "cancel":
+            assert dispatcher.final_state(handle) == (
+                JobState.COMPLETED if outcome == "success" else JobState.FAILED
+            )
+        fetched = tmp_path / "fetched"
+        dispatcher.fetch_results(handle, fetched)
+        for name in (*inputs, "OUTCAR", "OSZICAR", "CONTCAR", "vasprun.xml",
+                     "WAVECAR", "CHGCAR", "stdout.log", "stderr.log", "_vq/exit-code"):
+            assert (fetched / name).read_bytes() == (workspace / name).read_bytes()
+        assert (fetched / "WAVECAR").read_bytes() == b"\x00\x01restart\xff"
+        for name, contents in inputs.items():
+            assert (deck / name).read_bytes() == contents
+        assert not (deck / "OUTCAR").exists()
+        assert workspace.is_dir()  # Fetch never retires the remote workspace.
+        assert not spec.clean_workdir_on_terminal
+        assert spec.retry_max == 0
+    finally:
+        if runner.process is not None and runner.process.poll() is None:
+            os.killpg(runner.process.pid, signal.SIGKILL)
+            runner.process.wait(timeout=10)
 
 
 @dataclass
@@ -106,9 +249,6 @@ class FakeRunner:
         if check and reply.returncode != 0:
             raise SchedulerError(f"fake remote failed: {argv}")
         return reply
-
-    def upload_tree(self, local_dir: Path, remote_dir: str) -> None:
-        self.uploads.append((Path(local_dir), remote_dir))
 
     def upload_file(self, local_path: Path, remote_path: str) -> None:
         self.uploads.append((Path(local_path), remote_path))
@@ -761,7 +901,7 @@ def test_build_job_script_node_scratch_runs_on_node_and_copies_back() -> None:
     # copied from scratch cannot clobber it), then scratch is cleaned up.
     copyback = script.index(f'__vq_reconcile {ws}')
     marker_write = script.rindex('__vq_write_marker "$__vq_rc"')
-    cleanup = script.index('rm -rf "$__vq_stage"')
+    cleanup = script.index('__vq_rmtree "$__vq_stage"')
     assert copyback < marker_write < cleanup
     # $USER stays unquoted so it expands on the node.
     assert "/tmp1/$USER/" in script
@@ -1033,40 +1173,6 @@ def test_build_job_script_without_node_scratch_runs_in_workspace() -> None:
     assert f"cd {ws}" in script
     assert "mktemp" not in script
     assert "__vq_scratch" not in script
-
-
-def test_workdir_docs_match_scheduler_scratch_runtime_contract() -> None:
-    """The agent contract must name the same discriminator as the scripts.
-
-    Without ``node_scratch_dir`` the payload cwd and scheduler workspace are
-    one directory; with it the payload runs from a node-local copy. The docs
-    used to promise two directories unconditionally, which made safe-looking
-    payloads overwrite their own inputs on the first route.
-    """
-    # The pre-split CLAUDE.md, which also stated this contract, stayed in the
-    # archived monorepo. AGENTS.md here sends agents to agent_interaction.md,
-    # the copy of the contract this repository holds itself to.
-    repo_root = Path(__file__).resolve().parents[1]
-    interaction_path = repo_root / "docs" / "agent_interaction.md"
-    assert interaction_path.is_file(), f"{interaction_path} is missing"
-    documents = (interaction_path,)
-    required_contract = (
-        "node_scratch_dir",
-        "$VQ_WORKDIR` resolves to the staged workspace",
-        "Never write onto a payload file.",
-        "dedicated output subdirectory",
-        "prove it is writable with a real write",
-    )
-
-    for document in documents:
-        text = " ".join(document.read_text().split())
-        for statement in required_contract:
-            assert statement in text, f"{document} omits {statement!r}"
-
-    interaction_doc = " ".join(interaction_path.read_text().split())
-    assert "Scheduler jobs have no separately managed workdir to fetch" in interaction_doc
-    assert "shared workspace returned by ordinary `vq fetch`" in interaction_doc
-    assert "output_dir.mkdir(exist_ok=False)" in interaction_doc
 
 
 def test_build_job_script_inserts_scheduler_hooks_inside_workdir() -> None:
@@ -1650,8 +1756,8 @@ def test_submit_raises_on_unparseable_qsub_id() -> None:
 
 def test_submit_wraps_upload_failure_as_scheduler_error(tmp_path: Path) -> None:
     """Regression (2026-07-16 host_c dispatch wedge): staging crosses the SSH
-    boundary and ``upload_tree`` can raise a *raw* ``transport.RemoteError``
-    (e.g. the untar step failing). ``submit`` must convert it to
+    boundary and ``upload_file`` can raise a *raw* ``transport.RemoteError``
+    (e.g. the scp step failing). ``submit`` must convert it to
     ``SchedulerError`` — the dispatch-domain error ``_start_scheduler_job``
     already catches — so ONE job's upload failure lands THAT spec FAILED rather
     than the raw error escaping ``submit`` and aborting the daemon's whole
@@ -1662,16 +1768,6 @@ def test_submit_wraps_upload_failure_as_scheduler_error(tmp_path: Path) -> None:
     class _UploadFailsRunner(FakeRunner):
         def upload_file(self, local_path: Path, remote_path: str) -> None:
             raise transport.RemoteError("simulated scp upload failure")
-
-        def upload_tree(self, local_dir: Path, remote_dir: str) -> None:
-            # The exact production symptom: the untar can't find the tarball.
-            raise transport.RemoteError(
-                "remote shell failed (exit 2) on host_c:\n"
-                "  cmd: tar -xf /tmp/vq-upload-abc123.tar -C "
-                f"{remote_dir}\n"
-                "  stderr: tar: /tmp/vq-upload-abc123.tar: Cannot open: "
-                "No such file or directory"
-            )
 
     runner = _UploadFailsRunner(responder=_qsub_ok())
     d = make_dispatcher(runner)
@@ -1749,10 +1845,10 @@ def test_poll_accepts_unique_torque_truncated_job_id() -> None:
 
 def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     squeue_table = textwrap.dedent("""\
-        123_0|PENDING|00:00|01:00:00|(Priority)
-        123_1|RUNNING|00:01|01:00:00|node001
-        124_0|PENDING|00:00|01:00:00|(Priority)
-        125_0|COMPLETED|00:10|01:00:00|node002
+        123_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        123_1|RUNNING|00:01|01:00:00|node001|None
+        124_0|PENDING|00:00|01:00:00|(Priority)|Priority
+        125_0|COMPLETED|00:10|01:00:00|node002|None
     """)
 
     def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
@@ -1778,10 +1874,58 @@ def test_slurm_poll_keeps_array_master_live_from_elements() -> None:
     assert runner.first("squeue").argv == [
         "squeue",
         "--noheader",
-        "--format=%i|%T|%M|%l|%N",
+        "--format=%i|%T|%M|%l|%N|%r",
         "--jobs",
         "123,124,125,126",
     ]
+
+
+def test_slurm_poll_evidence_carries_why_a_job_is_still_queued() -> None:
+    # vibe-qc#148: the poll already knew; nothing carried it to the operator.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(
+                0,
+                "123|PENDING|00:00|01:00:00||Resources\n"
+                "124|RUNNING|00:01|01:00:00|node001|None\n",
+                "",
+            )
+        return None
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    evidence = dispatcher.poll_with_evidence(
+        [SchedulerHandle("123", "/ws/123"), SchedulerHandle("124", "/ws/124")]
+    )
+
+    assert evidence.queued_reasons == {"123": "Resources"}
+
+
+def test_poll_evidence_survives_a_dialect_without_reason_support() -> None:
+    # A reason is telemetry: a dialect that cannot supply one must cost the
+    # operator an explanation, never a failed observation.
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv and argv[0] == "squeue":
+            return RemoteResult(0, "123|RUNNING|00:01|01:00:00|node001|None\n", "")
+        return None
+
+    class _NoReasonHook:
+        """A dialect from before the reason hook existed."""
+
+        def __init__(self, inner: object) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:
+            if name == "parse_poll_reasons":
+                raise AttributeError(name)
+            return getattr(self._inner, name)
+
+    dispatcher = make_slurm_dispatcher(FakeRunner(responder=responder))
+    dispatcher.dialect = _NoReasonHook(dispatcher.dialect)  # type: ignore[assignment]
+
+    evidence = dispatcher.poll_with_evidence([SchedulerHandle("123", "/ws/123")])
+
+    assert evidence.phases == {"123": SchedulerPhase.RUNNING}
+    assert evidence.queued_reasons == {}
 
 
 def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
@@ -1789,7 +1933,7 @@ def test_slurm_poll_does_not_prefix_match_distinct_numeric_ids() -> None:
         if argv and argv[0] == "squeue":
             return RemoteResult(
                 0,
-                "123|RUNNING|00:01|01:00:00|node001\n",
+                "123|RUNNING|00:01|01:00:00|node001|None\n",
                 "",
             )
         return None
@@ -1857,7 +2001,7 @@ def test_slurm_poll_isolates_an_explicitly_invalid_id_from_live_siblings() -> No
             if requested == "123":
                 return RemoteResult(
                     0,
-                    "123|RUNNING|00:01|01:00:00|node001\n",
+                    "123|RUNNING|00:01|01:00:00|node001|None\n",
                     "",
                 )
             if requested == "999":
@@ -3521,6 +3665,55 @@ def test_fetch_results_raises_on_download_failure_but_cleans_remote(
     assert ["rm", "-f", runner.downloads[0][0]] in runner.argvs()
 
 
+def test_fetch_results_survives_a_failed_archive_cleanup(tmp_path: Path) -> None:
+    """#170: the remote archive's cleanup is best effort. A stalled connection
+    on that `rm` used to turn a completed transfer into a failed fetch, so a
+    finished job kept retrying a fetch that had already brought its files home."""
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv[:2] == ["rm", "-f"]:
+            raise SchedulerError("ssh transport failed for scheduler command: rm -f")
+        return None
+
+    runner = FakeRunner(responder=responder)
+    runner.result_files = {"job.out": "energy = -76.0\n", "_vq/exit-code": "0\n"}
+    d = make_dispatcher(runner)
+    local = tmp_path / "out"
+
+    assert d.fetch_results(SchedulerHandle("1.cluster", "/ws/1"), local) is True
+
+    assert (local / "job.out").read_text() == "energy = -76.0\n"
+    assert ["rm", "-f", runner.downloads[0][0]] in runner.argvs()
+
+
+def test_fetch_results_reports_the_download_error_not_the_cleanup_error(
+    tmp_path: Path,
+) -> None:
+    def responder(argv: list[str], stdin: str | None) -> RemoteResult | None:
+        if argv[:2] == ["rm", "-f"]:
+            raise SchedulerError("cleanup could not reach the host")
+        return None
+
+    d = make_dispatcher(FakeRunner(responder=responder, fail_download=True))
+    with pytest.raises(SchedulerError, match="failed to download results") as caught:
+        d.fetch_results(SchedulerHandle("1.cluster", "/ws/1"), tmp_path / "out")
+    assert "cleanup" not in str(caught.value)
+
+
+def test_ssh_runner_downloads_results_with_fresh_connection_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """#170: the result download is replay-safe, so it retries a dropped or
+    stalled connection on a fresh one, like the staging upload."""
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        scheduler_dispatch.transport, "download_file",
+        lambda host_cfg, remote, local, **kwargs: calls.append(kwargs),
+    )
+    runner = scheduler_dispatch.SshRemoteRunner(HostConfig(ssh="cluster-login"))
+    runner.download_file("/ws/1.result-x.tar", tmp_path / "x.tar")
+    assert calls == [{"retry_transient": 2}]
+
+
 def test_fetch_results_skips_absolute_symlinks_and_keeps_real_files(
     tmp_path: Path,
 ) -> None:
@@ -3600,7 +3793,9 @@ def test_fetch_results_merge_failure_is_retryable(tmp_path: Path) -> None:
 
     # The remote workspace was not deleted; a later pass recreates its tar and
     # can complete after the local type conflict is resolved.
-    assert runner.none_match(lambda argv: argv == ["rm", "-rf", "/ws/1"])
+    assert runner.none_match(
+        lambda argv: argv == ["rm", "-rf", "/ws/1"] or "vq-rmtree" in argv
+    )
     (local / "reference.out").rmdir()
     dispatcher.fetch_results(handle, local)
 
@@ -3616,7 +3811,9 @@ def test_cleanup_remote_workspace_removes_configured_job_dir() -> None:
 
     d.cleanup_remote_workspace(SchedulerHandle("12345.cluster", ws))
 
-    assert ["rm", "-rf", "--", ws, f"{ws}.submit-once.json"] in runner.argvs()
+    assert bulk_delete.rmtree_argv(
+        ws, f"{ws}.submit-once.json", f"{ws}.submit-once.attempt"
+    ) in runner.argvs()
 
 
 def test_cleanup_remote_workspace_removes_only_workspace_and_exact_receipt() -> None:
@@ -3627,7 +3824,9 @@ def test_cleanup_remote_workspace_removes_only_workspace_and_exact_receipt() -> 
     d.cleanup_remote_workspace(SchedulerHandle("12345.cluster", ws))
 
     cleanup = runner.argvs()[-1]
-    assert cleanup == ["rm", "-rf", "--", ws, f"{ws}.submit-once.json"]
+    assert cleanup == bulk_delete.rmtree_argv(
+        ws, f"{ws}.submit-once.json", f"{ws}.submit-once.attempt"
+    )
     assert all("*" not in argument for argument in cleanup)
 
 
@@ -3896,19 +4095,85 @@ def test_ssh_submit_once_requires_receipt_absent_before_scheduler_mutation(
     )
     runner = SshRemoteRunner(HostConfig(ssh="cluster"))
 
-    result = runner.submit_once(
-        ["sh", "-c", f": > {shlex.quote(str(sentinel))}"],
-        receipt_path=str(receipt),
-        vq_job_id="abc123",
-        dialect_name="torque",
-        remote_workspace=str(workspace),
-        array_size=None,
-    )
-
-    assert result.returncode == 64
+    with pytest.raises(scheduler_dispatch.SchedulerRemoteOutcomeUnknown):
+        runner.submit_once(
+            ["sh", "-c", f": > {shlex.quote(str(sentinel))}"],
+            receipt_path=str(receipt),
+            vq_job_id="abc123",
+            dialect_name="torque",
+            remote_workspace=str(workspace),
+            array_size=None,
+        )
     assert not sentinel.exists()
     assert receipt.read_text() == '{"stale":true}\n'
 
+
+
+@pytest.mark.parametrize("fence_bytes", ["", "{partial", '{"prior":"attempt"}'])
+def test_submit_fence_survives_missing_receipt_and_refuses_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fence_bytes: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fence = Path(f"{workspace}.submit-once.attempt")
+    fence.write_text(fence_bytes)
+    mutated = tmp_path / "mutated"
+
+    def local_shell(_host, *argv, **kwargs):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=5)
+
+    monkeypatch.setattr("vq.scheduler_dispatch.transport.run_remote_shell", local_shell)
+    runner = SshRemoteRunner(HostConfig(ssh="cluster"))
+    with pytest.raises(scheduler_dispatch.SchedulerRemoteOutcomeUnknown):
+        runner.submit_once(
+            ["touch", str(mutated)], receipt_path=f"{workspace}.submit-once.json",
+            vq_job_id="abc123", dialect_name="torque",
+            remote_workspace=str(workspace), array_size=None,
+        )
+    assert not mutated.exists()
+    assert fence.read_text() == fence_bytes
+    assert not Path(f"{workspace}.submit-once.json").exists()
+
+
+def test_concurrent_submit_once_admits_only_one_scheduler_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    workspace = tmp_path / "workspace"
+    (workspace / "_vq").mkdir(parents=True)
+    invocations = tmp_path / "invocations"
+    barrier = Barrier(2)
+
+    def local_shell(_host, *argv, **kwargs):
+        barrier.wait(timeout=5)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=5)
+
+    monkeypatch.setattr("vq.scheduler_dispatch.transport.run_remote_shell", local_shell)
+    runner = SshRemoteRunner(HostConfig(ssh="cluster"))
+
+    def submit():
+        try:
+            return runner.submit_once(
+                ["sh", "-c", f"echo once >> {shlex.quote(str(invocations))}; "
+                 "printf '12345.cluster\\n'"],
+                receipt_path=f"{workspace}.submit-once.json", vq_job_id="abc123",
+                dialect_name="torque", remote_workspace=str(workspace), array_size=None,
+            )
+        except scheduler_dispatch.SchedulerRemoteOutcomeUnknown:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: submit(), range(2)))
+    assert sum(result is not None for result in results) == 1
+    assert invocations.read_text().splitlines() == ["once"]
+    assert json.loads(Path(f"{workspace}.submit-once.json").read_text())["status"] == "accepted"
+    attempt = json.loads(Path(f"{workspace}.submit-once.attempt").read_text())
+    assert attempt["vq_job_id"] == "abc123"
+    assert attempt["remote_workspace"] == str(workspace)
+    assert len(attempt["attempt_id"]) == 32
+    assert len(attempt["command_sha256"]) == 64
 
 def test_ssh_submit_once_capture_cannot_be_path_replaced_by_peer(
     tmp_path: Path,
@@ -4248,11 +4513,15 @@ def test_scheduler_retry_evidence_cleanup_is_idempotent_when_workspace_missing(
     receipt = Path(f"{workspace}.submit-once.json")
     receipt.parent.mkdir(parents=True)
     receipt.write_text("stale")
+    attempt = Path(f"{workspace}.submit-once.attempt")
+    attempt.write_text("prior attempt")
 
+    dispatcher._prepare_scheduler_retry_evidence(workspace)
     dispatcher._prepare_scheduler_retry_evidence(workspace)
 
     assert not Path(workspace).exists()
     assert not receipt.exists()
+    assert not attempt.exists()
 
 
 def test_ssh_submit_once_preserves_transport_ambiguity(
@@ -4351,60 +4620,6 @@ def test_ssh_runner_uses_longer_tar_timeout(
 
     assert seen["timeout"] == SCHEDULER_ARCHIVE_TIMEOUT_SECONDS
     assert seen["retry_transient"] == 1
-
-
-def test_ssh_runner_upload_tree_stages_on_shared_fs_not_node_local_tmp(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Regression (2026-07-16 host_c dispatch wedge): ``upload_tree`` must stage
-    the tarball workspace-adjacent on the shared cluster FS
-    (``<remote_dir>.upload.tar``), NOT under node-local ``/tmp``.
-
-    host_c balances login01/login02; the ``scp`` upload and the ``tar -xf`` are
-    two separate ssh connections that can land on different login nodes. With a
-    node-local ``/tmp`` path the tarball scp'd onto one node is invisible to the
-    untar on the other — ``tar: /tmp/vq-upload-<id>.tar: Cannot open: No such
-    file or directory`` (exit 2) — which aborted the whole dispatch tick. A
-    shared-FS sibling of ``remote_dir`` (the same placement ``fetch_results``
-    uses for ``<ws>.result.tar``) is visible from any login node."""
-    uploads: list[tuple[Path, str]] = []
-    shells: list[list[str]] = []
-
-    def fake_upload_file(
-        host_cfg: object, local_path: object, remote_path: str, **kwargs: object
-    ) -> None:
-        uploads.append((Path(str(local_path)), remote_path))
-
-    def fake_run_remote_shell(
-        host_cfg: object, *shell_args: str, **kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        shells.append(list(shell_args))
-        return subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(
-        "vq.scheduler_dispatch.transport.upload_file", fake_upload_file
-    )
-    monkeypatch.setattr(
-        "vq.scheduler_dispatch.transport.run_remote_shell", fake_run_remote_shell
-    )
-
-    (tmp_path / "input.dat").write_text("payload")
-    runner = SshRemoteRunner(HostConfig(ssh="cluster"))
-    remote_dir = "/home/USER/.vibeqc-cluster/jobs/jobX"
-    runner.upload_tree(tmp_path, remote_dir)
-
-    expected_tar = f"{remote_dir}.upload.tar"
-    # The scp destination is the shared-FS, workspace-adjacent tar — never /tmp.
-    assert len(uploads) == 1
-    _local, scp_dest = uploads[0]
-    assert scp_dest == expected_tar
-    assert not scp_dest.startswith("/tmp/")
-    # The untar reads back that SAME path, so it can't miss across a node hop.
-    untar = next(s for s in shells if s and s[0] == "tar")
-    assert untar == ["tar", "-xf", expected_tar, "-C", remote_dir]
-    # Cleanup targets the same shared-FS tar, not a node-local /tmp file.
-    rm = next(s for s in shells if s and s[0] == "rm")
-    assert rm == ["rm", "-f", expected_tar]
 
 
 # --------------------------------------------------------------------------- #

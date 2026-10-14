@@ -6,8 +6,8 @@ Regression for 2026-07-25: a managed host_f ``vibeqc-dev`` rebuild
 paused ALL dispatch while ANY admin-update marker existed. The marker names
 exactly what it protects; the daemon now holds only those targets:
 
-  * ``scheduler:<host>`` / ``scheduler-runtime:<host>:<program>`` hold that
-    scheduler host's handoffs only;
+  * ``scheduler:<host>`` holds that host's handoffs; immutable runtime
+    builds serialize updates without holding eligible current-runtime jobs;
   * a plain env name (a venv update on the daemon's own host) holds local
     execution only;
   * anything unrecognised holds everything — fail-safe, never fail-open.
@@ -122,11 +122,11 @@ def _marker(envs: list[str]) -> AdminUpdateMarker:
     )
 
 
-def test_scheduler_runtime_scope_names_only_that_host() -> None:
+def test_scheduler_runtime_scope_does_not_hold_dispatch() -> None:
     scope = admin.admin_update_marker_scope(
         _marker(["scheduler-runtime:host_f:vibeqc-dev"])
     )
-    assert scope == frozenset({"host_f"})
+    assert scope == frozenset()
 
 
 def test_helper_scope_names_only_that_host() -> None:
@@ -284,11 +284,11 @@ class TestScopedDispatchHold:
             "a host_c handoff must not wait on a host_f rebuild"
         )
 
-    def test_the_named_cluster_is_still_held(
+    def test_helper_update_still_holds_the_named_cluster(
         self, daemon: Daemon, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         admin.write_admin_update_marker(
-            envs=["scheduler-runtime:host_f:vibeqc-dev"], host="host_f"
+            envs=["scheduler:host_f"], host="host_f"
         )
         started: list[str] = []
         monkeypatch.setattr(

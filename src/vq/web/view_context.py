@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
-from vq.spec import JobSpec, JobState
+from vq.spec import TERMINAL_STATES, JobSpec, JobState
 from vq.status import terminal_diagnosis_for_spec
+from vq.web import calculations, readiness
 
 if TYPE_CHECKING:
     from vq.web.fleet import FleetSnapshot, HostSnapshot
@@ -372,6 +373,15 @@ FLEET_SORT_FIELDS = {
     "diagnosis",
     "command",
     "cwd",
+    # #168 calculation overview columns.
+    "runtime",
+    "wait",
+    "cpu_used",
+    "rss",
+    "rss_peak",
+    "nodes",
+    "software",
+    "sample",
 }
 
 #: The default ordering. Not a column: it ranks *active* work above
@@ -383,14 +393,20 @@ FLEET_SORT_FIELDS = {
 #: on a busy host the only running job can be hundreds of rows down.
 DEFAULT_FLEET_SORT = "status"
 
-#: Rank for :data:`DEFAULT_FLEET_SORT`. Lower sorts first. Anything not
-#: listed is terminal and shares the bottom rank, where recency decides.
-_STATE_RANK = {
+#: Rank for :data:`DEFAULT_FLEET_SORT`, by :func:`calculations.activity`.
+#: Lower sorts first. Finished work shares the bottom rank, where recency
+#: decides. Ranked by activity rather than raw state (#168): a scheduler job
+#: vq handed off is raw ``running`` while it still waits in the cluster
+#: queue, and it belongs with the queued work, not among the running jobs.
+#: Unconfirmed reservations come right after running ones: they may be
+#: running, and they are what needs a look.
+_ACTIVITY_RANK = {
     "running": 0,
-    "suspended": 1,
-    "pending": 2,
+    "unconfirmed": 1,
+    "held": 2,
+    "queued": 3,
 }
-_TERMINAL_RANK = 3
+_TERMINAL_RANK = 4
 
 
 def fleet_query_state(query_params: Mapping[str, str]) -> dict[str, str]:
@@ -409,6 +425,7 @@ def fleet_query_state(query_params: Mapping[str, str]) -> dict[str, str]:
     return {
         "host": (query_params.get("host") or "all").strip(),
         "state": (query_params.get("state") or "all").strip().lower(),
+        "program": (query_params.get("program") or "all").strip(),
         "tag": (query_params.get("tag") or "").strip(),
         "submitter": (query_params.get("submitter") or "").strip(),
         "q": (query_params.get("q") or "").strip(),
@@ -457,6 +474,8 @@ def fleet_row_matches(row: dict, query: dict[str, str]) -> bool:
         return False
     if query["state"] != "all" and row.get("state") != query["state"]:
         return False
+    if query.get("program", "all") != "all" and row.get("program") != query["program"]:
+        return False
     if query["tag"]:
         tags = row.get("tags")
         if not isinstance(tags, list) or query["tag"] not in tags:
@@ -475,6 +494,7 @@ def fleet_row_matches(row: dict, query: dict[str, str]) -> bool:
                 row.get("scheduler_state"),
                 row.get("submitter"),
                 row.get("job_name"),
+                row.get("program"),
                 row.get("failure_reason"),
                 " ".join(command) if isinstance(command, list) else command,
             )
@@ -485,7 +505,7 @@ def fleet_row_matches(row: dict, query: dict[str, str]) -> bool:
     return True
 
 
-def fleet_row_view(row: dict) -> dict[str, object]:
+def fleet_row_view(row: dict, *, now: datetime | None = None) -> dict[str, object]:
     command = row.get("command")
     diagnosis = row.get("terminal_diagnosis")
     return {
@@ -510,6 +530,9 @@ def fleet_row_view(row: dict) -> dict[str, object]:
         "diagnosis": (
             diagnosis.get("summary") if isinstance(diagnosis, dict) else None
         ),
+        # #168: runtime, measured usage, location and software, each with
+        # its own unknown state. Never the declared cpus/mem_mb above.
+        "calc": calculations.calculation_view(row, now=now or datetime.now(UTC)),
     }
 
 
@@ -518,10 +541,33 @@ def _fleet_submitted(row: dict) -> datetime:
     return parse_time_for_sort(raw if isinstance(raw, str) else None)
 
 
-def _sort_fleet_rows(rows: list[dict], query: dict[str, str]) -> None:
+def _calc_sort_key(row: dict[str, object], field: str, now: datetime) -> object:
+    """Sort key of a #168 column. Unknown sorts below every known value."""
+    if field in {"runtime", "wait"}:
+        runtime = calculations.runtime_view(row, now=now)
+        value = runtime["seconds" if field == "runtime" else "wait_seconds"]
+        return value if isinstance(value, float) else -1.0
+    if field in {"cpu_used", "rss", "rss_peak", "sample"}:
+        observation = calculations.observation_view(row, now=now)
+        if field == "sample":
+            age = observation["age_seconds"]
+            # Freshest first when descending; unknown ages last.
+            return -age if isinstance(age, float) else float("-inf")
+        value = observation[
+            {"cpu_used": "cpu_cores", "rss": "rss_mb", "rss_peak": "rss_peak_mb"}[field]]
+        return value if isinstance(value, float) else -1.0
+    if field == "nodes":
+        return str(calculations.location_view(row)["nodes"] or "")
+    return calculations.software_view(row) or ""
+
+
+def _sort_fleet_rows(
+    rows: list[dict], query: dict[str, str], *, now: datetime | None = None,
+) -> None:
     """Order the fleet job rows in place, per the active sort."""
     field = query.get("sort") or DEFAULT_FLEET_SORT
     descending = query.get("dir", "desc") == "desc"
+    now = now or datetime.now(UTC)
 
     if field == DEFAULT_FLEET_SORT:
         # Active work first, newest within each rank. Deliberately NOT
@@ -529,10 +575,13 @@ def _sort_fleet_rows(rows: list[dict], query: dict[str, str]) -> None:
         # visible without scrolling, and an "ascending" variant that
         # buries it under every completed job has no use.
         rows.sort(key=_fleet_submitted, reverse=True)
-        rows.sort(key=lambda r: _STATE_RANK.get(str(r.get("state")), _TERMINAL_RANK))
+        rows.sort(key=lambda r: _ACTIVITY_RANK.get(calculations.activity(r), _TERMINAL_RANK))
         return
 
     def key(row: dict) -> object:
+        if field in {"runtime", "wait", "cpu_used", "rss", "rss_peak", "nodes", "software",
+                     "sample"}:
+            return _calc_sort_key(row, field, now)
         if field == "submitted":
             return _fleet_submitted(row)
         if field in {"cpus", "mem"}:
@@ -562,25 +611,71 @@ def _sort_fleet_rows(rows: list[dict], query: dict[str, str]) -> None:
     rows.sort(key=key, reverse=descending)
 
 
+def last_known_view(
+    snapshot: FleetSnapshot | None, query: dict[str, str], *, now: datetime,
+) -> list[dict[str, Any]]:
+    """#168: per unlisted host, the rows its last successful listing showed.
+
+    Each row is rendered as of that listing, so a running job's runtime
+    stops there instead of growing for a job nobody can see now. Filtered
+    like the live table, newest first, and never part of its totals.
+    """
+    if snapshot is None:
+        return []
+    groups = []
+    for host in snapshot.hosts:
+        observed = parse_time_for_sort(host.last_known_at)
+        if not host.last_known or observed == datetime.min.replace(tzinfo=UTC):
+            continue
+        rows = [row for row in host.last_known if fleet_row_matches(row, query)]
+        if not rows:
+            continue
+        rows.sort(key=_fleet_submitted, reverse=True)
+        groups.append({
+            "host": host.host,
+            "observed_at": host.last_known_at,
+            "age": calculations.format_duration((now - observed).total_seconds()),
+            "reason": host.overview.admin_down or host.jobs_error,
+            "jobs": [fleet_row_view(row, now=observed) for row in rows],
+        })
+    return groups
+
+
 def fleet_jobs_context(
     snapshot: FleetSnapshot | None,
     query_params: Mapping[str, str],
 ) -> dict[str, object]:
     query = fleet_query_state(query_params)
+    now = datetime.now(UTC)
     rows: list[dict] = snapshot.jobs if snapshot is not None else []
     filtered = [row for row in rows if fleet_row_matches(row, query)]
-    _sort_fleet_rows(filtered, query)
+    _sort_fleet_rows(filtered, query, now=now)
     limit = int(query["limit"])
     visible = filtered[:limit]
-    hosts = sorted({row.get("queue_host") or "" for row in rows} - {""})
+    last_known = last_known_view(snapshot, query, now=now)
+    carried = [
+        row for host in (snapshot.hosts if snapshot is not None else [])
+        for row in host.last_known
+    ]
+    hosts = sorted({row.get("queue_host") or "" for row in rows + carried} - {""})
     states = sorted({str(row.get("state")) for row in rows if row.get("state")})
+    programs = sorted({
+        row["program"] for row in rows if isinstance(row.get("program"), str) and row["program"]
+    })
     query_string = fleet_query_string(query)
     return {
         "snapshot": snapshot,
         "query": query,
-        "jobs": [fleet_row_view(row) for row in visible],
+        "jobs": [fleet_row_view(row, now=now) for row in visible],
+        # #168: over every matching row, not just the visible page.
+        "summary": calculations.calculation_summary(filtered, now=now),
+        "coverage": calculations.coverage_view(snapshot, host=query["host"]),
+        "last_known": last_known,
+        "last_known_count": sum(len(group["jobs"]) for group in last_known),
+        "format_duration": calculations.format_duration,
         "host_options": hosts,
         "state_options": states,
+        "program_options": programs,
         "row_limit_options": ROW_LIMITS,
         "shown_count": len(visible),
         "filtered_count": len(filtered),
@@ -634,7 +729,6 @@ def fleet_summary(cards: list[dict[str, object]]) -> dict[str, object]:
         "running": sum(_int(c, "running") for c in cards),
         "pending": sum(_int(c, "pending") for c in cards),
         "running_cpus": sum(_int(c, "running_cpus") for c in cards),
-        "degraded": sum(1 for c in reachable if c.get("daemon_ok") is False),
         "draining": sum(1 for c in reachable if c.get("draining")),
         "attention": sum(1 for c in cards if c.get("jobs_error")),
         # The number an operator running a rolling update actually
@@ -668,6 +762,15 @@ def fleet_grid_context(
     stale_after = duration + max(interval_seconds * 3, interval_seconds + 30)
     refresh = refresh_state or {}
     elapsed = refresh.get("elapsed_seconds")
+    # #168: daemon health, dispatch and program eligibility per target,
+    # read from this same snapshot. Daemon counts are per daemon, so a
+    # scheduler lane does not repeat its driver's health.
+    fleet_readiness = readiness.fleet_readiness(snapshot)
+    by_target = fleet_readiness["by_target"] if fleet_readiness is not None else {}
+    for card in cards:
+        card["readiness"] = (
+            by_target.get(str(card["host"])) if isinstance(by_target, dict) else None
+        )
     return {
         "snapshot": snapshot,
         "refreshing": bool(refresh.get("refreshing")),
@@ -676,6 +779,7 @@ def fleet_grid_context(
         "interval_seconds": interval_seconds,
         "cards": cards,
         "summary": fleet_summary(cards),
+        "readiness": fleet_readiness,
         "snapshot_age_seconds": age,
         "snapshot_age": format_idle(age),
         "snapshot_stale": age is not None and age > stale_after,
@@ -683,6 +787,44 @@ def fleet_grid_context(
         "duplicate_enrolments": (
             snapshot.duplicate_enrolments if snapshot is not None else []
         ),
+    }
+
+
+def final_usage_view(detail: Mapping[str, object] | None) -> dict[str, object] | None:
+    """#168: a finished job's measured usage for the drill-down, or None.
+
+    None when the owning host's vq does not report ``resource_usage`` at
+    all (an older version) or the job has not finished; a finished job
+    without a receipt is said to have none, which is not the same thing.
+    """
+    status = detail.get("status") if detail is not None else None
+    if not isinstance(status, dict) or "resource_usage" not in status:
+        return None
+    if status.get("state") not in {state.value for state in TERMINAL_STATES}:
+        return None
+    usage = status["resource_usage"]
+    if not isinstance(usage, dict):
+        return {"status": "absent"}
+    if usage.get("status") != "ok":
+        return {"status": usage.get("status"), "error": usage.get("error")}
+    peak = usage.get("peak_rss_mb")
+    declared_mem = status.get("mem_mb")
+    return {
+        "status": "ok",
+        "collector": usage.get("collector"),
+        "receipts": usage.get("receipts"),
+        "wall": calculations.format_duration(calculations._number(usage.get("wall_seconds"))),
+        "cpu": calculations.format_duration(
+            calculations._number(usage.get("active_cpu_seconds"))),
+        "average_cores": usage.get("average_cores"),
+        "declared_cpus": status.get("cpus"),
+        "peak_rss_mb": peak,
+        "peak_rss_scope": usage.get("peak_rss_scope"),
+        "declared_mem_mb": declared_mem,
+        "peak_share": (round(100.0 * peak / declared_mem, 1)
+                       if isinstance(peak, (int, float)) and isinstance(declared_mem, int)
+                       and declared_mem > 0 else None),
+        "process_count": usage.get("process_count"),
     }
 
 
@@ -701,4 +843,54 @@ def doctor_context(state: Mapping[str, object]) -> dict[str, object]:
         "refreshing": state["refreshing"],
         "ok_count": ok_count,
         "bad_count": bad_count,
+    }
+
+
+def convergence_chart(
+    preview: dict[str, object] | None,
+    *,
+    width: int = 360,
+    height: int = 120,
+) -> dict[str, object] | None:
+    """Polyline geometry for an SCF convergence plot (#65, V2).
+
+    Plots log10 of the ``||[F,DS]||`` residual against the iteration, so the
+    page draws one ``<polyline>`` with no script. ``None`` when the preview has
+    fewer than two positive residuals.
+    """
+    import math
+
+    series = preview.get("scf") if isinstance(preview, dict) else None
+    if not isinstance(series, list):
+        return None
+    points = [
+        (int(p["iter"]), math.log10(float(p["residual"])))
+        for p in series
+        if isinstance(p, dict) and isinstance(p.get("residual"), (int, float))
+        and p["residual"] > 0 and isinstance(p.get("iter"), int)
+    ]
+    if len(points) < 2:
+        return None
+    xs = [x for x, _ in points]
+    ys = [y for _, y in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = math.floor(min(ys)), math.ceil(max(ys))
+    if y1 == y0:
+        y1 = y0 + 1
+    pad = 6
+
+    def sx(x: int) -> float:
+        return pad + (width - 2 * pad) * ((x - x0) / (x1 - x0) if x1 > x0 else 0.0)
+
+    def sy(y: float) -> float:
+        return pad + (height - 2 * pad) * (y1 - y) / (y1 - y0)
+
+    return {
+        "width": width,
+        "height": height,
+        "points": " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in points),
+        "first_iter": x0,
+        "last_iter": x1,
+        "log_top": y1,
+        "log_bottom": y0,
     }
