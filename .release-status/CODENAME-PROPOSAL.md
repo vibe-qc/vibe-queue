@@ -15,7 +15,7 @@ maps to the release's substance. Picks happen at ship time, not pre-reserved.
 
 Substance reconstructed from the monorepo bump commits
 (`git log -- vibe-queue/src/vq/__init__.py` in a clone of the frozen
-`mpei/vibeqc` monorepo, project 19).
+`example-org/vibeqc` monorepo, project 19).
 
 | Version | Date | What shipped | Proposed | Theme link |
 |---|---|---|---|---|

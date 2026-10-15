@@ -671,74 +671,10 @@ class TestUpdateEnvExecution:
         assert any("empty" in e for e in result.work_errors)
 
     # ------------------------------------------------------------------
-    # v0.5.40: CMAKE_BUILD_PARALLEL_LEVEL cap on the build env. Caps
-    # ninja parallelism so vibe-qc's template-heavy translation units
-    # don't peak past host RAM and trigger global OOM (concrete bug:
-    # host_d hung 2026-05-16 from 32 concurrent cc1plus on 125 GB box).
+    # #133: vq no longer injects CMAKE_BUILD_PARALLEL_LEVEL. Its
+    # MemTotal-based level overrode the product helper's memory-aware
+    # sizing and OOM-killed a host's build; an operator value passes through.
     # ------------------------------------------------------------------
-
-    def test_safe_build_parallelism_formula(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """v0.5.41 heuristic: min(nproc, max(2, mem_mb // 15000), 6).
-        Verifies all four regimes — RAM-bound, nproc-bound, the
-        2-worker minimum floor, and the v0.5.41 hard cap of 6 — by
-        faking /proc/meminfo + os.cpu_count."""
-        # Helper to fake the meminfo read
-        def fake_meminfo(mem_kb: int) -> None:
-            meminfo = tmp_path / "meminfo"
-            meminfo.write_text(f"MemTotal:       {mem_kb} kB\n")
-            import builtins
-            orig_open = builtins.open
-            def fake_open(path, *a, **kw):  # type: ignore[no-untyped-def]
-                if str(path) == "/proc/meminfo":
-                    return orig_open(meminfo, *a, **kw)
-                return orig_open(path, *a, **kw)
-            monkeypatch.setattr(builtins, "open", fake_open)
-
-        # host_d-like: 32 threads, 125 GB → hard-cap at 6.
-        # (125*1024 MB) // 15000 = 8, but min(..., 6) wins.
-        fake_meminfo(125 * 1024 * 1024)
-        monkeypatch.setattr(admin.os, "cpu_count", lambda: 32)
-        assert admin._safe_build_parallelism() == 6
-
-        # host_a-like: 16 threads, 62 GB → RAM-bound at 4.
-        # (62*1024 MB) // 15000 = 4.
-        fake_meminfo(62 * 1024 * 1024)
-        monkeypatch.setattr(admin.os, "cpu_count", lambda: 16)
-        assert admin._safe_build_parallelism() == 4
-
-        # nproc-bound: 3 threads, 64 GB → nproc=3 wins over RAM=4 and cap=6.
-        fake_meminfo(64 * 1024 * 1024)
-        monkeypatch.setattr(admin.os, "cpu_count", lambda: 3)
-        assert admin._safe_build_parallelism() == 3
-
-        # Floor: 8 threads, 4 GB → max(2, 0) = 2 minimum.
-        fake_meminfo(4 * 1024 * 1024)
-        monkeypatch.setattr(admin.os, "cpu_count", lambda: 8)
-        assert admin._safe_build_parallelism() == 2
-
-        # v0.5.41 hard cap regression: 64 threads, 256 GB → still 6,
-        # not 17 (256000//15000). The cap exists because above 6
-        # workers ninja serializes on link/IO contention, not because
-        # of any memory shortfall on a monster box.
-        fake_meminfo(256 * 1024 * 1024)
-        monkeypatch.setattr(admin.os, "cpu_count", lambda: 64)
-        assert admin._safe_build_parallelism() == 6
-
-    def test_safe_build_parallelism_no_proc_meminfo(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """macOS / hosts without /proc/meminfo: return None so the
-        caller leaves env unchanged (system default wins)."""
-        import builtins
-        orig_open = builtins.open
-        def fake_open(path, *a, **kw):  # type: ignore[no-untyped-def]
-            if str(path) == "/proc/meminfo":
-                raise FileNotFoundError("/proc/meminfo")
-            return orig_open(path, *a, **kw)
-        monkeypatch.setattr(builtins, "open", fake_open)
-        assert admin._safe_build_parallelism() is None
 
     @staticmethod
     def _bash_env(captures: list[tuple[list[str], dict[str, str] | None]]) -> dict[str, str]:
@@ -767,12 +703,10 @@ class TestUpdateEnvExecution:
             f"no bash invocation found among captured calls: {[a for a, _ in captures]}"
         )
 
-    def test_update_script_injects_parallelism_cap_when_unset(
+    def test_update_script_never_injects_a_parallelism_level(
         self, state_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When the calling env has no CMAKE_BUILD_PARALLEL_LEVEL,
-        vq computes one and injects it. Asserts the env dict passed
-        to the bash subprocess.run carries the cap."""
+        """#133: with no operator value, the build env carries none from vq."""
         repo = _make_git_repo(state_dir / "repo")
         (repo / "scripts").mkdir()
         (repo / "scripts" / "update.sh").write_text("#!/bin/bash\n")
@@ -783,7 +717,6 @@ class TestUpdateEnvExecution:
         )
         cfg = config.load_config()
 
-        monkeypatch.setattr(admin, "_safe_build_parallelism", lambda: 8)
         monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
 
         captures: list[tuple[list[str], dict[str, str] | None]] = []
@@ -795,8 +728,9 @@ class TestUpdateEnvExecution:
             admin.update_env("vibeqc-dev", cfg, host="localhost")
 
         bash_env = self._bash_env(captures)
-        assert bash_env.get("CMAKE_BUILD_PARALLEL_LEVEL") == "8"
+        assert "CMAKE_BUILD_PARALLEL_LEVEL" not in bash_env
         assert bash_env.get("GIT_OPTIONAL_LOCKS") == "0"
+        assert not hasattr(admin, "_safe_build_parallelism")
 
     def test_update_script_honors_pre_existing_parallelism_env(
         self, state_dir: Path, monkeypatch: pytest.MonkeyPatch
@@ -815,7 +749,6 @@ class TestUpdateEnvExecution:
         )
         cfg = config.load_config()
 
-        monkeypatch.setattr(admin, "_safe_build_parallelism", lambda: 8)
         monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "4")
 
         captures: list[tuple[list[str], dict[str, str] | None]] = []
@@ -827,39 +760,8 @@ class TestUpdateEnvExecution:
             admin.update_env("vibeqc-dev", cfg, host="localhost")
 
         bash_env = self._bash_env(captures)
-        # User's "4" preserved, NOT replaced with the computed "8".
+        # The operator's "4" reaches the build unchanged.
         assert bash_env.get("CMAKE_BUILD_PARALLEL_LEVEL") == "4"
-
-    def test_update_script_no_cap_when_meminfo_unreadable(
-        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """On macOS dev / hosts where _safe_build_parallelism returns
-        None, vq leaves the env untouched and trusts the system
-        default. Verified by asserting CMAKE_BUILD_PARALLEL_LEVEL is
-        NOT in the bash subprocess env."""
-        repo = _make_git_repo(state_dir / "repo")
-        (repo / "scripts").mkdir()
-        (repo / "scripts" / "update.sh").write_text("#!/bin/bash\n")
-        _write_venv_program(
-            state_dir / "cfg",
-            git_dir=str(repo),
-            update_script="scripts/update.sh",
-        )
-        cfg = config.load_config()
-
-        monkeypatch.setattr(admin, "_safe_build_parallelism", lambda: None)
-        monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
-
-        captures: list[tuple[list[str], dict[str, str] | None]] = []
-        def fake_run(argv, *a, **kw):  # type: ignore[no-untyped-def]
-            captures.append((list(argv), kw.get("env")))
-            return _ok_proc()
-
-        with patch("vq.admin.subprocess.run", side_effect=fake_run):
-            admin.update_env("vibeqc-dev", cfg, host="localhost")
-
-        bash_env = self._bash_env(captures)
-        assert "CMAKE_BUILD_PARALLEL_LEVEL" not in bash_env
 
     # ------------------------------------------------------------------
     # v0.5.41: nice + ionice argv prefix on Linux update_script invocations.
@@ -1578,7 +1480,7 @@ class TestSelfUpdateRestart:
         monkeypatch.setattr(
             admin,
             "_verify_restarted_daemon",
-            lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+            lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
                 verified=True,
                 actual_sha=expected_sha,
                 actual_tree_sha256=None,
@@ -1663,7 +1565,7 @@ class TestSelfUpdateRestart:
         monkeypatch.setattr(
             admin,
             "_verify_restarted_daemon",
-            lambda sha, *, expected_tree_sha256=None: admin.DaemonProvenance(
+            lambda sha, *, expected_tree_sha256=None, **_kw: admin.DaemonProvenance(
                 verified=True,
                 actual_sha=expected_sha,
                 actual_tree_sha256=None,
@@ -4756,23 +4658,6 @@ class TestUpdateEnvDrivesStateMachine:
     full state sequence and ends with the file removed on success
     or the sticky FAILED state on failure."""
 
-    def test_success_path_clears_marker(self, state_dir: Path) -> None:
-        repo = _make_git_repo(state_dir / "repo")
-        _write_venv_program(
-            state_dir / "cfg", git_dir=str(repo), update_script=None,
-        )
-        cfg = config.load_config()
-        with patch(
-            "vq.admin.subprocess.run",
-            side_effect=[_ok_proc(stdout="ok")],
-        ):
-            result = admin.update_env(
-                "vibeqc-dev", cfg, host="localhost",
-            )
-        assert result.success
-        # Marker file removed entirely on success.
-        assert admin.admin_update_marker_exists() is False
-
     def test_failure_path_transitions_to_sticky_FAILED(
         self, state_dir: Path
     ) -> None:
@@ -5561,3 +5446,36 @@ class TestCheckoutShaMustDescribeTheRunningCode:
         (pkg / "__init__.py").write_text("x = 1\n", encoding="utf-8")
 
         assert admin.current_source_sha(pkg / "__init__.py", require_tracked=True) is None
+
+
+class TestForwardedBuildParallelism:
+    """#133: a driver-side CMAKE_BUILD_PARALLEL_LEVEL reaches a remote update."""
+
+    def test_the_driver_value_is_forwarded_when_set(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vq import cli
+
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", "2")
+        env = cli._remote_admin_update_environment()
+        assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
+        assert {"VQ_UPDATE_SCRIPT_TIMEOUT", "VQ_BUILD_STALL_TIMEOUT"} <= set(env)
+
+    def test_nothing_is_forwarded_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from vq import cli
+
+        monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
+        assert set(cli._remote_admin_update_environment()) == {
+            "VQ_UPDATE_SCRIPT_TIMEOUT", "VQ_BUILD_STALL_TIMEOUT"}
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "two", "2.5"])
+    def test_a_malformed_value_is_refused_not_forwarded(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str,
+    ) -> None:
+        import click
+
+        from vq import cli
+
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", bad)
+        with pytest.raises(click.UsageError, match="not a positive integer"):
+            cli._remote_admin_update_environment()

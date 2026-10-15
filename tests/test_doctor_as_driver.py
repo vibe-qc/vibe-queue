@@ -104,7 +104,8 @@ def _fake_remote_factory(captured, *, candidate_probe):  # type: ignore[no-untyp
         return subprocess.CompletedProcess(
             args=["vq"],
             returncode=0,
-            stdout=json.dumps({"ok": True, "version": "0.12.1"}),
+            stdout=json.dumps({"ok": True, "version": "0.12.1",
+                               "source_sha": DRIVER_SHA, "source_tree_sha256": TREE_SHA256}),
             stderr="",
         )
 
@@ -112,6 +113,58 @@ def _fake_remote_factory(captured, *, candidate_probe):  # type: ignore[no-untyp
 
 
 class TestDoctorAsDriver:
+    @pytest.mark.parametrize("helper_sha,helper_tree,candidate_ok,candidate_tree,expected_ok", [
+        (DRIVER_SHA, TREE_SHA256, True, "22" * 32, False),
+        ("c" * 40, "33" * 32, True, "22" * 32, False),
+        ("b" * 40, "22" * 32, True, "22" * 32, True),
+        (DRIVER_SHA, TREE_SHA256, True, None, False),
+        (DRIVER_SHA, TREE_SHA256, False, "22" * 32, False),
+    ], ids=["helper-matches-caller", "three-distinct-identities", "helper-matches-candidate",
+            "candidate-identity-unavailable", "candidate-daemon-unavailable"])
+    def test_helper_identity_uses_candidate_daemon_not_invoker(
+        self, doctor_state, monkeypatch, helper_sha, helper_tree,
+        candidate_ok, candidate_tree, expected_ok,
+    ):
+        calls = []
+        local_probes = []
+        def local_identity(kind, deadline):
+            local_probes.append(kind)
+            return (DRIVER_SHA, None) if kind == "source_sha" else (TREE_SHA256, None)
+
+        monkeypatch.setattr(doctor_module, "_driver_identity_probe", local_identity)
+
+        def remote(host_cfg, *args, **kwargs):
+            calls.append((host_cfg.ssh, args))
+            if args == ("--version",):
+                output = "vq, version 0.26.32\n"
+            elif args == ("source-identity",):
+                output = json.dumps({"source_sha": helper_sha, "source_tree_sha256": helper_tree})
+            elif args[:2] == ("daemon", "ping"):
+                assert host_cfg.ssh == "erz-ssh"
+                output = json.dumps({"ok": candidate_ok, "version": "0.26.32",
+                                     "source_sha": "b" * 40, "source_tree_sha256": candidate_tree})
+            elif args[:2] == ("scheduler-probe", "host_f"):
+                output = json.dumps(_PROBE_PAYLOAD)
+            else:
+                raise AssertionError(args)
+            return subprocess.CompletedProcess(args, 0, output, "")
+
+        monkeypatch.setattr("vq.cli.transport.run_remote_vq", remote)
+        result = CliRunner().invoke(main, ["doctor", "host_f", "--as-driver", "erz", "--json"])
+        payload = json.loads(result.output)
+        helper = next(item for item in payload["checks"] if item["name"] == "scheduler_remote_vq")
+        assert helper["ok"] is expected_ok
+        assert "candidate driver 'erz'" in helper["message"]
+        assert helper["comparison_driver"] == "erz"
+        if candidate_ok and candidate_tree:
+            assert helper["comparison_source_sha"] == "b" * 40
+            assert helper["comparison_source_tree_sha256"] == candidate_tree
+        else:
+            assert "unavailable" in helper["message"]
+        assert not local_probes
+        assert sum(args[:2] == ("daemon", "ping") for _, args in calls) == 1
+        assert not any(ssh == "driver-ssh" for ssh, _ in calls)
+
     def test_healthy_candidate_substitutes_for_the_configured_driver(
         self, doctor_state: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

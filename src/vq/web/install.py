@@ -86,7 +86,9 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -248,6 +250,13 @@ class InstallPlan:
     commands: list[Command] = field(default_factory=list)
     final_writes: list[FileWrite] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    expected_files: dict[Path, bytes | None] = field(default_factory=dict)
+    preserved_environment: dict[str, str] = field(default_factory=dict)
+    """Environment the replaced unit set that the generated unit keeps
+    (``preserve_environment`` plans only)."""
+    dropped_environment: list[str] = field(default_factory=list)
+    """Environment the replaced unit set that the generated unit would not
+    carry, or would set to a different value, each named for the refusal."""
 
     def render(self) -> str:
         out: list[str] = [
@@ -347,10 +356,27 @@ def console_runtime_import_error() -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _ManagedProgram:
+    """The configured venv program an interpreter belongs to, as a remedy needs it.
+
+    ``rebuildable`` is whether vq has any route to rebuild the environment
+    that already exists, which is exactly whether the program configures an
+    ``update_script``: an ordinary ``vq admin update`` runs that script and
+    nothing else, and a provision cannot step in because
+    :func:`vq.admin._refuse_occupied_git_dir` refuses to build over the
+    checkout this program already has.
+    """
+
+    name: str
+    extras: list[str]
+    rebuildable: bool
+
+
 def _managed_program_serving_this_vq(
     python: str | None = None,
-) -> tuple[str, list[str]] | None:
-    """The configured venv program an interpreter belongs to, and its extras.
+) -> _ManagedProgram | None:
+    """The configured venv program an interpreter belongs to.
 
     ``python`` defaults to this interpreter; ``vq web status`` passes the
     one recorded in the console's install marker instead.
@@ -359,7 +385,9 @@ def _managed_program_serving_this_vq(
     key plus ``vq admin update``; on a laptop checkout it is ``pip``. Telling
     an operator to run pip inside a vq-managed checkout is telling them to do
     the one thing the fleet rules forbid, so the message has to know which
-    host it is on.
+    host it is on. For the same reason it carries whether vq could rebuild
+    this program at all: a remedy naming a command that exits 0 and changes
+    nothing is worse than no remedy, because the operator believes it.
     """
     try:
         cfg = config.load_config()
@@ -380,8 +408,28 @@ def _managed_program_serving_this_vq(
                 continue
         except OSError:
             continue
-        return name, list(getattr(program, "extras", []))
+        return _ManagedProgram(
+            name=name,
+            extras=list(getattr(program, "extras", [])),
+            rebuildable=bool(getattr(program, "update_script", None)),
+        )
     return None
+
+
+_NO_REBUILD_ROUTE = (
+    "but it configures no update_script, so `vq admin update` would pull its "
+    "checkout and rebuild nothing. Point one at the checkout's own script, "
+    "then rebuild"
+)
+"""Why ``vq admin update PROGRAM`` is not the remedy for this program.
+
+A program may declare ``extras`` with ``install_script`` alone (#47): a
+provision applies the floor once, which is a real route, so the config model
+admits that shape. Nothing rebuilds the venv afterwards, and this guard runs
+when the console is already pointed at a venv that is wrong -- so the remedy
+it prints has to be the one that ends with uvicorn on disk, not the one that
+exits 0.
+"""
 
 
 def _console_runtime_remedy(python: str | None = None) -> str:
@@ -392,16 +440,36 @@ def _console_runtime_remedy(python: str | None = None) -> str:
             "Install the extra into this environment and re-run:\n"
             "    pip install -e '.[web]'"
         )
-    program, extras = managed
-    if "web" in extras:
+    program = managed.name
+    if "web" in managed.extras:
         # Declared but not yet built: the config is already right and the
-        # venv has not caught up. Do not send the operator back to edit it.
+        # venv has not caught up. Do not send the operator back to edit it --
+        # unless what the config is missing is the key that makes a rebuild
+        # possible at all.
+        if not managed.rebuildable:
+            return (
+                f"The managed program {program!r} already declares the web "
+                f"extra, {_NO_REBUILD_ROUTE}:\n"
+                f"    [programs.{program}]\n"
+                '    update_script = "scripts/update.sh"\n'
+                f"    $ vq admin update {program}"
+            )
         return (
             f"The managed program {program!r} already declares the web extra; "
             "its environment has not been rebuilt since. Rebuild it:\n"
             f"    $ vq admin update {program}"
         )
-    wanted = ", ".join(f'"{name}"' for name in [*extras, "web"])
+    wanted = ", ".join(f'"{name}"' for name in [*managed.extras, "web"])
+    if not managed.rebuildable:
+        return (
+            f"This interpreter is the managed program {program!r}. Declaring "
+            "the extra is what the next rebuild will preserve, "
+            f"{_NO_REBUILD_ROUTE}:\n"
+            f"    [programs.{program}]\n"
+            f"    extras = [{wanted}]\n"
+            '    update_script = "scripts/update.sh"\n'
+            f"    $ vq admin update {program}"
+        )
     return (
         f"This interpreter is the managed program {program!r}, so install the "
         "extra the way the next rebuild will preserve — declare it, then "
@@ -531,6 +599,45 @@ def resolve_service_command(kind: ServiceKind) -> list[str]:
     return [str(python), "-m", "vq", *kind.verb]
 
 
+def _refuse_legacy_service_command(argv: list[str]) -> None:
+    """An explicit reinstall must not undo an existing slot migration."""
+    try:
+        cfg = config.load_config()
+        command = Path(argv[0]).absolute()
+        for name, program in cfg.programs.items():
+            if not isinstance(program, config.VenvProgram) or not program.runtime_slot_execution:
+                continue
+            legacy = Path(program.git_dir).resolve()
+            if (command.parent.resolve() == Path(program.python).parent.resolve()
+                    or command.is_relative_to(legacy)
+                    or command.resolve().is_relative_to(legacy)):
+                from vq import runtime_slots
+
+                try:
+                    selected = runtime_slots.select_python(program.runtime_slot_root)
+                    if command.parent.resolve() == selected.python.parent.resolve():
+                        continue
+                except runtime_slots.RuntimeSlotError:
+                    pass
+                raise InstallError(
+                    f"{name!r} is slot-executed; this command would install its legacy "
+                    "executable. Run the install explicitly with the retained slot's vq."
+                )
+    except (config.ConfigError, OSError) as exc:
+        raise InstallError(f"cannot verify service executable provenance: {exc}") from exc
+
+
+def _existing_bytes(path: Path) -> bytes | None:
+    try:
+        if path.is_symlink():
+            raise InstallError(f"refusing to replace symlinked service file {path}")
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise InstallError(f"cannot read service file {path}: {exc}") from exc
+
+
 def _install_marker_path(kind: ServiceKind = CONSOLE_SERVICE) -> Path:
     return paths.config_dir() / kind.marker_name
 
@@ -552,22 +659,22 @@ def _marker_payload(
     unit_name: str,
     unit_path: Path,
     kind: ServiceKind = CONSOLE_SERVICE,
+    preserved_environment: dict[str, str] | None = None,
 ) -> str:
-    return (
-        json.dumps(
-            {
-                "vq_version": __version__,
-                kind.command_key: resolve_service_command(kind),
-                "python": sys.executable,
-                "manager": manager,
-                "unit_name": unit_name,
-                "unit_path": str(unit_path),
-                "installed_at": datetime.now(UTC).isoformat(),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    payload: dict[str, object] = {
+        "vq_version": __version__,
+        kind.command_key: resolve_service_command(kind),
+        "python": sys.executable,
+        "manager": manager,
+        "unit_name": unit_name,
+        "unit_path": str(unit_path),
+        "installed_at": datetime.now(UTC).isoformat(),
+    }
+    if preserved_environment:
+        # As written in the replaced unit: a systemd %h stays %h, which is
+        # what the unit carries and what systemd resolves at load time.
+        payload["preserved_environment"] = dict(preserved_environment)
+    return json.dumps(payload, indent=2) + "\n"
 
 
 # --------------------------------------------------------------------------
@@ -639,6 +746,182 @@ def daemon_caps_not_in_config(
         if getattr(daemon_config, DAEMON_CAP_FLAGS[flag], None) is None:
             missing.append(flag)
     return missing
+
+
+_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_UNIT_DIRECTIVE = re.compile(r"^\s*(?P<key>[A-Za-z]+)\s*=(?P<value>.*)$", re.DOTALL)
+
+UNPRESERVABLE_SYSTEMD_ENVIRONMENT = (
+    "EnvironmentFile",
+    "PassEnvironment",
+    "UnsetEnvironment",
+)
+"""``[Service]`` directives that shape the daemon's environment but that an
+install cannot carry over as ``Environment=`` text it has read. Their effect
+depends on a file's contents or on the manager's own environment, and
+``EnvironmentFile=`` overrides ``Environment=``, so a copy could not be
+checked against the roots this install sets. An install refuses on them."""
+
+
+@dataclass(frozen=True)
+class ReplacedEnvironment:
+    """The operator environment in the unit an install is about to replace.
+
+    ``vq daemon install`` rewrites the unit, and the daemon's environment is
+    what every job it starts inherits. One host's hand-written unit set
+    ``Environment=PATH=%h/bin:<orca dir>:...``; the generated unit kept only
+    ``VQ_STATE_DIR`` and dropped PATH without a word, so ORCA and the
+    ``~/bin`` wrappers would have stopped resolving after the rewrite (#125).
+    """
+
+    lines: tuple[str, ...] = ()
+    """systemd: the ``Environment=`` lines exactly as written, continuation
+    lines included, for the generated unit to carry verbatim. Quoting,
+    several assignments per line and specifiers such as ``%h`` therefore
+    mean the same thing after the rewrite as before it."""
+    assignments: dict[str, str] = field(default_factory=dict)
+    """The value each variable ends up with, in order. For systemd it is the
+    value as written, specifiers unexpanded -- systemd still resolves them at
+    load time."""
+    unpreservable: tuple[str, ...] = ()
+    """What shapes the environment but cannot be carried over, each named as
+    written."""
+
+
+def _unit_logical_lines(text: str) -> list[tuple[str, str]]:
+    """``(logical, original)`` per unit directive.
+
+    systemd joins a line that ends in a backslash with the next one, and the
+    backslash becomes a space. ``logical`` is that joined text, for parsing;
+    ``original`` is the physical lines unchanged, for copying.
+    """
+    joined: list[tuple[str, str]] = []
+    logical: list[str] = []
+    original: list[str] = []
+    for line in text.splitlines():
+        original.append(line)
+        if line.endswith("\\"):
+            logical.append(line[:-1] + " ")
+            continue
+        logical.append(line)
+        joined.append(("".join(logical), "\n".join(original)))
+        logical, original = [], []
+    if original:
+        joined.append(("".join(logical), "\n".join(original)))
+    return joined
+
+
+def systemd_unit_environment(unit_path: Path) -> ReplacedEnvironment:
+    """The ``[Service]`` environment of an existing unit, as an install sees it.
+
+    A missing unit has none. A unit that exists but cannot be read is named
+    as unpreservable: answering "no environment" for a file vq could not read
+    is how an environment gets dropped silently.
+    """
+    try:
+        text = unit_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ReplacedEnvironment()
+    except (OSError, UnicodeDecodeError) as exc:
+        return ReplacedEnvironment(
+            unpreservable=(f"{unit_path} (cannot be read: {exc})",),
+        )
+    section = ""
+    lines: list[str] = []
+    assignments: dict[str, str] = {}
+    unpreservable: list[str] = []
+    for logical, original in _unit_logical_lines(text):
+        stripped = logical.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped
+            continue
+        match = _UNIT_DIRECTIVE.match(stripped)
+        if section != "[Service]" or match is None:
+            continue
+        key, value = match.group("key"), match.group("value").strip()
+        if key in UNPRESERVABLE_SYSTEMD_ENVIRONMENT:
+            unpreservable.append(stripped)
+            continue
+        if key != "Environment":
+            continue
+        if not value:
+            # An empty assignment resets the list. Copied in place, it still
+            # resets exactly what it reset before.
+            assignments.clear()
+            lines.append(original)
+            continue
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            unpreservable.append(f"{stripped} (unbalanced quoting)")
+            continue
+        for word in words:
+            name, separator, assigned = word.partition("=")
+            if separator and _ENVIRONMENT_NAME.fullmatch(name):
+                assignments.pop(name, None)
+                assignments[name] = assigned
+        lines.append(original)
+    return ReplacedEnvironment(tuple(lines), assignments, tuple(unpreservable))
+
+
+def launchd_plist_environment(plist_path: Path) -> ReplacedEnvironment:
+    """The ``EnvironmentVariables`` of an existing launchd agent."""
+    try:
+        data = plist_path.read_bytes()
+    except FileNotFoundError:
+        return ReplacedEnvironment()
+    except OSError as exc:
+        return ReplacedEnvironment(
+            unpreservable=(f"{plist_path} (cannot be read: {exc})",),
+        )
+    try:
+        payload = plistlib.loads(data)
+    except Exception as exc:  # noqa: BLE001 - plistlib raises several types
+        return ReplacedEnvironment(
+            unpreservable=(f"{plist_path} (not a readable plist: {exc})",),
+        )
+    variables = payload.get("EnvironmentVariables") if isinstance(payload, dict) else None
+    if variables is None:
+        return ReplacedEnvironment()
+    if not isinstance(variables, dict):
+        return ReplacedEnvironment(
+            unpreservable=("EnvironmentVariables (not a dictionary)",),
+        )
+    assignments: dict[str, str] = {}
+    unpreservable: list[str] = []
+    for name, value in variables.items():
+        if isinstance(name, str) and isinstance(value, str):
+            assignments[name] = value
+        else:
+            unpreservable.append(f"EnvironmentVariables {name!r} (not a string)")
+    return ReplacedEnvironment((), assignments, tuple(unpreservable))
+
+
+def _systemd_value_resolved(written: str, home: str) -> str | None:
+    """A written ``Environment=`` value with ``%h`` and ``%%`` resolved.
+
+    Only for comparing it against the absolute root this install would set.
+    None when it carries another specifier, whose value vq does not know.
+    """
+    resolved: list[str] = []
+    index = 0
+    while index < len(written):
+        character = written[index]
+        if character != "%":
+            resolved.append(character)
+            index += 1
+            continue
+        specifier = written[index + 1:index + 2]
+        if specifier == "%":
+            resolved.append("%")
+        elif specifier == "h":
+            resolved.append(home)
+        else:
+            return None
+        index += 2
+    return "".join(resolved)
 
 
 def available_managers() -> list[str]:
@@ -772,20 +1055,26 @@ def _systemd_unit_text(
     service_home: Path | None = None,
     environment: dict[str, str] | None = None,
     kind: ServiceKind = CONSOLE_SERVICE,
+    preserved_lines: tuple[str, ...] = (),
+    inherited: frozenset[str] = frozenset(),
 ) -> str:
+    """``preserved_lines`` are copied verbatim ahead of the generated
+    ``Environment=`` lines, so a generated root that differs still wins (the
+    later assignment does); ``inherited`` names the generated variables left
+    out because a preserved line already sets the same value."""
     exec_start = " ".join(_systemd_quote(item) for item in argv)
     target = "default.target" if user_unit else "multi-user.target"
     service_lines: list[str] = []
     if not user_unit:
         if service_user is None or service_home is None:
             raise InstallError("systemd-system requires an unprivileged service user")
-        service_lines.extend(
-            [
-                f"User={service_user}",
-                f"Environment={_systemd_quote(f'HOME={service_home}')}",
-            ]
-        )
+        service_lines.append(f"User={service_user}")
+    service_lines.extend(preserved_lines)
+    if not user_unit and "HOME" not in inherited:
+        service_lines.append(f"Environment={_systemd_quote(f'HOME={service_home}')}")
     for name, value in sorted((environment or {}).items()):
+        if name in inherited:
+            continue
         service_lines.append(f"Environment={_systemd_quote(f'{name}={value}')}")
     service_preamble = "\n".join(service_lines)
     if service_preamble:
@@ -865,6 +1154,39 @@ def _launchd_path(label: str) -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
+def _reconcile_environment(
+    plan: InstallPlan,
+    replaced: ReplacedEnvironment,
+    generated: dict[str, str],
+    resolve: Callable[[str], str | None] | None = None,
+) -> frozenset[str]:
+    """Record what the generated unit keeps and what it would drop.
+
+    Returns the generated variables a preserved assignment already sets to
+    the same value, which the generated unit then leaves to that assignment.
+    A preserved assignment that differs from what this install sets is a
+    change of environment, not a preservation, and is named as dropped.
+    """
+    plan.dropped_environment.extend(replaced.unpreservable)
+    inherited: set[str] = set()
+    for name, written in replaced.assignments.items():
+        if name in generated:
+            value = resolve(written) if resolve is not None else written
+            if value != generated[name]:
+                plan.dropped_environment.append(
+                    f"{name}={written} (this install sets {generated[name]})"
+                )
+                continue
+            inherited.add(name)
+        plan.preserved_environment[name] = written
+    if plan.preserved_environment:
+        plan.notes.append(
+            "kept the environment of the unit being replaced: "
+            + ", ".join(plan.preserved_environment)
+        )
+    return frozenset(inherited)
+
+
 def build_plan(
     *,
     manager: str,
@@ -873,8 +1195,17 @@ def build_plan(
     start: bool = True,
     service_user: str | None = None,
     kind: ServiceKind = CONSOLE_SERVICE,
+    preserve_environment: bool = False,
 ) -> InstallPlan:
-    """Everything the install will do, without doing any of it."""
+    """Everything the install will do, without doing any of it.
+
+    ``preserve_environment`` carries the environment of the unit being
+    replaced into the generated one (``vq daemon install``, #125): systemd
+    ``Environment=`` lines verbatim, launchd ``EnvironmentVariables`` by
+    value. What cannot be carried, and preserved values that differ from the
+    roots this install sets, land in :attr:`InstallPlan.dropped_environment`
+    for the caller to refuse on.
+    """
     unit_name = unit_name or kind.unit_name
     description = description or kind.description
     validate_unit_name(unit_name)
@@ -930,6 +1261,24 @@ def build_plan(
                     description=name,
                 )
         unit_path = _systemd_paths(manager, unit_name)
+        plan.expected_files[unit_path] = _existing_bytes(unit_path)
+        replaced = (
+            systemd_unit_environment(unit_path)
+            if preserve_environment
+            else ReplacedEnvironment()
+        )
+        generated = dict(service_environment)
+        if service_home is not None:
+            generated["HOME"] = str(service_home)
+        # %h is the home of the user running the service manager: this user
+        # for a user unit, root for the system manager whatever User= says.
+        specifier_home = str(Path.home()) if user_unit else "/root"
+        inherited = _reconcile_environment(
+            plan,
+            replaced,
+            generated,
+            lambda written: _systemd_value_resolved(written, specifier_home),
+        )
         plan.writes.append(
             FileWrite(
                 path=unit_path,
@@ -941,6 +1290,8 @@ def build_plan(
                     service_home=service_home,
                     environment=service_environment,
                     kind=kind,
+                    preserved_lines=replaced.lines,
+                    inherited=inherited,
                 ),
                 purpose="service unit",
             )
@@ -979,6 +1330,13 @@ def build_plan(
         # files, so the console needs somewhere durable to write them.
         # vq's state root is already per-user and already exists.
         log_dir = paths.state_root()
+        plan.expected_files[plist_path] = _existing_bytes(plist_path)
+        replaced = (
+            launchd_plist_environment(plist_path)
+            if preserve_environment
+            else ReplacedEnvironment()
+        )
+        _reconcile_environment(plan, replaced, service_environment)
         plan.writes.append(
             FileWrite(
                 path=plist_path,
@@ -986,7 +1344,7 @@ def build_plan(
                     argv,
                     label,
                     log_dir,
-                    service_environment,
+                    {**replaced.assignments, **service_environment},
                 ).decode("utf-8"),
                 purpose="launchd user agent",
             )
@@ -1024,14 +1382,23 @@ def build_plan(
             f"available here: {', '.join(available_managers()) or 'none'}"
         )
 
+    _refuse_legacy_service_command(argv)
     unit_path = plan.writes[0].path
     plan.final_writes.append(
         FileWrite(
             path=_install_marker_path(kind),
-            content=_marker_payload(manager, unit_name, unit_path, kind),
+            content=_marker_payload(
+                manager, unit_name, unit_path, kind, plan.preserved_environment,
+            ),
             mode=0o600,
             purpose=f"provenance marker (which vq installed this {kind.description})",
         )
+    )
+    for write in [*plan.writes, *plan.final_writes]:
+        if write.path not in plan.expected_files:
+            plan.expected_files[write.path] = _existing_bytes(write.path)
+    plan.notes.append(
+        "Replaced files are backed up beside the originals; retain them for recovery."
     )
     return plan
 
@@ -1094,18 +1461,50 @@ def apply_plan(plan: InstallPlan) -> list[str]:
     can never claim that a half-applied service was installed successfully.
     """
     log: list[str] = []
+    for path, expected in plan.expected_files.items():
+        if _existing_bytes(path) != expected:
+            raise InstallError(f"{path} changed since planning; review a new install plan")
 
     def write_file(write: FileWrite) -> None:
-        temporary = write.path.with_name(f".{write.path.name}.vq-install-{os.getpid()}")
+        temporary: Path | None = None
         try:
             write.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(write.content, encoding="utf-8")
-            os.chmod(temporary, write.mode)
+            before = _existing_bytes(write.path)
+            if write.path in plan.expected_files and before != plan.expected_files[write.path]:
+                raise InstallError(
+                    f"{write.path} changed since planning; review a new install plan"
+                )
+            if before is not None:
+                fd, raw_backup = tempfile.mkstemp(
+                    prefix=f".{write.path.name}.vq-install-backup-", dir=write.path.parent,
+                )
+                with os.fdopen(fd, "wb") as backup:
+                    backup.write(before)
+                    os.fchmod(backup.fileno(), stat.S_IMODE(write.path.stat().st_mode))
+                    backup.flush()
+                    os.fsync(backup.fileno())
+                log.append(f"backed up {write.path} to {raw_backup}")
+            fd, raw = tempfile.mkstemp(prefix=f".{write.path.name}.vq-install-",
+                                       dir=write.path.parent)
+            temporary = Path(raw)
+            with os.fdopen(fd, "w", encoding="utf-8") as output:
+                output.write(write.content)
+                os.fchmod(output.fileno(), write.mode)
+                output.flush()
+                os.fsync(output.fileno())
+            if _existing_bytes(write.path) != before:
+                raise InstallError(
+                    f"{write.path} changed since planning; review a new install plan"
+                )
             temporary.replace(write.path)
+            if write.path.read_bytes() != write.content.encode("utf-8"):
+                raise InstallError(f"service file readback differs after writing {write.path}")
         except OSError as e:
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
             raise InstallError(f"cannot write {write.path}: {e}") from e
+        finally:
+            if temporary is not None:
+                with contextlib.suppress(OSError):
+                    temporary.unlink(missing_ok=True)
         log.append(f"wrote {write.path}")
 
     for write in plan.writes:
@@ -1239,8 +1638,7 @@ class ConsoleServiceStatus:
 
     This is the check whose absence let a console serve 1081-commit-stale
     code for weeks. It compares the *installer's* version against the
-    version you are running the status command with — so it fires as soon
-    as you upgrade vq and have not re-installed the console."""
+    version and executable paths you are running the status command with."""
     active: bool | None
     """Whether the service manager reports it running. None if unknown."""
     detail: str | None = None
@@ -1326,6 +1724,11 @@ def console_service_status(
         drifted=(
             installed_by_version is not None
             and installed_by_version != __version__
+        ) or (
+            isinstance(marker.get(kind.command_key), list)
+            and marker[kind.command_key] != resolve_service_command(kind)
+        ) or (
+            isinstance(recorded_python, str) and recorded_python != sys.executable
         ),
         active=_service_active(manager, unit_name) if manager else None,
         runtime_ok=runtime.ok,

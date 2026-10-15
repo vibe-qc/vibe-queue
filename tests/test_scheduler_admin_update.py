@@ -452,6 +452,149 @@ def test_verified_scheduler_update_never_prunes_staging(
     assert not any(args and args[0] == "source-stage-prune" for args in calls)
 
 
+@pytest.mark.no_autopatch_lifecycle_lock
+@pytest.mark.parametrize("first_rc", [0, 1])
+@pytest.mark.parametrize("same_source", [False, True])
+def test_disjoint_runtime_delivery_completes_while_first_build_waits(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, first_rc: int, same_source: bool,
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.test_admin_lifecycle_transaction import _real_program
+
+    program = "vibeqc-dev"
+    sha = "b" * 40
+    _write_scheduler_config(state_dir / "cfg", runtime_program=program)
+    cfg = config.load_config()
+    cfg.hosts["host_g"] = cfg.hosts["host_f"].model_copy(update={"ssh": "host-g.invalid"})
+    sources = []
+    for name in ("source-a", "source-b", "driver"):
+        directory = state_dir / name
+        directory.mkdir()
+        sources.append(_real_program(directory))
+    cfg_a = cfg.model_copy(update={"scheduler_runtime_source_repo": sources[0].git_dir})
+    source_alias = state_dir / "source-alias"
+    source_alias.symlink_to(sources[0].git_dir, target_is_directory=True)
+    cfg_b = cfg.model_copy(update={
+        "scheduler_runtime_source_repo": str(source_alias) if same_source else sources[1].git_dir,
+    })
+    driver_keys = admin.toolset_lifecycle_resources([sources[2]])
+    monkeypatch.setattr(admin, "_scheduler_runtime_driver_resources", lambda: driver_keys)
+    # Run the controlled build in the updater thread; no SSH or fleet state.
+    preparing = threading.Event()
+    prepared = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    original_prepare = admin._feed_and_prepare_runtime_source
+
+    def prepare(host, *args, **kwargs):
+        if host == "host_f":
+            preparing.set()
+            assert prepared.wait(10), "test did not release source preparation"
+        return original_prepare(host, *args, **kwargs)
+
+    monkeypatch.setattr(admin, "_feed_and_prepare_runtime_source", prepare)
+
+    def build(host_cfg, argv, **kwargs):
+        calls.append(host_cfg.ssh)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(10), "test did not release the first build"
+            return subprocess.CompletedProcess(argv, first_rc, "first build", "")
+        return subprocess.CompletedProcess(argv, 0, "second build", "")
+
+    def verify(host_cfg, *argv, **kwargs):
+        receipt = {
+            "program": program, "source_sha": sha, "tag": None,
+            "healthy": True, "activation": "atomic", "quiescent": True,
+            "active_path": "/opt/example/runtime/current", "updater_pid": None,
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(receipt), "")
+
+    monkeypatch.setattr(admin, "_run_scheduler_update_command_with_heartbeat", build)
+    monkeypatch.setattr(transport, "run_remote_shell", verify)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            admin.update_scheduler_runtime, "host_f", program, cfg_a, expected_sha=sha,
+        )
+        try:
+            assert preparing.wait(10), "source preparation never started"
+            # A physical alias cannot bypass the fence while source is in use.
+            with (
+                pytest.raises(admin.AdminUpdateInProgress, match="lifecycle.*checkout"),
+                admin.toolset_lifecycle_lock([], action="source mutation", extra_resources=(
+                    ("checkout", str(admin._canonical_lifecycle_checkout(source_alias))),
+                )),
+            ):
+                pytest.fail("source mutation admitted during preparation")
+            prepared.set()
+            if not entered.wait(10):
+                pytest.fail(f"first build never started: {first.result(timeout=1)!r}")
+            # Report refresh uses the same real lifecycle fence as a rollout.
+            # Its network fetch is synthetic; it must be admitted while the
+            # already prepared source is building remotely.
+            from vq import fleet_release
+
+            fetches = []
+
+            def fetch(argv, **kwargs):
+                fetches.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            fleet_release._fetch_report_sources(
+                Path(sources[0].git_dir), {}, runner=fetch,
+            )
+            assert len(fetches) == 1 and "fetch" in fetches[0]
+            # Same target remains protected by its live marker after the
+            # source fence is released.
+            with pytest.raises(admin.AdminUpdateInProgress):
+                admin.update_scheduler_runtime("host_f", program, cfg_a, expected_sha=sha)
+            # Shared driver readers must never become a mutation handoff.
+            with (
+                pytest.raises(admin.AdminUpdateInProgress, match="lifecycle"),
+                admin.toolset_lifecycle_lock([sources[2]], action="mutate driver"),
+            ):
+                pytest.fail("driver mutation admitted")
+            second = admin.update_scheduler_runtime("host_g", program, cfg_b, expected_sha=sha)
+            assert second.success
+            assert not first.done()
+            assert admin.load_scheduler_runtime_status()[f"host_g:{program}"].last_success
+            assert admin.admin_update_marker_exists()  # first lease still owned
+        finally:
+            prepared.set()
+            release.set()
+        first_result = first.result(timeout=10)
+    assert first_result.success is (first_rc == 0)
+    assert len(calls) == 2
+    records = admin.load_scheduler_runtime_status()
+    assert records[f"host_f:{program}"].last_success is (first_rc == 0)
+    assert records[f"host_g:{program}"].last_success
+    assert admin.admin_update_marker_exists() is (first_rc != 0)
+
+
+@pytest.mark.no_autopatch_lifecycle_lock
+def test_scheduler_remote_wait_refuses_rebound_state_registry(state_dir, monkeypatch) -> None:
+    from contextlib import ExitStack
+
+    monkeypatch.setattr(admin, "_scheduler_runtime_driver_resources", lambda: (
+        ("checkout", str(state_dir / "driver")),
+    ))
+    original = paths.state_root()
+    with ExitStack() as ownership, admin.toolset_lifecycle_lock([], action="test remote wait"):
+        ownership.enter_context(admin.admin_update_ownership())
+        admin.acquire_admin_update_marker(envs=["scheduler-runtime:host_f:demo"], host="host_f")
+        marker = admin.admin_update_marker_path().read_bytes()
+        with (
+            pytest.raises(admin.AdminUpdateInProgress, match="binding changed"),
+            admin._independent_runtime_work(ownership),
+        ):
+            monkeypatch.setenv(paths.ENV_STATE_DIR, str(state_dir / "replacement-state"))
+        assert (original / admin.ADMIN_UPDATE_MARKER_FILENAME).read_bytes() == marker
+
+
 def test_update_scheduler_runtime_builds_verifies_and_records_last_ok(
     state_dir: Path,
 ) -> None:
@@ -2016,6 +2159,29 @@ def test_status_table_names_the_last_good_identity(state_dir: Path) -> None:
     assert "aaaaaaaaaaaa (v0.15.50)" in text
 
 
+def test_status_table_shows_the_participant_inventory(state_dir: Path) -> None:
+    """#72: STORE/PREVIOUS/SCHEMA come from the last participant inventory."""
+    _write_scheduler_config(state_dir / "cfg", runtime_program="vibeqc-release")
+    cfg = config.load_config()
+    admin.record_scheduler_runtime_outcome(
+        _runtime_result(success=True, sha="a" * 40, tag="v0.15.50")
+    )
+    header, row = admin.format_scheduler_runtime_status("host_f", cfg).splitlines()[-2:]
+    assert "STORE     PREVIOUS     SCHEMA LAST GOOD" in header
+    assert row.split()[-5:-2] == ["-", "-", "-"]
+
+    records = admin.load_scheduler_runtime_status()
+    records["host_f:vibeqc-release"].inventory = {
+        "store": "canonical", "previous": "c" * 40, "launcher_schema": 3}
+    admin._write_scheduler_runtime_status(records)
+
+    row = admin.format_scheduler_runtime_status("host_f", cfg).splitlines()[-1]
+    assert "canonical cccccccccccc 3      aaaaaaaaaaaa (v0.15.50)" in row
+    status = json.loads(admin.format_scheduler_runtime_status_json("host_f", cfg))
+    last = status["deployments"]["vibeqc-release"]["last"]
+    assert last["inventory"]["store"] == "canonical"
+
+
 def test_scheduler_phase_poll_projects_vq_specs_as_single_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2415,9 +2581,9 @@ def test_each_program_stages_from_its_own_repository(state_dir: Path) -> None:
         hosts={"localhost": config.HostConfig(ssh="localhost")},
         scheduler_runtime_source_repo="/srv/vibe-qc",
         pin_source_repos={
-            "mpei/vibe-qc": "/srv/vibe-qc",
-            "mpei/vibe-view": "/srv/vibe-view",
-            "mpei/vibe-queue": "/srv/vibe-queue",
+            "example-org/vibe-qc": "/srv/vibe-qc",
+            "example-org/vibe-view": "/srv/vibe-view",
+            "example-org/vibe-queue": "/srv/vibe-queue",
         },
     )
     resolve = admin.program_source_repo
@@ -2443,5 +2609,5 @@ def test_vibe_qc_programs_still_work_without_pin_source_repos(
     with pytest.raises(admin.AdminError) as excinfo:
         admin.program_source_repo(cfg, "vibe-view")
     message = str(excinfo.value)
-    assert "mpei/vibe-view" in message
+    assert '"vibe-view" = "/path/to/checkout"' in message
     assert "pin_source_repos" in message

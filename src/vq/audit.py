@@ -116,6 +116,8 @@ def summarise_args(method: str, args: dict[str, Any]) -> str:
     * ``set_scheduler_drain_lease`` → owner/host/lease-scoped action
     * ``set_legacy_scheduler_drain_release`` → legacy host release
     """
+    if method == "set_scheduler_submit_recovery":
+        return f"jobid={args.get('jobid')} plan_digest={args.get('expected_plan_digest')}"
     if method == "set_admin_status":
         env = args.get("env")
         return f"env={env}" if env else "(no env)"

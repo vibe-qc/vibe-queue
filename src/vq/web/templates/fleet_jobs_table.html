@@ -2,14 +2,132 @@
 {% if snapshot is none %}
 <p class="empty">Gathering the first fleet snapshot…</p>
 {% else %}
-{% if filtered_count > shown_count %}
-<p class="hint">Showing newest {{ shown_count }} of {{ filtered_count }} matching jobs. Increase rows or filter to narrow the table.</p>
+{# #168: the summary lives inside the polled fragment so its totals move
+   with the table. Allocation (what running jobs declared) and measurement
+   (fresh watchdog samples) are separate tiles and never added together. #}
+{% for item in coverage.unlisted %}
+<div class="banner banner-bad" role="alert">
+  <strong>{{ item.host }} was not listed in this snapshot.</strong>
+  {% if item.last_known_count %}Its jobs are missing from every total below; the
+  {{ item.last_known_count }} it listed at {{ item.last_known_at[:19] | replace("T", " ") }} UTC
+  are shown under <a href="#last-known">Last known</a>, not as current:
+  {% else %}Its jobs are missing from this table and from every total below:{% endif %}
+  {{ item.reason }}
+</div>
+{% endfor %}
+{% for item in coverage.duplicates %}
+<div class="banner banner-warn" role="alert">
+  <strong>{{ item["keys"] | join(" and ") }} are the same machine ({{ item.hostname }}).</strong>
+  Every job on it is listed and counted twice.
+</div>
+{% endfor %}
+{% for item in coverage.usage_errors %}
+<div class="banner banner-warn" role="status">
+  <strong>Resource samples from {{ item.host }} could not be read.</strong>
+  Its running jobs show a collector error instead of usage: {{ item.reason }}
+</div>
+{% endfor %}
+
+<div class="fleet-summary">
+  <div class="tile"><span class="tile-value">{{ summary.counts.running }}</span><span class="tile-label">running</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.counts.queued }}</span><span class="tile-label">queued</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.counts.held }}</span><span class="tile-label">held / paused</span></div>
+  <div class="tile {% if summary.counts.unconfirmed %}tile-warn{% endif %}" title="Live scheduler jobs whose phase is not an observed run, queue or hold: unpolled, a failed poll, collecting results, an unknown submit.">
+    <span class="tile-value">{{ summary.counts.unconfirmed }}</span><span class="tile-label">unconfirmed</span>
+  </div>
+  <div class="tile"><span class="tile-value">{{ summary.counts.finished }}</span><span class="tile-label">finished</span></div>
+  <div class="tile" title="Sum of the cpus declared by running jobs.">
+    <span class="tile-value">{{ summary.allocated_cpus }}</span><span class="tile-label">cpus allocated</span>
+  </div>
+  <div class="tile" title="Sum of the mem_mb limits declared by running jobs.">
+    <span class="tile-value">{{ "%.1f" | format(summary.allocated_mem_mb / 1024) }}</span><span class="tile-label">GiB mem allocated{% if summary.unlimited_mem_jobs %} + {{ summary.unlimited_mem_jobs }} unlimited{% endif %}</span>
+  </div>
+  <div class="tile {% if summary.partial %}tile-warn{% endif %}" title="Core-equivalents measured by the latest fresh watchdog samples (CPU% / 100).">
+    <span class="tile-value">{{ summary.measured_cpu_cores }}{% if summary.partial %}*{% endif %}</span><span class="tile-label">cpu cores used</span>
+  </div>
+  <div class="tile {% if summary.partial %}tile-warn{% endif %}" title="Sum of each measured job's resident memory.">
+    <span class="tile-value">{{ "%.1f" | format(summary.measured_rss_mb / 1024) }}{% if summary.partial %}*{% endif %}</span><span class="tile-label">GiB rss used</span>
+  </div>
+</div>
+<p class="hint">
+  Totals cover the {{ filtered_count }} job{{ "" if filtered_count == 1 else "s" }} matching the filters.
+  Allocated is what running jobs declared; used is measured, from
+  {{ summary.measured_jobs }} of {{ summary.counts.running }} running job{{ "" if summary.counts.running == 1 else "s" }}.
+  {% if summary.partial %}<strong>* Partial:</strong>
+  {% for item in summary.unmeasured %}{{ item.count }} {{ item.label }} ({{ item.detail }}){% if not loop.last %}; {% endif %}{% endfor %}.
+  {% endif %}
+  GPUs are not shown: vq records no GPU allocation and has no GPU collector yet.
+</p>
+
+{# #168: the console's own sweep history (in memory, bounded) and each
+   host's load against its budget. Fleet-wide, not filtered. #}
+{% if trend %}
+<div class="trend-strip" aria-label="fleet trends">
+  {% for chart in trend.charts %}
+  <figure class="trend">
+    {{ chart.svg }}
+    <figcaption>{{ chart.label }}:
+      {% if chart.latest is not none %}{{ "%.1f" | format(chart.latest) if chart.latest % 1 else "%d" | format(chart.latest) }}{% else %}-{% endif %}{% if chart.latest_allocated is defined and chart.latest_allocated is not none %} / {{ "%d" | format(chart.latest_allocated) }}{% endif %}
+    </figcaption>
+  </figure>
+  {% endfor %}
+</div>
+<p class="hint">
+  Trends cover the last {{ trend.points }} sweep{{ "" if trend.points == 1 else "s" }} of this console since {{ trend.since[:19] | replace("T", " ") }} UTC
+  (kept in its memory; a restart starts afresh). Used is measured from fresh samples; a dot under a point marks a
+  partial sweep (an unmeasured running job or an unlisted host), so a dip there is missing data, not idle work.
+</p>
 {% endif %}
+{% if host_load %}
+<div class="table-scroll">
+<table class="queue host-load">
+  <thead>
+    <tr>
+      <th>host</th><th title="Running jobs listed for this host.">running</th>
+      <th title="CPUs the running jobs declared, against the daemon's configured budget.">cpus allocated / budget</th>
+      <th title="Core-equivalents measured by fresh watchdog samples, and how many running jobs had one.">cores used</th>
+      <th title="Resident memory measured by fresh samples, against the host's total and currently available memory.">rss MB / total (free)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for h in host_load %}
+    <tr>
+      <td>{{ h.host }}</td>
+      {% if not h.listed %}
+      <td colspan="4" class="hint" title="{{ h.reason or '' }}">not listed in this snapshot: unknown, not idle</td>
+      {% else %}
+      <td class="num">{{ h.running }}</td>
+      <td class="num">{{ h.allocated_cpus }} / {{ h.max_cpus if h.max_cpus is not none else "?" }}</td>
+      <td class="num">
+        {% if h.lane %}<span class="hint">not sampled</span>
+        {% elif h.measured_cores is not none %}{{ h.measured_cores }}{% if h.partial %}* <span class="hint">({{ h.measured_jobs }} of {{ h.running }})</span>{% endif %}
+        {% elif h.running %}<span class="hint">no fresh sample</span>{% else %}-{% endif %}
+      </td>
+      <td class="num">
+        {% if h.measured_rss_mb is not none %}{{ "%.0f" | format(h.measured_rss_mb) }}{% elif h.lane %}<span class="hint">not sampled</span>{% else %}-{% endif %}
+        {% if h.mem_total_mb %}<span class="hint"> / {{ h.mem_total_mb }}{% if h.mem_available_mb is not none %} ({{ h.mem_available_mb }} free){% endif %}</span>{% endif %}
+      </td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+
 {% if jobs %}
+<nav class="toolbar" aria-label="Fleet job pages">
+  <span class="hint">Showing {{ first_row }}–{{ last_row }} of {{ filtered_count }} matching jobs{% if filtered_count != total_count %} ({{ total_count }} total){% endif %}.</span>
+  {% if page_count > 1 %}
+  {% if previous_page_href %}<a class="button-link" rel="prev" href="{{ previous_page_href }}">← Previous</a>{% endif %}
+  <span aria-current="page">Page {{ page_number }} of {{ page_count }}</span>
+  {% if next_page_href %}<a class="button-link" rel="next" href="{{ next_page_href }}">Next →</a>{% endif %}
+  {% endif %}
+</nav>
 {# Inside #fleet-jobs-table for the same reason as queue_table.html: the 10 s
    poll swaps this fragment in for the hx element itself, so the scroll box has
-   to be part of the fragment rather than a wrapper around it. Eleven columns
-   -- this is the table that used to pan the header and nav off screen. #}
+   to be part of the fragment rather than a wrapper around it. It is a wide
+   table, which is why it scrolls rather than panning the header and nav. #}
 <div class="table-scroll">
 <table class="queue">
   <thead>
@@ -20,8 +138,16 @@
       <th><a href="{{ sort_href('host') }}">host{{ sort_label('host') }}</a></th>
       <th><a href="{{ sort_href('state') }}">state{{ sort_label('state') }}</a></th>
       <th><a href="{{ sort_href('sched') }}">sched{{ sort_label('sched') }}</a></th>
-      <th><a href="{{ sort_href('cpus') }}">cpus{{ sort_label('cpus') }}</a></th>
-      <th><a href="{{ sort_href('mem') }}">mem MB{{ sort_label('mem') }}</a></th>
+      <th title="Execution time: since dispatch minus pauses for a direct job, the scheduler's reported walltime for a scheduler job; final duration once finished."><a href="{{ sort_href('runtime') }}">runtime{{ sort_label('runtime') }}</a></th>
+      <th title="Queue wait, kept apart from runtime: still growing while queued; submission to dispatch for a started direct job."><a href="{{ sort_href('wait') }}">wait{{ sort_label('wait') }}</a></th>
+      <th title="Declared cpus."><a href="{{ sort_href('cpus') }}">cpus{{ sort_label('cpus') }}</a></th>
+      <th title="Measured core-equivalents (CPU% / 100); a finished job shows average busy cores from its final receipt."><a href="{{ sort_href('cpu_used') }}">cpu used{{ sort_label('cpu_used') }}</a></th>
+      <th title="Declared memory limit."><a href="{{ sort_href('mem') }}">mem MB{{ sort_label('mem') }}</a></th>
+      <th title="Measured resident memory of the job's processes, from the latest watchdog sample."><a href="{{ sort_href('rss') }}">rss MB{{ sort_label('rss') }}</a></th>
+      <th title="Running jobs: sampled RSS peak or Slurm's largest-task peak. Finished jobs: the final receipt's largest single-process peak. Never summed."><a href="{{ sort_href('rss_peak') }}">peak MB{{ sort_label('rss_peak') }}</a></th>
+      <th title="Where the job executes: its host, or the compute node(s) the scheduler reported."><a href="{{ sort_href('nodes') }}">nodes{{ sort_label('nodes') }}</a></th>
+      <th><a href="{{ sort_href('software') }}">software{{ sort_label('software') }}</a></th>
+      <th title="Age of the measurement, or why there is none."><a href="{{ sort_href('sample') }}">sample{{ sort_label('sample') }}</a></th>
       <th><a href="{{ sort_href('submitted') }}">submitted (UTC){{ sort_label('submitted') }}</a></th>
       <th><a href="{{ sort_href('submitter') }}">submitter{{ sort_label('submitter') }}</a></th>
       <th><a href="{{ sort_href('name') }}">name / tags{{ sort_label('name') }}</a></th>
@@ -32,13 +158,31 @@
   </thead>
   <tbody>
     {% for job in jobs %}
+    {% set rt = job.calc.runtime %}
+    {% set obs = job.calc.observation %}
+    {% set loc = job.calc.location %}
     <tr class="state-{{ job.state }}">
       <td class="jobid"><a href="/fleet/jobs/{{ job.id }}?host={{ job.host }}">{{ job.id }}</a></td>
       <td>{{ job.host }}</td>
       <td class="state state-{{ job.state }}">{{ job.state }}</td>
       <td>{{ job.sched or "-" }}</td>
+      <td class="num" title="{% if rt.source == 'receipt' %}measured by the final command receipt; largest element walltime for an array{% elif rt.source == 'scheduler' %}reported by the scheduler{% elif rt.source == 'vq' %}since dispatch{% if rt.started_at %} at {{ rt.started_at[:19] | replace('T', ' ') }}{% endif %}, minus pauses{% elif job.calc.activity == 'running' %}the scheduler has not reported a walltime yet{% endif %}{% if rt.limit_seconds %}; limit {{ format_duration(rt.limit_seconds) }} ({{ rt.limit_source }}){% endif %}">
+        {{ format_duration(rt.seconds) }}{% if rt.limit_seconds %}<span class="hint"> / {{ format_duration(rt.limit_seconds) }}</span>{% endif %}
+      </td>
+      <td class="num" title="{% if rt.waiting %}still waiting since submission{% elif rt.wait_seconds is not none %}submission to dispatch{% elif loc.driver and job.calc.activity != 'queued' %}the scheduler's own queue wait is not recorded{% endif %}">
+        {% if rt.waiting %}<span class="hint">waiting </span>{% endif %}{{ format_duration(rt.wait_seconds) }}
+      </td>
       <td class="num">{{ job.cpus if job.cpus else "-" }}</td>
+      <td class="num" title="{{ obs.detail }}">{{ "%.1f" | format(obs.cpu_cores) if obs.cpu_cores is not none else "-" }}{% if obs.status == 'final' and obs.cpu_cores is not none %} <span class="hint">avg</span>{% endif %}</td>
       <td class="num">{{ job.mem_mb if job.mem_mb else "-" }}</td>
+      <td class="num" title="{{ obs.detail }}">{{ "%.0f" | format(obs.rss_mb) if obs.rss_mb is not none else "-" }}</td>
+      <td class="num" title="{% if obs.rss_peak_scope == 'largest task' %}peak RSS of the largest task in the running steps (Slurm sstat), since {{ obs.rss_peak_since[:19] | replace('T', ' ') }} UTC; not the job's total memory{% elif obs.rss_peak_since %}sampled peak since {{ obs.rss_peak_since[:19] | replace('T', ' ') }} UTC{% else %}{{ obs.detail }}{% if obs.rss_peak_scope %}; {{ obs.rss_peak_scope }}{% endif %}{% endif %}">{{ "%.0f" | format(obs.rss_peak_mb) if obs.rss_peak_mb is not none else "-" }}{% if obs.rss_peak_scope == 'largest task' %} <span class="hint">task</span>{% elif obs.status == 'final' and obs.rss_peak_mb is not none %} <span class="hint">process</span>{% endif %}</td>
+      <td class="who" title="{{ loc.nodes or '' }}">
+        {{ (loc.nodes | truncate(32, true)) if loc.nodes else "-" }}
+        {% if loc.driver %}<span class="hint">via {{ loc.driver }}</span>{% endif %}
+      </td>
+      <td>{{ job.calc.software or "-" }}</td>
+      <td class="ts" title="{{ obs.detail }}{% if obs.sample_at %} ({{ obs.sample_at[:19] | replace('T', ' ') }} UTC){% endif %}">{{ obs.label or "-" }}</td>
       <td class="ts">{{ job.submitted_at[:19] | replace("T", " ") if job.submitted_at else "-" }}</td>
       <td class="who">{{ job.submitter or "-" }}</td>
       <td>
@@ -57,6 +201,52 @@
 </div>
 {% else %}
 <p class="empty">No jobs match.</p>
+{% endif %}
+
+{# #168: an unlisted host's last successful listing. These rows are not
+   current, so they are in no count or total above; each is shown as of the
+   listing (runtime stops there), without measured usage. #}
+{% if last_known %}
+<h3 id="last-known">Last known: {{ last_known_count }} job{{ "" if last_known_count == 1 else "s" }} on hosts not listed now</h3>
+<p class="hint">
+  What each host showed at its last successful listing. These jobs may have
+  finished, failed or been requeued since; none of them is counted above.
+  Runtime is as of that listing.
+</p>
+<div class="table-scroll">
+<table class="queue last-known">
+  <thead>
+    <tr>
+      <th>id</th><th>host</th><th>listed (UTC)</th><th>state then</th><th>sched then</th>
+      <th title="As of the listing.">runtime then</th><th>cpus</th><th>mem MB</th>
+      <th>nodes</th><th>software</th><th>submitted (UTC)</th><th>name / tags</th><th>command</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for group in last_known %}
+    {% for job in group.jobs %}
+    {% set rt = job.calc.runtime %}
+    {% set loc = job.calc.location %}
+    <tr class="last-known-row">
+      <td class="jobid"><a href="/fleet/jobs/{{ job.id }}?host={{ job.host }}">{{ job.id }}</a></td>
+      <td>{{ job.host }}</td>
+      <td class="ts" title="{{ group.reason }}">{{ group.observed_at[:19] | replace("T", " ") }} <span class="hint">({{ group.age }} ago)</span></td>
+      <td class="state">{{ job.state }}</td>
+      <td>{{ job.sched or "-" }}</td>
+      <td class="num">{{ format_duration(rt.seconds) }}{% if rt.limit_seconds %}<span class="hint"> / {{ format_duration(rt.limit_seconds) }}</span>{% endif %}</td>
+      <td class="num">{{ job.cpus if job.cpus else "-" }}</td>
+      <td class="num">{{ job.mem_mb if job.mem_mb else "-" }}</td>
+      <td class="who" title="{{ loc.nodes or '' }}">{{ (loc.nodes | truncate(32, true)) if loc.nodes else "-" }}{% if loc.driver %} <span class="hint">via {{ loc.driver }}</span>{% endif %}</td>
+      <td>{{ job.calc.software or "-" }}</td>
+      <td class="ts">{{ job.submitted_at[:19] | replace("T", " ") if job.submitted_at else "-" }}</td>
+      <td>{{ job.name or "-" }}{% if job.tags %} <span class="hint">[{{ job.tags | join(", ") }}]</span>{% endif %}</td>
+      <td class="cmd"><code>{{ job.command | truncate(80, true) }}</code></td>
+    </tr>
+    {% endfor %}
+    {% endfor %}
+  </tbody>
+</table>
+</div>
 {% endif %}
 {% endif %}
 </div>

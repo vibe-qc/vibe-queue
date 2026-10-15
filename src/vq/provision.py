@@ -612,6 +612,11 @@ def _programs_check(
     has a lane. A host with none is planned as "no managed lane" and silently
     skipped by ``rollout-latest`` -- indistinguishable in the output from a
     host that is fully converged.
+
+    The query names ``localhost`` explicitly (#174). A bare ``vq programs``
+    resolves the target's own ``default_host``: absent, it fails with "HOST is
+    required"; naming another machine, the target delegates there and this
+    check would describe that machine's registry instead of the target's.
     """
     try:
         if is_local_host(host_cfg.ssh):
@@ -619,7 +624,7 @@ def _programs_check(
             import sys  # noqa: PLC0415
 
             proc = subprocess.run(
-                [sys.executable, "-m", "vq", "programs", "--json"],
+                [sys.executable, "-m", "vq", "programs", "localhost", "--json"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -630,6 +635,7 @@ def _programs_check(
             proc = transport.run_remote_vq(
                 host_cfg,
                 "programs",
+                "localhost",
                 "--json",
                 check=False,
                 timeout=60,
@@ -653,7 +659,7 @@ def _programs_check(
             check(
                 "programs_registered",
                 False,
-                f"`vq programs --json` on {host} exited "
+                f"`vq programs localhost --json` on {host} exited "
                 f"{proc.returncode}: {detail}",
             )
         ]
@@ -665,7 +671,8 @@ def _programs_check(
             check(
                 "programs_registered",
                 False,
-                f"`vq programs --json` on {host} did not return JSON: {detail}",
+                f"`vq programs localhost --json` on {host} did not return JSON: "
+                f"{detail}",
             )
         ]
     names = sorted(

@@ -93,6 +93,30 @@ def test_events_unknown_job_errors(state: Path) -> None:
     assert "no such job" in result.output
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("options, count", [
+    ([], 3), (["--tail", "2"], 2), (["--kind", "state_transition", "--tail", "1"], 1),
+])
+def test_events_keeps_valid_timeline_when_a_record_is_not_an_object(
+    state: Path, as_json: bool, options: list[str], count: int,
+) -> None:
+    ws = _job_with_events(state)
+    expected = events.read_events(ws)[-count:]
+    with (ws / "_vq" / "events.jsonl").open("a") as stream:
+        stream.write("null\n[]\n")
+    args = ["events", "abc123456789", *options]
+    if as_json:
+        args.append("--json")
+
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    if as_json:
+        assert json.loads(result.stdout) == {"jobid": "abc123456789", "events": expected}
+    else:
+        assert result.stdout.strip().splitlines() == [_format_event(event) for event in expected]
+
+
 def test_events_delegates_a_remote_host(
     state: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -162,3 +186,105 @@ def test_format_event_shows_unknown_kinds_without_dropping_data() -> None:
     assert "future_kind" in line
     assert "widget=frob" in line
     assert "n=3" in line
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_events_filters_before_taking_the_tail(state: Path, as_json: bool) -> None:
+    ws = _job_with_events(state)
+    # A later nonmatching event must not displace the last matching transition.
+    events.append_event(ws, events.EventKind.KILL_REQUESTED, "abc123456789")
+    args = ["events", "abc123456789", "--kind", "state_transition", "-n", "1"]
+    if as_json:
+        args.append("--json")
+
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    if as_json:
+        selected = json.loads(result.output)["events"]
+        assert len(selected) == 1
+        assert selected[0]["to"] == "completed"
+        assert selected[0]["exit_code"] == 0
+    else:
+        assert "running -> completed (exit 0)" in result.output
+        assert "pending -> running" not in result.output
+        assert "kill_requested" not in result.output
+
+
+def test_events_multiple_kinds_include_future_names_without_duplicates(state: Path) -> None:
+    ws = _job_with_events(state)
+    with (ws / "_vq" / "events.jsonl").open("a") as stream:
+        stream.write(json.dumps({"ts": "future", "kind": "future_kind", "widget": 3}) + "\n")
+    result = CliRunner().invoke(main, [
+        "events", "abc123456789", "--kind", "submitted", "--kind", "future_kind",
+        "--kind", "submitted", "--tail", "0", "--json",
+    ])
+
+    assert result.exit_code == 0, result.output
+    selected = json.loads(result.output)["events"]
+    assert [record["kind"] for record in selected] == ["submitted", "future_kind"]
+    assert selected[-1]["widget"] == 3
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_events_no_matching_kind(state: Path, as_json: bool) -> None:
+    _job_with_events(state)
+    args = ["events", "abc123456789", "--kind", "watchdog_kill"]
+    if as_json:
+        args.append("--json")
+    result = CliRunner().invoke(main, args)
+
+    assert result.exit_code == 0, result.output
+    if as_json:
+        assert json.loads(result.output) == {"jobid": "abc123456789", "events": []}
+    else:
+        assert "no matching events" in result.output
+        assert "workspace was cleaned up" not in result.output
+
+
+@pytest.mark.parametrize("tail, count", [(0, 3), (2, 2), (10, 3)])
+def test_events_tail_without_filter(state: Path, tail: int, count: int) -> None:
+    ws = _job_with_events(state)
+    result = CliRunner().invoke(main, [
+        "events", "abc123456789", "--tail", str(tail), "--json",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["events"] == events.read_events(ws)[-count:]
+
+
+def test_events_rejects_negative_tail(state: Path) -> None:
+    result = CliRunner().invoke(main, ["events", "abc123456789", "--tail", "-1"])
+    assert result.exit_code == 2
+    assert "Invalid value" in result.output
+
+
+@pytest.mark.parametrize("scheduler", [False, True])
+def test_events_delegates_selection_options(
+    state: Path, monkeypatch: pytest.MonkeyPatch, scheduler: bool,
+) -> None:
+    (state / "cfg" / "config.toml").write_text(
+        'default_host = "localhost"\n[hosts.localhost]\nssh = "localhost"\n'
+        '[hosts.remote]\nssh = "remote"\n'
+        '[hosts.cluster]\nssh = "cluster"\nscheduler = "slurm"\n'
+        'scheduler_dialect = "slurm"\nscheduler_driver = "remote"\n'
+        'scratch_root = "/scratch/jobs"\n'
+    )
+    captured = {}
+
+    def delegate(host, cfg, *args):
+        captured.update(host=host, args=args)
+        return '{"jobid":"abc123456789","events":[]}\n'
+
+    monkeypatch.setattr("vq.cli._delegate_to_remote", delegate)
+    result = CliRunner().invoke(main, [
+        "events", "cluster" if scheduler else "remote", "abc123456789",
+        "--kind", "kill_requested", "--kind", "watchdog_kill", "-n", "4", "--json",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert captured["host"] == "remote"
+    assert captured["args"] == (
+        "events", "localhost", "abc123456789", "--kind", "kill_requested",
+        "--kind", "watchdog_kill", "--tail", "4", "--json",
+    )

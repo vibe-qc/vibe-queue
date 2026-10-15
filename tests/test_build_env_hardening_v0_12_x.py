@@ -21,6 +21,7 @@ import os
 import shlex
 import subprocess
 import sys
+import textwrap
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -759,8 +760,8 @@ def _prog(
     )
 
 
-def _managed_python(work: Path) -> Path:
-    python = work / ".venv" / "bin" / "python"
+def _managed_python(work: Path, venv_subdir: str = ".venv") -> Path:
+    python = work / venv_subdir / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text(
         "#!/bin/sh\n"
@@ -781,6 +782,162 @@ def _seed_so(work: Path, import_check: str, content: str) -> Path:
 
 
 class TestAtomicBuildRollback:
+    @staticmethod
+    def _managed_basis_overlay(
+        tmp_path: Path, phase: str,
+    ) -> tuple[Path, str, str, config.VenvProgram, Path]:
+        """A real Git update with a tiny identity-bound generated catalog.
+
+        The fixture's package checks data identities and bytes before exposing
+        its inert native-core identity. No QC installation or compiler is used.
+        """
+        core = tmp_path / "runtime" / "_vibeqc_core.so"
+        core.parent.mkdir()
+        core.write_text("OLD")
+        basis_model = textwrap.dedent('''\
+            import json
+            import os
+            from pathlib import Path
+            root = Path(__file__).resolve().parents[1]
+            bundled = root / 'python/vibeqc/basis_library/basis'
+            overlay = root / 'build/basis_library'
+            receipt = overlay / 'receipt.json'
+            def identities():
+                return {str(p.relative_to(root)): [p.stat().st_ino,
+                        p.stat().st_mtime_ns, p.stat().st_ctime_ns]
+                        for base in (bundled, overlay / 'basis')
+                        for p in sorted(base.iterdir())}
+            def prepare():
+                assert os.environ['PYTHON_BIN'] == str(root / '.venv/bin/python')
+                if (root / 'fail-basis-setup').exists():
+                    raise SystemExit(23)
+                (overlay / 'basis').mkdir(parents=True, exist_ok=True)
+                for p in (overlay / 'basis').iterdir():
+                    if not (bundled / p.name).exists():
+                        p.unlink()
+                for p in bundled.iterdir():
+                    target = overlay / 'basis' / p.name
+                    if not target.exists() or target.read_bytes() != p.read_bytes():
+                        target.write_bytes(p.read_bytes())
+                receipt.write_text(json.dumps(identities()))
+            def validate():
+                if not overlay.exists():
+                    return
+                assert json.loads(receipt.read_text()) == identities(), 'stale basis receipt'
+                for p in bundled.iterdir():
+                    assert p.read_bytes() == (overlay / 'basis' / p.name).read_bytes()
+            ''')
+        setup = (
+            '#!/bin/bash\nset -eu\n'
+            '"$PYTHON_BIN" -c "from basis_fixture import prepare; prepare()"\n'
+        )
+        build_sh = "#!/bin/bash\nset -eu\n"
+        if phase in {"after", "late"}:
+            build_sh += 'PYTHON_BIN="$PWD/.venv/bin/python" bash scripts/setup_basis_library.sh\n'
+        if phase == "setup-fails":
+            build_sh += "touch fail-basis-setup\n"
+        build_sh += "exit 0\n" if phase == "late" else "exit 1\n"
+        work, sha_a, sha_b = _make_tracking_repos(
+            tmp_path, build_sh=build_sh,
+            initial_files={
+                ".gitignore": ".venv/\n__pycache__/\nbuild/\nfail-basis-setup\n",
+                "python/basis_fixture.py": basis_model,
+                "python/vibeqc/__init__.py": (
+                    "from basis_fixture import validate\nvalidate()\n"
+                    "__version__ = '1.0'\nclass _Core: pass\n_vibeqc_core = _Core()\n"
+                    f"_vibeqc_core.__file__ = {str(core)!r}\n"
+                ),
+                "python/vibeqc/basis_library/basis/orbital.g94": "old basis\n",
+                "scripts/setup_basis_library.sh": setup,
+                "cpp/src/bindings.cpp": "// managed source marker\n",
+                "post.sh": "#!/bin/bash\nexit 1\n",
+            },
+            remote_files={
+                "python/vibeqc/basis_library/basis/orbital.g94": "new basis\n",
+                "python/vibeqc/basis_library/basis/new.ecp": "new sidecar\n",
+            },
+        )
+        os.utime(work / "cpp/src/bindings.cpp", ns=(1_000_000_000, 1_000_000_000))
+        os.utime(core, ns=(2_000_000_000, 2_000_000_000))
+        python = _managed_python(work)
+        prog = _prog(work, update_script="build.sh", import_check=None, python=str(python))
+        if phase == "late":
+            prog = prog.model_copy(update={"post_update_script": "post.sh"})
+        if phase != "no-overlay":
+            subprocess.run(
+                ["bash", str(work / "scripts/setup_basis_library.sh")],
+                cwd=work, env={**os.environ, "PYTHON_BIN": str(python)}, check=True,
+            )
+        assert admin._run_import_check(str(python), "vibeqc", source_root=work)[0] == 0
+        return work, sha_a, sha_b, prog, core
+
+    @pytest.mark.no_autopatch_branch_check
+    @pytest.mark.no_autopatch_build_runner
+    @pytest.mark.no_autopatch_lifecycle_lock
+    @pytest.mark.parametrize("phase", ["before", "after", "late", "setup-fails", "no-overlay"])
+    def test_managed_rollback_recovers_basis_overlay(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+    ) -> None:
+        work, sha_a, sha_b, prog, core = self._managed_basis_overlay(tmp_path, phase)
+        original_runner = admin._run_monitored_build
+        setup_calls = []
+
+        def checked_runner(argv, **kwargs):
+            if kwargs["log_label"] == "rollback basis setup":
+                assert kwargs["env"]["PYTHON_BIN"] == prog.python
+                assert kwargs["pass_fds"]
+                for fd in kwargs["pass_fds"]:
+                    os.fstat(fd)  # real lifecycle descriptors, still owned
+                setup_calls.append(argv)
+            return original_runner(argv, **kwargs)
+
+        monkeypatch.setattr(admin, "_run_monitored_build", checked_runner)
+        with admin.toolset_lifecycle_lock([prog], action="rollback-basis-test"):
+            result = admin._do_update_work("vibeqc-release", prog, expected_sha=sha_b)
+        assert result.success is False
+        assert _head(work) == sha_a
+        assert core.read_text() == "OLD"
+        if phase == "setup-fails":
+            assert result.rolled_back is False
+            assert "basis overlay recovery failed (exit 23)" in result.rollback_summary
+            assert admin._run_import_check(prog.python, "vibeqc", source_root=work)[0] != 0
+        else:
+            assert result.rolled_back is True, result.rollback_summary
+            assert admin._run_import_check(
+                prog.python, "vibeqc", source_root=work,
+                expected_version="1.0", check_version=True,
+            )[0] == 0
+        if phase == "no-overlay":
+            assert not setup_calls
+            assert not (work / "build/basis_library").exists()
+        else:
+            assert setup_calls
+            assert not (work / "build/basis_library/basis/new.ecp").exists()
+
+    @pytest.mark.parametrize(
+        "refusal", ["missing-script", "sealed-runtime", "external-overlay", "external-basis"],
+    )
+    def test_basis_recovery_refuses_unsafe_setup(
+        self, tmp_path: Path, refusal: str,
+    ) -> None:
+        work, _sha_a, _sha_b, prog, _core = self._managed_basis_overlay(tmp_path, "before")
+        receipt = work / "build/basis_library/receipt.json"
+        before = receipt.read_bytes()
+        if refusal == "missing-script":
+            (work / "scripts/setup_basis_library.sh").unlink()
+        elif refusal == "sealed-runtime":
+            marker = Path(prog.python).parent.parent / runtime_slots.IMMUTABLE_RUNTIME_MARKER
+            marker.write_text("sealed")
+        else:
+            target = tmp_path / "external-overlay"
+            linked = receipt.parent / "basis" if refusal == "external-basis" else receipt.parent
+            linked.rename(target)
+            linked.symlink_to(target, target_is_directory=True)
+        prepared, errors = admin._prepare_rollback_basis_overlay(prog)
+        assert prepared is False
+        assert errors and "basis overlay recovery failed" in errors[0]
+        assert receipt.read_bytes() == before
+
     def test_failed_build_rolls_back_tree_and_restores_so(
         self, tmp_path: Path
     ) -> None:
@@ -2779,6 +2936,105 @@ class TestSlotEnabledUpdate:
             runtime_slot_root=str(root),
         )
 
+    @pytest.mark.no_autopatch_branch_check
+    def test_custom_venv_build_preserves_registered_path_and_profile(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        (repo / "build.sh").write_text(
+            '#!/bin/bash\nset -eu\n'
+            'test "$1" = "--extras"\ntest "$2" = "all"\n'
+            'test "$3" = "--venv"\ntest "$4" = ".venv-viewer"\n'
+            'mkdir -p "$4/bin"\n'
+            "printf '#!/bin/sh\\nexit 0\\n' > \"$4/bin/python\"\n"
+            'chmod +x "$4/bin/python"\n'
+        )
+        (repo / ".gitignore").write_text(".venv*/\n")
+        _git(repo, "add", "build.sh", ".gitignore")
+        _git(repo, "commit", "-m", "custom virtualenv builder")
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        prog = self._prog(repo, root).model_copy(update={
+            "python": str(repo / ".venv-viewer/bin/python"),
+            "update_script": "build.sh --extras all --venv .venv-viewer",
+        })
+
+        result = admin._do_slot_update_work("viewer", prog, expected_sha=sha)
+
+        assert result.success, result.work_errors
+        assert runtime_slots.resolve_current(root) == sha
+        assert runtime_slots.slot_python(root, sha) == (
+            runtime_slots.slot_source(root, sha) / ".venv-viewer/bin/python"
+        )
+        assert not (runtime_slots.slot_source(root, sha) / ".venv").exists()
+        assert not (repo / ".venv-viewer").exists()
+
+    @pytest.mark.no_autopatch_branch_check
+    @pytest.mark.parametrize("field", ["update_script", "post_update_script"])
+    def test_absolute_update_script_builds_only_the_slot(
+        self, tmp_path: Path, field: str,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        script = repo / "build runtime.sh"
+        script.write_text(
+            '#!/bin/bash\nset -eu\n'
+            'test "$1" = "argument with spaces"\ntest "$2" = "--flag"\n'
+            'cd -- "$(dirname -- "$0")"\n'
+            'printf changed > sentinel\n'
+            'mkdir -p .venv/bin\n'
+            "printf '#!/bin/sh\\nexit 0\\n' > .venv/bin/python\n"
+            'chmod +x .venv/bin/python\n'
+        )
+        (repo / "sentinel").write_text("original")
+        (repo / ".gitignore").write_text(".venv/\nsentinel\n")
+        _git(repo, "add", script.name, ".gitignore")
+        _git(repo, "commit", "-m", "absolute-path builder")
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        program = self._prog(repo, root).model_copy(
+            update={field: shlex.join([str(script), "argument with spaces", "--flag"])},
+        )
+
+        result = admin._do_slot_update_work("demo", program, expected_sha=sha)
+
+        assert (repo / "sentinel").read_text() == "original"
+        assert result.success, result.work_errors
+        assert (runtime_slots.slot_source(root, sha) / "sentinel").read_text() == "changed"
+        assert runtime_slots.resolve_current(root) == sha
+
+    @pytest.mark.no_autopatch_branch_check
+    @pytest.mark.parametrize("field", ["update_script", "post_update_script"])
+    @pytest.mark.parametrize("spelling", ["absolute", "traversal", "symlink"])
+    def test_slot_script_cannot_escape_to_a_legacy_updater(
+        self, tmp_path: Path, field: str, spelling: str,
+    ) -> None:
+        repo, _first, _second = self._live_repo(tmp_path)
+        sentinel = tmp_path / "sentinel"
+        sentinel.write_text("original")
+        outside = tmp_path / "outside.sh"
+        outside.write_text(f"printf changed > {shlex.quote(str(sentinel))}\n")
+        if spelling == "absolute":
+            command = str(outside)
+        elif spelling == "traversal":
+            command = "../outside.sh"
+        else:
+            (repo / "linked.sh").symlink_to(outside)
+            _git(repo, "add", "linked.sh")
+            _git(repo, "commit", "-m", "external script link")
+            command = "linked.sh"
+        sha = _head(repo)
+        root = tmp_path / "rt"
+        program = self._prog(repo, root).model_copy(update={field: command})
+
+        result = admin._do_slot_update_work("demo", program, expected_sha=sha)
+
+        assert not result.success
+        assert sentinel.read_text() == "original"
+        assert any("source tree" in error for error in result.work_errors)
+        assert not (root / "current").exists()
+        if spelling != "symlink":
+            assert not root.exists(), "reject external paths before preparing a slot"
+
     def test_expected_sha_is_required(self, tmp_path: Path) -> None:
         """Slots are keyed by commit, so the target must be known up front."""
         repo, _first, _second = self._live_repo(tmp_path)
@@ -2969,9 +3225,11 @@ class TestSlotEnabledUpdate:
         ),
         ids=["nested-venv", "immutable-marker-component"],
     )
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
     def test_fresh_structural_slot_rejects_core_in_excluded_source_path(
-        self, tmp_path: Path, core_relative: str
+        self, tmp_path: Path, core_relative: str, venv_subdir: str,
     ) -> None:
+        core_relative = core_relative.replace(".venv", venv_subdir)
         repo = tmp_path / "live-vibeqc"
         repo.mkdir()
         _git(repo, "init", "-b", "main")
@@ -2991,20 +3249,20 @@ class TestSlotEnabledUpdate:
         source = repo / "cpp" / "src" / "bindings.cpp"
         source.parent.mkdir(parents=True)
         source.write_text("// native source\n", encoding="utf-8")
-        (repo / ".gitignore").write_text(".venv/\n__pycache__/\n")
+        (repo / ".gitignore").write_text(f"{venv_subdir}/\n__pycache__/\n")
         (repo / "build.sh").write_text(
             "#!/bin/bash\n"
             "set -eu\n"
-            f"mkdir -p .venv/bin {shlex.quote(str(Path(core_relative).parent))}\n"
+            f"mkdir -p {venv_subdir}/bin {shlex.quote(str(Path(core_relative).parent))}\n"
             f"echo CORE > {shlex.quote(core_relative)}\n"
-            "cat > .venv/bin/python <<'EOF'\n"
+            f"cat > {venv_subdir}/bin/python <<'EOF'\n"
             "#!/bin/sh\n"
             '_vq_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
             '_vq_source=$(dirname "$(dirname "$_vq_bin")")\n'
             f'PYTHONPATH="$_vq_source/python" exec {shlex.quote(sys.executable)} '
             '-S "$@"\n'
             "EOF\n"
-            "chmod +x .venv/bin/python\n",
+            f"chmod +x {venv_subdir}/bin/python\n",
             encoding="utf-8",
         )
         _git(repo, "add", "-A")
@@ -3013,7 +3271,7 @@ class TestSlotEnabledUpdate:
         root = tmp_path / "rt"
         program = config.VenvProgram(
             kind="venv",
-            python=str(repo / ".venv" / "bin" / "python"),
+            python=str(repo / venv_subdir / "bin" / "python"),
             git_dir=str(repo),
             branch="main",
             update_script="build.sh",
@@ -3031,8 +3289,9 @@ class TestSlotEnabledUpdate:
         assert "outside the slot's hashed content" in result.import_check_output
         assert runtime_slots.resolve_current(root) is None
 
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
     def test_verified_structural_slot_is_revalidated_before_reuse(
-        self, tmp_path: Path
+        self, tmp_path: Path, venv_subdir: str,
     ) -> None:
         repo = tmp_path / "live-vibeqc"
         repo.mkdir()
@@ -3046,14 +3305,14 @@ class TestSlotEnabledUpdate:
             "_vibeqc_core = _Core()\n"
             "_vibeqc_core.__file__ = str(\n"
             "    Path(__file__).resolve().parents[2]\n"
-            "    / '.venv' / 'lib' / 'vibeqc' / '_vibeqc_core.so'\n"
+            f"    / {venv_subdir!r} / 'lib' / 'vibeqc' / '_vibeqc_core.so'\n"
             ")\n",
             encoding="utf-8",
         )
         bindings = repo / "cpp" / "src" / "bindings.cpp"
         bindings.parent.mkdir(parents=True)
         bindings.write_text("// native source\n", encoding="utf-8")
-        (repo / ".gitignore").write_text(".venv/\n__pycache__/\n")
+        (repo / ".gitignore").write_text(f"{venv_subdir}/\n__pycache__/\n")
         _git(repo, "add", "-A")
         _git(repo, "commit", "-m", "structural vibeqc")
         sha = _head(repo)
@@ -3064,10 +3323,11 @@ class TestSlotEnabledUpdate:
             sha,
             transaction_id=transaction,
             in_use=lambda: set(),
+            venv_subdir=venv_subdir,
         )
         source = runtime_slots.materialize_source(repo, root, sha)
-        _managed_python(source)
-        core = source / ".venv" / "lib" / "vibeqc" / "_vibeqc_core.so"
+        _managed_python(source, venv_subdir)
+        core = source / venv_subdir / "lib" / "vibeqc" / "_vibeqc_core.so"
         core.parent.mkdir(parents=True)
         core.write_text("STALE", encoding="utf-8")
         slot_bindings = source / "cpp" / "src" / "bindings.cpp"
@@ -3080,7 +3340,7 @@ class TestSlotEnabledUpdate:
         )
         program = config.VenvProgram(
             kind="venv",
-            python=str(repo / ".venv" / "bin" / "python"),
+            python=str(repo / venv_subdir / "bin" / "python"),
             git_dir=str(repo),
             branch="main",
             update_script="build.sh",
