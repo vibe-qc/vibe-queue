@@ -393,3 +393,75 @@ def test_launchd_reinstall_fails_bounded_without_provenance(
         assert calls.count('bootstrap') == 1
     if failure in {'loaded', 'unknown-state'}:
         assert 'bootstrap' not in calls
+
+
+@pytest.mark.parametrize("kind", [install.DAEMON_SERVICE, install.CONSOLE_SERVICE])
+def test_install_refuses_legacy_executable_for_slot_registration(
+    service_environment, monkeypatch, kind,
+):
+    prog = config.VenvProgram(
+        kind="venv", python=str(service_environment.parent / "python"),
+        git_dir=str(service_environment.parents[1]), branch="main",
+        runtime_slot_root=str(service_environment.parents[2] / "slots"),
+        runtime_slot_execution=True,
+    )
+    monkeypatch.setattr(config, "load_config", lambda: config.Config(programs={"queue": prog}))
+    with pytest.raises(install.InstallError, match="slot-executed"):
+        install.build_plan(manager="systemd-user", kind=kind)
+
+
+def test_console_status_detects_same_version_executable_drift(monkeypatch):
+    from vq import __version__
+
+    monkeypatch.setattr(install, "read_install_marker", lambda kind: {
+        "vq_version": __version__, "console_command": ["/opt/old/bin/vq", "web", "run"],
+        "python": "/opt/old/bin/python",
+    })
+    monkeypatch.setattr(install, "probe_console_runtime",
+                        lambda python: install.ConsoleRuntimeVerdict(True))
+    monkeypatch.setattr(install, "resolve_service_command",
+                        lambda kind: ["/opt/current/bin/vq", "web", "run"])
+    assert install.console_service_status().drifted
+
+
+def test_reinstall_keeps_backup_and_rejects_changed_plan(service_environment, monkeypatch):
+    plan = install.build_plan(manager="systemd-user")
+    unit = plan.writes[0].path
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    original = b'[Service]\nEnvironment="EXAMPLE_SETTING=retained"\n'
+    unit.write_bytes(original)
+    unit.chmod(0o640)
+    plan = install.build_plan(manager="systemd-user", preserve_environment=True)
+    monkeypatch.setattr(install, "_run_install_command", lambda cmd: subprocess.CompletedProcess(
+        cmd.argv, 0, "", ""))
+    unit.write_bytes(b"changed after planning\n")
+    with pytest.raises(install.InstallError, match="changed since"):
+        install.apply_plan(plan)
+    assert unit.read_bytes() == b"changed after planning\n"
+    unit.write_bytes(original)
+    install.apply_plan(plan)
+    backups = list(unit.parent.glob(f".{unit.name}.vq-install-backup-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == original
+    assert backups[0].stat().st_mode & 0o777 == 0o640
+    assert "EXAMPLE_SETTING=retained" in unit.read_text()
+
+
+@pytest.mark.parametrize("unsupported", [False, True])
+def test_web_cli_preserves_environment_or_refuses(service_environment, monkeypatch, unsupported):
+    from click.testing import CliRunner
+
+    from vq.cli import main
+
+    unit = install.build_plan(manager="systemd-user").writes[0].path
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    original = '[Service]\nEnvironment="EXAMPLE_SETTING=keep"\n'
+    if unsupported:
+        original += 'EnvironmentFile=/etc/example/web.env\n'
+    unit.write_text(original)
+    monkeypatch.setattr(install, "require_console_runtime", lambda: None)
+    result = CliRunner().invoke(main, ["web", "install", "--manager", "systemd-user", "--dry-run"])
+    assert result.exit_code == (1 if unsupported else 0), result.output
+    assert ("--allow-dropping-unit-environment" if unsupported
+            else 'Environment="EXAMPLE_SETTING=keep"') in result.output
+    assert unit.read_text() == original

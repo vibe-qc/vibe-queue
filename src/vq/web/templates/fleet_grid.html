@@ -39,16 +39,27 @@
 </div>
 {% endfor %}
 
+{# #168: a configured target is a config key, not a machine. Daemon counts
+   are per daemon: a scheduler lane reports its driver's health, so counting
+   it again would repeat the driver. #}
+{% set r = readiness %}
 <div class="fleet-summary">
-  <div class="tile"><span class="tile-value">{{ summary.hosts }}</span><span class="tile-label">hosts</span></div>
+  <div class="tile"><span class="tile-value">{{ summary.hosts }}</span><span class="tile-label">configured targets</span></div>
+  <div class="tile {% if r.resources.unidentified %}tile-warn{% endif %}">
+    <span class="tile-value">{{ r.resources.known }}{% if r.resources.unidentified %}+?{% endif %}</span>
+    <span class="tile-label">execution resources</span>
+  </div>
   <div class="tile"><span class="tile-value">{{ summary.running }}</span><span class="tile-label">running</span></div>
   <div class="tile"><span class="tile-value">{{ summary.pending }}</span><span class="tile-label">pending</span></div>
   <div class="tile"><span class="tile-value">{{ summary.running_cpus }}</span><span class="tile-label">cpus busy</span></div>
   <div class="tile {% if summary.unreachable %}tile-bad{% endif %}">
     <span class="tile-value">{{ summary.unreachable }}</span><span class="tile-label">unreachable</span>
   </div>
-  <div class="tile {% if summary.degraded %}tile-bad{% endif %}">
-    <span class="tile-value">{{ summary.degraded }}</span><span class="tile-label">degraded</span>
+  <div class="tile {% if r.daemons.degraded %}tile-bad{% endif %}">
+    <span class="tile-value">{{ r.daemons.degraded }}</span><span class="tile-label">daemons degraded</span>
+  </div>
+  <div class="tile {% if r.daemons.unknown %}tile-warn{% endif %}">
+    <span class="tile-value">{{ r.daemons.unknown }}</span><span class="tile-label">daemon health unknown</span>
   </div>
   {# The number an operator running a rolling update is actually watching. #}
   <div class="tile {% if not summary.converged %}tile-warn{% endif %}">
@@ -61,8 +72,69 @@
   {% if snapshot_age %}updated {{ snapshot_age }} ago{% else %}updated just now{% endif %}
   · sweep took {{ snapshot.duration_seconds }} s
   {% if summary.vq_versions %}· vq {{ summary.vq_versions | join(", ") }}{% endif %}
-  {% if not summary.converged %}<strong>— fleet is not on one vq version</strong>{% endif %}
+  {% if not summary.converged %}<strong>— fleet is not on one vq version</strong>
+  (a rollout state, not a dispatch hold: see readiness below){% endif %}
 </p>
+
+<section class="readiness" aria-labelledby="readiness-heading">
+  <h2 id="readiness-heading">Execution readiness</h2>
+  <p class="hint">
+    {{ r.targets.daemon_hosts }} daemon host{{ "" if r.targets.daemon_hosts == 1 else "s" }}
+    and {{ r.targets.scheduler_lanes }} scheduler lane{{ "" if r.targets.scheduler_lanes == 1 else "s" }}
+    on {{ r.resources.machines }} machine{{ "" if r.resources.machines == 1 else "s" }}
+    and {{ r.resources.clusters }} cluster{{ "" if r.resources.clusters == 1 else "s" }}{% if r.resources.unidentified %},
+    plus {{ r.resources.unidentified }} target{{ "" if r.resources.unidentified == 1 else "s" }} not identified{% endif %}.
+    Dispatch: {{ r.dispatch.open }} open · {{ r.dispatch.held }} held · {{ r.dispatch.unknown }} unknown.
+    Live calculations, each counted once:
+    {{ r.executions.counts.running }} running ({{ r.executions.allocated_cpus }} CPUs allocated),
+    {{ r.executions.counts.queued }} queued{% if r.executions.counts.held %}, {{ r.executions.counts.held }} held{% endif %}{% if r.executions.counts.unconfirmed %}, {{ r.executions.counts.unconfirmed }} unconfirmed{% endif %}.
+  </p>
+  {% if r.partial %}
+  <div class="banner banner-warn" role="status">
+    <strong>Partial: {{ r.partial | length }} target{{ "" if r.partial | length == 1 else "s" }} not observed.</strong>
+    Their eligibility is unknown and their calculations are missing from every total; they are not idle.
+    <ul>
+      {% for p in r.partial %}<li>{{ p.target }}: {{ p.reason | truncate(200, true) }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% if r.programs %}
+  <div class="table-scroll">
+  <table class="readiness-table">
+    <thead><tr><th>program</th><th>eligible on (current runtime)</th><th>updates</th><th>not eligible</th></tr></thead>
+    <tbody>
+    {% for p in r.programs %}
+    <tr>
+      <td>{{ p.program }}</td>
+      <td>{% for e in p.eligible %}{{ e.target }}{% if e.runtime %} ({{ e.runtime }}){% endif %}{% if not loop.last %}, {% endif %}{% else %}<span class="hint">none established</span>{% endfor %}</td>
+      <td>{% for u in p.updates %}
+        <div>{{ u.target }}: <strong>{{ u.state }}</strong>{% if u.holds_dispatch %} (dispatch held){% else %} (current runtime unaffected){% endif %}{% if u.action %}<br><small>{{ u.action }}</small>{% endif %}</div>
+      {% else %}-{% endfor %}</td>
+      <td>
+        {% for h in p.held %}<div>held on {{ h.target }}: {{ h.reason | truncate(200, true) }}</div>{% endfor %}
+        {% for x in p.refused %}<div>refused on {{ x.target }}: {{ x.reason | truncate(200, true) }}</div>{% endfor %}
+        {% for u in p.unknown %}<div>unknown on {{ u.target }}: {{ u.reason | truncate(200, true) }}</div>{% endfor %}
+        {% if not (p.held or p.refused or p.unknown) %}-{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="hint">No target reported a program runtime, an update lease or a refused job.</p>
+  {% endif %}
+  {% if r.admission_failures %}
+  <h3>Admission failures</h3>
+  <ul class="readiness-failures">
+    {% for f in r.admission_failures %}
+    <li><strong>{{ f.program }}</strong> on <strong>{{ f.target }}</strong>, {{ f.kind }}{% if f.at %} at {{ f.at }}{% endif %}:
+      {{ f.reason | truncate(300, true) }}
+      (<a href="/fleet/jobs/{{ f.job }}?host={{ f.target }}">{{ f.job }}</a>)</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</section>
 
 <div class="fleet-grid">
   {% for card in cards %}
@@ -88,10 +160,17 @@
       {% elif not card.reachable %}
         <span class="badge badge-bad">unreachable</span>
       {% else %}
+        {# A scheduler lane has no daemon of its own: the health shown is its driver's. #}
+        {% set daemon_label = "driver daemon" if card.readiness and card.readiness.kind == "scheduler" else "daemon" %}
         {% if card.daemon_ok %}
-          <span class="badge badge-ok">daemon ok</span>
+          <span class="badge badge-ok">{{ daemon_label }} ok</span>
         {% elif card.daemon_ok is sameas false %}
-          <span class="badge badge-bad">daemon degraded</span>
+          <span class="badge badge-bad">{{ daemon_label }} degraded</span>
+        {% endif %}
+        {% if card.readiness %}
+          {% if card.readiness.dispatch == "open" %}<span class="badge badge-ok">dispatch open</span>
+          {% elif card.readiness.dispatch == "held" %}<span class="badge badge-warn">dispatch held</span>
+          {% else %}<span class="badge badge-warn">dispatch unknown</span>{% endif %}
         {% endif %}
         {% if card.draining %}<span class="badge badge-warn">draining</span>{% endif %}
         {% if card.throttled %}<span class="badge badge-warn">throttled</span>{% endif %}
@@ -153,6 +232,9 @@
     {% endif %}
     {% if card.admin_marker_stale_reason %}
     <p class="host-card-error">{{ card.admin_marker_stale_reason }}</p>
+    {% endif %}
+    {% if card.reachable and card.readiness and card.readiness.dispatch != "open" %}
+    <p class="host-card-error">dispatch {{ card.readiness.dispatch }}: {{ card.readiness.reasons | join("; ") | truncate(300, true) }}</p>
     {% endif %}
 
     <p class="hint"><a href="/fleet/jobs?host={{ card.host }}">jobs on {{ card.host }} →</a></p>

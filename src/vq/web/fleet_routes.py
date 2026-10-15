@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import parse_qs, quote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,7 +19,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.concurrency import run_in_threadpool
 
 from vq import auth, config
-from vq.web import authn, fleet_audit
+from vq.web import authn, calculations, fleet_audit
 from vq.web import fleet as fleet_mod
 from vq.web import view_context as web_view
 
@@ -113,7 +114,18 @@ def register_fleet_routes(
         return web_view.fleet_jobs_context(
             cache.snapshot(),
             request.query_params,
+            trend=cache.trend(),
         )
+
+    def _broker_jobs() -> dict[str, object] | None:
+        """#64 B7: this host's broker jobs, metadata only, when it is a broker."""
+        from vq import broker_service, config  # noqa: PLC0415
+
+        try:
+            cfg = config.load_config()
+        except config.ConfigError:
+            return None
+        return broker_service.console_view(cfg)
 
     def _fleet_grid_context() -> dict[str, object]:
         # The cache's own interval, not a constant: the staleness
@@ -165,6 +177,7 @@ def register_fleet_routes(
             return ident
         context = _fleet_jobs_context(request)
         context["identity"] = ident
+        context["broker"] = _broker_jobs()
         context.update(_daemon_badge_context())
         return services.templates.TemplateResponse(
             request,
@@ -215,10 +228,24 @@ def register_fleet_routes(
             jobid,
             multi_user=multi_user,
         )
+        preview = None
+        if payload is not None:
+            from vq import previews
+
+            status = payload.get("status") if isinstance(payload, dict) else None
+            if isinstance(status, dict) and isinstance(status.get("stdout"), str):
+                program = status.get("program")
+                preview = previews.preview(
+                    program if isinstance(program, str) else None,
+                    status["stdout"][-previews.MAX_TAIL_BYTES:],
+                )
         context: dict[str, object] = {
             "jobid": jobid,
             "queue_host": queue_host,
             "detail": payload,
+            "preview": preview,
+            "chart": web_view.convergence_chart(preview),
+            "final_usage": web_view.final_usage_view(payload),
             "error": error,
             "identity": ident,
             "can_act": (
@@ -556,9 +583,55 @@ def register_fleet_routes(
         filtered = [
             row for row in rows if services.row_matches(row, query)
         ]
+        now = datetime.now(UTC)
+        jobs = []
+        for row in filtered:
+            observation = row.get("resource_observation")
+            if isinstance(observation, dict):
+                current = calculations.observation_view(row, now=now)
+                row = {**row, "resource_observation": {
+                    **observation, "status": current["status"],
+                    "age_seconds": current["age_seconds"],
+                }}
+            jobs.append(row)
+        # #168: what each unlisted host showed at its last successful
+        # listing. Not current, so apart from "jobs" and "count".
+        last_known = [
+            {"host": host.host, "observed_at": host.last_known_at,
+             "reason": host.overview.admin_down or host.jobs_error,
+             "jobs": matching}
+            for host in (snapshot.hosts if snapshot is not None else [])
+            if (matching := [row for row in host.last_known
+                             if services.row_matches(row, query)])
+        ]
         return {
             "gathered_at": snapshot.gathered_at if snapshot else None,
             "warming_up": snapshot is None,
             "count": len(filtered),
-            "jobs": filtered,
+            "jobs": jobs,
+            "last_known": last_known,
         }
+
+    @app.get("/api/v1/fleet/jobs/{jobid}/preview")
+    def api_fleet_job_preview(request: Request, jobid: str) -> dict[str, object]:
+        """Calculation preview (#65): parsed from the stdout tail the job
+        drill-down already exposes to this identity, and nothing else."""
+        _api_gate(request)
+        queue_host = (request.query_params.get("host") or "").strip()
+        snapshot = cache.snapshot()
+        if not queue_host and snapshot is not None:
+            for row in snapshot.jobs:
+                if row.get("id") == jobid:
+                    queue_host = str(row.get("queue_host") or "")
+                    break
+        if not queue_host:
+            raise HTTPException(
+                status_code=404,
+                detail=f"job {jobid!r} not in the fleet snapshot; pass ?host=HOST",
+            )
+        payload, error = fleet_mod.fetch_job_preview(
+            config.load_config(), queue_host, jobid, multi_user=multi_user,
+        )
+        if payload is None:
+            raise HTTPException(status_code=502, detail=error or "preview unavailable")
+        return payload
