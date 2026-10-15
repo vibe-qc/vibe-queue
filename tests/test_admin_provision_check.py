@@ -402,8 +402,43 @@ def test_the_program_registry_is_read_from_the_target_not_the_driver(
     # vibeqc-dev. The verdict must describe the target.
     payload = provision.diagnose_host(_cfg(programs=True), "host_d")
 
-    assert seen == [("programs", "--json")]
+    # #174: `localhost` explicitly. A bare `vq programs` would resolve the
+    # target's own default_host, which may be absent or another machine.
+    assert seen == [("programs", "localhost", "--json")]
     assert _named(payload, "programs_registered")["programs"] == ["vibeqc-dev"]
+
+
+def _local_config(tmp_path, *, default_host: str | None):  # type: ignore[no-untyped-def]
+    """A config dir with one registered program and a chosen default_host."""
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    default = f'default_host = "{default_host}"\n' if default_host else ""
+    (cfg_dir / "config.toml").write_text(
+        default
+        + '[hosts.elsewhere]\nssh = "elsewhere.example.invalid"\n'
+        + '[programs.true-prog]\nkind = "binary"\nbinary = "/bin/sh"\n'
+    )
+    return cfg_dir
+
+
+@pytest.mark.parametrize("default_host", [None, "elsewhere"],
+                         ids=["no-default-host", "default-host-elsewhere"])
+def test_a_local_target_lists_its_own_registry_whatever_its_default_host(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, default_host: str | None,
+) -> None:
+    """#174, end to end through a real `python -m vq programs` subprocess.
+    Without `localhost` the first case exits 2 (HOST is required) and the
+    second delegates to an unreachable machine; either way the check failed
+    on a host whose registry is fine."""
+    monkeypatch.setenv(config.ENV_CONFIG_DIR, str(_local_config(
+        tmp_path, default_host=default_host)))
+    monkeypatch.setenv("VQ_STATE_DIR", str(tmp_path / "state"))
+
+    verdicts = provision._programs_check("localhost", config.HostConfig(ssh="localhost"))
+
+    (verdict,) = verdicts
+    assert verdict["ok"] is True, verdict["message"]
+    assert verdict["programs"] == ["true-prog"]
 
 
 def test_a_non_json_programs_reply_fails_rather_than_reading_as_empty(

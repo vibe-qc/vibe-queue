@@ -37,6 +37,7 @@ def test_conftest_overrides_every_inherited_persistent_path() -> None:
         paths.ENV_MULTI_USER_ROOT,
         config.ENV_TEST_SYSTEM_CONFIG_FILE,
         "VQ_WEB_TOKEN_FILE",
+        "VQ_SOURCE_PROJECTS_FILE",
     ):
         resolved = Path(os.environ[name]).expanduser().resolve(strict=False)
         assert resolved == sandbox or sandbox in resolved.parents

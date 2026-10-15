@@ -1,5 +1,7 @@
 # Operator prompts for the release + upgrade chats
 
+**Audience: agents.** Part of [The agent contract](agent/index.md).
+
 > **Historical monorepo prompts.** The shared tree, version paths and tag
 > ownership described below predate the repository split. Use the current
 > [release process](release_process.md) and [installation guide](installation.md)
@@ -9,7 +11,7 @@ Copy-paste prompts for the two recurring ecosystem chats, plus the standing
 process decisions they depend on.
 
 These live here because the queue chat owns `vibe-queue/docs/` and wrote the
-[fleet update runbook](fleet_update_runbook.md) the upgrade prompt points at.
+[fleet update runbook](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_update_runbook.md) the upgrade prompt points at.
 The **release** prompt follows the work the release chat owns in
 [`docs/release_process.md`](https://vibe-qc.com/docs/release_process.html), including the
 sibling-version backstop. If this prompt and that process differ, the release
@@ -71,7 +73,7 @@ the fleet.
 
 > We have a new release of the vibe-qc ecosystem. Roll it to the fleet.
 >
-> **Read [`vibe-queue/docs/fleet_update_runbook.md`](fleet_update_runbook.md)
+> **Read [`vibe-queue/docs/fleet_update_runbook.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_update_runbook.md)
 > before the first command.** It has the order of operations, the
 > no-builds-on-login-nodes routing, and the recovery paths. Do not improvise
 > around it; if it is wrong or silent on something, say so rather than

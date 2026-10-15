@@ -431,6 +431,18 @@ VQ_LIFECYCLE_VENV="$VENV_PATH"
 trap 'vq_lifecycle_cleanup' EXIT
 vq_acquire_lifecycle_lock "$VENV_PATH" update
 vq_assert_mutable_runtime_target "$VENV_PATH" 1
+# Only the authenticated admin build may reach a building slot here. It has
+# no previous environment to replace: the slot owner handles failed preparation,
+# while the durable replacement helper must continue refusing every slot path.
+FRESH_RUNTIME_SLOT=0
+if [ "$RECREATE_VENV" = "1" ] && \
+   [[ "$VENV_PATH" =~ ^(.+)/releases/([0-9a-f]{40})/source/([^/]+)$ ]]; then
+    if [ -e "$VENV_PATH" ] || [ -L "$VENV_PATH" ]; then
+        echo "Error: fresh runtime slot target already exists; let the slot owner recover it." >&2
+        exit 1
+    fi
+    FRESH_RUNTIME_SLOT=1
+fi
 RECEIPT_PATH="$(vq_venv_replacement_receipt_path "$VENV_PATH")"
 if [ -e "$RECEIPT_PATH" ] || [ -L "$RECEIPT_PATH" ]; then
     vq_assert_daemon_stopped_or_managed \
@@ -480,7 +492,10 @@ fi
 VENV_PREFLIGHT_COMPLETE=0
 prepare_venv_update() {
     [ "$VENV_PREFLIGHT_COMPLETE" = "0" ] || return 0
-    if [ "$RECREATE_VENV" = "1" ]; then
+    if [ "$FRESH_RUNTIME_SLOT" = "1" ]; then
+        # There is no legacy venv and no durable replacement receipt to arm.
+        :
+    elif [ "$RECREATE_VENV" = "1" ]; then
         # Arm cleanup before checkout mutation. The old venv stays in place
         # until replacement work begins and is restored after any later error.
         if [ "$ADMIN_MANAGED_DAEMON_RESTART" = "1" ]; then
@@ -550,8 +565,16 @@ if [ "$SKIP_GIT" != "1" ]; then
 fi
 
 if [ "$RECREATE_VENV" = "1" ]; then
-    vq_start_venv_replacement "$VENV_PATH"
-    echo "==> Creating replacement virtualenv: $VENV_PATH"
+    if [ "$FRESH_RUNTIME_SLOT" = "1" ]; then
+        vq_assert_mutable_runtime_target "$VENV_PATH" 1
+        if [ -e "$VENV_PATH" ] || [ -L "$VENV_PATH" ]; then
+            echo "Error: fresh runtime slot target appeared during preparation." >&2
+            exit 1
+        fi
+    else
+        vq_start_venv_replacement "$VENV_PATH"
+    fi
+    echo "==> Creating virtualenv: $VENV_PATH"
     "$PYTHON_BIN" -m venv "$VENV_PATH"
 fi
 vq_install_environment "$VENV_PATH" "$EXTRAS_SPEC" "$EDITABLE"
@@ -559,7 +582,7 @@ vq_verify_environment "$VENV_PATH" "$EXTRAS_PROFILE"
 vq_record_venv_ownership "$VENV_PATH"
 vq_record_source_marker "$VENV_PATH" "$EDITABLE"
 vq_record_install_metadata "$VENV_PATH" "$EXTRAS_PROFILE" "$EDITABLE"
-if [ "$RECREATE_VENV" = "1" ]; then
+if [ "$RECREATE_VENV" = "1" ] && [ "$FRESH_RUNTIME_SLOT" != "1" ]; then
     vq_commit_venv_replacement
 fi
 

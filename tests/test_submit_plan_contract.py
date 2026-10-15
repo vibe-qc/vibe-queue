@@ -81,6 +81,7 @@ def plan_harness(
                 'scratch_root = "/cluster"',
                 'scheduler_driver = "driver"',
                 'scheduler_max_wall_time_seconds = 7200',
+                'scheduler_max_cpus = 64',
                 "",
                 "[hosts.host_f.branches]",
                 'release = "/cluster/release/python"',
@@ -1843,3 +1844,72 @@ def test_qvf_backend_validation_contract(
     assert result.exit_code == 2
     assert result.output.rstrip().splitlines()[-1] == expected_error
     assert list(paths.queue_dir().glob("*.json")) == []
+
+
+
+# --- lane width warnings at submit (vibe-qc#148) ----------------------------
+
+
+def test_a_too_wide_scheduler_request_warns_and_is_still_accepted(
+    plan_harness: PlanHarness,
+) -> None:
+    # Before this, the submit path returned no warnings at all for a
+    # scheduler target, so a request that the lane could never run was
+    # accepted in silence and discovered days later as a queued job.
+    from vq.submit import _scheduler_width_warnings
+
+    warnings = _scheduler_width_warnings(
+        cpus=128, jobid="abc123", scheduler_target="host_f"
+    )
+
+    assert len(warnings) == 1
+    assert "job abc123" in warnings[0]
+    assert "at most 64" in warnings[0]
+    assert "asks for 128" in warnings[0]
+
+
+def test_a_scheduler_request_within_the_lane_width_is_silent(
+    plan_harness: PlanHarness,
+) -> None:
+    from vq.submit import _scheduler_width_warnings
+
+    assert (
+        _scheduler_width_warnings(
+            cpus=64, jobid="abc123", scheduler_target="host_f"
+        )
+        == ()
+    )
+
+
+def test_an_undeclared_lane_width_warns_about_nothing(
+    plan_harness: PlanHarness,
+) -> None:
+    # local-host_f declares no scheduler_max_cpus: unknown is not unlimited,
+    # but it is also not grounds for a warning vq cannot support.
+    from vq.submit import _scheduler_width_warnings
+
+    assert (
+        _scheduler_width_warnings(
+            cpus=4096, jobid="abc123", scheduler_target="local-host_f"
+        )
+        == ()
+    )
+
+
+def test_an_unreadable_config_costs_the_warning_not_the_submit(
+    plan_harness: PlanHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vq import submit as submit_mod
+
+    def boom() -> object:
+        raise RuntimeError("config is unreadable")
+
+    monkeypatch.setattr(submit_mod.config, "load_config", boom)
+
+    assert (
+        submit_mod._scheduler_width_warnings(
+            cpus=128, jobid="abc123", scheduler_target="host_f"
+        )
+        == ()
+    )

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from vq import config, fetch, paths, submit, transport
@@ -408,12 +410,13 @@ def test_scheduler_qvf_auto_snapshots_registered_full_sha(
     )
     monkeypatch.setenv(config.ENV_CONFIG_DIR, str(cfg_dir))
     sha = "a" * 40
+    launcher = f"/cluster/runtime/releases/{sha}/source/.venv/bin/python"
     payload = json.dumps(
         [
             {
                 "name": "vibeqc-dev",
                 "kind": "venv",
-                "python": "/cluster/bin/vibeqc-dev-python",
+                "python": launcher,
                 "current_git_sha_full": sha,
                 "import_version": "0.15.59",
             }
@@ -433,7 +436,7 @@ def test_scheduler_qvf_auto_snapshots_registered_full_sha(
 
     assert pin is not None
     assert pin.expected_git_sha == sha
-    assert pin.resolved_executable == "/cluster/bin/vibeqc-dev-python"
+    assert pin.resolved_executable == launcher
 
 
 def test_artifact_only_fetch_returns_no_queue_sidecars(tmp_path: Path) -> None:
@@ -533,6 +536,46 @@ def test_qvf_status_distinguishes_chemistry_failure(tmp_path: Path) -> None:
     assert lifecycle["chemistry_failed"] is True
     assert lifecycle["queue_process_failed"] is False
     assert lifecycle["outcome"] == "chemistry_failed"
+
+
+@pytest.mark.parametrize("archive,run_status,sequence,complete,outcome", [
+    ("corpus/job_set_methods.qvf", "pending", None, False, "pending"),
+    ("corpus/job_set.qvf", "running", 0, True, "running"),
+    ("corpus/provenance_full.qvf", "converged", 0, False, "terminal_incomplete"),
+    ("legacy/reaction_path_v2.qvf", None, None, False, "unavailable"),
+])
+def test_qvf_status_reads_upstream_fixtures(
+    tmp_path: Path, archive, run_status, sequence, complete, outcome,
+) -> None:
+    """Use the pinned upstream bytes without defining a queue-owned format."""
+    qvf_root = os.environ.get("VQ_TEST_QVF_ROOT")
+    if not qvf_root:
+        pytest.skip("set VQ_TEST_QVF_ROOT to the pinned qvf checkout")
+    original = (Path(qvf_root) / "conformance" / archive).read_bytes()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    artifact = workspace / "job.qvf"
+    artifact.write_bytes(original)
+    queue = tmp_path / "queue"
+    queue.mkdir()
+    JobSpec(
+        id="qvfupstream1",
+        command=["true"],
+        cwd=str(workspace),
+        cpus=1,
+        qvf_artifact_name="job.qvf",
+        state=JobState.RUNNING,
+    ).write(queue / "qvfupstream1.json")
+
+    payload = json.loads(show_status_json("localhost", "qvfupstream1", queue_dir=queue, tail=0))
+    lifecycle = payload["qvf_lifecycle"]
+    assert "error" not in lifecycle
+    assert lifecycle["run_status"] == run_status
+    assert lifecycle["sequence"] == sequence
+    assert lifecycle["run_record_complete"] is complete
+    assert lifecycle["outcome"] == outcome
+    assert lifecycle["done"] is False
+    assert artifact.read_bytes() == original
 
 
 def test_daemon_qvf_round_trip_fetch_rerun_and_failed_container(

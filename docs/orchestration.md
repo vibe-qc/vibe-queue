@@ -1,5 +1,7 @@
 # Driving vq from a script
 
+**Audience: operators and agents.** Part of [Running a host](operator/index.md) and [The agent contract](agent/index.md).
+
 **Match on `outcome`. Never on message text.**
 
 This page is the contract between vq and an unattended caller. It exists
@@ -183,17 +185,26 @@ scope.
 `vibeqc-dev` and `vibe-view` all proceed. A `--all` request is refused, and
 correctly so — it includes the program that failed.
 
-**Dispatch: host-wide.** The same marker holds *job dispatch* on that host
-until it is acknowledged, and it does not narrow when the update stops. That
-is deliberate where the marker was born — a venv being rebuilt must not be
-dispatched into — but it means a failed marker left sitting keeps the host
-from running work, which is what "still scoping compute-c's dispatch" meant hours
-after that update died.
+**Dispatch: separate from build ownership.** Scheduler runtime deployments
+stage immutable bundles and activate atomically. Direct-host programs with
+`runtime_slot_execution = true` also build beside the serving generation and
+do not pause calculations. These background markers serialize updates and
+retain failure/recovery evidence, but allow jobs eligible for the healthy
+current runtime, including other programs on the same target.
 
-So if a host has gone quiet after a failed update, the marker is the thing to
-look at, and `--acknowledge-failed-marker` (or `vq admin clear-update-marker`)
-is what releases it. Narrowing the dispatch hold to the failed program is a
-separate design question and has not been done.
+Each job still resolves and records its actual execution generation. Existing
+bindings retain their files across activation; later jobs can select the new
+generation. A required SHA absent from current is never satisfied by the old
+runtime. Missing or defective runtimes, resource limits and explicit drains
+remain independent gates. Submission receipts list background updates separately
+from `dispatch_holds`.
+
+In-place environment updates, scheduler helper changes and serving-daemon
+transactions retain their dispatch fences. Pause/recovery receipts stay armed,
+and unreadable or unknown markers hold everything. Legacy plain-env markers
+remain conservative: they do not prove an immutable build. Inspect status and
+use `--acknowledge-failed-marker` for a failed ordinary build, or
+`vq admin recover-update` for a managed transaction; never delete active receipts.
 
 ## A worked example
 

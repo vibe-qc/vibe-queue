@@ -96,6 +96,31 @@
 </section>
 {% endif %}
 
+{# #168: what the finished command measurably used, from its receipt. #}
+{% if final_usage %}
+<section class="monitor">
+  <h3>final resource usage</h3>
+  {% if final_usage.status == "ok" %}
+  <dl>
+    <dt>wall</dt><dd>{{ final_usage.wall }}</dd>
+    <dt>cpu time</dt><dd>{{ final_usage.cpu }}{% if final_usage.average_cores is not none %} ({{ final_usage.average_cores }} cores on average{% if final_usage.declared_cpus %} of {{ final_usage.declared_cpus }} declared{% endif %}){% endif %}</dd>
+    <dt>peak rss</dt><dd>{% if final_usage.peak_rss_mb is not none %}{{ "%.0f" | format(final_usage.peak_rss_mb) }} MB{% if final_usage.peak_share is not none %} ({{ final_usage.peak_share }}% of {{ final_usage.declared_mem_mb }} MB declared){% endif %}{% else %}unknown{% endif %}</dd>
+    {% if final_usage.process_count is not none %}<dt>processes</dt><dd>{{ final_usage.process_count }} at most at once</dd>{% endif %}
+  </dl>
+  <p class="hint">
+    Measured by {{ final_usage.collector }}{% if final_usage.receipts and final_usage.receipts > 1 %} over {{ final_usage.receipts }} array elements (cpu summed, wall and peak the largest){% endif %}.
+    Peak rss is the {{ final_usage.peak_rss_scope }}, not a sum over the job's processes.
+  </p>
+  {% elif final_usage.status == "absent" %}
+  <p class="hint">No usage receipt. The command did not exit on its own (a killed job leaves none), or it ran under a vq that did not write one.</p>
+  {% elif final_usage.status == "error" %}
+  <p class="hint">The collector could not measure this run: {{ final_usage.error }}</p>
+  {% else %}
+  <p class="host-card-error">The usage receipt is not shown because it cannot be trusted: {{ final_usage.error }}</p>
+  {% endif %}
+</section>
+{% endif %}
+
 {% if detail.samples %}
 <section class="monitor">
   <h3>resource samples (last {{ detail.samples | length }}, newest first)</h3>
@@ -123,6 +148,31 @@
     </tbody>
   </table>
   </div>
+</section>
+{% endif %}
+
+{% if preview and (preview.method or preview.formula or preview.name or preview.scf
+    or preview.error or preview.optimisation or preview.headline.total_energy is not none) %}
+<section class="preview">
+  <h3>calculation</h3>
+  <dl>
+    {% if preview.name or preview.formula %}<dt>system</dt><dd>{{ preview.name or "" }}{% if preview.name and preview.formula %} &middot; {% endif %}{{ preview.formula or "" }}{% if preview.atoms %} ({{ preview.atoms }} atoms{% if preview.periodic_dimensions %}, {{ preview.periodic_dimensions }}D periodic{% endif %}){% endif %}</dd>{% endif %}
+    {% if preview.method %}<dt>method</dt><dd>{{ preview.method }}{% if preview.basis %} / {{ preview.basis }}{% endif %}</dd>{% endif %}
+    {% if preview.headline.total_energy is not none %}<dt>total energy</dt><dd class="num">{{ "%.10f" | format(preview.headline.total_energy) }} Ha</dd>{% endif %}
+    {% if preview.headline.gap_ev is not none %}<dt>gap</dt><dd class="num">{{ "%.4f" | format(preview.headline.gap_ev) }} eV</dd>{% endif %}
+    {% if preview.scf %}<dt>SCF</dt><dd class="num">iteration {{ preview.scf[-1].iter }}, E = {{ "%.10f" | format(preview.scf[-1].energy) }} Ha, residual {{ "%.2e" | format(preview.scf[-1].residual) }}</dd>{% endif %}
+    {% if preview.scf_energies | length > 1 %}<dt>SCF solutions</dt><dd class="num">{{ preview.scf_energies | length }} (latest {{ "%.10f" | format(preview.scf_energies[-1]) }} Ha)</dd>{% endif %}
+    {% if preview.optimisation %}<dt>optimisation</dt><dd class="num">{{ preview.optimisation.iterations }} iterations, max|grad| {{ "%.2e" | format(preview.optimisation.max_gradient) }}, {{ "converged" if preview.optimisation.converged else "not converged" }}</dd>{% endif %}
+    {% if preview.error %}<dt>error</dt><dd>{{ preview.error }}</dd>{% endif %}
+  </dl>
+  {% if chart %}
+  <figure>
+    <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" width="{{ chart.width }}" height="{{ chart.height }}" role="img" aria-label="SCF residual per iteration, log scale">
+      <polyline fill="none" stroke="currentColor" stroke-width="1.5" points="{{ chart.points }}"/>
+    </svg>
+    <figcaption class="hint">log10 ||[F,DS]|| from {{ chart.log_top }} to {{ chart.log_bottom }}, iterations {{ chart.first_iter }}&ndash;{{ chart.last_iter }}</figcaption>
+  </figure>
+  {% endif %}
 </section>
 {% endif %}
 
