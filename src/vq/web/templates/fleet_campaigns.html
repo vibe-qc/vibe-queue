@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}vq · campaigns{% endblock %}
+{% block content %}
+<h2>Campaigns</h2>
+<p class="hint">
+  Campaigns whose controller (<code>vq campaign run</code>) runs on this
+  machine as the console's user, read from each run directory's journal:
+  the same view as <code>vq campaign status</code>. Read only; it refreshes
+  every 10 s. <a href="/fleet">← host grid</a>
+</p>
+{% include "fleet_campaigns_board.html" %}
+{% endblock %}

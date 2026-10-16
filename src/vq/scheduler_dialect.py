@@ -72,6 +72,46 @@ def enforce_scheduler_wall_time_limit(
     )
 
 
+def scheduler_width_warning(
+    requested_cpus: int | None,
+    maximum_cpus: int | None,
+    *,
+    scheduler_host: str | None = None,
+    partition: str | None = None,
+) -> str | None:
+    """Warn about an ask wider than the lane can ever run, or ``None``.
+
+    Deliberately a *warning*, unlike
+    :func:`enforce_scheduler_wall_time_limit`. A width limit is a capacity
+    observation and capacity changes: a node comes back, a partition is
+    resized, the declared figure goes stale. Refusing on a stale number would
+    reject work the cluster can now run, so the operator is told and the
+    submission proceeds.
+
+    An unknown maximum warns about nothing -- ``None`` means "not declared",
+    never "unlimited".
+    """
+    if (
+        requested_cpus is None
+        or maximum_cpus is None
+        or requested_cpus <= maximum_cpus
+    ):
+        return None
+    lane = (
+        f"scheduler lane {scheduler_host!r}"
+        if scheduler_host is not None
+        else "scheduler lane"
+    )
+    if partition is not None:
+        lane += f" (partition {partition!r})"
+    return (
+        f"{lane} declares at most {maximum_cpus} cpu(s) per job; "
+        f"this asks for {requested_cpus}. The scheduler will accept it and "
+        "may never start it. Check `vq scheduler-probe` and resize, or "
+        "update scheduler_max_cpus if the lane has grown."
+    )
+
+
 class SchedulerPhase(Enum):
     """Coarse, scheduler-agnostic phase derived from scheduler status output.
 
@@ -101,6 +141,12 @@ class QstatDetail:
     landed on and how much of its walltime budget it has used. The execution
     host and used walltime may be absent while queued, and every detail field is
     optional except ``raw_state``.
+
+    ``queued_reason`` is the scheduler's own verbatim explanation for a job
+    that has not started -- Torque's ``comment`` and Slurm's ``Reason``. It is
+    set only while the job is PENDING, because those strings answer "why is
+    this not running yet" and mean nothing once it is. A queued job whose
+    scheduler offers no explanation keeps ``None``.
     """
 
     raw_state: str
@@ -108,6 +154,31 @@ class QstatDetail:
     walltime_used: str | None = None
     walltime_limit: str | None = None
     exit_code: int | None = None
+    queued_reason: str | None = None
+    #: #168: Torque's ``resources_used.mem`` and ``resources_used.cput``,
+    #: verbatim: the job's memory as the scheduler measures it and its CPU
+    #: time so far. Slurm's sacct reports neither for a running job; its CPU
+    #: time comes from ``sstat`` (:meth:`SlurmDialect.parse_usage`).
+    mem_used: str | None = None
+    cpu_used: str | None = None
+    #: #168: Slurm's ``sstat`` ``MaxRSS``, the peak RSS of the job's largest
+    #: task among its running steps, as ``<KiB>kb``. A peak, of one task: it
+    #: is never the job's total memory, which Slurm does not report live.
+    task_peak_rss: str | None = None
+
+
+@dataclass(frozen=True)
+class LiveUsage:
+    """What ``sstat`` reports for one running Slurm job (#168).
+
+    ``task_peak_rss`` is :attr:`QstatDetail.task_peak_rss`; ``cpu_used`` is
+    the CPU time of the job's running steps so far, as ``H:MM:SS``, in the
+    same sense as Torque's ``resources_used.cput``. Either is None when a
+    step does not report it.
+    """
+
+    task_peak_rss: str | None = None
+    cpu_used: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +287,16 @@ class SchedulerDialect(Protocol):
         """
         ...
 
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        """``{job_id: reason}`` from the *same* poll stdout, pending jobs only.
+
+        The scheduler's verbatim answer to "why has this not started", for the
+        dialects whose coarse poll carries one. A dialect that reports the
+        reason elsewhere (Torque, in the detail poll's ``comment``) returns an
+        empty mapping here.
+        """
+        ...
+
     def detail_command(self, job_id: str) -> list[str]:
         """argv for accounting/detail output for one requested job id."""
         ...
@@ -251,6 +332,18 @@ class SchedulerDialect(Protocol):
         """
         ...
 
+    def ended_on_its_own(self, state: str) -> bool:
+        """Whether accounting proves the job ended by itself (#126).
+
+        True only for a terminal state the scheduler records when the job's
+        own command finished (for SLURM, ``COMPLETED`` or ``FAILED``), never
+        for a cancellation, a timeout or any other scheduler-attributed end.
+        A dialect without such evidence answers False. The daemon uses it to
+        keep a job's real outcome when a ``vq kill`` arrived after the job
+        had already finished.
+        """
+        ...
+
     def cancel_command(self, job_id: str) -> list[str]:
         """argv that cancels ``job_id`` (e.g. ``["qdel", job_id]``)."""
         ...
@@ -262,6 +355,57 @@ class SchedulerDialect(Protocol):
     def release_command(self, job_id: str) -> list[str]:
         """argv that releases a scheduler hold on ``job_id``."""
         ...
+
+
+_TORQUE_MEMORY = re.compile(r"^\s*(?P<amount>\d+)\s*(?P<unit>[kmgtp]?)(?P<kind>[bw]?)\s*$",
+                            re.IGNORECASE)
+
+
+def torque_memory_mb(value: str | None) -> float | None:
+    """MiB from a Torque memory value such as ``5242880kb``, or None.
+
+    Torque writes an integer with an optional ``k/m/g/t/p`` multiplier
+    (powers of 1024) and ``b`` for bytes; a bare number is bytes. Word units
+    (``w``) depend on the machine's word size and are not converted.
+    """
+    if value is None:
+        return None
+    match = _TORQUE_MEMORY.match(value)
+    if match is None or match["kind"].lower() == "w":
+        return None
+    power = "kmgtp".find(match["unit"].lower()) + 1 if match["unit"] else 0
+    return int(match["amount"]) * 1024.0**power / 1024.0**2
+
+
+_SLURM_MEMORY = re.compile(r"^(?P<amount>\d+(?:\.\d+)?)(?P<unit>[KMGTP]?)$")
+_SLURM_CPU_TIME = re.compile(
+    r"^(?:(?P<days>\d+)-)?(?:(?P<hours>\d+):)?(?P<minutes>\d+):(?P<seconds>\d+(?:\.\d+)?)$")
+
+
+def slurm_memory_bytes(value: str) -> int | None:
+    """Bytes from a Slurm memory field such as ``1.50G`` or ``123456K``.
+
+    Slurm prints bytes with a ``K/M/G/T/P`` multiplier (powers of 1024), and
+    a bare number below 1024 as bytes. Blank (no accounting) is None.
+    """
+    match = _SLURM_MEMORY.match(value.strip())
+    if match is None:
+        return None
+    power = "KMGTP".find(match["unit"]) + 1 if match["unit"] else 0
+    return round(float(match["amount"]) * (1 << (10 * power)))
+
+
+def slurm_cpu_seconds(value: str) -> float | None:
+    """Seconds from a Slurm CPU-time field: ``MM:SS.mmm``, ``HH:MM:SS`` or
+    ``D-HH:MM:SS``. Blank (no accounting) is None."""
+    match = _SLURM_CPU_TIME.match(value.strip())
+    if match is None:
+        return None
+    days, hours = int(match["days"] or 0), int(match["hours"] or 0)
+    minutes, seconds = int(match["minutes"]), float(match["seconds"])
+    if minutes >= 60 or seconds >= 60 or (match["days"] and hours >= 24):
+        return None
+    return ((days * 24 + hours) * 60 + minutes) * 60 + seconds
 
 
 def format_walltime(seconds: int) -> str:
@@ -489,6 +633,13 @@ class TorqueDialect:
             result[fields[0]] = self.phase_for_state(fields[-2])
         return result
 
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        # Torque's coarse qstat table has no reason column. The queued
+        # explanation arrives with the detail poll instead, as `comment` in
+        # the `qstat -f` block, and is carried on QstatDetail.queued_reason.
+        del stdout
+        return {}
+
     def detail_command(self, job_id: str) -> list[str]:
         return ["qstat", "-f", job_id]
 
@@ -504,9 +655,47 @@ class TorqueDialect:
         return ["qstat", "-f", *job_ids]
 
     # A `qstat -f` record opens with "Job Id: <id>"; the body is `key = value`
-    # lines (some wrapped onto indented continuation lines, which we ignore --
-    # the fields we read fit one line on a single-node job).
+    # lines. Torque wraps a long value by inserting a newline and a tab, so
+    # continuation lines are rejoined before the fields are read: a queued
+    # job's `comment` -- the scheduler's own explanation for why it has not
+    # started -- is routinely long enough to wrap, and so is the `exec_host`
+    # list of a multi-node job.
     _DETAIL_FIELD = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=\s*(.*?)\s*$")
+
+    @staticmethod
+    def _unwrap_detail_lines(lines: Sequence[str]) -> list[str]:
+        """Rejoin Torque's tab-continued value lines into whole fields.
+
+        Torque breaks a long attribute value with a newline and a tab, so
+        dropping the leading tab and concatenating restores the original string
+        (the space either side of the break is part of the value). A site whose
+        qstat wraps some other way simply leaves the value as it arrived, which
+        is the pre-existing truncated-but-harmless behaviour rather than a
+        mangled one.
+        """
+        joined: list[str] = []
+        for line in lines:
+            if line.startswith("\t") and joined:
+                joined[-1] += line[1:]
+                continue
+            joined.append(line)
+        return joined
+
+    def _pending_comment(self, raw_state: str, comment: str | None) -> str | None:
+        """A queued job's ``comment``, or ``None`` once it is not queued.
+
+        Torque reuses ``comment`` for run-time annotations, so it is only the
+        "why is this not running" answer while the job is PENDING. An
+        unrecognized state yields ``None`` rather than raising: a parse of
+        live telemetry must not fail the whole poll over one odd record.
+        """
+        if not comment:
+            return None
+        try:
+            phase = self.phase_for_state(raw_state)
+        except DialectError:
+            return None
+        return comment if phase is SchedulerPhase.PENDING else None
 
     def parse_qstat_detail(self, stdout: str) -> dict[str, QstatDetail]:
         result: dict[str, QstatDetail] = {}
@@ -514,7 +703,7 @@ class TorqueDialect:
         # preamble before the first header.
         blocks = re.split(r"(?im)^Job Id:\s*", stdout)
         for block in blocks[1:]:
-            lines = block.splitlines()
+            lines = self._unwrap_detail_lines(block.splitlines())
             job_id = lines[0].strip()
             if not job_id:
                 continue
@@ -523,11 +712,17 @@ class TorqueDialect:
                 m = self._DETAIL_FIELD.match(line)
                 if m:
                     fields[m.group(1)] = m.group(2)
+            raw_state = fields.get("job_state", "")
             result[job_id] = QstatDetail(
-                raw_state=fields.get("job_state", ""),
+                raw_state=raw_state,
                 exec_host=fields.get("exec_host"),
                 walltime_used=fields.get("resources_used.walltime"),
                 walltime_limit=fields.get("Resource_List.walltime"),
+                mem_used=fields.get("resources_used.mem"),
+                cpu_used=fields.get("resources_used.cput"),
+                queued_reason=self._pending_comment(
+                    raw_state, fields.get("comment")
+                ),
             )
         return result
 
@@ -558,6 +753,11 @@ class TorqueDialect:
         # accounting state to reconcile against here.
         del state
         return None
+
+    def ended_on_its_own(self, state: str) -> bool:
+        # "C" covers a clean end and a qdel alike, so it proves nothing.
+        del state
+        return False
 
 
 class SlurmDialect:
@@ -678,22 +878,59 @@ class SlurmDialect:
         return match.group(1)
 
     def poll_command(self, job_ids: Sequence[str]) -> list[str]:
+        # %r (the pending reason) rides along on the coarse poll: Slurm reports
+        # why a job has not started in squeue and nowhere in sacct, so reading
+        # it here costs no extra round trip on the poll path.
         return [
             "squeue",
             "--noheader",
-            "--format=%i|%T|%M|%l|%N",
+            "--format=%i|%T|%M|%l|%N|%r",
             "--jobs",
             ",".join(job_ids),
         ]
+
+    # The trailing %r is free text ("Resources", "Priority",
+    # "ReqNodeNotAvail, UnavailableNodes:node[1-4]"), so a row is split with a
+    # bounded maxsplit: a delimiter inside the reason lands in the reason
+    # rather than making an otherwise sound row look malformed and failing the
+    # whole host's poll. Too *few* fields is still a hard parse error.
+    _POLL_FIELD_COUNT = 6
+
+    def _split_poll_row(self, line: str) -> list[str]:
+        fields = line.split("|", self._POLL_FIELD_COUNT - 1)
+        if (
+            len(fields) < self._POLL_FIELD_COUNT
+            or not fields[0].strip()
+            or not fields[1].strip()
+        ):
+            raise DialectError("malformed squeue row in scheduler poll output")
+        return fields
+
+    def parse_poll_reasons(self, stdout: str) -> dict[str, str]:
+        """``{job_id: reason}`` for the pending jobs in one squeue poll.
+
+        Only PENDING rows carry an explanation; squeue prints the placeholder
+        ``None`` for a job that is already running, which is dropped here so a
+        caller never records "None" as a reason.
+        """
+        reasons: dict[str, str] = {}
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = self._split_poll_row(line)
+            if self.phase_for_state(fields[1].strip()) is not SchedulerPhase.PENDING:
+                continue
+            reason = fields[self._POLL_FIELD_COUNT - 1].strip()
+            if reason and reason.lower() != "none":
+                reasons[fields[0].strip()] = reason
+        return reasons
 
     def parse_poll(self, stdout: str) -> dict[str, SchedulerPhase]:
         result: dict[str, SchedulerPhase] = {}
         for line in stdout.splitlines():
             if not line.strip():
                 continue
-            fields = line.split("|")
-            if len(fields) != 5 or not fields[0].strip() or not fields[1].strip():
-                raise DialectError("malformed squeue row in scheduler poll output")
+            fields = self._split_poll_row(line)
             job_id = fields[0].strip()
             if job_id in result:
                 raise DialectError(
@@ -749,6 +986,54 @@ class SlurmDialect:
 
     def poll_detail_command(self, job_ids: Sequence[str]) -> list[str]:
         return self.detail_command(",".join(job_ids))
+
+    def usage_command(self, job_ids: Sequence[str]) -> list[str]:
+        """``sstat`` for running jobs' live usage, one row per running step
+        (#168). Neither ``squeue`` nor ``sacct -X`` reports it."""
+        return [
+            "sstat",
+            "--allsteps",
+            "--parsable2",
+            "--noheader",
+            "--format=JobID,MaxRSS,AveCPU,NTasks",
+            "-j",
+            ",".join(job_ids),
+        ]
+
+    def parse_usage(self, stdout: str) -> dict[str, LiveUsage]:
+        """Each job's live usage from :meth:`usage_command` output.
+
+        ``MaxRSS`` is the largest task's peak, so a job keeps the largest over
+        its steps; its CPU time is ``AveCPU * NTasks`` summed over them. A
+        value any step leaves blank (accounting disabled, a step just
+        starting) makes that value unknown for the job rather than partial.
+        Only running steps are listed, so a step that already ended is not
+        in either number.
+        """
+        steps: dict[str, list[tuple[int | None, float | None]]] = {}
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = line.split("|")
+            if len(fields) != 4 or "." not in fields[0]:
+                raise DialectError("malformed sstat row in scheduler usage output")
+            job_id = fields[0].strip().split(".", 1)[0]
+            peak = slurm_memory_bytes(fields[1])
+            average = slurm_cpu_seconds(fields[2])
+            tasks = int(fields[3]) if fields[3].strip().isdigit() else None
+            cpu = average * tasks if average is not None and tasks else None
+            steps.setdefault(job_id, []).append((peak, cpu))
+        usage: dict[str, LiveUsage] = {}
+        for job_id, rows in steps.items():
+            peaks = [peak for peak, _ in rows if peak is not None]
+            cpus = [cpu for _, cpu in rows if cpu is not None]
+            usage[job_id] = LiveUsage(
+                task_peak_rss=(f"{-(-max(peaks) // 1024)}kb"
+                               if len(peaks) == len(rows) else None),
+                cpu_used=(format_walltime(round(sum(cpus)))
+                          if len(cpus) == len(rows) else None),
+            )
+        return usage
 
     def parse_qstat_detail(self, stdout: str) -> dict[str, QstatDetail]:
         native: dict[str, QstatDetail] = {}
@@ -902,6 +1187,13 @@ class SlurmDialect:
         if normalized in self._ABNORMAL_FINISHED_STATES:
             return normalized
         return None
+
+    def ended_on_its_own(self, state: str) -> bool:
+        # COMPLETED and FAILED are the two ends the job's own command decides;
+        # a scancel that took effect reads CANCELLED instead (#126).
+        if not state.strip():
+            return False
+        return self._normalize_state(state) in {"COMPLETED", "FAILED"}
 
 
 # Registry mapping the ``scheduler_dialect`` config value to its implementation.

@@ -19,13 +19,15 @@ from dataclasses import dataclass
 from typing import cast
 
 from vq import admin as admin_module
-from vq import config, host_status, ssh_probe, transport
+from vq import config, host_status, paths, ssh_probe, transport
 from vq import drain as drain_module
 from vq.host import is_local_host
 from vq.scheduler_dispatch import (
     RemoteResult,
     RemoteRunner,
     SchedulerError,
+    read_scheduler_scratch_roots,
+    unbound_staged_job_ids,
     wrapper_already_applied,
 )
 
@@ -576,7 +578,55 @@ def ping_remote(
             **_daemon_provenance_metadata(envelope),
         )
     )
+    checks.extend(state_root_checks(envelope))
     return checks, False
+
+
+def state_root_checks(envelope: dict[str, object]) -> list[dict[str, object]]:
+    """Whether vq here and the host's running daemon use one state root (#64 B1).
+
+    A ``remote_vq`` that resolves a different root than the daemon (a bare
+    ``vq`` where the service runs a wrapper exporting ``VQ_STATE_DIR``) reads
+    an empty second store: status, overview and the console then show a host
+    with no jobs. Fails only when some daemon of this user is running and
+    none uses this root. Nothing is added when the answer predates the
+    evidence, the host is multi-user, or the process scan was not possible.
+    """
+    roots = envelope.get("state_roots")
+    if not isinstance(roots, dict):
+        return []
+    client = roots.get("client")
+    daemons = roots.get("daemons")
+    if not isinstance(client, str) or not isinstance(daemons, list):
+        return []
+    known = [d for d in daemons if isinstance(d, dict)]
+    elsewhere = sorted({
+        str(d["state_root"]) for d in known
+        if d.get("state_root") and d.get("state_root") != client
+    })
+    if not known:
+        return [check("state_root_agreement", True,
+                      f"no running daemon to compare; vq here uses {client}",
+                      client_state_root=client, daemons=known)]
+    if any(d.get("state_root") == client for d in known):
+        message = f"the daemon uses the same state root as vq here ({client})"
+        if elsewhere:
+            message += "; other daemons of this user use " + ", ".join(elsewhere)
+        return [check("state_root_agreement", True, message,
+                      client_state_root=client, daemons=known)]
+    if not elsewhere:
+        return [check("state_root_agreement", True,
+                      f"a daemon runs but its state root is unreadable; vq here uses {client}",
+                      client_state_root=client, daemons=known)]
+    return [check(
+        "state_root_agreement", False,
+        f"vq here uses state root {client}, but the running daemon uses "
+        + ", ".join(elsewhere)
+        + ". This vq reads a second, stale store. Point remote_vq at the "
+        "command the daemon runs with (a wrapper that exports VQ_STATE_DIR), "
+        "or export the same VQ_STATE_DIR",
+        client_state_root=client, daemons=known,
+    )]
 
 
 def ping_local(
@@ -609,7 +659,8 @@ def ping_local(
                     True,
                     f"responsive (version={version})",
                     **_daemon_provenance_metadata(envelope),
-                )
+                ),
+                *state_root_checks(envelope),
             ],
             False,
         )
@@ -620,7 +671,8 @@ def ping_local(
             False,
             error,
             **_daemon_provenance_metadata(envelope),
-        )
+        ),
+        *state_root_checks(envelope),
     ], False
 
 
@@ -698,6 +750,122 @@ def console_runtime_checks(
             "console_runtime",
             True,
             f"web console runtime not determined: {detail or 'no verdict'}",
+        )
+    ]
+
+
+def declared_extras_route_checks(
+    cfg: config.Config,
+) -> list[dict[str, object]]:
+    """Whether a declared ``extras`` floor has a route into its venv (#84).
+
+    A venv program declares ``extras`` to say what its environment is *for*,
+    and that floor reaches pip only through vq's own ``scripts/install.sh`` or
+    ``scripts/update.sh``, resolved inside the checkout the program points at.
+    Config load cannot check which script the configured commands *point* at,
+    because at load time there may be no checkout to read; the provision
+    refuses where the evidence is, but only once someone runs it. So a program
+    whose installer is a site command loads clean, provisions never, updates
+    quietly, and produces the symptom the key exists to prevent: a console
+    venv declaring ``extras = ["web"]``, built without uvicorn, whose unit
+    fails on every start while the doctor reports nothing unusual.
+
+    This is the check that says it out loud, on the one host that can answer:
+    the scripts are files in a checkout, so the question is only answerable
+    where that checkout is. ``vq doctor REMOTE`` therefore leaves it out
+    rather than guessing from the local config, which describes local
+    programs.
+
+    Three things it deliberately does not do. It says nothing at all when no
+    program declares ``extras``, which is every host that only runs the daemon
+    -- there is no situation to report. It **fails** only for a program where
+    both scripts were resolved and neither is vq's own, which is the state
+    with no route at all. And where the checkout does not exist yet or cannot
+    be read it reports that it could not answer and stays OK: a doctor run
+    that goes red on a host mid-provision is a doctor run operators learn to
+    ignore.
+    """
+    declaring = [
+        (name, prog)
+        for name, prog in sorted(cfg.programs.items())
+        if isinstance(prog, config.VenvProgram) and prog.extras
+    ]
+    if not declaring:
+        return []
+    lines: list[str] = []
+    records: list[dict[str, object]] = []
+    unroutable: list[str] = []
+    for name, prog in declaring:
+        routes = admin_module.declared_extras_routes(prog)
+        declared = list(prog.extras)
+        records.append(
+            {
+                "program": name,
+                "extras": declared,
+                "install_script": prog.install_script,
+                "update_script": prog.update_script,
+                "install_route": routes.install,
+                "update_route": routes.update,
+                "install_detail": routes.install_detail,
+                "update_detail": routes.update_detail,
+                "applied_at_install": routes.applied_at_install,
+                "applied_on_update": routes.applied_on_update,
+            }
+        )
+        if routes.applied_on_update:
+            lines.append(
+                f"{name}: extras {declared} are re-applied by every "
+                f"`vq admin update {name}` (update_script resolves to "
+                f"{routes.update_detail})"
+            )
+        elif routes.applied_at_install:
+            lines.append(
+                f"{name}: extras {declared} were applied once, by the "
+                "provision, and nothing re-applies them: update_script is "
+                + (
+                    "not configured"
+                    if routes.update == admin_module.ExtrasRoute.ABSENT
+                    else f"{routes.update_detail}"
+                )
+                + ". Point it at the checkout's own scripts/update.sh to keep "
+                "the declaration true across rebuilds"
+            )
+        elif routes.undetermined:
+            lines.append(
+                f"{name}: cannot tell whether extras {declared} have a route "
+                "into this venv: "
+                + "; ".join(
+                    detail
+                    for route, detail in (
+                        (routes.install, routes.install_detail),
+                        (routes.update, routes.update_detail),
+                    )
+                    if route == admin_module.ExtrasRoute.UNKNOWN and detail
+                )
+            )
+        else:
+            unroutable.append(name)
+            lines.append(
+                f"{name}: extras {declared} have no route into this venv. "
+                f"install_script is {prog.install_script!r} and update_script "
+                f"is {prog.update_script!r}; neither is the checkout's own "
+                "scripts/install.sh or scripts/update.sh, so a provision "
+                "refuses and an update rebuilds without them. Point one of "
+                "them at the checkout's own script, or drop the declaration"
+            )
+    ok = not unroutable
+    headline = (
+        f"{len(declaring)} program(s) declare extras"
+        if ok
+        else "declared extras with no route into the venv: "
+        + ", ".join(unroutable)
+    )
+    return [
+        check(
+            "declared_extras_routes",
+            ok,
+            "\n".join([headline, *lines]),
+            programs=records,
         )
     ]
 
@@ -1375,6 +1543,28 @@ _HELPER_SOURCE_IDENTITY_SINCE = (0, 26, 0)
 # verdict and in the message of a failed check.
 _HELPER_SOURCE_IDENTITY_SUBPROBE = "helper_source_identity"
 
+# The two verdicts in which the helper answered with an identity that is not
+# the driver's. `vq submit` refuses a scheduler target on these (#127); every
+# other failed verdict means the identity is unknown, not different.
+HELPER_TREE_MISMATCH = "source-tree SHA-256 mismatch"
+HELPER_SHA_MISMATCH = "SOURCE-SHA mismatch"
+
+
+def helper_identity_mismatch(verdict: dict[str, object]) -> bool:
+    """Whether a ``scheduler_remote_vq`` verdict proves the helper differs.
+
+    True only for a failed verdict that names both identities. A timeout, an
+    unreachable helper, a missing marker or a malformed answer is False: the
+    driver did not find out, which is a different condition (see
+    ``docs/orchestration.md``, "precondition-failed" versus "locked").
+    """
+    if verdict.get("ok") is not False:
+        return False
+    message = verdict.get("message")
+    return isinstance(message, str) and (
+        HELPER_TREE_MISMATCH in message or HELPER_SHA_MISMATCH in message
+    )
+
 
 def _parse_helper_version(version: str | None) -> tuple[int, ...] | None:
     """Return the leading numeric release tuple of a helper version, if any."""
@@ -1601,28 +1791,43 @@ def _classify_helper_identity(
     deadline: _CheckDeadline,
     prefix: str,
     helper_version: str | None,
+    driver_identity: dict[str, object] | None = None,
+    driver_label: str = "driver",
 ) -> dict[str, object]:
     """Compare the helper's live identity with the driver's own."""
-    expected_sha, _sha_error = _driver_identity_probe("source_sha", deadline)
+    if driver_identity is None:
+        expected_sha, _sha_error = _driver_identity_probe("source_sha", deadline)
+    else:
+        value = driver_identity.get("source_sha")
+        expected_sha = (
+            value.lower() if driver_identity.get("ok") is True
+            and isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{40}", value)
+            else None
+        )
     if expected_sha is None:
         return check(
             "scheduler_remote_vq",
             False,
             (
-                f"{prefix}; driver source SHA unavailable, cannot verify "
+                f"{prefix}; {driver_label} source SHA unavailable, cannot verify "
                 "scheduler helper provenance"
             ),
         )
-    expected_tree, tree_error = _driver_identity_probe(
-        "source_tree_sha256",
-        deadline,
-    )
+    if driver_identity is None:
+        expected_tree, tree_error = _driver_identity_probe("source_tree_sha256", deadline)
+    else:
+        value = driver_identity.get("source_tree_sha256")
+        expected_tree = (
+            value.lower() if isinstance(value, str)
+            and re.fullmatch(r"[0-9a-fA-F]{64}", value) else None
+        )
+        tree_error = "daemon did not report a valid source-tree digest"
     if expected_tree is None:
         return check(
             "scheduler_remote_vq",
             False,
             (
-                f"{prefix}; driver source-tree digest unavailable: "
+                f"{prefix}; {driver_label} source-tree digest unavailable: "
                 f"{tree_error or '(no detail)'}"
             ),
         )
@@ -1640,8 +1845,8 @@ def _classify_helper_identity(
             "scheduler_remote_vq",
             False,
             (
-                f"{prefix}; source-tree SHA-256 mismatch: helper "
-                f"{identity.tree or '(missing)'}, driver {expected_tree}"
+                f"{prefix}; {HELPER_TREE_MISMATCH}: helper "
+                f"{identity.tree or '(missing)'}, {driver_label} {expected_tree}"
             ),
             version=helper_version,
             source_sha=identity.sha or None,
@@ -1663,8 +1868,8 @@ def _classify_helper_identity(
             "scheduler_remote_vq",
             False,
             (
-                f"{prefix}; SOURCE-SHA mismatch: helper {identity.sha}, "
-                f"driver {expected_sha}"
+                f"{prefix}; {HELPER_SHA_MISMATCH}: helper {identity.sha}, "
+                f"{driver_label} {expected_sha}"
             ),
             version=helper_version,
             source_sha=identity.sha or None,
@@ -1675,7 +1880,7 @@ def _classify_helper_identity(
         True,
         (
             f"{prefix}; source-tree SHA-256 {identity.tree} and SOURCE-SHA "
-            f"{identity.sha} match driver"
+            f"{identity.sha} match {driver_label}"
         ),
         version=helper_version,
         source_sha=identity.sha,
@@ -1688,6 +1893,8 @@ def scheduler_remote_vq_check(
     *,
     host_label: str,
     check_timeout: float = DEFAULT_CHECK_TIMEOUT_SECONDS,
+    comparison_driver: str | None = None,
+    comparison_identity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Verify the scheduler helper's version and source identity.
 
@@ -1697,7 +1904,8 @@ def scheduler_remote_vq_check(
     answers that read in one round trip; an older one costs two. On a login
     node that needs 2.5 s per python start-up the legacy shape sits right at
     the default budget, which is what ``[fleet] check_timeout_seconds`` is
-    for on the rollout sweep.
+    for on the rollout sweep. A candidate-driver rehearsal reuses the daemon
+    identity already collected by doctor instead of probing this caller.
     """
     deadline = _CheckDeadline(check_timeout)
     try:
@@ -1723,12 +1931,27 @@ def scheduler_remote_vq_check(
     )
     if proc.returncode == 0:
         try:
-            return _classify_helper_identity(
+            verdict = _classify_helper_identity(
                 host_cfg,
                 deadline=deadline,
                 prefix=f"{host_cfg.remote_vq} available on {host_cfg.ssh}: {detail}",
                 helper_version=helper_version,
+                driver_identity=(
+                    (comparison_identity or {}) if comparison_driver is not None else None
+                ),
+                driver_label=(
+                    f"candidate driver {comparison_driver!r}"
+                    if comparison_driver is not None else "driver"
+                ),
             )
+            if comparison_driver is not None:
+                identity = comparison_identity or {}
+                verdict.update(
+                    comparison_driver=comparison_driver,
+                    comparison_source_sha=identity.get("source_sha"),
+                    comparison_source_tree_sha256=identity.get("source_tree_sha256"),
+                )
+            return verdict
         except _DoctorCheckTimeout as exc:
             return _timed_out_check("scheduler_remote_vq", exc)
     if proc.returncode == 127:
@@ -1876,6 +2099,144 @@ def scheduler_runtime_deployments_check(
     )
 
 
+def _strandable_on(host: str, *, multi_user: bool) -> list[str]:
+    """Jobs on ``host`` that may be staged and carry no recorded workspace.
+
+    The same question, over the same queue, as the driver's
+    ``Daemon._strandable_scheduler_workspaces``: an unreadable row names no
+    target and is skipped there too.
+    """
+    from vq.spec import JobSpec
+
+    if multi_user:
+        queue_dirs = [
+            paths.user_queue_dir(user_dir.name)
+            for user_dir in paths._all_user_dirs()
+        ]
+    else:
+        queue_dirs = [paths.queue_dir()]
+    specs: list[JobSpec] = []
+    for queue_dir in queue_dirs:
+        try:
+            spec_paths = sorted(queue_dir.glob("*.json"))
+        except OSError:
+            continue
+        for spec_path in spec_paths:
+            try:
+                specs.append(JobSpec.read(spec_path))
+            except (OSError, ValueError):
+                continue
+    return unbound_staged_job_ids(specs, host)
+
+
+def scheduler_scratch_root_check(
+    host: str,
+    host_cfg: config.HostConfig,
+) -> dict[str, object]:
+    """Report whether the configured ``scratch_root`` is the one in force (#63).
+
+    The driver refuses to adopt a changed ``scratch_root`` for a host while a
+    job on it may already be staged somewhere only the previous root can
+    locate, and it refuses to *bind* jobs to a root it has no memory to check
+    against. Both are correct and both mean the same thing to an operator:
+    the value in ``config.toml`` is not the value this host is running on, and
+    no other command said so -- the refusal was one log line per daemon
+    lifetime and appeared in no output at all.
+
+    Answered from the driver's own record of what it last served
+    (:func:`vq.paths.scheduler_scratch_roots_path`), what config now says, and
+    the queue, so it costs no SSH and no daemon RPC. The queue is not
+    optional. The record is written only when the driver looks the host up --
+    a dispatch, a reattachment, a cleanup -- never by a poll, so on its own it
+    lags: a host whose key was changed and whose driver has not looked since
+    reads as "moved" whether or not anything holds it, and a doubt the driver
+    would settle at its next lookup reads as still open. What decides both is
+    whether a job that may be staged still carries no recorded workspace
+    (:func:`vq.scheduler_dispatch.unbound_staged_job_ids`), which is the
+    driver's own test, asked here of the same queue. A check that failed on
+    the record alone failed the runbook's own procedure on an idle host --
+    and ``fleet_rollout.doctor_failures`` turns that into a blocked roll.
+
+    Read where the driver keeps its state: run on another machine it reports
+    "no record" rather than a verdict, because a host with no record is
+    exactly a host this vq has never driven.
+    """
+    name = "scheduler_scratch_root"
+    configured = (host_cfg.scratch_root or "").rstrip("/")
+    multi_user = paths.is_multi_user()
+    remembered = read_scheduler_scratch_roots(
+        paths.scheduler_scratch_roots_path(multi_user=multi_user)
+    ).get(host)
+    if remembered is None:
+        return check(
+            name,
+            True,
+            f"no record of a driver serving {host} from this state root"
+            + (f"; config says {configured!r}" if configured else ""),
+        )
+    strandable = _strandable_on(host, multi_user=multi_user)
+    listed = ", ".join(strandable[:5]) + (", ..." if len(strandable) > 5 else "")
+    if strandable and remembered.confirmed and remembered.root != configured:
+        return check(
+            name,
+            False,
+            f"held at {remembered.root!r}; config says {configured!r}. The "
+            f"driver keeps serving the root it last adopted while "
+            f"{len(strandable)} job(s) on this host that may already be "
+            f"staged under it carry no recorded workspace ({listed}). Those "
+            "jobs bind when the driver next starts and reattaches to them, "
+            "or they drain; the change lands on the driver's next lookup of "
+            "this host after that. A host still held after a restart has a "
+            "job that did not reattach, and that job is the real problem",
+            scratch_root_configured=configured,
+            scratch_root_in_force=remembered.root,
+        )
+    if strandable and not remembered.confirmed:
+        return check(
+            name,
+            False,
+            f"{remembered.root!r} is in force unconfirmed"
+            + (
+                f", and config now says {configured!r}, which the driver "
+                "follows at its next lookup of this host"
+                if remembered.root != configured
+                else ""
+            )
+            + f". The driver first saw this "
+            f"host with {len(strandable)} job(s) that carry no recorded "
+            f"workspace ({listed}) and no record of a previous root to check "
+            "the configured one against, so it cannot tell whether those "
+            "jobs were staged under it. It is not binding them to it, and it "
+            "will not hold this key back either -- there is nothing proven to "
+            "hold. If the key was changed in the same window as the upgrade, "
+            "restore the previous value and restart the driver, which "
+            "reattaches those jobs under it; otherwise this clears when they "
+            "drain and the driver next looks the host up",
+            scratch_root_configured=configured,
+            scratch_root_in_force=remembered.root,
+            scratch_root_confirmed=False,
+        )
+    if remembered.root != configured or not remembered.confirmed:
+        return check(
+            name,
+            True,
+            f"config says {configured!r}; the driver last recorded "
+            f"{remembered.root!r}"
+            + ("" if remembered.confirmed else " unconfirmed")
+            + ". Nothing on this host that may be staged lacks a recorded "
+            "workspace, so nothing holds it: the driver takes the configured "
+            "value as settled at its next lookup of this host",
+            scratch_root_configured=configured,
+            scratch_root_in_force=remembered.root,
+        )
+    return check(
+        name,
+        True,
+        f"{remembered.root!r} is configured and in force",
+        scratch_root_in_force=remembered.root,
+    )
+
+
 def diagnose_host(
     cfg: config.Config,
     host: str,
@@ -1977,6 +2338,22 @@ def diagnose_host(
         )
         checks.append(scheduler_program_hooks_check(cfg, host_cfg))
         checks.append(scheduler_command_wrapper_check(host_cfg))
+        checks.append(scheduler_scratch_root_check(host, host_cfg))
+        # Reuse the candidate's existing daemon-ping receipt for provenance.
+        # Never silently substitute this invoking client's identity when the
+        # candidate is older, unavailable, or lacks identity metadata (#171).
+        candidate_checks = None
+        comparison = {}
+        if as_driver is not None:
+            candidate_checks, _ = daemon_checks(
+                cfg, as_driver, timeout=timeout, check_timeout=check_timeout,
+            )
+            comparison = {
+                "comparison_driver": as_driver,
+                "comparison_identity": next(
+                    (item for item in candidate_checks if item["name"] == "daemon_rpc"), {},
+                ),
+            }
         # This check crosses the scheduler host's own SSH route. Driver-side
         # failures below belong to the driver's separate route and diagnosis.
         own_ssh_checks.append(
@@ -1984,6 +2361,7 @@ def diagnose_host(
                 host_cfg,
                 host_label=host,
                 check_timeout=check_timeout,
+                **comparison,
             )
         )
         checks.extend(own_ssh_checks[-1:])
@@ -2015,12 +2393,15 @@ def diagnose_host(
                         ),
                     )
                 )
-                driver_checks, _driver_transport_failed = daemon_checks(
-                    cfg,
-                    effective_driver,
-                    timeout=timeout,
-                    check_timeout=check_timeout,
-                )
+                if candidate_checks is None:
+                    driver_checks, _driver_transport_failed = daemon_checks(
+                        cfg,
+                        effective_driver,
+                        timeout=timeout,
+                        check_timeout=check_timeout,
+                    )
+                else:
+                    driver_checks = candidate_checks
                 checks.extend(driver_checks)
                 checks.extend(
                     scheduler_probe_checks(
@@ -2050,6 +2431,13 @@ def diagnose_host(
             checks.extend(
                 console_runtime_checks(cfg, host, check_timeout=check_timeout)
             )
+
+    # A program's scripts are files in a checkout, so only the host holding
+    # that checkout can say whether a declared extras floor has a route into
+    # its venv. `cfg.programs` describes this machine's programs, so asking it
+    # about a remote host would answer from the wrong config (#84).
+    if is_local_host(host):
+        checks.extend(declared_extras_route_checks(cfg))
 
     # If the first hop answered but SSH later failed at the transport layer,
     # spend one verbose probe to classify the broken link. RemoteError checks

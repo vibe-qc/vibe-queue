@@ -55,6 +55,11 @@ _CLIENT_BINS = (
 _SERVER_STATE_RE = re.compile(r"(?im)^\s*server_state\s*=\s*(\S+)\s*$")
 _QUEUE_RE = re.compile(r"(?im)^\s*Queue:\s*(\S+)\s*$")
 _QUEUE_ATTR_RE = re.compile(r"(?im)^\s*(enabled|started)\s*=\s*(\S+)\s*$")
+# The attribute that makes a PBS queue's lane authoritative: it names the
+# node property that queue routes to. Read-only, from ``qstat -Qf``.
+_QUEUE_NEEDNODES_RE = re.compile(
+    r"(?im)^\s*resources_default\.neednodes\s*=\s*(\S.*?)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,116 @@ class QueueLiveness:
     name: str
     enabled: bool | None = None
     started: bool | None = None
+
+    default_neednodes: str | None = None
+    """The queue's ``resources_default.neednodes``, verbatim, or ``None`` when
+    the queue does not set one.
+
+    This is the site attribute vq treats as authoritative for *which lane a
+    queue routes to*: it names the node property a job in this queue lands on.
+    Kept raw so the lane attribution stays auditable against the scheduler's
+    own words -- :func:`_neednodes_lanes` is the only place it is interpreted.
+    """
+
+
+@dataclass(frozen=True)
+class NodeCapacity:
+    """One compute node's width, and how much of it is free right now."""
+
+    name: str
+    total_cpus: int | None = None
+    """Cores the node has in total (PBS ``np``, SLURM ``%c``)."""
+
+    free_cpus: int | None = None
+    """Cores a job could take on this node right now. ``0`` for a node that
+    is fully allocated *and* for one the scheduler cannot use at all."""
+
+    state: str | None = None
+    """The scheduler's own node state, verbatim."""
+
+    usable: bool = True
+    """False when the scheduler will not place work here at all (PBS
+    ``down``/``offline``, SLURM ``down``/``drain``/``fail``/``maint``). A
+    node that is merely busy stays usable: it frees up on its own."""
+
+    lanes: tuple[str, ...] = ()
+    """Every lane this node is in, as the scheduler reported them.
+
+    On SLURM that is the row's partition -- ``sinfo -N`` emits one row per
+    node *per partition*, so a node in two partitions is two rows of one lane
+    each. On PBS it is **all** of the node's properties, in the order
+    ``pbsnodes`` printed them, because a PBS node carries as many properties
+    as the site gave it and their order means nothing. Empty when the
+    scheduler reported no lane at all.
+    """
+
+
+# What makes a lane a lane. A SLURM partition *is* the scheduling lane, so its
+# authority is never in question. On PBS a lane is a node property, and the
+# only thing that says which property a queue routes to is that queue's
+# ``resources_default.neednodes``; with no queue naming it, grouping by
+# property is vq's inference and is marked as one rather than passed off as a
+# queue.
+LANE_AUTHORITY_PARTITION = "partition"
+LANE_AUTHORITY_QUEUE_DEFAULT = "queue_default"
+LANE_AUTHORITY_NODE_PROPERTY = "node_property"
+
+
+@dataclass(frozen=True)
+class GroupCapacity:
+    """The same two numbers for one lane, and what says it is a lane."""
+
+    name: str
+
+    authority: str
+    """Why this lane is believed to be a scheduling lane.
+
+    * :data:`LANE_AUTHORITY_PARTITION` -- SLURM. The partition is the lane;
+      there is nothing to infer.
+    * :data:`LANE_AUTHORITY_QUEUE_DEFAULT` -- PBS. At least one queue's
+      ``resources_default.neednodes`` names this node property, and
+      :attr:`queues` lists them.
+    * :data:`LANE_AUTHORITY_NODE_PROPERTY` -- PBS, **inferred**. The property
+      exists on nodes, but no queue vq could read declares a default that
+      routes to it. The capacity figures are still true of the nodes carrying
+      the property; what is unproven is that any queue sends work there.
+    """
+
+    max_cpus_now: int | None = None
+    max_cpus_when_free: int | None = None
+    usable_nodes: int = 0
+    unusable_nodes: int = 0
+
+    queues: tuple[str, ...] = ()
+    """The PBS queues whose ``resources_default.neednodes`` names this lane.
+
+    Non-empty exactly when :attr:`authority` is
+    :data:`LANE_AUTHORITY_QUEUE_DEFAULT`; this is the queue to submit to for
+    the capacity on this row.
+    """
+
+
+@dataclass(frozen=True)
+class SchedulableCapacity:
+    """The largest request this host could start, now and at all.
+
+    Two numbers, because they answer different questions and #148 turned on
+    the difference. ``max_cpus_now`` answers "will this start": a request
+    wider than it waits. ``max_cpus_when_free`` answers "can this *ever*
+    start": a request wider than it waits forever, because no node the
+    scheduler can use is that wide even when idle.
+    """
+
+    max_cpus_now: int | None = None
+    max_cpus_when_free: int | None = None
+    usable_nodes: int = 0
+    unusable_nodes: int = 0
+    nodes: tuple[NodeCapacity, ...] = ()
+    groups: tuple[GroupCapacity, ...] = ()
+    error: str | None = None
+    """Why the census is unavailable. When set, every figure above is
+    ``None``/empty and NO capacity claim is made -- an unreadable census must
+    never read as "nothing is free"."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +249,14 @@ class ProbeResult:
     slurm_partition_probe_error: str | None = None
     """Diagnostic from a failed ``sinfo`` availability probe, if any."""
 
+    capacity: SchedulableCapacity | None = None
+    """What the scheduler could actually start right now, per host and lane.
+
+    ``None`` when no census was attempted (the client binary is absent, or the
+    host is not a scheduler host). A census that was attempted and failed is a
+    :class:`SchedulableCapacity` carrying ``error``, so "unreadable" is never
+    confused with "nothing free"."""
+
     notes: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -160,27 +283,78 @@ def _parse_bool(value: str) -> bool | None:
     return None
 
 
+def _unfold_qstat(output: str) -> str:
+    """Rejoin the continuation lines ``qstat -f`` folds long values onto.
+
+    PBS and Torque wrap a long attribute value and continue it on the next
+    line indented by a tab, with the break placed anywhere -- mid-word, mid
+    path. The fold is byte-exact: removing the newline and that one tab
+    restores the value. Parsing line at a time instead truncates the value at
+    the fold, which for ``resources_default.neednodes`` silently costs the
+    real lane its authoritative attribution and reports it as inferred, while
+    a partial word becomes a lane of its own.
+
+    Only a leading tab continues a line. A space-indented line is an ordinary
+    attribute, which is how ``qstat`` indents them in the first place.
+    """
+    unfolded: list[str] = []
+    for line in output.splitlines():
+        if line.startswith("\t") and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    joined = "\n".join(unfolded)
+    # Output with no fold comes back unchanged, so this is never the reason
+    # something downstream sees a different string than the scheduler sent --
+    # for the line endings a scheduler actually sends. `splitlines` also
+    # splits on CR, CRLF, form feed and the Unicode separators, and rejoining
+    # with LF normalizes those rather than preserving them. That is invisible
+    # here, because the only caller re-splits the result and the transport
+    # allocates no tty, and it is stated rather than claimed away.
+    return joined + "\n" if output.endswith("\n") else joined
+
+
 def _parse_queue_liveness(output: str) -> tuple[QueueLiveness, ...]:
     queues: list[QueueLiveness] = []
-    current: dict[str, object] | None = None
-    for line in output.splitlines():
+    name: str | None = None
+    enabled: bool | None = None
+    started: bool | None = None
+    neednodes: str | None = None
+
+    def flush() -> None:
+        if name is None:
+            return
+        queues.append(
+            QueueLiveness(
+                name=name,
+                enabled=enabled,
+                started=started,
+                default_neednodes=neednodes,
+            )
+        )
+
+    for line in _unfold_qstat(output).splitlines():
         queue_match = _QUEUE_RE.match(line)
         if queue_match:
-            if current is not None:
-                queues.append(QueueLiveness(**current))
-            current = {
-                "name": queue_match.group(1),
-                "enabled": None,
-                "started": None,
-            }
+            flush()
+            name = queue_match.group(1)
+            enabled = started = None
+            neednodes = None
             continue
-        if current is None:
+        if name is None:
             continue
         attr_match = _QUEUE_ATTR_RE.match(line)
         if attr_match:
-            current[attr_match.group(1)] = _parse_bool(attr_match.group(2))
-    if current is not None:
-        queues.append(QueueLiveness(**current))
+            value = _parse_bool(attr_match.group(2))
+            if attr_match.group(1).lower() == "enabled":
+                enabled = value
+            else:
+                started = value
+            continue
+        needs_match = _QUEUE_NEEDNODES_RE.match(line)
+        if needs_match:
+            neednodes = needs_match.group(1)
+    flush()
     return tuple(queues)
 
 
@@ -276,6 +450,282 @@ def _probe_slurm_partition_availability(
     return tuple(held), None
 
 
+# A node the scheduler will not place work on at all, as opposed to one that
+# is merely busy. PBS spells this in `state` (down / offline / unknown);
+# SLURM in the %t abbreviation. Only these mean "waiting will not help".
+_PBS_UNUSABLE_STATES = ("down", "offline", "unknown")
+_SLURM_UNUSABLE_STATES = (
+    "down", "drain", "drng", "draining", "drained", "fail", "failing",
+    "maint", "unk", "unknown", "boot", "powering", "power", "resv", "inval",
+)
+
+# `jobs = 0/12345.host_f, 1/12345.host_f` or, on some Torque builds, the range
+# form `jobs = 0-127/12345.host_f`. Both name the cores, not the jobs.
+_PBS_JOB_SLOT_RE = re.compile(r"^\s*(\d+)(?:-(\d+))?/")
+
+
+def _pbs_allocated_cpus(jobs_value: str) -> int:
+    """Cores already taken on one PBS node, from its ``jobs`` attribute."""
+    taken = 0
+    for entry in jobs_value.split(","):
+        match = _PBS_JOB_SLOT_RE.match(entry)
+        if match is None:
+            continue
+        low = int(match.group(1))
+        high = int(match.group(2)) if match.group(2) else low
+        taken += max(0, high - low + 1)
+    return taken
+
+
+def _neednodes_lanes(value: str) -> tuple[str, ...]:
+    """The node properties a ``resources_default.neednodes`` value routes to.
+
+    Torque spells the value as ``+``-joined specs of ``:``-joined terms, and
+    only some of those terms are properties: ``wide``, ``1:ppn=128``,
+    ``2:wide:ppn=64``, ``1:ppn=8+1:gpu:ppn=4``. A ``key=value`` term is a
+    resource and a lone ``ppn`` is neither; what is left is a property name
+    (or, at some sites, a specific host name, which simply matches no property
+    and contributes no lane). Order is preserved and duplicates are dropped.
+
+    A digit-only term is a node *count*, but only where a count can stand: as
+    the first term of a spec. Elsewhere it is a property whose name happens to
+    be numeric, which sites do have -- a GPU generation such as ``2080`` is
+    the obvious one. Dropping it everywhere silently unattributed the queue
+    that routes to it.
+    """
+    lanes: list[str] = []
+    for spec in value.split("+"):
+        for index, term in enumerate(spec.split(":")):
+            token = term.strip()
+            if not token or "=" in token or token == "ppn":
+                continue
+            if index == 0 and token.isdigit():
+                continue  # the node count
+            if token not in lanes:
+                lanes.append(token)
+    return tuple(lanes)
+
+
+def _pbs_lane_queues(
+    queues: tuple[QueueLiveness, ...],
+) -> dict[str, tuple[str, ...]]:
+    """Map each authoritatively-declared lane to the queues that route to it.
+
+    Only ``resources_default.neednodes`` is consulted: it is the attribute the
+    maintainer settled on as authoritative for PBS lane membership. A queue
+    that sets none contributes nothing, which leaves its lane to inference.
+    """
+    lanes: dict[str, list[str]] = {}
+    for queue in queues:
+        if not queue.default_neednodes:
+            continue
+        for lane in _neednodes_lanes(queue.default_neednodes):
+            routed = lanes.setdefault(lane, [])
+            if queue.name not in routed:
+                routed.append(queue.name)
+    return {lane: tuple(routed) for lane, routed in lanes.items()}
+
+
+def _parse_pbsnodes(output: str) -> tuple[NodeCapacity, ...]:
+    """Parse ``pbsnodes -a`` into a per-node width/free-core census.
+
+    A node record is an unindented name followed by indented ``key = value``
+    lines. Only ``np``, ``state``, ``properties`` and ``jobs`` are read; every
+    other attribute is ignored, and a record missing ``np`` still counts as a
+    node with an unknown width rather than disappearing.
+
+    **Every** property becomes a lane the node is in. PBS lists them in no
+    meaningful order, so singling one out -- as this parser once did, taking
+    the first -- invents a lane membership the scheduler never stated and
+    hides the others.
+    """
+    nodes: list[NodeCapacity] = []
+    name: str | None = None
+    attrs: dict[str, str] = {}
+
+    def flush() -> None:
+        if name is None:
+            return
+        state = attrs.get("state")
+        usable = not any(
+            bad in (state or "").lower() for bad in _PBS_UNUSABLE_STATES
+        )
+        total: int | None = None
+        if attrs.get("np", "").strip().isdigit():
+            total = int(attrs["np"].strip())
+        if not usable:
+            free: int | None = 0
+        elif total is None:
+            free = None
+        else:
+            free = max(0, total - _pbs_allocated_cpus(attrs.get("jobs", "")))
+        properties = attrs.get("properties", "").strip()
+        lanes = tuple(
+            prop for prop in (p.strip() for p in properties.split(",")) if prop
+        )
+        nodes.append(
+            NodeCapacity(
+                name=name,
+                total_cpus=total,
+                free_cpus=free,
+                state=state,
+                usable=usable,
+                lanes=lanes,
+            )
+        )
+
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            flush()
+            name, attrs = line.strip(), {}
+            continue
+        key, sep, value = line.strip().partition("=")
+        if sep:
+            attrs[key.strip()] = value.strip()
+    flush()
+    return tuple(nodes)
+
+
+def _parse_sinfo_nodes(output: str) -> tuple[NodeCapacity, ...]:
+    """Parse ``sinfo -N`` rows (``%N|%P|%t|%c|%C``) into the same census.
+
+    ``%C`` is SLURM's ``allocated/idle/other/total`` breakdown, so the idle
+    field is the free-core count directly -- no arithmetic against running
+    jobs, and no double counting on a mixed node.
+    """
+    nodes: list[NodeCapacity] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) < 5 or not fields[0].strip():
+            continue
+        name, partition, state, cpus, breakdown = (f.strip() for f in fields[:5])
+        base = state.rstrip("*~#$@+").lower()
+        usable = base not in _SLURM_UNUSABLE_STATES
+        total = int(cpus) if cpus.isdigit() else None
+        free: int | None = None
+        parts = breakdown.split("/")
+        if len(parts) == 4 and parts[1].isdigit():
+            free = int(parts[1])
+        if not usable:
+            free = 0
+        nodes.append(
+            NodeCapacity(
+                name=name,
+                total_cpus=total,
+                free_cpus=free,
+                state=state or None,
+                usable=usable,
+                lanes=(partition.rstrip("*"),) if partition.rstrip("*") else (),
+            )
+        )
+    return tuple(nodes)
+
+
+def _summarize_capacity(
+    nodes: tuple[NodeCapacity, ...],
+    *,
+    error: str | None = None,
+    default_authority: str = LANE_AUTHORITY_NODE_PROPERTY,
+    lane_queues: dict[str, tuple[str, ...]] | None = None,
+) -> SchedulableCapacity:
+    """Fold a node census into the per-host and per-lane headline figures.
+
+    ``lane_queues`` carries the authoritative lanes -- on PBS, the node
+    properties some queue's ``resources_default.neednodes`` names, mapped to
+    those queues. A lane in it is reported as
+    :data:`LANE_AUTHORITY_QUEUE_DEFAULT`; every other lane falls back to
+    ``default_authority``, which is :data:`LANE_AUTHORITY_PARTITION` for SLURM
+    (a partition needs no corroboration) and
+    :data:`LANE_AUTHORITY_NODE_PROPERTY` for PBS (an inference, marked).
+    """
+    if error is not None:
+        return SchedulableCapacity(error=error)
+
+    def fold(subset: tuple[NodeCapacity, ...]) -> tuple[int | None, int | None, int, int]:
+        usable = tuple(n for n in subset if n.usable)
+        now = [n.free_cpus for n in usable if n.free_cpus is not None]
+        ever = [n.total_cpus for n in usable if n.total_cpus is not None]
+        return (
+            max(now) if now else None,
+            max(ever) if ever else None,
+            len(usable),
+            len(subset) - len(usable),
+        )
+
+    max_now, max_ever, usable_count, unusable_count = fold(nodes)
+    routing = lane_queues or {}
+    groups: list[GroupCapacity] = []
+    for name in sorted({lane for n in nodes for lane in n.lanes}):
+        subset = tuple(n for n in nodes if name in n.lanes)
+        g_now, g_ever, g_usable, g_unusable = fold(subset)
+        routed = routing.get(name, ())
+        groups.append(
+            GroupCapacity(
+                name=name,
+                authority=(
+                    LANE_AUTHORITY_QUEUE_DEFAULT if routed else default_authority
+                ),
+                max_cpus_now=g_now,
+                max_cpus_when_free=g_ever,
+                usable_nodes=g_usable,
+                unusable_nodes=g_unusable,
+                queues=routed,
+            )
+        )
+    return SchedulableCapacity(
+        max_cpus_now=max_now,
+        max_cpus_when_free=max_ever,
+        usable_nodes=usable_count,
+        unusable_nodes=unusable_count,
+        nodes=nodes,
+        groups=tuple(groups),
+    )
+
+
+def _probe_pbs_capacity(
+    runner: RemoteRunner,
+    queues: tuple[QueueLiveness, ...] = (),
+) -> SchedulableCapacity:
+    """Read-only ``pbsnodes -a`` census; never mutates scheduler state.
+
+    ``queues`` is the ``qstat -Qf`` reading the liveness probe already made
+    (also read-only), reused here rather than paid for a second time. It is
+    what decides lane authority: a lane a queue's
+    ``resources_default.neednodes`` names is the queue's, and one no queue
+    names is vq's own inference from node properties. Passing ``()`` -- the
+    case where ``qstat`` is absent or its read failed -- leaves every lane
+    inferred, which is exactly the claim that can then be supported.
+    """
+    result = runner.run(["pbsnodes", "-a"], check=False)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return _summarize_capacity((), error=detail or f"exit {result.returncode}")
+    nodes = _parse_pbsnodes(result.stdout)
+    if not nodes:
+        return _summarize_capacity((), error="pbsnodes -a reported no nodes")
+    return _summarize_capacity(nodes, lane_queues=_pbs_lane_queues(queues))
+
+
+def _probe_slurm_capacity(runner: RemoteRunner) -> SchedulableCapacity:
+    """Read-only ``sinfo -N`` census; never mutates scheduler state."""
+    result = runner.run(
+        ["sinfo", "--noheader", "--Node", "--format=%N|%P|%t|%c|%C"],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return _summarize_capacity((), error=detail or f"exit {result.returncode}")
+    nodes = _parse_sinfo_nodes(result.stdout)
+    if not nodes:
+        return _summarize_capacity((), error="sinfo reported no nodes")
+    # A SLURM partition IS the scheduling lane -- nothing here is inferred.
+    return _summarize_capacity(nodes, default_authority=LANE_AUTHORITY_PARTITION)
+
+
 def probe(runner: RemoteRunner) -> ProbeResult:
     """Detect the scheduler dialect on the host behind ``runner``.
 
@@ -310,6 +760,9 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             liveness_notes,
         ) = _probe_pbs_liveness(runner)
         notes.extend(liveness_notes)
+    capacity: SchedulableCapacity | None = None
+    if binaries.get("pbsnodes"):
+        capacity = _probe_pbs_capacity(runner, queues)
     slurm_partitions_not_up: tuple[str, ...] | None = None
     slurm_partition_probe_error: str | None = None
     if binaries.get("squeue"):
@@ -318,6 +771,8 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             slurm_partitions_not_up,
             slurm_partition_probe_error,
         ) = _probe_slurm_partition_availability(runner)
+        if binaries.get("sinfo"):
+            capacity = _probe_slurm_capacity(runner)
 
     if binaries.get("sbatch") and binaries.get("squeue"):
         m = _ANY_VERSION_RE.search(raw_slurm)
@@ -339,6 +794,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             slurm_squeue_error=slurm_squeue_error,
             slurm_partitions_not_up=slurm_partitions_not_up,
             slurm_partition_probe_error=slurm_partition_probe_error,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -356,6 +812,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             pbs_sched_running=pbs_sched_running,
             scheduler_daemons=scheduler_daemons,
             queues=queues,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -374,6 +831,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
             pbs_sched_running=pbs_sched_running,
             scheduler_daemons=scheduler_daemons,
             queues=queues,
+            capacity=capacity,
             notes=tuple(notes),
         )
 
@@ -403,6 +861,7 @@ def probe(runner: RemoteRunner) -> ProbeResult:
         pbs_sched_running=pbs_sched_running,
         scheduler_daemons=scheduler_daemons,
         queues=queues,
+        capacity=capacity,
         notes=tuple(notes),
     )
 
@@ -452,19 +911,120 @@ def format_report(result: ProbeResult, host: str) -> str:
         lines.append(f"  SLURM squeue: {status}")
         if result.slurm_squeue_error:
             lines.append(f"  warning: squeue failed: {result.slurm_squeue_error}")
+    lines.extend(_format_capacity(result.capacity))
     for note in result.notes:
         lines.append(f"  note: {note}")
     return "\n".join(lines)
 
 
+def _format_capacity(capacity: SchedulableCapacity | None) -> list[str]:
+    """Render the schedulable-capacity block of the probe report."""
+    if capacity is None:
+        return []
+    if capacity.error is not None:
+        return [f"  capacity: unavailable ({capacity.error})"]
+    now = "?" if capacity.max_cpus_now is None else str(capacity.max_cpus_now)
+    ever = (
+        "?" if capacity.max_cpus_when_free is None
+        else str(capacity.max_cpus_when_free)
+    )
+    lines = [
+        f"  capacity: largest job that can start now: {now} cpu(s); "
+        f"largest the usable nodes could ever run: {ever}",
+        f"  nodes: {capacity.usable_nodes} usable, "
+        f"{capacity.unusable_nodes} unusable",
+    ]
+    inferred_lane = False
+    for group in capacity.groups:
+        g_now = "?" if group.max_cpus_now is None else group.max_cpus_now
+        g_ever = (
+            "?" if group.max_cpus_when_free is None else group.max_cpus_when_free
+        )
+        # Only what adds something is spelled out: a SLURM partition is
+        # self-evidently the lane and gets no marker, a PBS lane a queue
+        # declares names that queue (which is the one to submit to), and an
+        # inferred lane is flagged so it is never read as a queue.
+        if group.authority == LANE_AUTHORITY_QUEUE_DEFAULT:
+            marker = f" [queue: {', '.join(group.queues)}]"
+        elif group.authority == LANE_AUTHORITY_NODE_PROPERTY:
+            marker = " [inferred]"
+            inferred_lane = True
+        else:
+            marker = ""
+        lines.append(
+            f"    {group.name}: now={g_now} when-free={g_ever} "
+            f"({group.usable_nodes} usable, {group.unusable_nodes} unusable)"
+            f"{marker}"
+        )
+    if inferred_lane:
+        lines.append(
+            "  [inferred]: a node property no queue's "
+            "resources_default.neednodes names"
+        )
+    unusable = [n.name for n in capacity.nodes if not n.usable]
+    if unusable:
+        shown = ", ".join(unusable[:8])
+        if len(unusable) > 8:
+            shown += f", +{len(unusable) - 8} more"
+        lines.append(f"  warning: unusable node(s): {shown}")
+    # The case this whole census exists for: a request can be admitted but
+    # never started, which otherwise only shows up as days of silent queueing.
+    if (
+        capacity.max_cpus_when_free is not None
+        and capacity.unusable_nodes > 0
+    ):
+        widest_down = max(
+            (n.total_cpus or 0 for n in capacity.nodes if not n.usable),
+            default=0,
+        )
+        if widest_down > capacity.max_cpus_when_free:
+            lines.append(
+                f"  warning: an unusable node is wider ({widest_down} cpu) than "
+                f"anything the scheduler can still run ({capacity.max_cpus_when_free} "
+                "cpu); requests sized for it will queue forever"
+            )
+    return lines
+
+
+PROBE_SCHEMA = "vq.scheduler-probe.v1"
+"""Identifies the shape of ``vq scheduler-probe --json`` (#83).
+
+An agent contract needs a version an agent can read, and this payload did
+not have one while its neighbours ``vq.fetch-manifest.v1`` and
+``vq.scheduler-resource-usage.v1`` did. That asymmetry cost something real:
+#23 replaced ``capacity.nodes[].group`` with ``lanes``, and a consumer
+reading the old field learned about it by receiving nothing.
+
+``v1`` names the shape as it stands after #23, not the one before it. There
+is no ``v0``: the unversioned payload was never something a consumer could
+pin, so nothing is served by minting a name for it retrospectively. Bump the
+number when a field changes meaning or goes away; adding one does not need
+it, because a reader that ignores unknown keys is unaffected.
+"""
+
+
 def to_json_dict(result: ProbeResult) -> dict[str, object]:
     """Stable machine-readable shape for ``vq scheduler-probe --json``."""
     payload = asdict(result)
+    payload["schema"] = PROBE_SCHEMA
     payload["notes"] = list(result.notes)
     payload["queues"] = [asdict(queue) for queue in result.queues]
     payload["scheduler_daemons"] = (
         list(result.scheduler_daemons) if result.scheduler_daemons is not None else None
     )
+    if result.capacity is None:
+        payload["capacity"] = None
+    else:
+        capacity = asdict(result.capacity)
+        capacity["nodes"] = [
+            {**asdict(node), "lanes": list(node.lanes)}
+            for node in result.capacity.nodes
+        ]
+        capacity["groups"] = [
+            {**asdict(group), "queues": list(group.queues)}
+            for group in result.capacity.groups
+        ]
+        payload["capacity"] = capacity
     return payload
 
 

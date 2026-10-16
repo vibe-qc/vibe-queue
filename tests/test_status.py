@@ -761,6 +761,75 @@ class TestSchedulerStatus:
             "(scheduler handoff time, not node start)"
         ) in out
 
+    def test_scheduler_queued_reason_is_shown_next_to_the_queued_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # vibe-qc#148: five ppn=128 jobs sat queued for six days because the
+        # only nodes that wide were one busy and one down. The scheduler said
+        # so on every poll; vq showed "queued" and nothing else.
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-30T15:19:15.097243+00:00",
+            scheduler_target="host_f-big",
+            scheduler_job_id="23350.cluster.example",
+            scheduler_state="queued",
+            scheduler_queued_reason=(
+                "Not Running: Not enough of the right type of nodes are "
+                "available to run the job"
+            ),
+        )
+
+        out = show_status("localhost", "abc", queue_dir=queue)
+
+        assert (
+            "queued_why:   Not Running: Not enough of the right type of "
+            "nodes are available to run the job"
+        ) in out
+
+    def test_scheduler_queued_reason_is_carried_in_status_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-30T15:19:15.097243+00:00",
+            scheduler_target="host_f-big",
+            scheduler_job_id="23350.cluster.example",
+            scheduler_state="queued",
+            scheduler_queued_reason="Resources",
+        )
+
+        payload = json.loads(show_status_json("localhost", "abc", queue_dir=queue))
+
+        assert payload["scheduler_queued_reason"] == "Resources"
+
+    def test_a_running_job_shows_no_queued_reason(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import vq.status as status_mod
+
+        monkeypatch.setattr(status_mod, "is_daemon_serving", lambda **k: True)
+        queue = _setup(
+            tmp_path,
+            state=JobState.RUNNING,
+            started_at="2026-06-25T10:00:00+00:00",
+            scheduler_target="host_f",
+            scheduler_job_id="555.cluster",
+            scheduler_state="running",
+            scheduler_exec_host="node07/0-19",
+        )
+
+        out = show_status("localhost", "abc", queue_dir=queue)
+
+        assert "queued_why:" not in out
+
     def test_scheduler_queued_status_json_exposes_effective_state(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -969,7 +1038,7 @@ class TestSchedulerStatus:
             tmp_path,
             state=JobState.RUNNING,
             started_at="2026-06-30T16:20:48.204564+00:00",
-            scheduler_target="host_f-jtwin",
+            scheduler_target="host_f-laneb",
         )
 
         out = show_status("localhost", "abc", queue_dir=queue)
@@ -1303,7 +1372,7 @@ class TestSchedulerStatus:
             jobid="target",
             state=JobState.PENDING,
             submitted_at="2026-06-30T10:00:00+00:00",
-            scheduler_target="host_f-itwin",
+            scheduler_target="host_f-lanea",
         )
         ws_root = tmp_path / "ws"
         JobSpec(
@@ -1313,7 +1382,7 @@ class TestSchedulerStatus:
             cpus=1,
             state=JobState.PENDING,
             submitted_at="2026-06-30T11:00:00+00:00",
-            scheduler_target="host_f-itwin",
+            scheduler_target="host_f-lanea",
         ).write(queue / "same.json")
         JobSpec(
             id="other",
@@ -1336,7 +1405,7 @@ class TestSchedulerStatus:
         out = show_status("localhost", "target", queue_dir=queue)
 
         assert "queue position: 1 of 2 pending" in out
-        assert "host_f-itwin scheduler lane" in out
+        assert "host_f-lanea scheduler lane" in out
 
 
 class TestStatusDaemonLiveness:
@@ -1538,20 +1607,20 @@ class TestStatusQueuePosition:
     ) -> None:
         queue = _setup(
             tmp_path,
-            jobid="twintarget01",
+            jobid="hosttarget01",
             state=JobState.PENDING,
             submitted_at="2026-06-05T12:00:00+00:00",
             scheduler_target="host_f",
         )
         JobSpec(
-            id="twinahead001",
+            id="hostahead001",
             command=["echo", "ok"],
-            cwd=str(tmp_path / "twinahead"),
+            cwd=str(tmp_path / "hostahead"),
             cpus=1,
             state=JobState.PENDING,
             submitted_at="2026-06-05T11:00:00+00:00",
             scheduler_target="host_f",
-        ).write(queue / "twinahead001.json")
+        ).write(queue / "hostahead001.json")
         JobSpec(
             id="localahead01",
             command=["echo", "ok"],
@@ -1561,32 +1630,32 @@ class TestStatusQueuePosition:
             submitted_at="2026-06-05T10:00:00+00:00",
         ).write(queue / "localahead01.json")
         JobSpec(
-            id="twindone0001",
+            id="hostdone0001",
             command=["echo", "ok"],
-            cwd=str(tmp_path / "twindone"),
+            cwd=str(tmp_path / "hostdone"),
             cpus=1,
             state=JobState.COMPLETED,
             scheduler_target="host_f",
             scheduler_walltime_used="00:30:00",
             started_at="2026-06-05T00:00:00+00:00",
             finished_at="2026-06-05T09:00:00+00:00",
-        ).write(queue / "twindone0001.json")
+        ).write(queue / "hostdone0001.json")
         # Two more host_f samples lift the generic source past the IID 293
         # low-sample flag so this test keeps exercising the numeric path.
         for i in (2, 3):
             JobSpec(
-                id=f"twindone000{i}",
+                id=f"hostdone000{i}",
                 command=["echo", "ok"],
-                cwd=str(tmp_path / f"twindone{i}"),
+                cwd=str(tmp_path / f"hostdone{i}"),
                 cpus=1,
                 state=JobState.COMPLETED,
                 scheduler_target="host_f",
                 scheduler_walltime_used="00:30:00",
                 started_at="2026-06-05T00:00:00+00:00",
                 finished_at="2026-06-05T09:00:00+00:00",
-            ).write(queue / f"twindone000{i}.json")
+            ).write(queue / f"hostdone000{i}.json")
 
-        out = show_status("localhost", "twintarget01", queue_dir=queue)
+        out = show_status("localhost", "hosttarget01", queue_dir=queue)
 
         assert "queue position: 2 of 2 pending" in out
         assert "queue eta:    ~30m00s before dispatch turn" in out
@@ -1876,6 +1945,22 @@ class TestPendingAdmissionReason:
 
         assert "pending:      scheduler job-count admission blocked" in out
         assert "1/1 scheduler jobs already active" in out
+
+        # #170: once the scheduler reported it finished, a job whose artifacts
+        # are still being collected holds no slot, here as in the daemon.
+        JobSpec(
+            id="twactive0001",
+            command=["echo", "ok"],
+            cwd=str(tmp_path / "ws" / "twactive0001"),
+            cpus=1,
+            state=JobState.RUNNING,
+            scheduler_target="host_f",
+            scheduler_state="fetch_failed",
+        ).write(queue / "twactive0001.json")
+
+        out = show_status("localhost", "abc", queue_dir=queue)
+
+        assert "scheduler job-count admission blocked" not in out
 
     def test_pending_scheduler_status_json_includes_scheduler_cap_block(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
