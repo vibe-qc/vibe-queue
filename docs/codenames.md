@@ -1,5 +1,7 @@
 # Release codenames and artwork
 
+**Audience: anyone.** The gallery of the release series; the naming rules are in [version compatibility](version_compatibility.md).
+
 Each minor release pairs a computing pioneer with a concept reflected in its
 work. Patch releases inherit their minor release's artwork, even when an early
 patch has its own historical codename. See [version compatibility](version_compatibility.md)

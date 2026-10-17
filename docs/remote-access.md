@@ -1,5 +1,7 @@
 # Reaching the queue from the internet
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 How to submit jobs to a vq queue host that lives behind a home/lab
 router, from anywhere — securely.
 
@@ -111,7 +113,7 @@ own. If it fails, fix it now — do not proceed to step 4.
 ### 4. Harden sshd on the queue host
 
 vq ships a ready drop-in at
-[`contrib/sshd_config.d/vq-hardening.conf`](../contrib/sshd_config.d/vq-hardening.conf).
+[`contrib/sshd_config.d/vq-hardening.conf`](https://github.com/vibe-qc/vibe-queue/blob/main/contrib/sshd_config.d/vq-hardening.conf).
 It disables password auth, scopes login to the queue user, and trims
 unused SSH features. On the queue host:
 
@@ -207,7 +209,7 @@ vq doctor pbs-cluster
 ```
 == vq doctor: pbs-cluster ==
 OK config: configured ssh='pbs-cluster' scheduler='pbs'
-OK ssh_route: 'pbs-cluster' -> ProxyJump 'gateway' -> gw.example.org:22 -> user@pbs-cluster.example.org:22
+OK ssh_route: 'pbs-cluster' -> ProxyJump 'gateway' -> gw.example.org:22 -> user@pbs-cluster.example:22
 FAIL ssh_first_hop: jump host 'gateway' gw.example.org:22: connection refused
   verdict: gw.example.org:22 refused the connection, so the jump host is up
     but its sshd is not accepting on that port

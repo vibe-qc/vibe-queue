@@ -1,5 +1,7 @@
 # vq retry — automatic re-enqueue on failure
 
+**Audience: people who run jobs.** Part of [Running jobs](user/index.md).
+
 `vq submit --retry N` lets a job automatically re-run up to N times
 when it exits non-zero. Use it for jobs that may fail transiently
 (network hiccups, license server timeout, intermittent OOM).

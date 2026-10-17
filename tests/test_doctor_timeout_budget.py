@@ -798,7 +798,7 @@ def test_deadline_contract_survives_active_and_just_cleared_admin_marker(
     monkeypatch.setenv(config.ENV_CONFIG_DIR, str(tmp_path / "cfg"))
     (tmp_path / "cfg").mkdir()
     admin.write_admin_update_marker(
-        envs=["scheduler-runtime:host_f:vibeqc-release"],
+        envs=["scheduler:host_f"],
         host="host_f",
     )
     if not marker_active:

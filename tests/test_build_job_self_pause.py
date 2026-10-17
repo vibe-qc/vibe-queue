@@ -23,9 +23,26 @@ from pathlib import Path
 
 import pytest
 
-from vq import config, paths, pause_resume
+from vq import cgroup, config, paths, pause_resume
 from vq.daemon import Daemon
 from vq.spec import JobSpec, JobState
+
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a teardown reap of whatever the daemon fixture left running.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 1 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# Nothing to bound it against here: these tests run `true`, which exits on
+# its own in milliseconds, and the one site using this budget is a fixture
+# teardown that asserts nothing (it even swallows the timeout), so a
+# generous value removes no coverage. Ten seconds matches
+# tests/test_transport.py and tests/test_pause_resume.py.
+_LIVENESS_SECONDS = 10.0
 
 
 @pytest.fixture
@@ -95,7 +112,12 @@ def test_pause_all_without_exclusion_is_saved_by_the_pgid_guard(
 
 
 @pytest.fixture
-def daemon(state_dir: Path) -> Iterator[Daemon]:
+def daemon(state_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Daemon]:
+    # Admission tests use a local process group, independent of host systemd
+    # support or a shared CI cgroup whose memory includes unrelated processes.
+    monkeypatch.setattr(cgroup, "available", lambda: False)
+    monkeypatch.setattr(cgroup, "cgroup_path_for_pid", lambda pid: None)
+    monkeypatch.setattr(cgroup, "cgroup_path_for_scope", lambda unit, **kwargs: None)
     d = Daemon(
         max_cpus=4,
         max_mem_mb=1000,
@@ -107,7 +129,7 @@ def daemon(state_dir: Path) -> Iterator[Daemon]:
     for rj in list(d._running.values()):
         try:
             rj.popen.kill()
-            rj.popen.wait(timeout=1)
+            rj.popen.wait(timeout=_LIVENESS_SECONDS)
         except Exception:
             pass
         rj.close_logs()

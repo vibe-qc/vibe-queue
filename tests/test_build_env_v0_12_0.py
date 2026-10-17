@@ -118,6 +118,7 @@ class TestBuildEnvCommand:
             lambda _env, _cfg: SimpleNamespace(
                 branch="main",
                 git_dir="/fake/repo",
+                runtime_slot_root=None,
             ),
         )
         monkeypatch.setattr(
