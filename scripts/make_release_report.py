@@ -56,21 +56,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Each pin resolves in its own GitLab project since the 2026-09-08 split.
-# One id no longer covers all four: after the split each component's gating
-# job runs in its own repository's pipeline, so the evidence lookup for a pin
-# has to be aimed at that pin's project. Path-based lookups 404 on this
-# instance (CLAUDE.md § 2), so the numeric id is what callers pass.
-PIN_SOURCES = {
-    "release": ("mpei/vibe-qc", 34),
-    "dev": ("mpei/vibe-qc", 34),
-    "vq": ("mpei/vibe-queue", 36),
-    "vibe_view": ("mpei/vibe-view", 35),
-}
+# Also works directly from a source checkout without an installed package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from vq.source_projects import PIN_SOURCES
 
-# The frozen pre-split monorepo. Reports generated before the split named it
-# once at top level; kept here only so historical reports remain readable.
-MONOREPO_PROJECT_ID = 19
 # Mandatory gate per pin, named as it is in that pin's OWN project. The
 # monorepo ran every component's gate in one pipeline, so the jobs needed
 # distinct names (`test-vq`, `vibe-view-test`); after the split each
@@ -240,7 +229,7 @@ def gating_evidence(
     sha: str,
     *,
     gating_job: str = "build-test",
-    project_id: int = PIN_SOURCES["release"][1],
+    project_id: int | None = None,
 ) -> dict[str, Any] | None:
     """Return successful ``gating_job`` evidence for an exact SHA, or None.
 
@@ -258,6 +247,8 @@ def gating_evidence(
       release-gate pipeline that failed a *different* component's gate is
       correct and intended — each component is gated by its own job.
     """
+    if project_id is None:
+        project_id = PIN_SOURCES["release"][1]
     for pipeline in glab_pipelines(sha=sha, per_page="20", project_id=project_id):
         if not is_release_gate_ref(pipeline.get("ref")):
             continue
@@ -439,11 +430,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--vq-repo",
-        help="path to the mpei/vibe-queue checkout the vq pin resolves in",
+        help="path to the vibe-queue checkout the vq pin resolves in",
     )
     ap.add_argument(
         "--vibe-view-repo",
-        help="path to the mpei/vibe-view checkout the vibe_view pin resolves in",
+        help="path to the vibe-view checkout the vibe_view pin resolves in",
     )
     ap.add_argument(
         "--vq-tag",

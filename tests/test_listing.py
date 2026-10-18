@@ -1131,13 +1131,13 @@ class TestPendingQueuePosition:
     def test_scheduler_targets_have_independent_pending_lanes(self) -> None:
         from vq.listing import pending_queue_position
 
-        itwin = self._p(
-            "itwin", submitted_at="2026-06-05T10:00:00+00:00",
-            scheduler_target="host_f-itwin",
+        lanea = self._p(
+            "lanea", submitted_at="2026-06-05T10:00:00+00:00",
+            scheduler_target="host_f-lanea",
         )
-        itwin_later = self._p(
-            "itwin2", submitted_at="2026-06-05T11:00:00+00:00",
-            scheduler_target="host_f-itwin",
+        lanea_later = self._p(
+            "lanea2", submitted_at="2026-06-05T11:00:00+00:00",
+            scheduler_target="host_f-lanea",
         )
         big = self._p(
             "big", submitted_at="2026-06-05T08:00:00+00:00",
@@ -1145,9 +1145,9 @@ class TestPendingQueuePosition:
         )
         local = self._p("local", submitted_at="2026-06-05T07:00:00+00:00")
 
-        pending = [big, local, itwin_later, itwin]
+        pending = [big, local, lanea_later, lanea]
 
-        assert pending_queue_position(itwin, pending) == (1, 2)
-        assert pending_queue_position(itwin_later, pending) == (2, 2)
+        assert pending_queue_position(lanea, pending) == (1, 2)
+        assert pending_queue_position(lanea_later, pending) == (2, 2)
         assert pending_queue_position(big, pending) == (1, 1)
         assert pending_queue_position(local, pending) == (1, 1)

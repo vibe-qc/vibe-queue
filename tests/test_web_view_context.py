@@ -292,10 +292,15 @@ def test_fleet_query_row_filter_and_projection_contract() -> None:
     assert query == {
         "host": "host_a",
         "state": "running",
+        "program": "all",
+        "project": "",
         "tag": "chemistry",
         "submitter": "alice",
         "q": "WATER",
+        "submitted_from": "",
+        "submitted_to": "",
         "limit": "50",
+        "page": "1",
         "sort": "status",
         "dir": "desc",
     }
@@ -308,10 +313,15 @@ def test_fleet_query_row_filter_and_projection_contract() -> None:
     assert view_context.fleet_row_matches(
         {**row, "queue_host": "host_f"}, query
     ) is False
-    assert view_context.fleet_row_view(row) == {
+    view = view_context.fleet_row_view(row)
+    # #168's calculation columns have their own tests; here only that the
+    # row carries them. No scheduler target, so its raw state decides.
+    assert view.pop("calc")["activity"] == "running"
+    assert view == {
         "id": "job-a",
         "host": "host_a",
         "state": "running",
+        "effective_state": "running",
         "sched": "queued",
         "cpus": 4,
         "mem_mb": 8000,
@@ -356,10 +366,15 @@ def test_fleet_snapshot_context_contract() -> None:
     assert context["query"] == {
         "host": "all",
         "state": "all",
+        "program": "all",
+        "project": "",
         "tag": "",
         "submitter": "",
         "q": "",
         "limit": "50",
+        "page": "1",
+        "submitted_from": "",
+        "submitted_to": "",
         # v0.25.x: the table sorts. "status" is not a column -- it ranks
         # active work above finished work, so a job running for two days
         # is not buried under everything that completed since.
@@ -377,7 +392,10 @@ def test_fleet_snapshot_context_contract() -> None:
 
     grid = view_context.fleet_grid_context(snapshot)
     assert grid["snapshot"] is snapshot
-    assert grid["cards"] == [view_context.fleet_host_card(host_snapshot)]
+    assert grid["cards"] == [{
+        **view_context.fleet_host_card(host_snapshot),
+        "readiness": grid["readiness"]["by_target"][host_snapshot.host],
+    }]
     assert grid["duplicate_enrolments"] == []
     assert grid["summary"]["hosts"] == 1
 
@@ -385,6 +403,7 @@ def test_fleet_snapshot_context_contract() -> None:
     assert empty["snapshot"] is None
     assert empty["cards"] == []
     assert empty["summary"]["hosts"] == 0
+    assert empty["readiness"] is None
     # No snapshot means no age to report -- and, critically, NOT stale:
     # "we have not swept yet" and "the sweep died" are different states
     # and must not render the same alarm.

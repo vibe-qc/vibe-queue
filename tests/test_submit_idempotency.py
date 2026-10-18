@@ -2458,3 +2458,19 @@ def test_remote_key_is_forwarded_once_and_rejects_multi_job_variants(
                 **fields,
             )
     assert len(observed) == 1
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_runtime_execution_receipt_preserves_predecessor_intent_digest(selected: bool) -> None:
+    """An unchanged request must replay claims admitted before slot bindings existed."""
+    pin = ProgramRuntimePin(expected_git_sha="a" * 40, enforce_git_sha=False)
+    if selected:
+        pin.resolved_git_sha = "b" * 40
+        pin.resolved_runtime_root = "/opt/runtime"
+        pin.resolved_runtime_source = "/opt/runtime/releases/selected/source"
+        pin.resolved_runtime_python = "/opt/runtime/releases/selected/source/.venv/bin/python"
+    spec = JobSpec(id="123456abcdef", command=["true"], cwd="/work", cpus=1,
+                   program="demo", program_runtime_pin=pin)
+    assert submit._submission_intent_digest(
+        spec, payload_kind="file", payload_digest="f" * 64, vibeqc_preflight=False,
+    ) == "5502202de21bbceed4e03b13dfc499fe0ca71ecab6887f9df67b20dbed9e6ad9"

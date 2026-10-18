@@ -1,0 +1,7 @@
+# Loaded after the configured external deployment job. Keep its script,
+# environment and docs-build dependency; move manual publishing off main.
+docs-deploy:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+      when: manual
+      allow_failure: true

@@ -7,7 +7,7 @@ With ``detached_build = true`` the command runs under ``setsid`` with its
 output, rc, and pid parked in a per-run directory; the driver observes via
 fresh per-poll connections. These tests pin the protocol: a dropped poll is
 tolerated, output streams into the run log exactly once, a wall timeout
-kills the remote process group, and the runtime lane wires it end to end.
+attempts remote termination without assuming success, and the runtime lane wires it end to end.
 """
 from __future__ import annotations
 
@@ -1527,7 +1527,7 @@ def test_detached_build_survives_a_dropped_poll_connection(
     assert fake.cleanup_seen, "the run dir must be cleaned up after success"
 
 
-def test_detached_timeout_kills_the_remote_process_group(
+def test_detached_timeout_attempts_remote_process_group_termination(
     state_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = _FakeBuildHost(polls=[_poll("none", "", 0)] * 50)
@@ -1543,7 +1543,56 @@ def test_detached_timeout_kills_the_remote_process_group(
             mode="runtime vibeqc-release update",
         )
 
-    assert fake.kill_scripts, "the wall timeout must kill the process group"
+    assert fake.kill_scripts, "the wall timeout must request process-group termination"
+
+
+@pytest.mark.parametrize("returncode,stdout", [(255, ""), (0, "RC=none\nSIZE=0\n")])
+@pytest.mark.parametrize("timeout", [3, 20])
+def test_detached_failed_poll_is_unobservable_without_termination(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str,
+    timeout: int,
+) -> None:
+    fake = _FakeBuildHost(polls=[])
+    def unavailable(host, *args, **kwargs):
+        if 'echo "RC=' in kwargs.get("stdin_data", ""):
+            return subprocess.CompletedProcess(
+                args, returncode, stdout, "banner exchange timed out"
+            )
+        return fake(host, *args, **kwargs)
+    ticks = iter(range(100))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(admin.time, "sleep", lambda _: None)
+    monkeypatch.setattr(admin, "DETACHED_BUILD_OBSERVATION_GRACE_SECONDS", 3)
+    monkeypatch.setattr(admin.transport, "run_remote_shell", unavailable)
+    with pytest.raises(transport.RemoteOutcomeUnknown, match="unobservable"):
+        admin._run_legacy_detached_scheduler_command(
+            _host_cfg(), ["/site/bin/deploy-runtime"], scratch_root="/scratch",
+            program="vibeqc-release", timeout=timeout, mode="runtime update",
+        )
+    assert not fake.kill_scripts
+    assert not fake.cleanup_seen
+
+
+def test_detached_timeout_does_not_claim_unconfirmed_termination(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = _FakeBuildHost(polls=[])
+    def unavailable_kill(host, *args, **kwargs):
+        if "kill --" in kwargs.get("stdin_data", ""):
+            raise transport.RemoteError("banner exchange timed out")
+        return fake(host, *args, **kwargs)
+    ticks = iter(range(100))
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(admin.time, "sleep", lambda _: None)
+    monkeypatch.setattr(admin.transport, "run_remote_shell", unavailable_kill)
+    with pytest.raises(transport.RemoteError, match="termination.*unconfirmed") as exc:
+        admin._run_legacy_detached_scheduler_command(
+            _host_cfg(), ["/site/bin/deploy-runtime"], scratch_root="/scratch",
+            program="vibeqc-release", timeout=0.5, mode="runtime update",
+        )
+    assert "process group killed" not in str(exc.value)
+    assert "reconcile" in str(exc.value).lower()
+    assert not fake.cleanup_seen
 
 
 def test_runtime_lane_streams_a_detached_build_end_to_end(
@@ -1677,3 +1726,71 @@ def test_bound_runtime_rc0_still_requires_independent_verify_for_last_ok(
     record = admin.load_scheduler_runtime_status()["host_f:vibeqc-release"]
     assert record.last_success is False
     assert record.last_ok_sha is None
+
+
+@pytest.mark.parametrize("action", ["observe", "retained", "launch"])
+@pytest.mark.parametrize("failure", ["exit255", "timeout"])
+def test_bound_helper_recovers_read_only_calls_on_fresh_ssh(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, action: str, failure: str,
+) -> None:
+    calls = []
+
+    def ssh(argv, **kwargs):
+        calls.append((argv, kwargs["input"]))
+        if "ControlPath=none" not in argv:
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 255, "", "stalled master")
+        return subprocess.CompletedProcess(argv, 0, "retained response", "")
+
+    monkeypatch.setattr(transport.subprocess, "run", ssh)
+    monkeypatch.setattr(transport.time, "sleep", lambda _: None)
+    if action == "launch" and failure == "timeout":
+        with pytest.raises(admin._DetachedObservationUnavailable):
+            admin._detached_helper_call(_host_cfg(), action, {"request": "unchanged"})
+    else:
+        result = admin._detached_helper_call(
+            _host_cfg(), action, {"request": "unchanged"},
+        )
+        assert result.returncode == (255 if action == "launch" else 0)
+    assert len(calls) == (1 if action == "launch" else 2)
+    assert "ControlPath=none" not in calls[0][0]
+    if action != "launch":
+        assert "ControlMaster=no" in calls[1][0]
+        assert "ControlPath=none" in calls[1][0]
+        assert calls[0][1] == calls[1][1]
+
+
+@pytest.mark.parametrize("failure", ["exit255", "timeout"])
+def test_legacy_poll_recovers_stalled_master_without_relaunch(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    calls = []
+    ticks = iter(range(100))
+
+    def ssh(argv, **kwargs):
+        script = kwargs["input"]
+        calls.append((argv, script))
+        if 'echo "RC=' in script:
+            if "ControlPath=none" not in argv:
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                return subprocess.CompletedProcess(argv, 255, "", "stalled master")
+            return subprocess.CompletedProcess(argv, 0, _poll("0", "built\n", 0), "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(transport.subprocess, "run", ssh)
+    monkeypatch.setattr(admin.time, "sleep", lambda _: None)
+    monkeypatch.setattr(admin.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(admin, "DETACHED_BUILD_OBSERVATION_GRACE_SECONDS", 3)
+    result = admin._run_legacy_detached_scheduler_command(
+        _host_cfg(), ["/site/bin/deploy-runtime"], scratch_root="/scratch",
+        program="vibeqc-release", timeout=20, mode="runtime update",
+    )
+    assert result.returncode == 0
+    assert result.stdout == "built\n"
+    assert len(calls) == 4  # one launch, two poll attempts, one cleanup
+    assert calls[1][1] == calls[2][1]  # replay the same read offset
+    assert "ControlPath=none" in calls[2][0]
+    assert all("ControlPath=none" not in calls[i][0] for i in (0, 1, 3))
+    assert not any("kill --" in script for _, script in calls)

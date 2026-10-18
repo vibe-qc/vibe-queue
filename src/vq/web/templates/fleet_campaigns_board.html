@@ -1,0 +1,68 @@
+<div id="campaign-board" hx-get="/fleet/campaigns/_board" hx-trigger="every 10s, refresh" hx-swap="outerHTML">
+{% for problem in registry_problems %}
+<p class="host-card-error">{{ problem }}</p>
+{% endfor %}
+{% if not campaigns %}
+<p class="empty">No campaign registered on this machine. <code>vq campaign run</code> registers its run directory here.</p>
+{% endif %}
+{% for c in campaigns %}
+<section class="campaign">
+  <h3>
+    {{ c.campaign_id }}
+    <span class="cg-status cg-{{ c.status }}">{{ c.status | replace("_", " ") }}</span>
+    <span class="hint" title="campaign digest {{ c.campaign_sha256 }}">run {{ c.run_dir_name }} · {{ c.campaign_sha256[:12] }} · registered {{ c.registered_at[:19] | replace("T", " ") }} UTC</span>
+  </h3>
+  {% if c.error %}
+  <p class="host-card-error">{{ c.error }}</p>
+  {% else %}
+  {% set g = c.graph %}
+  <div class="table-scroll">
+  <svg class="campaign-graph" width="{{ g.width }}" height="{{ g.height }}" viewBox="0 0 {{ g.width }} {{ g.height }}" role="img" aria-label="{{ c.campaign_id }} graph">
+    {% for e in g.edges %}
+    <path class="cg-edge cg-edge-{{ e.on }}" d="{{ e.path }}"><title>{{ e.from }} → {{ e.to }} ({{ e.on }})</title></path>
+    {% endfor %}
+    {% for n in g.nodes %}
+    <g class="cg-node cg-{{ n.status }}" transform="translate({{ n.x }},{{ n.y }})">
+      <title>{{ n.id }}: {{ n.status }}{% for r in n.reasons %}; {{ r }}{% endfor %}{% if n.next %}; next: {{ n.next }}{% endif %}</title>
+      <rect width="{{ g.box_width }}" height="{{ g.box_height }}" rx="5"></rect>
+      <text x="8" y="18" class="cg-id">{{ n.id | truncate(22, true) }}</text>
+      <text x="8" y="34" class="cg-sub">{{ n.kind }} · {{ n.host | truncate(16, true) }}</text>
+      <text x="8" y="50" class="cg-sub">{{ n.status }}{% if n.attempt %} · attempt {{ n.attempt.number }}{% endif %}</text>
+    </g>
+    {% endfor %}
+  </svg>
+  </div>
+  <div class="table-scroll">
+  <table class="queue campaign-nodes">
+    <thead><tr><th>node</th><th>status</th><th>attempt / job</th><th>outputs</th><th>why / next</th></tr></thead>
+    <tbody>
+    {% for n in g.nodes %}
+    <tr>
+      <td class="jobid">{{ n.id }} <span class="hint">{{ n.kind }}</span></td>
+      <td><span class="cg-status cg-{{ n.status }}">{{ n.status }}</span></td>
+      <td>
+        {% if n.attempt %}
+          {{ n.attempt.number }} {{ n.attempt.state }}{% if n.attempt.retry_of %} <span class="hint">(retries {{ n.attempt.retry_of }})</span>{% endif %}
+          {% if n.attempt.href %}· <a href="{{ n.attempt.href }}">{{ n.attempt.job_id }}</a> <span class="hint">on {{ n.attempt.host }}</span>{% endif %}
+        {% else %}-{% endif %}
+      </td>
+      <td>
+        {% for o in n.outputs %}<span class="cg-output cg-out-{{ o.status | replace(' ', '-') }}">{{ o.name }}: {{ o.status }}</span>{% if not loop.last %}<br>{% endif %}{% else %}-{% endfor %}
+      </td>
+      <td class="diag">
+        {% for r in n.reasons %}{{ r }}<br>{% endfor %}
+        {% if n.next %}<span class="hint">next: {{ n.next }}</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% if c.retain %}
+  <p class="hint">Kept for unfinished consumers:
+    {% for r in c.retain %}{{ r.node }} attempt {{ r.attempt }} (for {{ r.needed_by | join(", ") }}){% if not loop.last %}; {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% endif %}
+</section>
+{% endfor %}
+</div>

@@ -23,6 +23,26 @@ from vq.daemon_control import (
 )
 from vq.spec import JobSpec, JobState
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a teardown reap of whatever the daemon left running.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 2 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# **It has a ceiling here.** `test_kill_running_keeps_killed_state` runs
+# `time.sleep(30)`, so a budget at or above 30 s would let a `wait()` after
+# `kill()` return because the sleep ended rather than because the kill
+# landed. Ten seconds stays a third of that; raising it means raising those
+# sleeps first. (Both sites are `finally` reaps that assert nothing, so the
+# ceiling protects a habit rather than a live assertion -- the slow job in
+# `test_running_appears_above_completed` sleeps only 2 s and is often gone
+# before the reap runs at all.)
+_LIVENESS_SECONDS = 10.0
+
 
 @pytest.fixture
 def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -190,7 +210,7 @@ class TestQueueOrdering:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
 
@@ -332,7 +352,7 @@ class TestKillE2E:
         finally:
             for rj in d._running.values():
                 rj.popen.kill()
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_LIVENESS_SECONDS)
                 rj.close_logs()
 
         spec = JobSpec.read(paths.spec_path(jobid))
