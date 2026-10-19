@@ -1,5 +1,16 @@
 # vq ↔ vibe-qc version compatibility
 
+Native slot seeding adds optional `runtime_slot_seed_adapter` and
+`runtime_slot_seed_timeout_seconds` program settings. Older strict config
+readers reject them: upgrade every reader before enabling the adapter.
+Omitting them preserves existing behavior. Resolved execution programs clear
+the adapter setting. The existing slot marker schema is unchanged; a separate
+`.vq-native-seed.json` sidecar records preparation only. See
+[native install seeding](native_install_seeding.md) for the opt-in contract,
+supported file types and outstanding product qualification.
+
+**Audience: operators and agents.** Part of [Running a host](operator/index.md) and [The agent contract](agent/index.md).
+
 vq is shipped as a subpackage of vibe-qc but carries its own version
 line (`vibe-queue/pyproject.toml` + `src/vq/__init__.py`). This page
 maps the two so you can answer "which vq did v0.X.Y of vibe-qc ship
@@ -35,6 +46,278 @@ two-repo coordination for trivially-coupled changes). vq stays in
 the vibe-qc monorepo at `vibe-queue/`.
 
 ## Config shape across versions
+
+### Resource previews and portable runtime bundles (#159, #161)
+
+`vq.resource-estimate/1` is a standalone read-only receipt, not a JobSpec field.
+No job/resource defaults or existing submit/preflight semantics change. Treat
+unknown memory scope and uncalibrated estimates as explicit limitations.
+`vq estimate-evaluate` reads `vq.estimate-evaluation-set/1` files and writes
+`vq.estimate-evaluation/1` reports. It reads both resource-usage receipt
+schemas and changes no queue state.
+Evaluation cases accept optional `memory_limit_scope` (`job`, `node`, `rank`
+or `unspecified`), defaulting to the existing total-job meaning. OOM verdicts
+now respect aggregation scope. Earlier strict readers reject the new field
+and can misclassify aggregate-limit kills; use an updated evaluator for these
+sets. Estimate receipts and persisted queue state are unchanged.
+
+Portable runtimes use separate `vq.runtime-build/1`, `vq.runtime-bundle/1`,
+`vq.runtime-trust/1`, `vq.runtime-artifact-store/1`,
+`vq.portable-runtime-target/1`, `vq.runtime-selection/1`,
+`vq.runtime-deploy-plan/1` and `vq.runtime-deployment/1` documents.
+Their generation identity is a SHA256 manifest digest; it is never passed off
+as a source SHA in the existing 40-hex runtime-slot APIs. Legacy roots are
+refused without mutation. Older Queue readers have no portable-bundle command
+and must not consume these roots as legacy slots. Use a supporting CLI to
+manage them; preserve every retained payload path across a downgrade. No
+existing queue state or registry requires migration for this opt-in feature.
+See [portable runtime bundles](portable_runtime_bundles.md).
+
+### Calculation campaigns (#165)
+
+`vq.campaign/1`, `vq.campaign-journal/1`, `vq.campaign-artifact/1` and
+`vq.campaign-status/1` are standalone files read and written only by
+`vq campaign`. No JobSpec field or queue state changes. A journal names the
+`campaign_sha256` it belongs to and is refused for any other campaign;
+idempotency keys derive from that digest. Older vq versions have no `campaign`
+command. `vq campaign run` submits through `vq submit HOST --idempotency-key`,
+reads jobs with `vq status HOST --json` and brings outputs back with
+`vq fetch HOST JOB --name`, so each node's host needs a vq that supports keyed
+submission and `fetch --name`; it keeps its journal, payloads and artifacts
+in the run directory it is given. A node's optional `sources` pin is part of
+`vq.campaign/1`: a vq without it refuses such a campaign as an unknown field,
+and a campaign without `sources` keeps the digest it had before the field
+existed. See [calculation campaigns](campaigns.md).
+
+### Final usage in queue listings (#168)
+
+`vq queue --json` adds `resource_usage`, the same validated final receipt
+summary as `vq status --json`. This is an additive response field, not a new
+JobSpec field or on-disk migration. Readers tolerate its absence from older
+hosts; the fleet table shows unknown final usage there. Scheduler aliases
+preserve the owning driver's summary rather than reading its workspace on
+the client. Nonterminal jobs and terminal jobs without receipts report `null`.
+
+### Placement explanations (#160)
+
+`vq.placement-fleet/1`, `vq.placement-request/1` and
+`vq.placement-explanation/1` are standalone files read and written only by
+`vq placement explain`. No queue or broker state changes, and broker
+placement keeps its FIFO pass and ranking. Older vq versions have no
+`placement` command. See [explainable placement plans](placement_policy.md).
+
+Placement requests may now include `wall_time_seconds`, and targets may declare
+`walltime_unlimited: true` as positive evidence of no walltime cap. Existing
+files remain readable. Earlier placement readers reject these new fields;
+use an updated reader to enforce explicit walltime requests. No queued job,
+broker record or live configuration is migrated.
+
+Placement requests may also include `scratch_mb_per_node`; targets may record
+`node.scratch_mb` and daemon hosts may record `free.scratch_mb`. These optional
+fields leave existing files readable. Earlier placement readers reject them;
+use an updated reader to enforce scratch requirements and account for current
+scratch headroom. No queue state or live admission configuration changes.
+
+Placement requests and targets may include an optional `os` label. A request
+requires an exact match; unknown target OS is rejected for an explicit request.
+Existing files remain readable and requests without `os` keep their behavior.
+Earlier placement readers reject the new field; use an updated reader for
+files that declare OS constraints. No queue or broker state is migrated.
+
+An explicit placement `account` now requires a match in the target's
+`accounts` list. Missing or `null` account capabilities are unknown and reject
+that target; earlier planners treated them as unrestricted. Existing files
+remain readable and requests without `account` keep their behavior. Use an
+updated planner for decisions that depend on account permission evidence.
+
+Placement requests may declare `mpi_ranks` and `threads_per_rank` together.
+Their product must equal `cpus`; whole ranks must fit the per-node CPU
+capacity. Existing requests without a layout keep their behavior. Earlier
+strict readers reject these optional fields; use an updated planner for
+rank/thread constraints. No queue or broker state is migrated.
+
+Placement requests may declare `required_data_access`, and targets may record
+`data_access`. Every required label needs a positive, exact match; missing or
+`null` target access is unknown. Existing files remain readable and requests
+without access requirements keep their behavior. Earlier strict readers reject
+these optional fields; use an updated planner for constrained plans. No queue
+or broker state is migrated.
+
+Placement requests may declare `required_licenses`, and targets may record
+`licenses`. Every required license-eligibility label needs a positive, exact
+match; missing or `null` eligibility is unknown. Existing files remain
+readable, and requests without license requirements keep their behavior.
+Earlier strict readers reject these optional fields; use an updated planner
+for license-constrained plans. No queue or broker state is migrated.
+
+### Runtime benchmark plans (#162)
+
+`vq.benchmark-plan/1`, `vq.benchmark-results/1` and `vq.benchmark-report/1`
+are standalone files read and written only by `vq benchmark`. No queue state
+changes. Results name the `plan_sha256` they were recorded under. Both the
+runner and analysis refuse results from another plan; the runner checks
+before contacting the queue or writing a checkpoint. `vq benchmark run` adds
+`vq.benchmark-binding/1`, `vq.benchmark-run-report/1` and a run-directory
+journal (`vq.benchmark-journal/1`); it submits with
+`vq submit HOST --idempotency-key` and reads back with `vq status` and
+`vq fetch --name`, so each bound host needs a vq that supports keyed
+submission, `fetch --name` and `resource_usage`. Older vq versions have no
+`benchmark` command. See [runtime benchmark campaigns](benchmark_campaigns.md).
+
+The benchmark runner also rejects a missing results file or missing
+measurement rows for journal entries marked `recorded`, before queue contact
+or checkpoint writes. Earlier runners could report success despite the lost
+measurements. Restore the campaign's matching results to resume. File schemas
+are unchanged; results written ahead of an interrupted journal checkpoint
+remain valid and are recollected as before.
+
+New benchmark journals include a random `run_id` to scope submission keys to
+one campaign instance. Fresh run directories now submit fresh jobs for the
+same plan; restarts and directory moves preserve the stored identity. Existing
+journals without `run_id` retain their original keys, including uncertain
+submissions. Earlier strict journal readers reject the new field; continue
+new campaigns with an updated controller. Plans, result files and reports
+are unchanged.
+
+Benchmark reports calculate conservative cost recovery from the lower
+confidence bound on mean paired core-second savings. Earlier reports used the
+relative-speedup interval and could understate the required count. Regenerate
+reports from the existing plans and results to apply this correction; neither
+input schema changes. The additive `settings.break_even_interval` field
+identifies the corrected method. Unavailable conservative counts remain `null`.
+
+### Held broker decision evidence (#64, after 0.26.25)
+
+Broker records may contain `held_blockers`, a map of target names to the latest
+placement refusal reasons. Readers accept older records without it. A held
+decision updates the record revision and observation time, preserving creation
+time, intent, payload and FIFO order; it never creates an attempt or charge.
+The field is omitted when empty and cleared when a target is reserved.
+Cancellation retains the last held reasons as historical evidence.
+
+Upgrade all readers of a broker store before running placement with this change.
+Readers through 0.26.25 reject records carrying the new field rather than
+ignore it. Downgrading those readers requires restoring a compatible store
+backup while the broker is stopped, reconciling any later accepted jobs first;
+do not delete held records or payloads to make a downgrade load.
+
+### Explicit local runtime execution binding (#72, 0.26.11)
+
+`programs.<name>.runtime_slot_execution` is an opt-in nested key. Older
+readers reject it rather than silently execute the legacy interpreter. Upgrade
+every reader of that registry before enabling it; remove the key to roll back
+the binding. The original `python` and `git_dir` remain usable build inputs.
+
+Job runtime pins add optional `resolved_runtime_root`,
+`resolved_runtime_source` and `resolved_runtime_python` fields. New readers
+accept their absence and select an execution generation at dispatch. Retries,
+resubmits and reboot recovery discard the previous execution selection while
+preserving submitted pin requirements. Older readers ignore these additive
+receipt fields and cannot enforce the new selection contract: drain active
+slot executions before downgrading the daemon, and restore the legacy registry
+binding first. Both runtime generations and legacy paths must remain present.
+
+### Runtime generation build input (#72, 0.26.12)
+
+`programs.<name>.runtime_slot_build_input = "current"` is an opt-in nested key
+that requires `runtime_slot_execution`. Older readers reject it. Upgrade every
+reader of that registry before setting it; remove the key (or set `"legacy"`)
+to return to building from the registered checkout, which must then exist
+again. `vq programs --json` gains `runtime_slot_build_input` in the binding
+block of execution-bound programs, and its `build_git_dir`/`build_python` name
+the active generation when the input is `"current"`. Lifecycle locks for any
+program with `runtime_slot_root` also hold the canonical runtime root, as a
+`checkout`-scope resource that older rollout handoffs accept.
+
+The serving-daemon path also supports this input after #142. Upgrade the
+updater and recovery entry points before opting in: earlier versions refuse
+the serving update, and their recovery path requires the legacy checkout.
+The receipt schema is unchanged. Concrete slot-local program snapshots now
+carry `runtime_slot_build_input = "legacy"` with their fixed generation paths;
+the registered program retains `"current"`. Recovery records the retained
+serving checkout instead of requiring the retired registered path.
+
+### Standalone runtime launchers and rebind manifests (#142)
+
+`vq runtime-launcher` exports a format-1 standalone selector using a retained
+base Python 3.12+. The generated file embeds the exporting version's runtime
+marker reader; an incompatible future slot format requires a new reviewed
+export. It does not depend on the old queue package remaining installed.
+
+`vq.runtime-rebind/1` is a distinct local migration manifest schema. Upgrade
+both the planning and recovery commands before using it: older versions reject
+the manifest, including the copy saved inside its transaction receipt. The
+outer receipt schema remains `vq.runtime-migration/1`. Rebind preserves runtime
+pointers and stores original launcher/config bytes and bootstrap identities;
+keep both bootstrap installations and the recorded generations available until
+the transaction is complete and rollback is no longer required.
+
+### Immutable serving-daemon receipts (#73, 0.26.12)
+
+Serving immutable generations add the distinct managed receipt schema
+`vq-managed-daemon-slots-v1`. Older recovery implementations refuse this schema;
+they must not clear its marker or reinterpret it as a legacy moved-venv receipt.
+Keep a version supporting this schema available until every transaction is
+recovered or committed and its scoped jobs resumed. The receipt retains original
+registry/service bytes and generation identities; both interpreter directories
+remain in place. Config execution-binding compatibility and saved job-generation
+pins have the separate downgrade constraints described above.
+
+### Scratch root separated from the state root (#63, 0.26.10)
+
+**A default changed, and a spec field was added.** `jobs/` and `workdirs/`
+move to a scratch root defaulting to `<state root>-scratch`; the state root
+keeps the queue, locks and archives. Nothing on disk moves, and the
+compatibility story is that a job is always read at the path it recorded:
+
+* **An older vq reading a newer vq's specs** sees `scheduler_remote_workspace`
+  as an unknown field. `JobSpec` tolerates that on read, and the older code
+  recomputes the workspace from the current `scratch_root` exactly as it
+  always did — correct as long as that key has not changed, which is the same
+  condition that applied before the field existed.
+* **A newer vq reading an older vq's specs** sees the field absent and binds
+  it when it reattaches to that job — a daemon start — from the same
+  derivation the older vq used. While a job on a scheduler host that **may
+  already be staged** is still unbound, the driver refuses to adopt a changed
+  `scratch_root` for that host. (A job still PENDING on its first attempt is
+  not one of those: nothing stages before dispatch, so it can strand nothing.)
+  It compares against the root it last *adopted*, which it keeps in
+  `<state root>/scheduler-scratch-roots.json`, so the refusal survives the
+  restart the runbook prescribes.
+
+  **The first start after this upgrade has no such record**, because the file
+  is written by the code this note describes. That start therefore serves what
+  is configured — there is nothing else it could serve — but it neither binds
+  that host's unbound jobs to it nor records the root as adopted: the entry is
+  written `{"root": ..., "confirmed": false}`. Those jobs keep resolving their
+  workspace from the derivation exactly as the older vq did, so restoring the
+  previous `scratch_root` and restarting the driver still repairs them, which
+  a binding written onto the spec would not. The entry becomes an ordinary
+  adopted one at the driver's first lookup of the host after those jobs drain
+  (a dispatch to it, a reattachment, a cleanup); a poll does not write it.
+  `vq doctor HOST` reports the state meanwhile, and judges it from the queue
+  as well as the entry, so a drained host passes before the entry catches up.
+
+  That file's own compatibility: an adopted root is still written as a bare
+  string, and only an unconfirmed one as an object, so a rollback to a vq that
+  reads only the version 1 shape keeps every entry it could itself have
+  written and skips only the unconfirmed ones — which it would have had no
+  memory of at all. The schema tag moves to
+  `vq.scheduler-scratch-roots/2`; no reader has ever checked it.
+* **A newer vq inheriting an older vq's state root** finds `jobs/` and
+  `workdirs/` under it and keeps using them for those jobs; cleanup and
+  accounting cover both roots. Only new dispatches use the new root.
+* **A rollback** is safe for jobs the older vq can see: their recorded paths
+  are absolute and the older vq reads them unchanged. Jobs dispatched by the
+  newer vq into the new root are readable too — the path is in the record —
+  but the older vq's `vq cleanup` will not account for the new root's
+  workdirs, because it never accounted for any workdirs.
+
+`scratch_root`, `jobs_root` and `workdir_root` are additive top-level config
+keys, so an older vq ignores them with a warning. That is exactly the case
+where **the operator must set `min_vq_version`** — two builds on one host
+resolving scratch differently is a split store, not a lost feature. Said in
+`docs/config.toml.example` beside the key, and in the phase 5 runbook.
 
 ### Console session-store transition (September 2026, unreleased)
 
@@ -80,7 +363,7 @@ the accepted-report era also match the committed fleet report unless the row
 explicitly records a retracted report. A candidate row is explicitly labeled
 and is not a release mapping until that tag and report exist. The "headline vq
 features" column points at notable behaviour the operator might want to know
-about; the full per-vq history is in [`roadmap.md`](roadmap.md).
+about; the full per-vq history is in [`roadmap.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/roadmap.md).
 
 | vibe-qc tag | vq version | codename | headline vq features in this ship |
 |-------------|------------|----------|------------------------------------|
@@ -213,10 +496,10 @@ own version-bump commits rather than invented. Two earlier lines were resolved
 in the same pass, because names had been attached to feature bullets rather
 than to releases: v0.11.0 carried four candidates and resolves to *Eager's
 Sharing*, v0.12.0 carried five and resolves to *Hopper's Bug*. The unpicked
-names stay in [`STATUS.md`](STATUS.md) as the per-feature labels they always
-were; they are not alternative release names. See
-[`.release-status/CODENAME-PROPOSAL.md`](../.release-status/CODENAME-PROPOSAL.md)
-for the reasoning behind each.
+names were the per-feature labels they always were; they are not alternative
+release names. See
+[`.release-status/CODENAME-PROPOSAL.md`](https://github.com/vibe-qc/vibe-queue/blob/main/.release-status/CODENAME-PROPOSAL.md)
+for the candidates and the reasoning behind each.
 
 ## Minor-release artwork
 

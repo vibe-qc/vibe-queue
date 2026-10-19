@@ -124,12 +124,19 @@ def _assert_cleanup_skip_diagnostic(
     state: JobState,
     prior_reason: str | None = None,
 ) -> JobSpec:
+    """The refusal is persisted, and it is not a claim that the job failed.
+
+    #63 follow-up: it used to be appended to ``failure_reason``, which
+    ``vq status`` prints as ``failure:`` and ``--json`` reports as the
+    terminal ``reason``. A COMPLETED job that merely kept its workdir is not
+    a failed job, and a FAILED one's own reason is not the queue's to
+    rewrite, so the diagnostic has a field of its own.
+    """
     persisted = JobSpec.read(spec_path)
     assert persisted.state == state
-    assert persisted.failure_reason is not None
-    assert "workdir cleanup" in persisted.failure_reason.lower()
-    if prior_reason is not None:
-        assert prior_reason in persisted.failure_reason
+    assert persisted.workdir_cleanup_note is not None
+    assert "workdir cleanup" in persisted.workdir_cleanup_note.lower()
+    assert persisted.failure_reason == prior_reason
     return persisted
 
 

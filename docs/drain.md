@@ -1,5 +1,7 @@
 # vq drain - temporary dispatch gate
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 `vq drain` lets you temporarily reduce or block new job dispatches
 without killing running jobs. Think of it as a "pause the queue" button
 with fine-grained control.

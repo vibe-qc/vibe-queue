@@ -33,6 +33,45 @@ _FORMATS = ("text", "json")
 # The digest covers every byte of the normalized public return, including JSON
 # indentation and key ordering. Scheduler snapshots intentionally include the
 # additive bounded-refresh audit introduced for BUG107.
+# The json digests moved once more for the additive `scheduler_queued_reason`
+# (vibe-qc#148): every payload gains exactly that one nullable key and nothing
+# else, which is why the text digests are unchanged -- the line renders only
+# for a queued job that has a reason.
+# And again for the additive `scheduler_remote_workspace` (#63), which records
+# the workspace a scheduler job was staged into before it was submitted. Same
+# additive shape: every json payload gains exactly that one nullable key, next
+# to `scheduler_remote_workspace_cleaned_at`, and nothing else, so the text
+# digests are unchanged. It belongs in the public payload rather than being
+# excluded like the `scheduler_poll_*` diagnostics, because "where is this
+# job's workspace" is the question an operator has when one looks stranded,
+# and the neighbouring `scheduler_job_id` is already there.
+# And once more for the additive `workdir_cleanup_note` (#63 follow-up): a
+# refused workdir cleanup used to be appended to `failure_reason`, which made
+# a COMPLETED job report a failure. Every json payload gains exactly that one
+# nullable key, next to `workdir_swept_at`, and nothing else; the text digests
+# are unchanged because the `workdir:` line renders only for a job that
+# carries a note, and no fixture here does.
+# And for the additive `resource_usage` (#168), a terminal job's measured usage
+# from its receipt: every json payload gains exactly that one key, null here
+# since no fixture has a receipt, and nothing else; the text digests are
+# unchanged because the `usage:` line renders only when a receipt exists.
+# And for the additive `scheduler_mem_used` / `scheduler_cpu_used` (#168), the
+# Torque/PBS detail poll's resources_used readings: every json payload gains
+# exactly those two nullable JobSpec keys and nothing else; the text digests
+# are unchanged because `sched_use:` renders only when the scheduler reported
+# them, and no fixture has.
+# And for the additive `scheduler_task_peak_rss` (#168), Slurm's live sstat
+# MaxRSS: every json payload gains exactly that one nullable JobSpec key and
+# nothing else; the text digests are unchanged because `sched_use:` renders
+# only when the scheduler reported usage, and no fixture has.
+# And for the additive `gpus` (#168), the GPUs a scheduler job requested
+# with --gpus: every json payload gains exactly that one nullable JobSpec
+# key and nothing else; the text digests are unchanged because the `gpus:`
+# line renders only when the job requested GPUs, and no fixture has.
+# And for the additive `runtime_bundle` (#161), the portable runtime
+# generation a job is bound to: every json payload gains exactly that one
+# nullable JobSpec key and nothing else; the text digests are unchanged
+# because the `runtime:` line renders only for a bound job, and no fixture is.
 # To update one, temporarily replace that digest with zeros and run the focused
 # case: the assertion prints the complete normalized output and new digest for
 # review.  Never update a digest without reviewing that output diff.
@@ -44,13 +83,13 @@ _OUTPUT_SHA256 = {
     ("dependency", "text"): "fe02636c0c1059904f8327bb01cfef64adac9bc9b0ce9ab9ddb4ca51e2fb3cba",
     ("qvf", "text"): "206afbcf785783de46ee3ae4ec62a653a502d435a435dcc579d4e046a59cbf3d",
     ("terminal", "text"): "4f7442bf729216211947120167be895fee74a44c4144e394ca04f72ba7e59667",
-    ("pending", "json"): "20866e675cd35b47e1e0fa41b28b77cf889175f2a08eee3e897075390619dfa2",
-    ("running", "json"): "90c9bc4d6f45d879bbfe8a5bbb1b210f70f8ea36b557d697f1adbe47253d69f6",
-    ("scheduler", "json"): "182bc0d73dd925ede0a9a6405306df389e04278038223f8faa6b064866ac1f36",
-    ("archived", "json"): "7b67031e095a4f1903f982550f1e6eea56bb1e5a62a597e1bdf4c2a40e2880d5",
-    ("dependency", "json"): "40c16ab38127b14b48b2a3786afe4e5613e295819c1016a2cb8e4f596c747601",
-    ("qvf", "json"): "61f952e584f8058fd1957934e22ca7c2ab266ea6ae64bcbce3b2a296d482fc5e",
-    ("terminal", "json"): "c672f5bc65472c990c6d0e6c651f61b6abeabe711edc222ca697cdf4e5c36f26",
+    ("pending", "json"): "e13106853686bab2e42bb2b471ee139672bc2485bfe4bfcd0c2e67dd5e728a80",
+    ("running", "json"): "3c3bd20e241eb47ff2034943d13066d4911a87df10a8c8793c3362c8d68069e2",
+    ("scheduler", "json"): "0b1e57eda5c6ccaa70f3661069217cbdd5bccf86d32faf3aa2766c7eabda8e5c",
+    ("archived", "json"): "69592b5c68e7e5ffaa4a941144d55da097c584deaf4c0ff28684ad4b5cd55fec",
+    ("dependency", "json"): "0ce59ecaa3fe0d46cb19bc775f49ba0f04ca5169a233c2053a283f38081dd2f9",
+    ("qvf", "json"): "d885d9ff123adc7013690a688ed2756b215f20572e2ffd580b9ddf0513048578",
+    ("terminal", "json"): "f50e117754131312c41558d639937fdcde51a4096238570b52d36e39454bd427",
 }
 
 

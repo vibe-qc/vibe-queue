@@ -1727,13 +1727,17 @@ runtime_lock="$snapshot/$RUNTIME_LOCK_REL"
 # downloaded as the non-root invoker under the exact hash lock carried by the
 # accepted commit, then independently inspected and copied into the root-owned
 # wheelhouse without following symlinks.
+# stdout is the wheel's file name, captured through a file rather than
+# command substitution: bash 3.2 cannot parse a heredoc nested inside `$( )`.
 PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - \
-    "$snapshot/vibe-queue" "$wheelhouse" <<'PY_BUILD_VQ_WHEEL'
+    "$snapshot/vibe-queue" "$wheelhouse" > "$work_dir/vq-wheel-name" \
+    <<'PY_BUILD_VQ_WHEEL'
 import base64
 import csv
 import hashlib
 import io
 import pathlib
+import re
 import stat
 import sys
 import tomllib
@@ -1745,7 +1749,14 @@ metadata = tomllib.loads((project / "pyproject.toml").read_text(encoding="utf-8"
 version = metadata["project"]["version"]
 if not isinstance(version, str) or not version or any(c not in "0123456789." for c in version):
     raise SystemExit("unsupported vq version in accepted pyproject")
-wheel_name = f"vq-{version}-py3-none-any.whl"
+name = metadata["project"]["name"]
+if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name):
+    raise SystemExit("unsupported vq distribution name in accepted pyproject")
+# The wheel and its .dist-info carry the normalized distribution name
+# (PEP 427): `vibe-queue` -> `vibe_queue` (#68). pip refuses a wheel whose
+# file name and METADATA disagree, so both come from the accepted pyproject.
+normalized = re.sub(r"[-_.]+", "_", name).lower()
+wheel_name = f"{normalized}-{version}-py3-none-any.whl"
 wheel_path = destination / wheel_name
 package = project / "src" / "vq"
 members = {}
@@ -1757,10 +1768,10 @@ for path in sorted(package.rglob("*")):
         raise SystemExit(f"writable source entry in sealed vq package: {path}")
     if stat.S_ISREG(entry.st_mode):
         members[(pathlib.Path("vq") / path.relative_to(package)).as_posix()] = path.read_bytes()
-dist_info = f"vq-{version}.dist-info"
+dist_info = f"{normalized}-{version}.dist-info"
 members[f"{dist_info}/METADATA"] = (
     "Metadata-Version: 2.4\n"
-    "Name: vq\n"
+    f"Name: {name}\n"
     f"Version: {version}\n"
     "Summary: Cross-machine job queue for vibe-qc workloads\n"
     "License-Expression: MPL-2.0\n"
@@ -1791,7 +1802,21 @@ with zipfile.ZipFile(wheel_path, "x", compression=zipfile.ZIP_DEFLATED) as archi
         info.compress_type = zipfile.ZIP_DEFLATED
         info.external_attr = 0o100644 << 16
         archive.writestr(info, data)
+# The only thing this prints, and the only thing the shell may believe about
+# the wheel's name. Deriving it a second time in shell is what broke when the
+# distribution was renamed (#68): this builder started writing the new
+# normalized name while a find two hundred lines below still matched the old
+# one, so it found nothing and every privileged refresh died at that gate.
+print(wheel_name)
 PY_BUILD_VQ_WHEEL
+read -r vq_wheel_name < "$work_dir/vq-wheel-name" \
+    || die "wheel build did not report the wheel it wrote"
+[ -n "$vq_wheel_name" ] || die "wheel build did not report the wheel it wrote"
+case "$vq_wheel_name" in
+    */*|*..*|"") die "wheel build reported an unusable wheel name" ;;
+    *.whl) : ;;
+    *) die "wheel build reported a name that is not a wheel: $vq_wheel_name" ;;
+esac
 
 source_gid="$(id -g "$source_user")" \
     || die "cannot resolve primary group for $source_user"
@@ -1962,9 +1987,12 @@ PY_SEAL_RUNTIME_WHEELS
 rm -rf -- "$dependency_stage"
 rm -f -- "$download_lock"
 chmod 0700 "$work_dir"
-mapfile -t vq_wheels < <(find "$wheelhouse" -maxdepth 1 -type f -name 'vq-*.whl' -print)
-[ "${#vq_wheels[@]}" = "1" ] || die "wheel build produced ${#vq_wheels[@]} vq wheels"
-vq_wheel="${vq_wheels[0]}"
+# The wheel the builder said it wrote, not a name guessed from a pattern. A
+# pattern has to be kept in step with the distribution's name by hand, and was
+# not when that name changed (#68).
+vq_wheel="$wheelhouse/$vq_wheel_name"
+[ -f "$vq_wheel" ] && [ ! -L "$vq_wheel" ] \
+    || die "wheel build did not leave $vq_wheel_name in the wheelhouse"
 wheelhouse_sha="$(PYTHONNOUSERSITE=1 "$LOCK_PYTHON" -I -S - "$wheelhouse" <<'PY'
 import hashlib
 import pathlib

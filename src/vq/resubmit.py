@@ -251,6 +251,8 @@ def resubmit_local(
             if overrides.scheduler_tasks is not None
             else source.scheduler_tasks
         ),
+        gpus=source.gpus,
+        runtime_bundle=source.runtime_bundle,
         mem_mb=(
             overrides.mem_mb if overrides.mem_mb is not None else source.mem_mb
         ),
@@ -279,11 +281,9 @@ def resubmit_local(
         ),
         branch=source.branch,
         program=source.program,
+        qvf_artifact_name=source.qvf_artifact_name,
         program_runtime_pin=(
-            source.program_runtime_pin.model_copy(
-                update={"resolved_git_sha": None},
-                deep=True,
-            )
+            source.program_runtime_pin.without_resolution()
             if source.program_runtime_pin is not None
             else None
         ),

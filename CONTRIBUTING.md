@@ -6,7 +6,7 @@ other command-line workload, onto a local machine, a remote host over SSH, or
 a cluster scheduler backend. It is useful on its own and does not build or
 install vibe-qc.
 
-The distribution is named `vq`; the repository is named `vibe-queue`.
+The distribution, like the repository, is named `vibe-queue`; the command and the import package are `vq`.
 
 ## Where to report what
 
@@ -16,7 +16,7 @@ The distribution is named `vq`; the repository is named `vibe-queue`.
 | A security-relevant bug | **Email mpei@vibe-qc.com** — see [SECURITY.md](SECURITY.md). Do not open a public issue. |
 | A wrong number in a calculation vq merely ran | [vibe-qc issues](https://github.com/vibe-qc/vibe-qc/issues) |
 | A viewer or `.qvf` rendering defect | [vibe-view issues](https://github.com/vibe-qc/vibe-view/issues) |
-| An ambiguity in the QVF format itself | [qvf issues](https://github.com/vibe-qc/qvf/issues) |
+| An ambiguity or proposed field in the QVF format itself | The canonical GitLab qvf project (project 37) |
 
 When you cannot tell whether the queue or the workload is at fault, file it
 here — moving an issue is cheap.
@@ -63,7 +63,7 @@ need. `[dev]` adds ruff and mypy.
 
 ## Running the tests
 
-Run pytest from the repository root with this checkout's source first on the
+For a full validation run, invoke pytest from the repository root with this checkout's source first on the
 import path, and clear inherited pytest options so a parent shell cannot
 disable the nested conftest:
 
@@ -87,28 +87,45 @@ daemon or writing live state. If you find yourself reaching for
 For ordinary work, run the lanes your change touches and name them in the
 commit message.
 
-### Known-red lanes
+### Keep checks proportional
 
-**There are none, as of 2026-09-09.** The suite is fully green: 8309 passed,
-36 skipped, 0 failed locally, and green in CI on the v0.26.0 release
-candidate (pipeline 5084).
+Run focused tests once for the changed behavior. Prefer an existing regression
+or one representative new case over another matrix. Do not expand a passing run
+without a concrete concern. Documentation-only edits need documentation/privacy
+checks, not runtime suites. Full validation is explicitly opt-in; see
+[testing policy](docs/testing.md).
 
-Three lanes used to be listed here -- `test_scheduler_admin_update` (x2, CI),
-`test_admin_lifecycle_transaction` and `test_multi_user_refresh_helper` (x2,
-local). The first was retired by `670d255` / `dcd01dc`, which dropped a stale
-stage-prune contract; the other two pass on a clean run. They were carried as
-"known red" long enough that the label outlived the failures.
+## QVF integration
 
-So a red suite is now a real signal. If something fails, it is either yours or
-new -- do not assume it is background noise. Two things that look like
-failures but are not:
+The qvf repository on canonical GitLab (project 37) is the sole owner of the
+format specification, JSON Schema, `registry.json` and reference validators.
+Propose a needed field there first and write it only after a qvf release
+contains it. Program-private data belongs in the producer's registered vendor
+namespace, such as `x_vibeqc` or `x_vibesketch`.
 
-* **Editing a source file while the suite runs.**
-  `test_read_vq_version_from_source_for_live_install` compares the *imported*
-  `vq.__version__` against a *fresh read* of `vq/__init__.py`, so bumping the
-  version mid-run reports genuine drift. It is doing its job.
-* **Two chats in one working tree.** A test file changing under a running
-  suite produces failures that vanish on re-run. Check `git status`.
+`.gitlab-ci.yml` pins v0.4.0 in `QVF_TAG`. Candidate CI clones that tag
+from the same GitLab namespace using the job token and exercises the queue's
+metadata reader against its reference archives. The GitHub mirror can lag
+and must not supply CI's QVF checkout. For a local check, set
+`VQ_TEST_QVF_ROOT` to an existing qvf checkout at the pinned tag and run
+`tests/test_qvf_queue_contract.py`; the upstream-fixture checks skip when this
+variable is absent and fail if a configured fixture is missing. They check
+synthetic submit/rerun results against the pinned schema and verify that status
+and artifact fetch preserve the upstream archives, including unrestricted NTO
+results. These are queue protocol tests; the synthetic runner performs no
+quantum-chemistry calculation.
+
+vq transports QVF archives unchanged, delegates execution and format
+validation to the managed producer, and reads lifecycle/progress metadata.
+It does not vendor a schema or spec, implement a reference validator, or use
+the `qvf-writer` package. If copies become necessary, vendor only byte-identical
+files from `QVF_TAG` and compare them against the cloned tag in CI. Never
+derive, edit or freeze a separate schema, including a v2 schema. If the Python
+package is introduced, declare a matching `qvf-writer>=` minimum requirement.
+
+The format remains `qvf_version` 1. Withdrawn version 2 is read and validated
+as current v1 with `W_VERSION_WITHDRAWN` by the format reader, per QVF spec
+section 3.1; vq's metadata inspection is not archive validation.
 
 ## The daemon is stateful, and the tests know it
 
@@ -173,7 +190,7 @@ why in the commit message.
 - **Python 3.12+.** PEP 8, four-space indent. Start every module with
   `from __future__ import annotations`. Type hints on public API.
 - `ruff check src/vq tests` with the config in `pyproject.toml`, line length
-  100. CI runs it as a blocking job; keep the tree clean.
+  100. Run it on edited Python files; keep the tree clean.
 - `mypy` is configured `strict`. Not yet a CI gate; do not add new failures.
 - Prefer editing existing modules over introducing new ones. `src/vq/` is
   already wide; a new file needs a reason beyond "this felt separate".
@@ -193,11 +210,36 @@ why in the commit message.
 - Do not tag `vX.Y.Z` and do not push to `release`; releases are cut
   separately.
 
+## Changelog fragments
+
+`CHANGELOG.md` is written by the release cut, not by the change. For anything
+a user or an operator would notice, add one file under `changelog.d/`:
+
+```
+changelog.d/<issues>-<topic>.<kind>.md
+```
+
+`<issues>` is the tracker issue number (several joined with `-`, as in
+`77-79-readiness-uncertainty`), `<topic>` a short kebab-case name, and
+`<kind>` the Keep a Changelog section in lower case: `added`, `changed`,
+`deprecated`, `removed`, `fixed` or `security`. The file holds **one** entry
+as it will read under `[Unreleased]`: a bold lead sentence, the body, and the
+issue number at the end. Write it as prose, with no list marker and no
+heading; the fold adds the `- ` and indents the rest, so a nested list inside
+the entry is written flush left and comes out nested. A change that needs an
+entry in two sections writes two files.
+
+A fragment is a file of its own, so two changes landing at once never
+conflict on the ledger. `python scripts/fold_changelog.py --check` validates
+the names, and the test suite runs it; the release cut folds the fragments
+into `CHANGELOG.md` with the same script.
+
 ## Before you open a merge request
 
 - Run the affected lanes locally and name them.
 - Keep `main` release-ready: no half-finished code paths, docs in parity,
-  `CHANGELOG.md` `[Unreleased]` reflecting what you actually landed.
+  and a changelog fragment for anything a user or an operator would notice
+  (see "Changelog fragments").
 - **vq versions are load-bearing for the fleet.** Private operations storage
   holds fleet release reports and runtime pins reference them by version. A change to the
   version scheme, the report schema, or `vq --version` output is a
@@ -255,3 +297,12 @@ privacy tests load the same external policy when configured.
 Site wrappers and deployment configuration are maintained separately in private
 operations storage. Product changes must use portable examples and preserve the
 existing generic installation and configuration APIs.
+
+### CI test scope
+
+Development builds, ordinary MRs and pushes neither launch nor wait for CI.
+Manual, scheduled and API requests on development refs also create no pipeline.
+Run one bounded local check for the changed behavior. Release candidates always
+run the full suite, including web coverage; `release` builds docs for optional
+manual publication. Locally use `python scripts/run_ci_tests.py`, or pytest with
+explicit paths. See [testing policy](docs/testing.md).
