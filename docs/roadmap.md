@@ -1,244 +1,199 @@
 # vq roadmap
 
-What vq is working towards next, and what has been released but is not yet
-proven on hosts. Rewritten on 2026-09-13 against `main` at `bdbeda9`. The
-previous file had become a release log for v0.1 to v0.9 with no forward
-section; it is preserved unchanged as
-[`roadmap_history.md`](roadmap_history.md).
+Reconciled on **2026-10-19** against release **v0.26.45** (2026-10-19),
+current source including the post-release estimate workflow, the source
+documentation and the live tracker.
+This is a delivery plan, not a deployment ledger or a claim that every feature
+in a release has completed its broader qualification.
 
 ## Where each kind of fact lives
 
-| question | authority |
+| Question | Authority |
 |---|---|
-| What shipped, and in which release? | `CHANGELOG.md`, from v0.26.0. Through v0.9: [`roadmap_history.md`](roadmap_history.md) |
-| What is open, and how urgent is it? | The project's GitLab issues (project 36), by `priority::P1` / `P2` |
-| In what order, and what gates what? | **This file** |
-| How agents work here | [`AGENTS.md`](../AGENTS.md). Decided in #24 |
-| What is deployed on which host? | `HANDOVER_FLEET.md` (the fleet ledger) and the accepted report in `releases/` |
-| Why the design is what it is | [`SPEC.md`](SPEC.md) |
-| Web console milestones | [`fleet_dashboard_design.md` § 6](fleet_dashboard_design.md#6-roadmap) |
-| Names for future minor releases | [`codenames.md`](codenames.md). A name is a reservation, not a scope |
+| What shipped, and in which release? | [Changelog](../CHANGELOG.md), with [unreleased fragments](../changelog.d/README.md) for main-only changes |
+| What is open, with what evidence and ownership? | Canonical issue tracker, selected through external operator configuration |
+| What comes next, and what depends on it? | This roadmap |
+| What does an interface implement? | Its feature guide and classified sections of [SPEC](SPEC.md) |
+| What is deployed? | External operator records; see [release records](../releases/README.md) |
+| Historical plans | [Archived v0.1–v0.9 roadmap](roadmap_history.md), [version history](version_compatibility.md), and explicitly historical design documents |
+| Release names | [Codenames](codenames.md); names do not impose feature scope |
 
-Release cutting, fleet release reports and fleet rolls belong to the release
-coordinator (the agentic loop) under the maintainer's authority. Development
-chats land code, record validation, and ask for deployment.
+Development owners check and land source. Release owners qualify and cut a
+candidate under the [release process](release_process.md). Functional acceptance
+can be performed by the implementing owner; no second reviewer or fleet-wide
+convergence is required. A real missing host observation holds its own feature
+claim, not unrelated development, releases or calculations on healthy runtimes.
 
----
+## 1. Current baseline
 
-## 1. Where things stand
+The latest tag checked is v0.26.45. The v0.26 line already includes local queues,
+Torque/PBS and Slurm dispatch, immutable runtime slots and recovery, retention,
+branch-tracking dev lanes, a durable daemon-host broker, the authenticated fleet
+console, public static snapshots and calculation previews. QVF protocol checks
+use toolkit 0.5.0; format version 1 and the established lifecycle are retained.
+See the changelog for individual release boundaries rather than duplicating its
+patch-by-patch history here.
 
-### Releases
+Several substantial features have already landed incrementally in v0.26:
+resource-estimate receipts and evaluation, read-only placement explanations,
+portable runtime bundles, benchmark and artifact campaign controllers, and the
+HTTPS submission gateway. Their full requested outcomes remain separate from
+those delivered increments; section 2 records the boundaries.
 
-| tag | date | commit | headline |
-|---|---|---|---|
-| v0.26.0 | 2026-09-09 | `b0f157a` | First public release: licence, changelog, documentation site, own CI |
-| v0.26.1 | 2026-09-12 | `95fd0fe` | Machine-readable `vq admin update` outcomes, declared `extras`, `vq admin install`, `vq daemon install`, scheduler and rollout fixes (#5–#14) |
-| v0.26.2 | 2026-09-12 | `c4622ad` | Rollout compares each component's SHAs in its own repository (#15) |
-| v0.26.3 | 2026-09-12 | `cfddd51` | Same-SHA update validation; nonexistent root-daemon unit (#16) |
-| v0.26.4 | 2026-09-13 | `d072f92` | Revocable console sessions, bounded login admission, write audit; slurm-cluster immutable runtime publication (#17) |
-| v0.26.5 | 2026-09-13 | `da2dbca` | Detached delegated updates (#37, #34), rollback of vendored native libraries (#44), per-host update cap (#32), `UNHEALTHY` programs (#45), console runtime checks (#28), and reliability fixes (#26–#29, #35, #38, #40, #41, #49, #50) |
+v0.26.45 adds the outbound gateway connector, daemon-job and campaign
+binding to portable runtime generations, scheduler GPU requests and
+node-allocation display, console refresh-cost measurements, benchmark
+recovery fixes, QVF scheduler launcher repair and macOS app packaging.
+Main additionally carries directory-input fingerprints, estimates attached
+at submission and collected for evaluation. Those estimate changes follow
+v0.26.45; source or release status does not establish deployment on a host.
+The tag also does not establish real site TLS or packaged-app acceptance.
 
-### Deployment
+### Completed work no longer treated as a gate
 
-* **Accepted fleet report:** `releases/v0.17.2.json` (`bdbeda9`). It pins
-  vq v0.26.5, vibe-qc v0.17.2 and vibe-view v2.16.2, all accepted under
-  rule A. **It has not been rolled.**
-* **Last recorded deployment:** the ledger's newest entry records the five
-  ordinary hosts on vq v0.26.3 (`cfddd51`) under report v0.17.1. Host changes
-  after that are not yet in the ledger.
-* **Exception:** compute-c's own vq is at `main` `01b9ca7`, installed on
-  2026-09-13 as the prerequisite for validating #37 on that host.
+The live tracker has eight open feature issues: **#153, #159, #160, #161, #162,
+#163, #165 and #168**; release coordination is tracked separately in **#189**.
+The earlier roadmap's September host-validation table,
+migration dependencies and decision queue are obsolete as an open-work list.
+Closed records retain their actual evidence and limitations; closure does not
+invent measurements absent from those records.
 
-Nothing from v0.26.5 is proven on a host until that report is rolled, apart
-from the #37 checks on compute-c described in § 2.
+In particular, #64's daemon-host broker has bounded two-target acceptance;
+#66's snapshot work, #72/#104 runtime migration, #73 self-update, #74 retention,
+#87 scheduler registrations, #109 branch tracking and #110 VASP workflow are
+closed records, not prerequisites to restart. #25 extras acceptance also
+completed. No old campaign-drain, independent-review or update-only hold is a
+standing release gate. Diagnose a newly observed defect on current source.
 
----
+#164's outbound connector is also closed after its restart/interruption
+acceptance harness. That does not substitute for #163's outstanding real TLS
+calculation. Publication visibility and deployment remain separately authorized
+operations; this roadmap does not change either.
 
-## 2. Released, not yet validated
+## 2. Open work and the next useful increment
 
-An issue here is closed only on the evidence its own validation checklist
-asks for, never on the merge. Each has a comment with the landed commit and
-that checklist.
+Tracker labels such as `workflow::intake` can lag substantial implementation.
+The descriptions below distinguish source delivery from the remaining requested
+outcome. Technical guides carry exact command/schema contracts.
 
-| issue | pri | what | in | validation state |
-|---|---|---|---|---|
-| #37 | P1 | Delegated venv update runs as a transient systemd user unit | v0.26.5 | On compute-c (logind `KillUserProcesses=yes`) the updater runs as a user unit outside every login session, and outlived the session that launched it. The brief's test, every driver session ended for 15 minutes, **has not yet been run correctly**: the first attempt left the driver polling. Pending: a rerun, then a repeat with ssh multiplexing off. **Until it passes, native rebuilds on compute-b, compute-c and compute-d still need the manual transient-unit workaround.** |
-| #44 | P1 | Rollback restores `third_party/*/install`; refuses an inconsistent baseline (exit 77) | v0.26.5 | Needs a host roll. compute-c's `vibeview-dev` will refuse by design until pinned to its own checkout |
-| #17 | P1 | slurm-cluster runtime publication preserves published artifacts | v0.26.4 | Only after the release-paper campaign's slurm-cluster jobs drain |
-| #32 | P2 | `[hosts.X] update_script_timeout_seconds`, forwarded to delegated updates | v0.26.5 | The **driver** must run v0.26.5 before the key has any effect |
-| #34 | P2 | `vq admin auto-update` detaches like `vq admin update` | v0.26.5 | Same prerequisite as #37 on the target |
-| #45 | P2 | `vq programs` reports `UNHEALTHY` apart from `MISSING` | v0.26.5 | Needs the driver on v0.26.5 |
-| #28 | P2 | `vq web status` / `vq doctor` probe the console's recorded interpreter | v0.26.5 | Host operator |
-| #27 | P2 | An exiting process group is not reported as another user's | v0.26.5 | CI on Linux; a multi-user host |
-| #40 | — | `vq web config` / `vq web run` say when the config did not load | v0.26.5 | Host operator |
-| #38 | — | Config validation errors carry key and reason only (confidential) | v0.26.5 | The maintainer decides disclosure and closure |
-| #26, #29 | P2 | Test-only reliability fixes | v0.26.5 | No recurrence in CI |
-| #19 | P2 | STATE-3 survivor escalation | v0.26.1 | Hosts without cgroups |
-| #25 | P2 | Declared extras floor; `vq web install` runtime refusal | v0.26.1 | Real hosts |
+| Issue / guide | Implemented now | Remaining work or acceptance |
+|---|---|---|
+| **#159 [Resource estimates](resource_estimation.md)** | Read-only `vq estimate` with file/directory fingerprints, versioned evidence/features and explicit memory scope, evaluation with censored failed/OOM observations; on main, `submit --estimate` binds input content and preserves the receipt, and `estimate-collect` exports completed-job evaluation sets. | Product-produced feature/input binding, QVF discovery, method-specific analytical components, runtime/scratch/layout models and held-out calibration. Estimates do not automatically change resource limits, admission or placement; the broker refuses attached estimates. |
+| **#160 [Placement](placement_policy.md)** | Read-only `vq placement explain` filters fit/compatibility and ranks completion-time components. Checks include OS/ISA/runtime, account, license/data access, memory/scratch, wall time and MPI layout. | Live capability ingestion, opt-in durable broker integration for daemon/PBS/Slurm targets, reservation/recovery and fairness comparison, followed by bounded live acceptance. Current daemon-only FIFO broker and `submit auto` remain unchanged. |
+| **#161 [Portable runtimes](portable_runtime_bundles.md)** | Authenticated manifests, package/publish/verify/deploy/rollback, file/HTTPS/SSH transport, bearer/mTLS HTTPS credentials and, in v0.26.45, immutable generation binding for daemon jobs; on main, scheduler jobs bind a named generation that their job script verifies on the node. | Product-owned relocation/ABI/native/data qualification on intended node classes and vendor-specific import qualification. Queue transport does not make an arbitrary chemistry build portable. |
+| **#162 [Benchmark campaigns](benchmark_campaigns.md)** | Plans, resumable submission/collection, paired analysis and uncertainty, CSV/JSON/plot export, isolation and checkpoint recovery. | A bounded real generic-versus-optimized pilot with qualified runtime identities, numerical agreement, repeats and measured cost/benefit. No optimization speedup or default variant is established by synthetic analysis tests. |
+| **#163 [HTTPS gateway](gateway.md)** | Scoped client keys, policy, resumable verified uploads, idempotent submit, status/logs/cancel, checksummed results, quotas/retention and `vq remote`. In v0.26.45, #164 adds an outbound-only connector with fencing, recovery and spool backpressure. | A real bounded calculation from a client without fleet access through a real TLS endpoint, with verified result retrieval. This is a trusted-group interface; per-project OS-account isolation is outside the accepted MVP. |
+| **#165 [Artifact campaigns](campaigns.md)** | Static DAG, manifests, durable controller/retry lineage, cross-host artifact relay, cleanup and console view. Main records executed runtimes and binds declared portable runtime digests on daemon hosts and scheduler targets; a scheduler job's generation counts as run only once the job completed with exit code 0 after its node verified it. | The live calculate → validate → render demonstration across two owning hosts using a directory/QVF artifact, and a bound node on a real scheduler target. Explicit scientific validation remains necessary; job exit zero alone is not chemistry acceptance. |
+| **#168 [Fleet calculation view](fleet_console.md)** | Elapsed time, declared versus observed resources, final usage, freshness/unknowns, filters/pagination and trends; v0.26.45 adds scheduler node details, whole-GPU allocation and measured synthetic refresh overhead. | Real mixed direct/PBS/Slurm/GPU demonstration and redacted article screenshot; GPU utilization/VRAM collection and per-GPU detail. Requested GPU count is allocation, not utilization; daemon GPU admission is not implemented. |
+| **#153 [Native-install reuse](native_install_seeding.md)** | Opt-in product adapter and provenance/semantic-input checks for candidate-prefix native/data verification. | Product qualification and a receipt from the next authorized live deployment. No default chemistry adapter or universal cache-reuse claim; missing provenance remains a scoped hold. |
 
-### Delivery order: dependencies, not preference
+### Dependencies that actually matter
 
-1. **Fix, or work around, #52 first.** `vq admin rollout-latest` silently plans
-   against an older report when a newer one fails pin validation, for
-   example when a pin checkout has not fetched. A roll that silently skips
-   `v0.17.2.json` reports every lane "at target" and deploys nothing.
-2. **Roll the v0.17.2 report, driver first.** On 2026-09-13 the driver's own
-   update to v0.26.5 rolled back on #53. It needs a health window that
-   covers the startup walk (`VQ_DAEMON_HEALTH_TIMEOUT`), or #22's spec
-   reduction, before any other host rolls. After that, the driver must carry
-   #32 before a host's configured cap is forwarded, and each target must
-   carry #37 and #34 before a detach check means anything.
-3. **Release compute-c back into the roll** once #37's remaining checks are
-   recorded.
-4. **slurm-cluster's lanes and #17's validation** come after the campaign drains.
+- #159 calibration and #162 measurements can improve #160's models; they are
+  not prerequisites for using the existing read-only placement explanation.
+- #165 campaigns that demand a portable runtime digest on a scheduler target
+  run on #161's scheduler binding; the campaign path has been exercised only
+  against a local stand-in for the cluster so far.
+- #163 live TLS acceptance can exercise the completed #164 relay, without
+  reopening its already accepted restart/recovery implementation.
+- #153 native-install seeding and #161 complete-runtime distribution solve
+  different problems. Neither permits skipping product provenance or ABI checks.
+- #168 observation remains read-only and can qualify independently of #160
+  automatic placement. Unsupported telemetry must stay unknown, not zero.
 
----
+## 3. Next feature release and article scope
 
-## 3. Open work, by theme
+**v0.27 is the next minor-release planning target**, rather than a promise to
+finish every open feature. No new compatibility-breaking 1.0 scope is defined
+by this reconciliation. The provisional v0.27 codename, *Fidge's Timestamp*,
+does not create a feature dependency.
 
-Every item is a tracker issue. Order within a theme follows the priority
-label.
+For an article-oriented cut, assemble the already delivered queue, runtime,
+broker and calculation-observation workflows, then include only the new
+capabilities whose claimed behavior has the relevant acceptance. Freeze exact
+versions and supported interfaces for reproducibility. A paper may describe
+implemented opt-in previews with explicit limits; it must not describe pending
+calibration, scheduler federation, portable chemistry qualification or GPU
+utilization as completed results.
 
-### Fleet update and rollout correctness
+The shortest remaining demonstrations to consider for the feature narrative
+are #163's TLS submit-to-results path, #168's mixed-fleet view and #165's bounded
+artifact campaign. They are independent qualification tasks, not an all-or-
+nothing release chain. Leave unfinished increments in section 2 and narrow the
+release headline if a demonstration is unavailable at the article freeze.
 
-* **#52 (P1)** — rollout-latest silently falls back to an older report; see § 2.
-* **#53 (P1)** — a driver self-update rolls back a good install. The daemon
-  health window (30 s + 10 ms per spec, 247 s for about 21,700 specs) is
-  shorter than the daemon's startup walk over its queue, which measured more
-  than 242 s cold. The rollback restarts the daemon a second time, and the
-  failed attempt fences the rollout as not retry-safe.
-* **#36 (P2)** — detached-build receipts are rejected during atomic
-  publication. The fix, `03e8312`, is stranded on an unmerged branch.
-* **#20 (P2)** — lifecycle scripts blank their own guidance: an unquoted
-  heredoc runs `vq self-update` and `vq admin update`.
+The release owner chooses the exact candidate and records accepted behavior
+and known limits, then runs the prescribed candidate CI and release checks.
+Ordinary documentation/source landings do not trigger full CI. Other apps'
+release numbers, whole-fleet rollout and completion of all eight issues are
+not prerequisites for cutting Queue's next minor release.
 
-### Scheduler throughput and observability
+Later v0.28–v0.33 names remain reservations, not assigned milestones. In
+particular, retention and broker functionality already exist; their old
+association with v0.31/v0.33 artwork does not defer them to those versions.
 
-On 2026-09-13 the driver's dispatch rate fell from about 375 to about 16 jobs
-an hour, while the release-paper campaign had several hundred jobs pending.
-**The cause is not established.** Several proposed mechanisms were tested and
-disproved; the measurements are recorded on #51 and #22. Do not fix to a
-mechanism that has not been measured.
+### GitLab release milestone
 
-* **#51 (P1)** — scheduler polls fail continuously with ssh
-  banner-exchange timeouts.
-* **#22 (P1)** — admission cost grows with every job ever run: terminal specs
-  are never reaped. `vq cleanup --archive` does not shrink the daemon's scan;
-  only deletion does, which is an owner decision (§ 4).
-* **#23 (P2)** — no way to see why a scheduler job is still queued, or whether
-  a request can be scheduled at all.
+In the configured GitLab project's **Plan > Milestones**, the canonical next
+release record is **v0.27 - Article-ready queue workflows** (milestone **1**).
+Its release acceptance issue is **#189**. The milestone describes the bounded
+release criteria; issues hold executable work, ownership and evidence. This
+roadmap explains how those pieces fit together.
 
-### Kill and lifecycle correctness
+The three article demonstrations above are candidate increments. #189 records
+which are accepted for the cut and which are explicitly deferred; the broad
+feature requests are linked, not assigned wholesale as mandatory v0.27 scope.
+Close the release milestone only after its selected criteria and prescribed
+release checks pass and the published tag is recorded. No 1.0 milestone is
+created without a concrete compatibility/stability commitment.
 
-* **#18 (P2)** — `vq kill` never escalates to SIGKILL for a reattached orphan
-  that ignores SIGTERM. Reproduced (note 25890). The fix sketched there waits
-  on a maintainer decision (§ 4); see
-  `handovers/HANDOVER_vq_kill_escalation.md`.
-* **#31 (P2)** — tests for killed-job survivors in quota, memory, cleanup and
-  drain. Tests landed in `fba3274` (v0.26.5); the issue is still open.
+## 4. Future options and scope boundaries
 
-### Test reliability
+The archived web-console M2–M6 labels are no longer a second release plan.
+The current console, gateway and campaign guides define delivered behavior;
+#168 owns the outstanding unified resource-view work. OIDC, broader
+organization hardening and any additional clear-failed workflow need a current
+bounded requirement before they become release commitments.
 
-* **#41** — the audit of short timeouts in `tests/`. The reaping module is
-  done; `tests/test_pause_resume.py` and `tests/test_daemon.py` are next.
-* **#48 (P2)** — a 1-second status-refresh budget flakes under CI load.
-* **#46 (P2)** — `_dispatch_started` can read `COMPLETED` for a backgrounding
-  command under load.
+Historical RECOV-4 recycled-process-group protection, ISO-1 cross-user read
+isolation and privileged root-daemon deployment proposals have no current
+open tracker entry. Keep their historical context; recheck current source and
+requirements before filing new work. They are not silently accepted features
+or inherited release blockers.
 
-### Documentation
+Current scope includes multiple hosts and schedulers, trusted-group scoped API
+identities, small artifact DAGs and whole-device scheduler GPU requests.
+Consequently the old blanket exclusions of distributed queues, all workflow
+DAGs and all GPU scheduling no longer describe the product. Boundaries remain:
 
-* **#39 (P2)** — `docs/vibe-qc-site` against the published vibe-qc pages.
-  Fixes shipped in v0.26.5; the issue is still open.
+- No adversarial multi-tenant sandbox or unrestricted cross-organization service.
+- No general dynamic scientific workflow language, distributed compute graph
+  engine or container orchestrator.
+- No migration of running calculations or scheduler-bypassing resource allocation.
+- No fractional GPU sharing, daemon GPU assignment or universal GPU telemetry.
+- No automatic claim of chemistry correctness, predictive accuracy or binary
+  portability from a successful queue operation alone.
 
-### Web console
+## Maintaining this roadmap
 
-Milestones live in [`fleet_dashboard_design.md` § 6](fleet_dashboard_design.md#6-roadmap).
-Still open:
+Reconcile this roadmap **every week** against current source, release tags,
+open and recently closed issues, and relevant acceptance evidence. Also update
+it when material evidence changes between reviews. Date the reconciliation and
+keep implemented, accepted, released and deployed states distinct. Use the
+GitLab milestone for the release scope and criteria, and issues for concrete
+work and evidence; do not duplicate the entire roadmap as an issue checklist.
 
-* **M2:** the OIDC provider (needs a maintainer OAuth registration), and a
-  queue-wide clear-failed action.
-* **M3:** the public endpoint (proxy, DNS, TLS, backup), and deployment
-  validation of the public-exposure gate.
-* **M4–M6:** results and QVF browsing, live operations and analytics, and
-  organization-facing hardening.
+When the release milestone is achieved, record its released version and advance
+the next feature-release target to the next justified version. A review may mark
+criteria satisfied or correct a planning target; actual package-version changes
+and tags follow the existing release process and candidate checks. Feature
+milestones do not automatically justify a SemVer major increment or require
+other apps to use the same number. Preserve incomplete work with its precise
+remaining criteria instead of declaring it done when a version changes.
 
-### Carried from the archived roadmap, not filed since the split
-
-These were recorded as open before the public repository existed. None has a
-project-36 issue. **Confirm they are still wanted before filing them.**
-
-* **RECOV-4:** guard reattach against a recycled pgid. Deferred to a Linux
-  host.
-* **ISO-1:** cross-user read isolation. Needs a decision on the admin access
-  model, and Linux validation.
-* **The privileged `/opt/vq` root-daemon apply lane,** and a supported
-  deployment model for compute-d's root unit. Both need an authorization
-  decision.
-
----
-
-## 4. Decisions waiting on the maintainer
-
-* **#21** — triage notes on #10, #11 and #12. Its rule, that `(#N)` in a
-  subject means a project-36 issue, is now written in `AGENTS.md`.
-* **#30** — a fleet report cannot converge while vibe-queue and vibe-view run
-  untagged `main`.
-* **#43** — when release-candidate branches are deleted.
-* **#47** — should `vq admin install` honour a program's declared `extras`?
-* **#18** — go ahead with the reproduced kill-escalation fix for reattached
-  orphans, or not.
-* **#38** — disclosure of the confidential fix.
-* **#22** — whether to delete old terminal job specs on the driver. This is
-  an owner decision about possibly uncollected results.
-* **The out-of-scope list below.** Two of its entries predate the fleet and
-  now contradict current direction:
-  * "distributed queue across multiple hosts": vq now drives many hosts and
-    two batch schedulers from one driver;
-  * "multi-tenant queues": console milestone M6 plans per-project separation.
-
-  Decide whether each is still out of scope, and how it is bounded.
-
----
-
-## 5. Future minor releases
-
-No issue is assigned to a version. There are no GitLab milestones, and the
-version of the next cut is chosen by the release coordinator when a candidate
-is prepared.
-
-[`codenames.md`](codenames.md) reserves provisional names and one-line
-concepts for v0.27.0 to v0.33.0. They are image themes, not commitments. Where
-a concept happens to match open work, that is noted as a possibility only:
-
-* v0.31.0 *Stonebraker's Vacuum*, "reclaim dead space through archiving and
-  automatic cleanup", is the nearest match for #22.
-* v0.33.0 *Erlang's Blocking*, "counted permits enforcing admission and
-  concurrency limits", is the nearest match for #23.
-
----
-
-## 6. Out of scope (under review, see § 4)
-
-* A distributed queue across multiple hosts. The original wording read:
-  "SLURM exists. vq's niche is single-host informal queues."
-* GPU scheduling: the runtime's job.
-* Container orchestration.
-* Multi-tenant or cross-organization queues.
-
----
-
-## How to update this file
-
-* **A change ships:** record it in `CHANGELOG.md` under `[Unreleased]`, not
-  here. `roadmap_history.md` is frozen.
-* **A fix lands that needs host or CI evidence:** add a row to § 2 with the
-  release it ships in once tagged. Remove the row only when its issue is
-  closed on that evidence.
-* **A release is tagged, or the fleet ledger records a deployment:** update
-  § 1 in the same change.
-* **New work:** file the issue first, then list it under its theme in § 3.
-  Items without an issue go under "Carried … not filed" only, and only until
-  someone files or drops them.
-* **A decision is made:** move it out of § 4 and apply it wherever it lands.
-* **Keep this file short.** Rationale belongs in the issue, the design
-  document or `SPEC.md`, not here.
+Use the tracker for detailed criteria and ownership, and changelog fragments for shipped behavior. Keep
+release inclusion, functional acceptance and deployment distinct. Do not
+recreate closed issues as a parallel host-validation ledger. Preserve historical
+designs as history, and update their live cross-references when an interface
+changes. Keep private deployment identities, evidence and configuration outside
+this product repository.

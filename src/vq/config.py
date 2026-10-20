@@ -54,16 +54,16 @@ falls back to "localhost" with no extra metadata, preserving v0.1 behavior.
 
 from __future__ import annotations
 
-import copy
 import math
 import os
 import re
 import sys
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -111,10 +111,19 @@ class ConfigError(RuntimeError):
     missing host, missing default_host)."""
 
 
-VIBEQC_REPO_SLUG = "mpei/vibe-qc"
+VIBEQC_REPO_SLUG = "vibe-qc"
 """Slug under which :attr:`Config.pin_source_repos` names the vibe-qc
 checkout, and the modern spelling of the deprecated
 :attr:`Config.scheduler_runtime_source_repo`."""
+
+FLEET_TRACKABLE_PROGRAMS = ("vibeqc-dev", "vibe-view")
+"""Programs whose rollout lane may follow a branch instead of its report pin.
+
+Release lanes and vq itself stay report-pinned: a report names what was
+released, and the driver's own vq identity is what every rollout derives its
+answers from. See :attr:`Config.fleet_tracking_lanes`."""
+
+_TRACKING_BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 
 KNOWN_PROGRAM_EXTRAS = ("web", "test", "dev")
 """Optional dependency groups vq publishes, as pip spells them.
@@ -242,7 +251,15 @@ def _split_unknown_top_level(data: dict, path: Path) -> dict:
 _DEPRECATED_SOURCE_REPO_WARNED = False
 
 
-def _warn_deprecated_source_repo() -> None:
+def source_repo_key(repositories: Mapping[str, str], product: str) -> str:
+    """Find a configured product without embedding a deployment namespace."""
+    matches = [slug for slug in repositories if slug.rsplit("/", 1)[-1] == product]
+    if len(matches) > 1:
+        raise ValueError(f"multiple pin_source_repos entries name {product!r}; select one")
+    return matches[0] if matches else product
+
+
+def _warn_deprecated_source_repo(repo_slug: str = VIBEQC_REPO_SLUG) -> None:
     """Say once that the global vibe-qc checkout setting has a modern spelling.
 
     Once per process, not once per load: policy is re-read per queue row
@@ -255,7 +272,7 @@ def _warn_deprecated_source_repo() -> None:
     _DEPRECATED_SOURCE_REPO_WARNED = True
     _warn_operator(
         "scheduler_runtime_source_repo is deprecated; it is the "
-        f'[pin_source_repos] "{VIBEQC_REPO_SLUG}" entry under an older name. '
+        f'[pin_source_repos] "{repo_slug}" entry under an older name. '
         "Move it there and delete this key."
     )
 
@@ -461,17 +478,39 @@ class SchedulerRuntimeDeployment(BaseModel):
     feed_source_mirror: str | None = None
     """Path (login-host-relative or absolute) of a PUSH-FED bare source
     mirror to feed with the exact ``--expected-sha`` before preparation.
-    pbs-cluster's compute build node is offline and the online login node is not
-    provisioned with private GitLab credentials, so its mirror at
-    ``.local/share/vq-pbs-cluster/vibeqc.git`` is authoritative only for what has
-    been pushed into it. When set, ``vq admin update PROGRAM HOST`` pushes
-    the exact SHA into the two refs for that profile -- ``refs/heads/release``
-    plus ``refs/remotes/origin/release`` for ``vibeqc-release``, or the
-    corresponding ``main`` refs for branch-tip programs -- together with all
-    tags from the driver's :attr:`Config.scheduler_runtime_source_repo`
-    (which is therefore required) over the host's ssh alias. Keeping the ref
-    pairs separate prevents a release feed from replacing the dev identity and
-    replaces the manual per-release feed step from the fleet runbook.
+    An offline compute build node with a login node that carries no source
+    credentials makes its mirror authoritative only for what has been pushed
+    into it. When set, ``vq admin update PROGRAM HOST`` feeds that mirror from
+    the driver's :attr:`Config.scheduler_runtime_source_repo` (which is
+    therefore required) over the host's ssh alias, and replaces the manual
+    per-release feed step from the fleet runbook.
+
+    **The feed never forces anything** (#81). One unforced, ``--atomic``
+    ``git push`` carries exactly four kinds of ref:
+
+    * ``refs/vq/pins/<sha>`` -- the immutable per-pin ref. Its name is the
+      commit it names, so feeding it is a creation or an exact no-op, and the
+      accepted pin stays addressable however the branches later move.
+    * ``refs/heads/release`` and ``refs/remotes/origin/release`` for
+      ``vibeqc-release``, or the corresponding ``main`` pair for branch-tip
+      programs. Keeping the pairs separate stops a release feed from replacing
+      the dev identity; feeding them atomically stops a half-fed lane, which
+      is what every preparer fails closed on.
+    * the tags that name this pin in the driver's clone -- the requested
+      release identity, not the whole tag namespace.
+
+    Anything that would need a force is refused **before** the push, with the
+    mirror's own values in the message, and the mirror is left byte-identical:
+    a lane branch that has moved past the accepted pin, a diverged branch, a
+    mirror commit the driver's clone does not contain, or a tag the mirror
+    already holds at another object. A legitimate but *older* accepted pin is
+    therefore a visible refusal an operator resolves deliberately, never a
+    silent pick-up of whatever newer tree the mirror drifted to. Refs and tags
+    the feed does not name are never touched at all.
+
+    ``--atomic`` needs git >= 2.4 on the receiving end; an older one refuses
+    the push, which is the correct failure for a feed that must be
+    all-or-nothing.
 
     **The mirror must already exist and be push-fed**: a bare repository whose
     ``origin`` names its own path, which is how the preparer tells a push-fed
@@ -604,6 +643,13 @@ class HostConfig(BaseModel):
     resolved cap to the target, including into a detached update's transient
     unit, and the SSH observer's own cap grows with it."""
 
+    broker: bool = False
+    """#64, client side: this entry names a fleet broker. ``vq submit`` to it
+    relays the job into the broker's held queue (``vq broker accept``) instead
+    of the host's own run queue, and ``status``/``logs``/``kill``/``fetch`` of
+    its ``b-...`` ids are answered by the broker. Point a separate entry (an
+    alias of the broker machine) at it to keep submitting to the machine
+    itself too. The broker's own ``[broker]`` section enables the role."""
     fleet_role: Literal["auto", "managed", "vq-only", "alias", "excluded"] = "auto"
     """How driver-owned fleet rollouts treat this host.
 
@@ -666,6 +712,19 @@ class HostConfig(BaseModel):
     Required when ``scheduler`` is not ``local``; must be ``None`` for a
     ``local`` host."""
 
+    scheduler_max_jobs: int | None = Field(default=None, ge=1)
+    """This driver's active allocation cap for this scheduler target. Aliases
+    share the strictest configured cap. Unknown submissions still reserve a
+    slot; finished allocations waiting for artifacts do not. Unset preserves
+    the daemon-global cap alone. This is not an account-wide site quota."""
+
+    scheduler_submit_interval_seconds: float = Field(
+        default=0.0, ge=0.0, allow_inf_nan=False,
+    )
+    """Minimum time between this driver's submission attempts to this target.
+    Aliases share the longest interval, including after failed attempts.
+    Zero preserves unpaced submission. Running jobs are never interrupted."""
+
     remote_scheduler_host: str | None = None
     """Arch 2 only: the ssh target the always-on vq daemon reaches to run
     ``qsub`` / ``qstat`` / ``qdel``. Usually equal to ``ssh``; kept separate
@@ -684,7 +743,24 @@ class HostConfig(BaseModel):
     """Absolute directory on the scheduler host under which staged
     workspaces and ``$VQ_WORKDIR``-equivalent scratch live (e.g.
     ``/home/USER`` when the cluster has no dedicated ``/scratch``). Required
-    when ``scheduler`` is not ``local``."""
+    when ``scheduler`` is not ``local``.
+
+    The scheduler-host half of one concept; the top-level
+    :attr:`Config.scratch_root` says the same thing for the host this config
+    belongs to (#63).
+
+    Changing it is safe under jobs in flight since #63: a job records the
+    workspace it was staged into (``spec.scheduler_remote_workspace``)
+    **before** the submission boundary, and every later step -- reattachment,
+    uncertain-submit reconciliation, retry, polling, log reads, fetch and
+    remote cleanup -- uses that recorded path rather than recomputing it from
+    the current value. A pre-#63 job carries no such record. The daemon binds
+    it when it reattaches to it (a daemon start), and refuses to adopt a
+    changed ``scratch_root`` for this host while any such job that may already
+    be staged -- past PENDING, or PENDING again after a retry -- is unbound.
+    On a first start with no record of a previous root it serves the
+    configured one unconfirmed and binds nothing to it; see
+    ``docs/fleet_layout.md``."""
 
     node_scratch_dir: str | None = None
     """Optional node-local scratch directory **template** on the compute node
@@ -732,6 +808,28 @@ class HostConfig(BaseModel):
     This is a pre-admission safety boundary, not a capacity observation.
     ``None`` means the limit is unknown, not that the scheduler is unlimited.
     Scheduler-host-only; local hosts must leave it unset.
+    """
+
+    scheduler_max_cpus: Annotated[
+        int,
+        Field(strict=True, gt=0),
+    ] | None = None
+    """Operator-declared widest request this scheduler lane can ever run.
+
+    The companion to ``scheduler_max_wall_time_seconds``, and read the same
+    way: a pre-admission boundary, not a live capacity observation. ``None``
+    means unknown, not unlimited.
+
+    Unlike wall time, exceeding this does **not** refuse the submission. A
+    node census goes stale -- a node returns to service, a partition is
+    resized -- and refusing on a stale number would reject work the cluster
+    can now run. ``vq submit`` warns instead, which is what the vibe-qc#148
+    starvation needed: the request was admitted and then never started, with
+    nothing anywhere saying it could not.
+
+    `vq scheduler-probe HOST` reports the figure to put here as
+    ``capacity.max_cpus_when_free``. Scheduler-host-only; local hosts must
+    leave it unset.
     """
 
     scheduler_prologue: list[str] = Field(default_factory=list)
@@ -806,6 +904,16 @@ class HostConfig(BaseModel):
     ``/home/USER/vibeqc-dev/scripts/install_cluster.sh``). Same parsing and
     trust boundary as :attr:`scheduler_update_command`."""
 
+    runtime_participant_command: str | None = None
+    """Reviewed site adapter for ``vq admin migrate-runtime`` participants (#72).
+
+    Run over this host's ``ssh`` with one JSON request on stdin and one JSON
+    response on stdout (protocol ``vq.runtime-participant/1``). Unset means the
+    host cannot take part in a runtime migration. Same parsing and trust
+    boundary as :attr:`scheduler_update_command`. Older vq versions reject this
+    key: upgrade every reader of the config first.
+    """
+
     scheduler_update_timeout_seconds: float | None = 7200.0
     """Timeout for the scheduler host's remote provisioning command. ``None``
     disables the transport timeout. The default is long enough for login-node
@@ -820,6 +928,7 @@ class HostConfig(BaseModel):
         "scheduler_update_host",
         "scheduler_update_stage",
         "scheduler_install_command",
+        "runtime_participant_command",
     )
     @classmethod
     def _validate_scheduler_strings(
@@ -937,6 +1046,10 @@ class HostConfig(BaseModel):
                     "scheduler_max_wall_time_seconds must be unset when "
                     "scheduler = 'local'"
                 )
+            if self.scheduler_max_cpus is not None:
+                raise ValueError(
+                    "scheduler_max_cpus must be unset when scheduler = 'local'"
+                )
             if self.scheduler_dialect is not None:
                 raise ValueError(
                     "scheduler_dialect must be unset when scheduler = 'local'"
@@ -960,6 +1073,10 @@ class HostConfig(BaseModel):
             if self.scheduler_update_stage is not None:
                 raise ValueError(
                     "scheduler_update_stage must be unset when scheduler = 'local'"
+                )
+            if self.scheduler_max_jobs is not None or self.scheduler_submit_interval_seconds:
+                raise ValueError(
+                    "scheduler admission limits require a non-local scheduler"
                 )
             if self.scheduler_prologue:
                 raise ValueError(
@@ -1099,6 +1216,7 @@ class HostConfig(BaseModel):
         return {
             "partition": partition,
             "max_wall_time_seconds": self.scheduler_max_wall_time_seconds,
+            "max_cpus": self.scheduler_max_cpus,
             "source": "host-config",
         }
 
@@ -1124,7 +1242,8 @@ class ProgramAvailability:
 
     ``status`` is ``OK``, ``MISSING`` (work dispatched here will fail) or
     ``UNHEALTHY`` (the runtime loads; its configured healthcheck does not
-    pass). ``healthcheck_status`` is one of the ``_program_probe.HEALTHCHECK_*``
+    pass), or ``SCHEDULER_ONLY`` (no local installation; target not probed).
+    ``healthcheck_status`` is one of the ``_program_probe.HEALTHCHECK_*``
     values for a venv program and ``None`` for kinds without a healthcheck.
     """
 
@@ -1159,11 +1278,9 @@ def _git_sha_matches(actual: str, expected: str) -> bool:
     """Accept exact or unambiguous configured-prefix SHA pins."""
     actual_norm = actual.strip().lower()
     expected_norm = expected.strip().lower()
-    return (
-        actual_norm == expected_norm
-        or actual_norm.startswith(expected_norm)
-        or expected_norm.startswith(actual_norm)
-    )
+    # The observed identity must contain every requested digit. A shorter
+    # display SHA cannot establish that a longer expected pin matches.
+    return bool(expected_norm) and actual_norm.startswith(expected_norm)
 
 
 class BinaryProgram(_ProgramBase):
@@ -1244,12 +1361,29 @@ class VenvProgram(_ProgramBase):
     Distinct from :attr:`update_script` because the two are genuinely
     different operations: one builds an environment that does not exist, the
     other refreshes one that does. ``vq admin install`` never runs the update
-    script, and ``vq admin update`` never runs this one."""
+    script, and ``vq admin update`` never runs this one.
+
+    When this program declares :attr:`extras`, the floor is appended to this
+    command as ``--extras PROFILE`` -- last, so it decides, and resolved over
+    whatever profile is configured here. That happens only when this is vq's
+    own ``scripts/install.sh`` or ``scripts/update.sh``, the same proof the
+    managed update requires before it names an install target; a declaration
+    any other installer would have to apply refuses the install instead."""
 
     update_script: str | None = None
     """Relative path under ``git_dir`` of the script to run after
-    ``git pull``. None means "no script, just the pull." Reserved for
-    v0.6.0's ``vq admin update``; ``vq programs`` doesn't run it."""
+    ``git pull``. None means "no script, just the pull." ``vq programs``
+    doesn't run it.
+
+    When this program declares :attr:`extras` **and** this command is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh`` inside this program's
+    checkout, the floor is appended to it as ``--extras PROFILE`` -- last, so
+    it decides, and resolved over the profile the run would otherwise install:
+    an operator's ``--update-script-arg --extras PROFILE``, else what
+    ``.vq-install-metadata`` records, else ``core``. With any other command,
+    the update runs exactly as it always has and says that the declaration was
+    not its to apply. Unlike the managed daemon transaction, this appends no
+    ``--recreate-venv``: it reinstalls into the existing environment."""
 
     runtime_slot_root: str | None = None
     """Opt this venv program into per-SHA runtime slots, rooted here.
@@ -1279,6 +1413,41 @@ class VenvProgram(_ProgramBase):
     is a hand-edited file, where rejecting a typo is worth having.)
     """
 
+    runtime_slot_execution: bool = False
+    """Explicitly select verified slots for this program's local execution.
+
+    The stored source/interpreter remain the legacy build inputs and compatible
+    paths. Execution consumers resolve one verified generation and retain its
+    exact paths; admin preparation still uses the stored inputs. Migration must
+    enable every alias together, after preparing the first verified generation.
+    Merely setting runtime_slot_root continues to opt in only to slot builds.
+    """
+
+    runtime_slot_build_input: Literal["legacy", "current"] = "legacy"
+    """Where the next runtime generation is cloned from.
+
+    ``"legacy"`` (the default) clones from the registered ``git_dir``, which
+    must therefore remain on disk. ``"current"`` clones from the active
+    verified generation, whose ``origin`` is the configured upstream, so the
+    registered ``git_dir``/``python`` become compatibility paths that may be
+    retired. Requires ``runtime_slot_execution``. The updater entry points and
+    virtualenv name are still derived from the registered paths, which are
+    only read as path arithmetic. Same reader-first rollout rule as
+    ``runtime_slot_root``: update every vq that reads this config first (#72).
+    """
+
+    runtime_slot_seed_adapter: str | None = None
+    """Tracked executable relative to the candidate source for native reuse.
+
+    Opts fresh slots into required reuse through the product-owned two-phase
+    protocol in docs/native_install_seeding.md. Missing provenance or failed
+    relocation holds before installation; it never silently requests a cold
+    build. No adapter is installed or selected by default.
+    """
+
+    runtime_slot_seed_timeout_seconds: int = Field(default=60, ge=1, le=600, strict=True)
+    """Wall-clock bound for each native-seed adapter phase."""
+
     extras: list[str] = Field(default_factory=list)
     """Optional dependency groups this program's virtualenv **requires**.
 
@@ -1299,11 +1468,11 @@ class VenvProgram(_ProgramBase):
     --update-script-arg --extras --update-script-arg PROFILE`` of #11, which
     changes one environment once. That is the right tool for "fix this host
     now"; this is the right one for "this venv is *for* serving the console",
-    because it is re-applied on every managed rebuild and it survives a venv
-    rebuilt outside that path -- a fresh provision, ``install.sh``,
-    ``reinstall.sh`` -- where ``.vq-install-metadata`` dies with the venv it
-    described. An operator request that does not cover this declaration is
-    refused rather than silently widened.
+    because it is re-applied on every rebuild vq performs and it survives a
+    venv rebuilt by a script run directly -- ``install.sh``, ``reinstall.sh``
+    -- where ``.vq-install-metadata`` dies with the venv it described. An
+    operator request that does not cover this declaration is refused rather
+    than silently widened.
 
     Concretely (coordinator, 2026-09-09): one venv served ``vq-daemon`` and
     ``vq-web``; its recorded profile was ``core``; ``vq web install`` had
@@ -1318,14 +1487,36 @@ class VenvProgram(_ProgramBase):
     ``all`` rather than dropping its test tooling. See
     :func:`vq.admin._resolve_extras_profile`.
 
-    **Where it takes effect:** the managed daemon transaction -- ``vq admin
-    update`` / ``vq self-update`` on the env serving this host's daemon. That
-    is the one path that has proved the updater is vq's own
-    ``scripts/update.sh`` before naming an install target on it; an ordinary
-    update runs whatever ``update_script`` says, which for a vibe-qc or
-    vibe-view program is a script that has never heard of ``--extras``. An
-    update that cannot apply a declaration says so rather than passing over it
-    (:func:`vq.admin._warn_if_declared_extras_are_inert`).
+    **Where it takes effect:** wherever vq itself builds the venv, which is
+    every build vq performs and no other. That is the managed daemon
+    transaction (``vq admin update`` / ``vq self-update`` on the env serving
+    this host's daemon), a fresh ``vq admin install``, and an ordinary ``vq
+    admin update`` on any other program. All three rest on one proof: the
+    command vq is about to name an install target on is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh``, resolved inside the
+    checkout this program points at (:func:`vq.admin._vq_own_script_proof`).
+    The proof is what makes naming the target safe, and it is the only thing
+    that decides: a program whose scripts are its own is built exactly as it
+    always was.
+
+    What a *failed* proof means differs, because the verbs stand at different
+    points in an environment's life. An update has a built, possibly serving
+    environment to leave alone, so it leaves it alone and says that it did
+    (:func:`vq.admin._warn_if_declared_extras_are_inert`). An install has
+    nothing to leave alone: it is about to create the venv, and creating it
+    without the runtime the program declares is precisely the failure this key
+    exists to prevent, so it is **refused** and names the remedy
+    (:func:`vq.admin._declared_extras_install_args`). A program that declares
+    nothing is unaffected by any of them.
+
+    A program carrying :attr:`install_script` and no :attr:`update_script` has
+    exactly one of those routes, and it fires once. There is nothing for ``vq
+    admin update`` to run afterwards, so that environment is never rebuilt: the
+    update pulls the checkout and reports success. Every message about this key
+    is worded for that shape separately, because the remedies that end in ``vq
+    admin update`` would otherwise name a command that changes nothing.
+    ``vq doctor`` reports which of the two routes a declaring program actually
+    has, on the host whose checkout can answer.
 
     **Deployment ordering matters**, for the same reason it does on
     :attr:`runtime_slot_root`: ``_ProgramBase`` sets ``extra="forbid"``, so a
@@ -1516,25 +1707,61 @@ class VenvProgram(_ProgramBase):
 
     @model_validator(mode="after")
     def _declared_extras_have_a_route_into_the_venv(self) -> VenvProgram:
-        """``extras`` is inert without the updater that applies it.
+        """``extras`` is inert unless vq itself builds the environment.
 
-        The declaration is read on the way to ``scripts/update.sh``, so a
-        program vq cannot rebuild would accept the key, change nothing, and
-        leave an operator believing the capability was declared -- the exact
-        belief that kept coordinator's console down. Refuse instead.
+        A program vq neither provisions nor rebuilds would accept the key,
+        change nothing, and leave an operator believing the capability was
+        declared -- the exact belief that kept a console down. Refuse instead.
+
+        There are two routes, and either one is enough. A fresh provision
+        applies the floor (``vq admin install``, #47) and an update re-applies
+        it (``vq admin update``, managed or ordinary, #85), so a program
+        configuring ``install_script`` or ``update_script`` can carry the
+        declaration. Having one is necessary but not sufficient: every route
+        applies the floor only through vq's own ``scripts/install.sh`` or
+        ``scripts/update.sh``, which the checkout has to exist to prove, so
+        the install refuses at provision time and an ordinary update says it
+        cannot honour the declaration. Neither check belongs here, where there
+        is no checkout to read; ``vq doctor`` makes the same proof on a host
+        that has one, so an operator can see the situation before a unit
+        starts failing (#84).
+
+        The two routes are not interchangeable, and admitting both here made
+        one config shape that several messages had assumed away: with
+        ``install_script`` alone the declaration is applied once, at provision,
+        and nothing rebuilds that venv afterwards. Every remedy that ends in
+        ``vq admin update`` is worded around that (#47).
         """
-        if self.extras and not self.update_script:
+        if self.extras and not (self.install_script or self.update_script):
             raise ValueError(
-                "extras requires update_script; vq applies a declared extra "
-                "when it rebuilds the environment, and a program without an "
-                "update script is never rebuilt by vq. Note that having one "
-                "is necessary but not sufficient: only a managed daemon "
-                "update applies the declaration"
+                "extras requires install_script or update_script; vq applies "
+                "a declared extra when it builds or rebuilds the environment, "
+                "and a program with neither script is never built by vq. Note "
+                "that having one is necessary but not sufficient: the floor "
+                "reaches pip only through vq's own scripts/install.sh or "
+                "scripts/update.sh"
             )
         return self
 
     @model_validator(mode="after")
     def _runtime_probe_settings_are_consistent(self) -> VenvProgram:
+        if self.runtime_slot_seed_adapter is not None:
+            if self.runtime_slot_root is None:
+                raise ValueError("runtime_slot_seed_adapter requires runtime_slot_root")
+            value = self.runtime_slot_seed_adapter
+            path = Path(value)
+            if (
+                not value or value == "." or path.is_absolute() or path.as_posix() != value
+                or any(part in {".", "..", ".git"} for part in path.parts)
+                or any(c in value for c in ("\\", "\x00", "\n", "\r"))
+            ):
+                raise ValueError("runtime_slot_seed_adapter must be one relative executable path")
+        if self.runtime_slot_execution and self.runtime_slot_root is None:
+            raise ValueError("runtime_slot_execution requires runtime_slot_root")
+        if self.runtime_slot_build_input == "current" and not self.runtime_slot_execution:
+            raise ValueError(
+                'runtime_slot_build_input = "current" requires runtime_slot_execution'
+            )
         if self.import_symbols and not self.import_check:
             raise ValueError("import_symbols requires import_check")
         if self.expected_import_version and not self.import_check:
@@ -1546,6 +1773,26 @@ class VenvProgram(_ProgramBase):
                 "healthcheck_command must be a single shell-style command line"
             )
         return self
+
+    def execution_program(self, *, retained_sha: str | None = None) -> VenvProgram:
+        """Resolve the local execution binding once, without changing build inputs."""
+        if not self.runtime_slot_execution:
+            return self
+        from vq import runtime_slots
+
+        assert self.runtime_slot_root is not None
+        try:
+            selected = (
+                runtime_slots.select_retained_python(self.runtime_slot_root, retained_sha)
+                if retained_sha is not None
+                else runtime_slots.select_python(self.runtime_slot_root)
+            )
+            program = runtime_slots.slot_local_program(self, selected.root, selected.sha)
+        except (runtime_slots.RuntimeSlotError, OSError) as exc:
+            raise ConfigError(f"cannot resolve runtime-slot execution: {exc}") from exc
+        if program.import_check is None and program.vibeqc_source_root() is not None:
+            program = program.model_copy(update={"import_check": "vibeqc"})
+        return program
 
     def current_git_sha(self, *, full: bool = False) -> str | None:
         args = ("HEAD",) if full else ("--short=12", "HEAD")
@@ -1621,7 +1868,7 @@ class VenvProgram(_ProgramBase):
         mismatches: list[str] = []
         if self.expected_git_sha:
             actual_sha = self.current_git_sha(
-                full=len(self.expected_git_sha) == 40
+                full=len(self.expected_git_sha) > 12
             )
             if actual_sha is None:
                 mismatches.append(
@@ -1694,6 +1941,11 @@ class VenvProgram(_ProgramBase):
         configured healthcheck failed, which on 2026-09-12 was a Linux-only
         ``xvfb-run`` on a macOS host beside a vibe-view that imported fine.
         """
+        if self.runtime_slot_execution:
+            try:
+                return self.execution_program().availability_status()
+            except ConfigError as exc:
+                return ProgramAvailability(PROGRAM_STATUS_MISSING, str(exc))
         not_run = (
             _program_probe.HEALTHCHECK_NOT_RUN
             if self.healthcheck_command
@@ -1820,8 +2072,25 @@ class ImportProgram(_ProgramBase):
         return True, f"{import_detail} from {self.python} ok"
 
 
+class SchedulerProgram(_ProgramBase):
+    """A driver-side program name with no local executable or installation.
+
+    Target configuration supplies hooks and runtime deployment authority just
+    as it does for other program kinds. Registration alone proves no remote
+    availability and cannot authorize a local job.
+    """
+
+    kind: Literal["scheduler"]
+
+    def availability(self) -> tuple[bool, str]:
+        return False, "scheduler-only registration; target runtime not probed"
+
+    def availability_status(self) -> ProgramAvailability:
+        return ProgramAvailability("SCHEDULER_ONLY", self.availability()[1])
+
+
 ProgramConfig = Annotated[
-    BinaryProgram | VenvProgram | ImportProgram,
+    BinaryProgram | VenvProgram | ImportProgram | SchedulerProgram,
     Field(discriminator="kind"),
 ]
 
@@ -1996,6 +2265,135 @@ class PoolConfig(BaseModel):
     ``[hosts.*]`` table (validated at load time)."""
 
 
+class BrokerConfig(BaseModel):
+    """#64: the fleet broker role -- the ``[broker]`` section on the broker host.
+
+    Off by default. When enabled, this host holds submissions relayed by
+    clients (``vq broker accept``) in its durable store and places them, in
+    strict FIFO order, on the listed daemon hosts; its daemon runs one
+    placement pass (``vq broker pass``) every ``interval_seconds``. Only the
+    broker needs the target inventory and their SSH credentials: compromising
+    the broker compromises every listed target (``SECURITY.md``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    targets: list[str] = Field(default_factory=list)
+    """Daemon hosts (``[hosts.*]`` keys with ``scheduler = "local"``) the
+    broker may place on. Explicit: nothing else is ever a target."""
+    interval_seconds: float = Field(default=60.0, ge=5, le=86400)
+    """How often the broker's daemon starts a placement pass."""
+    max_age_seconds: float = Field(default=180.0, gt=0, le=86400)
+    """Oldest capacity evidence a placement may use."""
+    retry_interval_seconds: float = Field(default=300.0, ge=0, le=86400)
+    """Least time between replays of one uncertain transfer."""
+    collect_timeout_seconds: float = Field(default=60.0, gt=0, le=3600)
+    """Bound on each target's ``vq broker capacity`` call."""
+
+    @model_validator(mode="after")
+    def _enabled_needs_targets(self) -> BrokerConfig:
+        if self.enabled and not self.targets:
+            raise ValueError("[broker] enabled = true needs at least one target")
+        if len(set(self.targets)) != len(self.targets):
+            raise ValueError("[broker] targets lists a host twice")
+        return self
+
+
+GATEWAY_SCOPES = ("submit", "read", "cancel", "download")
+"""What a gateway API key may do (#163). Checked on every request."""
+
+
+class GatewayProjectConfig(BaseModel):
+    """#163: one ``[gateway.projects.NAME]`` -- what a project's keys may run.
+
+    Server-side policy: a client chooses within it, never outside it. It
+    selects a project, not an OS identity -- every gateway job runs under the
+    broker's execution account (trusted-group MVP, ``SECURITY.md``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    programs: list[str] = Field(min_length=1)
+    """Registered program names this project may run (``--program``)."""
+    max_cpus: int = Field(ge=1)
+    max_mem_mb: int = Field(ge=1)
+    max_wall_time_seconds: int = Field(ge=1)
+    max_active_jobs: int = Field(default=10, ge=1)
+    """Queued plus running gateway jobs per principal in this project."""
+    storage_quota_mb: int = Field(default=1024, ge=1)
+    """Uploads plus retained results per principal in this project."""
+    result_retention_days: int = Field(default=14, ge=1, le=3650)
+
+
+class GatewayConfig(BaseModel):
+    """#163: the HTTPS submission gateway -- the ``[gateway]`` section.
+
+    Off by default. A separate service (``vq gateway serve``) on the broker
+    host: clients authenticate with per-project API keys and submit through
+    the broker's intake, so the gateway holds no SSH keys or fleet inventory.
+    It binds loopback behind a TLS reverse proxy, or terminates TLS itself
+    when ``tls_cert``/``tls_key`` are set; a plaintext non-loopback bind is
+    refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode: Literal["local", "relay"] = "local"
+    """``local``: submit to the broker on this host. ``relay`` (#164): hold
+    admitted jobs for an enrolled outbound connector on the broker host; this
+    host then needs no broker, SSH keys or fleet inventory."""
+    bind: str = "127.0.0.1"
+    port: int = Field(default=8770, ge=1, le=65535)
+    tls_cert: str | None = None
+    tls_key: str | None = None
+    projects: dict[str, GatewayProjectConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _transport(self) -> GatewayConfig:
+        if (self.tls_cert is None) != (self.tls_key is None):
+            raise ValueError("[gateway] tls_cert and tls_key are set together")
+        for path in (self.tls_cert, self.tls_key):
+            if path is not None and not Path(path).is_absolute():
+                raise ValueError("[gateway] TLS paths must be absolute")
+        for name in self.projects:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+                raise ValueError(f"[gateway.projects] invalid project name {name!r}")
+        return self
+
+
+class ConnectorConfig(BaseModel):
+    """#164: the outbound connector -- the ``[connector]`` section on a broker host.
+
+    Off by default. ``vq connector run`` makes only outbound HTTPS requests to
+    a relay-mode gateway, claims the project's work and drives this host's
+    broker; nothing listens. Its credential comes from ``vq connector enroll``
+    and lives in owner-only state, never in this file.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    gateway_url: str | None = None
+    ca_file: str | None = None
+    """A private CA bundle for the gateway's TLS certificate, if any."""
+    poll_seconds: float = Field(default=25.0, ge=1, le=30)
+    """How long one claim request may wait for work (long polling)."""
+    spool_mb: int = Field(default=4096, ge=1)
+    """Disk the connector may use for staged payloads and collected results.
+    Work that would not fit is left at the gateway, which shows clients the
+    backpressure instead of filling this host's disk."""
+
+    @model_validator(mode="after")
+    def _url(self) -> ConnectorConfig:
+        if self.enabled and not self.gateway_url:
+            raise ValueError("[connector] enabled = true needs gateway_url")
+        if self.ca_file is not None and not Path(self.ca_file).is_absolute():
+            raise ValueError("[connector] ca_file must be absolute")
+        return self
+
+
 class WebConsoleConfig(BaseModel):
     """v0.25.0: host-local defaults for ``vq web run`` — the ``[web]`` section.
 
@@ -2078,6 +2476,80 @@ class WebConsoleConfig(BaseModel):
         return stripped
 
 
+PUBLIC_DISPLAY_NAME_MAX_LEN = 64
+"""Longest public display name ``[public_snapshot.hosts]`` accepts."""
+
+DEFAULT_PUBLIC_STALE_AFTER_SECONDS = 900
+"""How long a written public snapshot counts as fresh, by default."""
+
+
+class PublicSnapshotConfig(BaseModel):
+    """#66: what the public fleet snapshot may say -- the ``[public_snapshot]`` section.
+
+    Read only by ``vq web public-snapshot`` on the operator's host. The
+    public snapshot is default deny: a host appears in it only under a
+    display name configured here, and never under its ``[hosts.<key>]``
+    key, its SSH target or anything it reports about itself. A host with
+    no entry here is left out of the snapshot entirely.
+
+    ``hosts`` maps a ``[hosts.<key>]`` key to the name the public page
+    shows for it. The value is published verbatim, so choose it as you
+    would choose any public text. A key that names no configured host is
+    not a load error (removing a host must not break every command); the
+    snapshot shows it as a card in state ``unknown``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hosts: dict[str, str] = Field(default_factory=dict)
+    """``<hosts key> = "<public display name>"``."""
+
+    title: str | None = None
+    """Heading of the public page. Unset shows a generic heading; the
+    console's ``[web] title`` is deliberately not reused, since an
+    operator may name an internal console differently from a public one."""
+
+    stale_after_seconds: int = Field(default=DEFAULT_PUBLIC_STALE_AFTER_SECONDS, ge=60)
+    """Seconds after generation at which the snapshot marks itself stale.
+    Set it above the interval of whatever timer runs the writer, so one
+    late run does not flip the page to stale."""
+
+    @field_validator("hosts")
+    @classmethod
+    def _display_names(cls, value: dict[str, str]) -> dict[str, str]:
+        cleaned: dict[str, str] = {}
+        seen: dict[str, str] = {}
+        for key, name in value.items():
+            if not key.strip():
+                raise ValueError("a host key must not be empty")
+            name = _public_text(name, what=f"display name for {key!r}")
+            if name.casefold() in seen:
+                raise ValueError(
+                    f"display name {name!r} is used for both {seen[name.casefold()]!r} "
+                    f"and {key!r}; each public card needs its own name"
+                )
+            seen[name.casefold()] = key
+            cleaned[key] = name
+        return cleaned
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, value: str | None) -> str | None:
+        return None if value is None else _public_text(value, what="title")
+
+
+def _public_text(value: str, *, what: str) -> str:
+    """Strip and bound one piece of operator-chosen public text."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{what} must not be empty")
+    if len(stripped) > PUBLIC_DISPLAY_NAME_MAX_LEN:
+        raise ValueError(f"{what} is longer than {PUBLIC_DISPLAY_NAME_MAX_LEN} characters")
+    if any(not ch.isprintable() for ch in stripped):
+        raise ValueError(f"{what} must not contain control characters")
+    return stripped
+
+
 class HostRetirement(BaseModel):
     """Explicit operator retirement, bound to exact historical host evidence."""
 
@@ -2142,6 +2614,16 @@ class FleetConfig(BaseModel):
     ``LaneState.probe_unavailable``), which is what makes the refusal
     retryable; raising the budget only makes it rarer."""
 
+    strict_helper_identity: bool = False
+    """Refuse ``vq submit`` to a scheduler host whose helper is another tree.
+
+    ``vq submit`` asks the doctor's ``scheduler_remote_vq`` question on the
+    driver before queueing for a scheduler host (#127). By default a proven
+    mismatch queues the job with a warning naming both identities, so a
+    driver-first rollout never refuses submits while helpers catch up. Set
+    this on the driver to refuse instead; ``--allow-helper-mismatch`` then
+    queues one submit anyway."""
+
 
 class DaemonRunConfig(BaseModel):
     """v0.16.0: host-local defaults for the ``vq daemon run`` capacity caps.
@@ -2176,7 +2658,13 @@ class DaemonRunConfig(BaseModel):
 
 
 class Config(BaseModel):
-    """Top-level config. Missing file -> empty Config (all defaults)."""
+    """Top-level config. Missing file -> empty Config (all defaults).
+
+    Top-level keys describe **this** host (its scratch roots, its defaults,
+    its pools); ``[hosts.<name>]`` describes a host this one submits to.
+    :attr:`scratch_root` deliberately carries the same name in both scopes:
+    it is one concept, "where disposable per-job trees live on that host".
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2214,9 +2702,22 @@ class Config(BaseModel):
     """v0.25.0: host-local defaults for ``vq web run``. Absent section =
     built-in defaults (loopback bind, port 8765, single-host mode). See
     :class:`WebConsoleConfig`."""
+    public_snapshot: PublicSnapshotConfig = Field(default_factory=PublicSnapshotConfig)
+    """#66: display names and freshness for ``vq web public-snapshot``.
+    Absent section = no host has a public name, so the snapshot shows no
+    host. See :class:`PublicSnapshotConfig`."""
     quotas: QuotaConfig = Field(default_factory=QuotaConfig)
     """v0.6.x: per-user quota enforcement. Absent section = quotas
     disabled (default). See :class:`QuotaConfig`."""
+    broker: BrokerConfig = Field(default_factory=BrokerConfig)
+    """#64: the fleet broker role. Absent section = not a broker. See
+    :class:`BrokerConfig`."""
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    """#163: the HTTPS submission gateway. Absent section = disabled. See
+    :class:`GatewayConfig`."""
+    connector: ConnectorConfig = Field(default_factory=ConnectorConfig)
+    """#164: the outbound connector to a relay-mode gateway. Absent section =
+    disabled. See :class:`ConnectorConfig`."""
     pools: dict[str, PoolConfig] = Field(default_factory=dict)
     """v0.11.0: named host groups for ``vq submit auto`` (``[pools.<name>]
     hosts = [...]``). Empty = no pools; ``vq submit auto`` then considers
@@ -2225,6 +2726,67 @@ class Config(BaseModel):
     """v0.11.0: if set, a bare ``vq submit auto`` (no ``--pool``) scopes to
     this pool instead of every host — e.g. point it at a "compute" pool so
     the daily-driver / gaming boxes are excluded by default."""
+
+    scratch_root: str | None = None
+    """#63: absolute directory on **this** host holding disposable per-job
+    scratch -- ``jobs/`` (the submitted workspace = a job's ``cwd``) and
+    ``workdirs/`` (``$VQ_WORKDIR``).
+
+    The same concept as :attr:`HostConfig.scratch_root`, which says it for a
+    scheduler host this daemon submits *to*. One name, one meaning, scoped to
+    the host the section describes.
+
+    Unset (the default) resolves to ``<state_root>-scratch``, so
+    ``~/.local/share/vq-scratch`` on a stock install. ``$VQ_SCRATCH_DIR``
+    overrides this key; see :func:`vq.paths.scratch_root` for the full
+    precedence.
+
+    **Set :attr:`min_vq_version` when you set this.** A vq that predates the
+    key ignores unrecognized top-level keys by design, so it would keep
+    resolving scratch under the state root while a newer vq on the same host
+    used this one -- a split store, exactly the failure
+    ``docs/fleet_layout.md`` phase 4 warns about for ``$VQ_STATE_DIR``.
+
+    Changing it strands no job: a job keeps the ``cwd``/``workdir`` it
+    recorded, and accounting, ``--delete`` and the age sweep all reach a
+    job's directories at the path that job recorded, under the current root,
+    the pre-#63 root under the state root, or a root you have since
+    configured away from. (The daemon's immediate ``--clean-tmp`` removal
+    keeps the narrower authority deliberately: it is automatic and
+    unattended, and a refusal there only defers, since the record survives
+    for the sweep and ``--delete``.) What a changed root does leave behind is an
+    *orphan* directory -- one whose job record is already gone -- under a root
+    no remaining record names: nothing enumerates it any more, so remove it by
+    hand. See :func:`vq.paths.workdir_roots_for_job`.
+
+    **Single-user only.** In multi-user mode the root is a deployment-wide
+    decision made through ``$VQ_MULTI_USER_SCRATCH_ROOT``, which the daemon
+    and every user's CLI inherit from the same environment; setting this key
+    there is a load error rather than a silently per-caller root (see
+    :func:`vq.paths.multi_user_scratch_root`)."""
+
+    jobs_root: str | None = None
+    """#63: absolute directory holding job workspaces, overriding
+    ``<scratch_root>/jobs``.
+
+    ``jobs/`` and ``workdirs/`` have the same lifecycle and default together
+    under :attr:`scratch_root`; this key and :attr:`workdir_root` exist so a
+    site that judges results slowly can keep ``jobs/`` on durable, backed-up
+    storage while workdirs churn on a scratch volume. Most hosts should leave
+    both unset and move the one root.
+
+    Single-user only: a multi-user host needs a per-uid tree under the
+    per-user scratch dir, which one path cannot express, so setting it there
+    is a load error rather than a silently ignored key."""
+
+    workdir_root: str | None = None
+    """#63: absolute directory holding per-job workdirs, overriding
+    ``<scratch_root>/workdirs``. See :attr:`jobs_root`; single-user only.
+
+    The daemon opens this exact directory with ``O_RDONLY | O_DIRECTORY |
+    O_NOFOLLOW`` before removing a job's workdir beneath it, so it may be
+    anywhere the daemon can reach while nothing below it may be a symlink
+    escape."""
     fleet_rollout_order: list[str] = Field(default_factory=list)
     """Canonical host order for ``vq admin rollout-latest``.
 
@@ -2232,8 +2794,29 @@ class Config(BaseModel):
     vq-only coordinator, or excluded host does not turn it into a runtime
     target; :attr:`HostConfig.fleet_role` remains authoritative.
     """
+    fleet_tracking_lanes: dict[str, str] = Field(default_factory=dict)
+    """Rollout lanes that follow a branch head instead of the report pin.
+
+    Keyed by program, valued by branch, e.g.::
+
+        [fleet_tracking_lanes]
+        "vibeqc-dev" = "main"
+
+    ``vq admin rollout-latest`` resolves each named branch head to a full SHA
+    once per rollout, in the checkout the program's report pin resolves in,
+    and deploys that exact SHA to every lane of the program through the usual
+    ``--expected-sha`` path. The head must descend from the report pin, so a
+    roll never moves a lane backwards. ``--only-tracking`` advances only these
+    lanes. ``--verify-only`` accepts a tracked lane on any SHA that descends
+    from the pin.
+
+    Only the programs in :data:`FLEET_TRACKABLE_PROGRAMS` can track a branch.
+    Empty (the default) keeps every lane on its report pin. A vq older than
+    this key ignores it with a warning and keeps tracked lanes at or after
+    their pin, so raise ``min_vq_version`` on the driver when adding it."""
+
     scheduler_runtime_source_repo: str | None = None
-    """DEPRECATED since v0.26.1: spell it ``pin_source_repos["mpei/vibe-qc"]``.
+    """DEPRECATED since v0.26.1: spell it ``pin_source_repos["example-org/vibe-qc"]``.
 
     Absolute path to a local vibe-qc git repository on the driver machine.
     When a ``[hosts.*.scheduler_runtime_deployments.*]`` profile sets
@@ -2245,7 +2828,7 @@ class Config(BaseModel):
     It predates the 2026-09-08 split, when one checkout held every program and
     one global setting was sufficient. :attr:`pin_source_repos` now describes
     the same thing per repository, and the two overlapping settings are one
-    setting too many: this one is exactly the ``"mpei/vibe-qc"`` entry.
+    setting too many: this is the configured vibe-qc repository entry.
 
     Still accepted, and still authoritative for vibe-qc programs when
     ``pin_source_repos`` has no entry for them, so a driver that has not
@@ -2276,9 +2859,9 @@ class Config(BaseModel):
     Keyed by the pin's ``repo`` slug, e.g.::
 
         [pin_source_repos]
-        "mpei/vibe-qc"    = "/home/USER/vq/vibe-qc-dev"
-        "mpei/vibe-queue" = "/home/USER/vq/vibe-queue"
-        "mpei/vibe-view"  = "/home/USER/vq/vibe-view-dev"
+        "example-org/vibe-qc"    = "/home/USER/vq/vibe-qc-dev"
+        "example-org/vibe-queue" = "/home/USER/vq/vibe-queue"
+        "example-org/vibe-view"  = "/home/USER/vq/vibe-view-dev"
 
     Schema ``/3`` reports pin four components across three repositories, and
     every pin's provenance -- tag, tag object, and SHA ancestry -- can only be
@@ -2327,9 +2910,32 @@ class Config(BaseModel):
         be silently choosing between two different checkouts.
         """
         return (
-            self.pin_source_repos.get(VIBEQC_REPO_SLUG)
+            self.pin_source_repos.get(source_repo_key(self.pin_source_repos, VIBEQC_REPO_SLUG))
             or self.scheduler_runtime_source_repo
         )
+
+    @field_validator("fleet_tracking_lanes")
+    @classmethod
+    def _tracking_lanes(cls, value: dict[str, str]) -> dict[str, str]:
+        for program, branch in value.items():
+            if program not in FLEET_TRACKABLE_PROGRAMS:
+                raise ValueError(
+                    f"fleet_tracking_lanes: {program!r} cannot track a branch; "
+                    "only " + ", ".join(FLEET_TRACKABLE_PROGRAMS) + " can. "
+                    "Release lanes and vq itself stay on the report pin."
+                )
+            if (
+                _TRACKING_BRANCH_PATTERN.fullmatch(branch) is None
+                or ".." in branch
+                or "//" in branch
+                or branch.endswith(("/", ".", ".lock"))
+                or "/." in branch
+            ):
+                raise ValueError(
+                    f"fleet_tracking_lanes: {program!r} names {branch!r}, "
+                    "which is not a plain branch name"
+                )
+        return value
 
     @field_validator("min_vq_version")
     @classmethod
@@ -2340,6 +2946,48 @@ class Config(BaseModel):
                 f'"0.26.0" (got {value!r})'
             )
         return value
+
+    @model_validator(mode="after")
+    def _validate_scratch_roots(self) -> Config:
+        """#63: the local scratch roots must be absolute, and the two
+        sub-roots must not be set on a multi-user host.
+
+        Absolute because a relative root would resolve against whatever
+        directory the caller happened to be in -- the daemon, ``vq cleanup``
+        and ``vq fetch`` are three different working directories, and a
+        sweep that resolves its root differently from the dispatcher that
+        created the tree is a deletion aimed at the wrong place.
+        """
+        for key in ("scratch_root", "jobs_root", "workdir_root"):
+            value: str | None = getattr(self, key)
+            if value is None:
+                continue
+            if not value.startswith(("/", "~/")):
+                raise ValueError(
+                    f"{key} must be an absolute path on this host, or start "
+                    f"with '~/'; got {value!r}"
+                )
+        if self.multi_user.enabled:
+            for key in ("jobs_root", "workdir_root"):
+                if getattr(self, key) is not None:
+                    raise ValueError(
+                        f"{key} is single-user only: a multi-user host keeps "
+                        "one tree per uid under the per-user scratch dir, "
+                        "which a single path cannot express. Move the whole "
+                        "root with $VQ_MULTI_USER_SCRATCH_ROOT instead."
+                    )
+            if self.scratch_root is not None:
+                raise ValueError(
+                    "scratch_root is single-user only: a config key is read "
+                    "from the calling process's own config file, so the root "
+                    "daemon (/etc/vq) and a user's CLI "
+                    "(~/.config/vq/config.toml) would resolve different "
+                    "scratch trees and `vq submit` would stage outside the "
+                    "tree the daemon accepts. Set "
+                    "$VQ_MULTI_USER_SCRATCH_ROOT for the whole deployment "
+                    "instead."
+                )
+        return self
 
     @model_validator(mode="after")
     def _validate_pools(self) -> Config:
@@ -2362,6 +3010,32 @@ class Config(BaseModel):
                 f"default_pool '{self.default_pool}' is not a defined pool; "
                 f"known pools: {sorted(self.pools) or '(none)'}"
             )
+        for name, entry in self.hosts.items():
+            if entry.broker and entry.scheduler != "local":
+                raise ValueError(
+                    f"host '{name}' sets broker = true but is a scheduler lane; a "
+                    "broker entry names the broker machine's daemon host"
+                )
+        for target in self.broker.targets:
+            host = self.hosts.get(target)
+            if host is None:
+                raise ValueError(
+                    f"[broker] target '{target}' is not a configured host; "
+                    f"known hosts: {sorted(self.hosts) or '(none)'}"
+                )
+            if host.scheduler != "local":
+                raise ValueError(
+                    f"[broker] target '{target}' is a scheduler lane; the broker "
+                    "places on daemon hosts (scheduler = \"local\") only"
+                )
+            if host.fleet_role in {"alias", "excluded"}:
+                # An alias is a second name for a machine another entry
+                # already names: its capacity would be promised twice.
+                raise ValueError(
+                    f"[broker] target '{target}' has fleet_role = "
+                    f"\"{host.fleet_role}\"; list each machine once, by its "
+                    "canonical host"
+                )
         if len(self.fleet_rollout_order) != len(set(self.fleet_rollout_order)):
             raise ValueError("fleet_rollout_order contains duplicate host names")
         unknown_rollout_hosts = [
@@ -2411,16 +3085,17 @@ class Config(BaseModel):
                     "scheduler_runtime_source_repo must be an absolute path on "
                     "the driver machine"
                 )
-            modern = self.pin_source_repos.get(VIBEQC_REPO_SLUG)
+            source_key = source_repo_key(self.pin_source_repos, VIBEQC_REPO_SLUG)
+            modern = self.pin_source_repos.get(source_key)
             if modern is not None and modern != self.scheduler_runtime_source_repo:
                 raise ValueError(
                     "scheduler_runtime_source_repo "
                     f"({self.scheduler_runtime_source_repo}) and "
-                    f"pin_source_repos[{VIBEQC_REPO_SLUG!r}] ({modern}) name "
+                    f"pin_source_repos[{source_key!r}] ({modern}) name "
                     "different vibe-qc checkouts. They are the same setting; "
                     "keep the pin_source_repos entry and delete the other"
                 )
-            _warn_deprecated_source_repo()
+            _warn_deprecated_source_repo(source_repo_key(self.pin_source_repos, VIBEQC_REPO_SLUG))
         stagers = [
             f"{host}:{program}"
             for host, host_cfg in self.hosts.items()
@@ -2533,12 +3208,28 @@ def _parse_config_bytes(contents: bytes) -> dict:
     return tomllib.loads(contents.decode("utf-8"))
 
 
+def _copy_toml_value(value: Any) -> Any:
+    """Isolate TOML containers without copying immutable scalar values.
+
+    This accepts only the built-in values returned by ``tomllib.loads`` with
+    its default float parser: dicts and lists are the only mutable types.
+    Strings, numbers, booleans and date/time values can safely be shared.
+    Unlike a general object graph, parsed TOML has no cycles or aliases that
+    require deepcopy's memo table or object reconstruction protocol.
+    """
+    if isinstance(value, dict):
+        return {key: _copy_toml_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_toml_value(item) for item in value]
+    return value
+
+
 def _read_config_data(path: Path) -> dict:
     # Always open/read: mtime, size and inode are not content authorities.
     # Validation receives a private mapping because validators/callers may
     # mutate nested containers. Validation itself is deliberately not cached.
     with path.open("rb") as stream:
-        return copy.deepcopy(_parse_config_bytes(stream.read()))
+        return _copy_toml_value(_parse_config_bytes(stream.read()))
 
 
 def system_multi_user_enabled() -> bool:

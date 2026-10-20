@@ -55,18 +55,56 @@ mode, not what you get by using `sudo`.
 
 * [The fleet console](../fleet_console.md) — cross-host view, accounts and
   audited write actions.
+* [Public fleet snapshot deployment](../public_snapshot_deployment.md) —
+  writer timer, isolated static serving, freshness monitoring and rollback.
 * [Multi-user deployment](../multi_user_deployment.md) — privileged shared
   installation under `/opt/vq`, ownership checks, admin group.
 * [Retiring a multi-user deployment](../multi_user_retirement.md).
+* [One directory layout for every host](../fleet_layout.md) — homes sorted by
+  lifecycle, the reviewed-plan migration tool, and the steps that need the
+  maintainer first.
+* [Limiting scheduler load](../scheduler_load.md) — target budgets, submission
+  pacing and process batching inside an allocation.
 * [Scheduler runtime deployment](../scheduler_runtime_deployment.md) — hosts
   where PBS or SLURM, not a vq daemon, owns dispatch.
+* [Portable runtime bundles](../portable_runtime_bundles.md) — package once,
+  verify and relocate to compatible prefixes without target builds.
+* [Runtime benchmark campaigns](../benchmark_campaigns.md) — plan a
+  generic-versus-optimized comparison and analyze its runs: paired ratios,
+  intervals, explicit exclusions and break-even.
+* [Submission gateway](../gateway.md) — HTTPS submission with per-project
+  API keys on the broker host; trusted group only.
+* [Explainable placement plans](../placement_policy.md) — where a job would
+  run across daemon hosts and scheduler lanes by predicted completion time,
+  with every rejection and score component shown.
+* [Runtime slots](../runtime_slots.md) — verified, immutable generations for a
+  program, and the reviewed `vq admin migrate-runtime` transaction that moves a
+  registration onto them. Accepted on one direct host so far.
+* [Repair recorded state paths](../state_path_repair.md) — plan and preserve
+  terminal records after an explicitly mapped state-root move.
 * [Operations](../operations.md) — the long-form operational reference.
+* [Driving vq from a script](../orchestration.md) — what a chain of
+  `vq admin update` calls may rely on: match on `outcome` and its exit code,
+  never on message text.
 
 ## When a host stops answering
 
 [Host recovery channels](../host_recovery_channels.md) defines the tiered
 contract every fleet host must satisfy *before* it joins, precisely because
 the moment you need a second way in is the moment you cannot set one up.
+
+## In the source tree, not on this site
+
+These pages describe the product as it is but are not published here. Read
+them on the [source tree](https://github.com/vibe-qc/vibe-queue/tree/main/docs).
+
+* [`state_file_audit.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/state_file_audit.md) —
+  where every file vq reads or writes lives, and which setting wins. Swept at
+  v0.25.0; its opening note says what has been added since.
+* [`fleet_update_runbook.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_update_runbook.md)
+  and [`fleet_update_prompt.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_update_prompt.md) —
+  what an operator's own runbook must preserve when updating a fleet host, and
+  what to hand a maintenance agent.
 
 ```{toctree}
 :hidden:
@@ -94,9 +132,20 @@ the moment you need a second way in is the moment you cannot set one up.
 :caption: Fleets
 
 ../fleet_console
+../public_snapshot_deployment
 ../multi_user_deployment
 ../multi_user_retirement
+../state_path_repair
+../fleet_layout
 ../scheduler_runtime_deployment
+../scheduler_load
+../portable_runtime_bundles
+../benchmark_campaigns
+../gateway
+../placement_policy
+../runtime_slots
+../native_install_seeding
 ../operations
+../orchestration
 ../host_recovery_channels
 ```

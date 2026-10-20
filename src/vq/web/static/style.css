@@ -249,6 +249,7 @@ td.jobid a, .jobid       { font-family: ui-monospace, "SF Mono", Menlo, monospac
                            border-radius: 3px; }
 
 .state {
+  background: var(--pending);
   padding: 0.1em 0.5em;
   border-radius: 3px;
   font-size: 0.85em;
@@ -256,16 +257,16 @@ td.jobid a, .jobid       { font-family: ui-monospace, "SF Mono", Menlo, monospac
   color: white;
   text-transform: uppercase;
 }
-.state-running       { background: var(--running); }
-.state-pending       { background: var(--pending); }
-.state-completed     { background: var(--completed); }
-.state-failed        { background: var(--failed); }
-.state-killed        { background: var(--killed); }
-.state-interrupted   { background: var(--interrupted); }
-.state-aborted_by_queue  { background: var(--aborted); }
-.state-oom_killed    { background: var(--watchdog); }
-.state-starved       { background: var(--watchdog); }
-.state-time_exceeded { background: var(--watchdog); }
+.state.state-running       { background: var(--running); }
+.state.state-pending       { background: var(--pending); }
+.state.state-completed     { background: var(--completed); }
+.state.state-failed        { background: var(--failed); }
+.state.state-killed        { background: var(--killed); }
+.state.state-interrupted   { background: var(--interrupted); }
+.state.state-aborted_by_queue  { background: var(--aborted); }
+.state.state-oom_killed    { background: var(--watchdog); }
+.state.state-starved       { background: var(--watchdog); }
+.state.state-time_exceeded { background: var(--watchdog); }
 
 dl.spec, .spec dl {
   display: grid;
@@ -383,3 +384,54 @@ td.cwd code {
   font-size: 0.88em;
   white-space: nowrap;
 }
+
+/* #168 execution readiness: per program, where the current runtime is
+   eligible, what updates are in flight or failed, and what holds or
+   refused it. */
+.readiness { margin: 0 0 1rem 0; }
+.readiness-table td { vertical-align: top; }
+.readiness-failures { margin: 0.3rem 0 0 1.2rem; padding: 0; }
+
+/* #168 last-known rows of an unlisted host: visibly not current. */
+.last-known-row { opacity: 0.75; font-style: italic; }
+
+/* #168 fleet trends: sparklines over the console's own sweep history. */
+.trend-strip { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0; }
+.trend { margin: 0; }
+.trend figcaption { font-size: 0.8rem; color: var(--muted); }
+.sparkline polyline { fill: none; stroke-width: 1.5; }
+.sparkline circle { stroke: none; }
+.sparkline .trend-running { stroke: var(--running); }
+.sparkline .trend-used { stroke: var(--ok); }
+.sparkline .trend-allocated { stroke: var(--muted); stroke-dasharray: 3 2; }
+.sparkline circle.trend-running { fill: var(--running); }
+.sparkline circle.trend-used { fill: var(--ok); }
+.sparkline circle.trend-allocated { fill: var(--muted); }
+.sparkline .trend-partial { fill: var(--warn); }
+.host-load td.num { white-space: nowrap; }
+
+/* #165: campaign graphs on /fleet/campaigns. */
+.campaign { margin: 1.2rem 0 2rem; }
+.campaign h3 { margin: 0 0 0.5rem; font-size: 1.05em; }
+.campaign-graph { display: block; margin: 0.4rem 0 0.8rem; max-width: none; }
+.cg-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; }
+.cg-edge-completion { stroke-dasharray: 5 4; }
+.cg-node rect { fill: white; stroke: var(--cg, var(--muted)); stroke-width: 2; }
+.cg-node text { font-size: 12px; fill: var(--fg); }
+.cg-node .cg-id { font-weight: 600; }
+.cg-node .cg-sub { fill: var(--muted); }
+.cg-status {
+  display: inline-block; padding: 0 0.45em; border-radius: 3px;
+  font-size: 0.85em; color: white; background: var(--cg, var(--muted));
+}
+.cg-succeeded   { --cg: var(--ok); }
+.cg-running,
+.cg-in_progress { --cg: var(--running); }
+.cg-ready       { --cg: #26a269; }
+.cg-waiting     { --cg: var(--pending); }
+.cg-blocked     { --cg: var(--warn); }
+.cg-failed      { --cg: var(--bad); }
+.cg-uncertain   { --cg: var(--watchdog); }
+.cg-out-verified { color: var(--ok); }
+.cg-out-not-published { color: var(--muted); }
+.cg-output:not(.cg-out-verified):not(.cg-out-not-published) { color: var(--bad); }
