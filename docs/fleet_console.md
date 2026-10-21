@@ -1,5 +1,7 @@
 # The vq fleet console
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 A read-only web dashboard for a vq fleet: one card per configured host,
 a cross-host job table, and a doctor board. It runs on one machine -- the
 *coordinator* -- and reaches the rest of the fleet over the SSH you have
@@ -8,7 +10,7 @@ port anywhere but the coordinator.
 
 This page is for someone setting it up on **their own** fleet. If you
 want to know how the console is put together, see
-[`fleet_dashboard_design.md`](fleet_dashboard_design.md).
+[`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md).
 
 ---
 
@@ -16,12 +18,14 @@ want to know how the console is put together, see
 
 | | |
 |---|---|
-| `/fleet` | One card per configured host: daemon health, queue counts, CPU and memory, deployed program versions, and the machine's own name for itself. Plus a fleet roll-up -- how many hosts, how many running, how many unreachable, and **how many distinct vq versions**, which is the number you watch during a rolling update. |
-| `/fleet/jobs` | Every job on every host in one filterable, sortable table. |
-| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve -- fetched live, not from the cached snapshot. |
+| `/fleet` | One card per configured host: daemon health, whether dispatch is open, queue counts, CPU and memory, deployed program versions, and the machine's own name for itself. Plus a fleet roll-up -- configured targets and the execution resources behind them, how many running, how many unreachable, degraded daemons, and **how many distinct vq versions**, which is the number you watch during a rolling update -- and an execution-readiness summary: where each program can run now, which updates are building or failed, and which jobs the queue refused. |
+| `/fleet/jobs` | Every job on every host in one filterable, sortable table, read as a calculation overview: running jobs first, how long each has run and waited, declared versus measured CPU and memory, where it executes, its program version, and how fresh each measurement is. Totals above the table keep allocation and measurement apart and say when they are partial. |
+| `/fleet/jobs/<id>` | Drill-down: status, event log, output tail, resource curve, and for a finished job its final resource usage (measured wall, CPU time and average cores, peak RSS against the declared memory). For a scheduler job, a "nodes" section lists each allocated node and its cores, as the scheduler reported them: PBS/Torque `exec_host` (`node07/0-7+node08/0-7`, one entry per core, or PBS Pro's `node07/0*8`) or a Slurm node list (`node[01-04,07]`), whose cores are "not reported". It is the allocation, not a per-node measurement. All of this is fetched live, not from the cached snapshot. For vibe-qc and ORCA jobs, a "calculation" section: system, method/basis, energies, optimisation state and an SCF convergence plot, parsed from the same output tail. |
+| `/fleet/campaigns` | Each calculation campaign whose controller runs on the console host, drawn as a graph: stages coloured by status, success and completion edges, each stage's latest job linked to its drill-down, which outputs are published and verified, and why a stage is waiting or blocked. See [Campaigns in the console](#campaigns-in-the-console). |
 | `/fleet/doctor` | `vq doctor` across the fleet, on demand. |
 | `/fleet/audit` | Who did what through the console (admins only). |
 | `/api/v1/fleet` | The whole snapshot as JSON. |
+| `/api/v1/fleet/jobs/<id>/preview?host=H` | A calculation preview parsed from the job's stdout tail: formula, method/basis, the latest SCF series, per-step energies, total energy and gap, optimisation summary, fatal error. vibe-qc and ORCA jobs; `preview` is `null` for other programs. The job's stdout is read, except that an ORCA job run through `contrib/run-orca.sh` is read from the one output file the wrapper writes (its output argument, or `<input>.out`); `source` in the response names which. |
 
 The host grid is served from a snapshot that a background thread
 refreshes on a timer (30 s by default). The job drill-down is not -- it
@@ -140,6 +144,17 @@ be owned by the console account and mode 0700; the database must be an owned
 regular file at mode 0600. Both are created automatically. All workers of one
 console must use the same local configuration directory. Separate replicas
 with separate disks do not share revocation or login budgets.
+
+SQLite serializes writers, so on a busy console the workers contend for the
+store: they are separate processes, and the most contended moment is several of
+them racing to create the store's tables on first use. A statement waits up to
+**15 seconds** for another worker before giving up with `database is locked`.
+That budget was 2 seconds, which a loaded CI runner exceeded, failing a request
+that would have succeeded a moment later. Raising it costs latency only while
+the lock is actually held, and the work runs in a worker thread rather than on
+the event loop. A store that is genuinely wedged still surfaces an error rather
+than hanging. `scripts/measure_session_lock_budget.py` measures what a given
+host needs if the default ever has to be revisited.
 
 Upgrading from stateless sessions signs every browser out once. Log in again;
 the existing account format remains valid. Login and account creation limit
@@ -288,6 +303,14 @@ loopback, do **both** of:
 `--i-understand-public-bind` or set `public_bind_ack = true`. The
 warning is about exposure, not about the bind being unsupported.
 
+**To show fleet status to the public, do not bind the console publicly.**
+Write a static snapshot with `vq web public-snapshot --out DIR`, and serve
+`DIR` from a separate unprivileged account. Only hosts you give a public
+display name appear, and only calculations submitted with a `public.<alias>`
+tag. The console stays on loopback. See
+[`web.md`, "Public fleet snapshot (#66)"](web.md#public-fleet-snapshot-66)
+and the [operator deployment runbook](public_snapshot_deployment.md).
+
 ---
 
 ## Keeping it current
@@ -370,6 +393,388 @@ every 10 s regardless, so it keeps animating even when the background
 sweep has died -- age is the only honest signal. The threshold follows
 your configured interval.
 
+## Reading execution readiness
+
+The panel under the tiles answers "can calculations run now, and where?"
+from the same snapshot as the cards. It adds no probe. Each number keeps
+apart things the cards alone blur together.
+
+**Configured targets are not machines.** A target is a `[hosts.<key>]`
+entry. *Execution resources* counts what is behind them: a daemon host is
+the machine that answered, by the name it reports for itself, so two keys
+for one machine count once; a scheduler lane is its cluster, and lanes
+that log in through the same SSH destination are one cluster. A target
+that did not answer cannot be identified (it may be a second key for a
+machine that did), so the tile shows `+?` and the panel says how many.
+
+**Daemon counts are per daemon.** A scheduler lane has no daemon of its
+own; its card shows its driver's health as `driver daemon ok` or
+`driver daemon degraded`. The `daemons degraded` tile counts the driver
+once, not once per lane. `daemon health unknown` counts daemons that
+did not answer or did not report health.
+
+**Dispatch is open, held or unknown, per target.** It is held when the
+snapshot proves a hold the daemon obeys: `vq host down`, a drain that
+covers the target, or an admin-update lease whose scope holds it. It is
+unknown when the target was not observed, its daemon is degraded, or its
+health was not reported; vq does not guess either way. `open` means
+nothing in the snapshot holds the target. It is not a promise that a
+particular job will start: quotas, memory pressure and each job's runtime
+pin are checked only at dispatch.
+
+**Updates sit beside the current runtime, not in place of it.** For each
+program the table lists where its current runtime is eligible (with the
+version the host reports), and separately any update lease naming it:
+
+* `building` with *current runtime unaffected* -- a replacement runtime
+  slot, or a scheduler runtime, is being built beside the one in use.
+  Jobs keep dispatching on the current runtime.
+* `update failed` or `needs recovery` with *current runtime unaffected* --
+  the replacement did not finish. The current runtime is still eligible;
+  the row carries the action the updater recorded (for example
+  `vq admin recover-update`).
+* any state with *dispatch held* -- an update that does hold the target,
+  such as a venv rebuild on the host itself. The program is listed as
+  held there, with the lease as the reason.
+
+Mixed vq versions across the fleet are a rollout state. They never make
+a target held or a program ineligible on their own.
+
+**Admission failures name the program, target and reason.** A job is
+listed when the queue refused it and nothing of the same program has been
+admitted on that target since:
+
+* `dispatch refused` -- the daemon failed it at dispatch, before it
+  started (for example a runtime pin it would not run). A job that ran
+  and exited non-zero, or failed because a dependency failed, is not an
+  admission failure.
+* `scheduler rejected` -- the scheduler refused the submission before
+  assigning a job ID.
+* `over capacity` -- a pending job that requests more than the target's
+  configured caps, so it cannot dispatch as configured.
+
+The program shows as `refused` on that target; the target itself stays
+open for other programs.
+
+**Partial means unknown, not idle.** A target that was not observed, is
+administratively down, or whose job listing failed is named in a
+*Partial* banner. Its calculations are missing from every total and its
+programs are listed as unknown or held there, never as eligible. *Live
+calculations* counts each job once per owning daemon, so a job on a
+scheduler lane is not charged to its driver as well, and a duplicate
+enrolment does not double it. A job still queued in the cluster counts as
+queued, never as running.
+
+## Reading the jobs table
+
+`/fleet/jobs` answers which calculations run where, for how long, and with
+what resources. Three kinds of value never share a cell: what a job
+**declared** (`cpus`, `mem MB`, its time limit), what was **measured**, and
+what is **unknown**. A missing measurement shows `-` with the reason in the
+sample column; it is never a zero and never the declared value.
+
+| Column | Meaning |
+|---|---|
+| runtime | Execution time. A direct job: since dispatch, minus paused time. A scheduler job: the walltime the scheduler reported, unknown until it reports one, because vq's start time for it is the hand-off to the scheduler and can include the cluster's queue wait. A finished job prefers its final command receipt's measured walltime (the largest element's for an array); without one it keeps the direct or scheduler duration. After a `/` the limit: the scheduler's, else the declared `wall_time_seconds`. |
+| wait | Queue wait, never counted as runtime. `waiting` and growing while the job is queued; submission to dispatch for a started direct job; unknown for a started scheduler job, whose wait inside the cluster queue is not recorded. |
+| cpus / cpu used | Declared cpus, then measured core-equivalents: the job's whole process group CPU% over the last watchdog interval, divided by 100. An 8-core job at full use reads about 8. A finished job shows its final receipt's average busy cores, marked `avg`; for an array this is the per-element average, not all elements' concurrent use. A GPU job's cpus cell also shows its `+N gpu` allocation and, below it, its measured GPU use. While it runs, that is the mean utilisation over the listed devices and their memory in use out of their total, from its newest sample, with the sample's age; past 10 minutes it is marked `stale`. Once finished, it is the mean utilisation and the largest device's peak memory, marked `peak`. The figure reads `gpu not measured` with the reason on hover. GPU use is device-level and never added into a total. |
+| mem MB / rss MB | Declared memory limit, then the resident memory of the job's processes in the latest watchdog sample. |
+| peak MB | The highest resident memory the watchdog's samples have shown for this run; hover for when tracking began. It is a *sampled* peak: a spike shorter than the sampling interval (about 5 s) is not in it. It survives a daemon restart, but a retry starts a new peak. For a running Slurm job the column instead shows `sstat`'s peak RSS of the job's largest task, marked `task`: one task's peak since the job started, not the job's memory. A finished job shows its final receipt's largest single-process peak, marked `process`; for an array it is the largest peak over the elements. This is not total job memory or current RSS. Peaks are never added up, since different jobs peak at different times, and a host whose vq does not record peaks shows `-`. |
+| nodes | Where it executes: a direct job's host, or the compute node(s) the scheduler reported (unknown until it starts). A job spread over several nodes reads `N nodes`; hover for each node and, for PBS/Torque, its allocated cores. Slurm's node list names nodes only, so their cores are not shown, and a string that does not parse is shown as reported. `via` names the scheduler driver that owns the job, which is not where it runs. |
+| software | The program, with its recorded version or build when the job pinned one. |
+| sample | The measurement's age, or why there is none: `stale` (over 30 s old at display time, or already marked stale by the collector), `age unknown` (missing/invalid timestamp or one ahead of the console clock), `no sample` (none yet, or the host cannot sample, e.g. no `/proc`), `scheduler, <age> ago` (a running scheduler job: for PBS/Torque, memory and CPU from the scheduler's own `resources_used`; for Slurm, CPU from `sstat` and the largest task's peak in the peak column, with no current memory; CPU is shown as average busy cores over the run so far rather than a current reading, and none of it is added to the fresh-sample totals), `not sampled` (a scheduler job whose scheduler has reported no usage yet, or whose Slurm accounting is disabled; its accounting arrives with the results), `collector error`, `unknown` (an older snapshot without measurements). |
+
+Default order is running jobs first, then live scheduler jobs whose phase is
+unconfirmed, then held or paused, then queued, then finished; newest first
+within each. A scheduler job vq has handed off but the cluster still queues
+counts as queued, not running. Filters (host, state, program, project, tag,
+owner, text) and sorting are in the URL, so they survive the refresh.
+
+The program selector includes live and last-known jobs. A selected program
+stays available when its last matching job disappears or the snapshot is
+empty, so applying another filter preserves the program selection.
+
+The state column, state filter and state sorting use the snapshot's effective
+execution state. A scheduler job waiting in the cluster queue is `queued`,
+and an unavailable scheduler observation is `unpolled`, `poll_failed` or
+`scheduler_unknown`; none matches `state=running`. Hover over a state to see
+the underlying vq lifecycle. Older rows without an effective state retain
+their lifecycle state. Last-known rows use the same selection, and a chosen
+state stays selected when its last matching job disappears. The jobs API
+uses the same filter and preserves both raw `state` and `effective_state`.
+
+Projects use exact, case-sensitive `project.NAME` tags attached at submission,
+for example `vq submit localhost --tag project.water-scan calculation.py`.
+The project selector lists names from live and last-known jobs. A job can
+belong to several projects by carrying several such tags; ordinary tags do
+not imply a project. Jobs without a project tag still appear with all projects
+selected. These labels use the existing submission metadata, including on
+older hosts.
+
+The owner field matches the recorded submitter exactly and suggests known
+values, including from last-known jobs. That value can be a numeric UID in
+multi-user mode or a `user@host` label; it is not a console account. Project,
+owner and the other filters combine with AND. They also apply to the
+authenticated jobs API (`?project=water-scan&submitter=alice`) and the
+last-known table, whose rows stay out of live totals. A project selection is
+retained even if its host disappears from the snapshot.
+
+The **submitted from** and **submitted through** filters bound submission dates
+in UTC, with both dates inclusive. Either bound may be omitted. For example,
+`?state=failed&submitted_from=2026-10-01&submitted_to=2026-10-15` selects failed
+jobs submitted during that interval. Offset timestamps are converted to UTC;
+legacy timestamps without an offset are treated as UTC. Jobs with missing or
+invalid submission times match only when no date bound is set. Invalid dates
+and reversed ranges return HTTP 400 rather than dropping the filter. Date
+bounds combine with the other filters on the page, refresh fragment, jobs API
+and last-known rows. They select from the existing cached snapshot; they do
+not fetch expired or archived history from hosts.
+
+**Previous** and **Next** page through all matching jobs in the cached snapshot,
+including finished history. The rows-per-page selector bounds each page; the
+page links preserve the filters, sort and row limit. The URL's one-based `page`
+also survives the background table refresh. Applying filters or changing sort
+starts at page 1. If a newer snapshot has fewer pages, the table falls back to
+the last available page. New or removed jobs can shift page boundaries between
+sweeps. Counts and resource totals cover all matches, and last-known jobs stay
+in their separate table. This pagination applies to the HTML table; the jobs
+API continues to return all cached jobs matching its filters.
+
+Finished rows show `final` in the sample column (with the element count for
+an array), using the same validated receipts as the job detail page. `no receipt`,
+`invalid receipt` and `collector error` keep unavailable values as `-`. An older
+host that does not report final usage shows `unknown`. Final measurements never
+age into stale live samples, and never contribute to live totals or trends.
+The background sweep receives summaries in its existing batched queue listing;
+rendering and refreshing the table make no individual job requests. Receipt
+reads run on the owning host with the existing file-size and array-count bounds.
+
+The totals cover every job matching the filters, not just the visible
+page. Allocated sums what running jobs declared. Used sums only fresh
+samples, marked `*` and itemised when some running job contributed none.
+RSS totals add each job's resident memory, so pages shared between jobs
+count once per job. The `gpus allocated` tile is allocation only: it sums
+what running jobs requested with `--gpus`, on scheduler targets and daemon
+hosts alike. A GPU job's row adds its
+measured use beside its `+N gpu`, and its detail page has the per-device
+figures: the newest sample while it runs and a summary once it has finished,
+both described next. A finished job's summary reaches the table in the
+owning host's queue listing, as `gpu_usage`, without a request per row.
+
+### GPU use of a finished job
+
+A scheduler job that requested `--gpus` samples `nvidia-smi` on its batch
+node every 30 seconds while its command runs. The samples are raw text in
+`_vq/gpu-samples.txt`, capped at 8 MiB, and each `nvidia-smi` call is
+bounded by `timeout 10` where the node has `timeout`. Once the job has
+finished and its workspace is fetched, the driver's fetch worker summarises
+them **once** into `_vq/gpu-usage.json`, with the sizes and mtimes of the
+samples it read. The job's detail page then has a **gpu use** section;
+`vq status` shows a `gpu use:` line and `vq status --json` a `gpu_usage`
+record. Only jobs that requested GPUs carry the record. Listings, and so
+every console refresh, read only that small summary, never the samples. A
+summary whose samples have since changed, or that fails validation, is
+ignored: `vq status` then parses the samples itself, and a listing shows no
+GPU use. A job that finished before the summary existed shows no GPU use in
+the table; `vq status` still parses its samples.
+
+Each listed device shows its model, its memory, and the peak memory held by
+processes of the job. It also shows device memory and the mean and peak
+utilisation. Device memory and utilisation are **device-level**: the device
+as a whole, not this job's share of it. Which devices are listed depends on
+what the node showed:
+
+| The node showed | Listed |
+|---|---|
+| exactly the allocated number | all of them, as the job's whole-GPU allocation |
+| more | only devices a process of the job was seen on; with none, use is "not measured" and says why |
+| fewer | the batch node's devices, marked partial: a multi-node job's other nodes are not observed |
+
+A process counts as the job's when it descends from the job script. On
+Slurm, a process in this job's cgroup counts too: its `/proc/<pid>/cgroup`
+names `job_<SLURM_JOB_ID>` exactly (cgroup v1 or v2), which covers the tasks
+of the job's `srun` steps, since they are slurmstepd's children rather than
+the script's. That needs Slurm's cgroup task containment. Without it, or on
+Torque/PBS, only descendants of the script are attributed. A process is
+counted once however it qualifies. Without `nvidia-smi` the job runs normally and its GPU use reads
+"not measured: nvidia-smi not found". `[N/A]` and `[Not Supported]` values
+are unknown, never zero. Samples that fail validation are not shown. GPU
+UUIDs are used only to match the two queries and are never shown. A daemon
+host's GPU jobs are admitted and assigned devices, but their use is not sampled.
+
+A scheduler array's elements write `gpu-samples.txt.<index>`. Each element is
+summarised on its own, since elements can run on different nodes, under the
+rule above. `vq status` then gives the element count, the mean utilisation
+over all their devices, and the largest single device's peak memory with its
+element. The detail page lists each element's devices, and the table uses
+the same figures. When the elements' coverage differs, the record says
+`mixed` and the page names each element's. One untrustworthy element makes
+the whole summary invalid. An array of more than 256 elements, or with more
+than 64 MiB of samples, is not summarised, and its GPU use says so.
+
+### GPU use of a running job
+
+While a GPU job runs, the driver's scheduler poll also reads the end of its
+`_vq/gpu-samples.txt`: one bounded `tail` of 32 KiB per file, with up to 32
+jobs per remote command. Only running jobs that requested GPUs are read, so a
+target without one makes no extra call. A failed read leaves the last figure
+in place and never fails the poll. The newest **complete** sample is used,
+meaning one followed by a later sample or the stop line, so the sample being
+written is never read half. It is stored on the job as `scheduler_gpu_live`
+within the poll's usual write budget (about once a minute).
+
+The job's detail page then has a **gpu now** section, and `vq status` shows a
+`gpu now:` line. Each lists per device the utilisation, device memory and
+the memory of the job's processes, with the time of the sample by the node's
+clock. The same coverage rule as for a finished job decides which devices
+are listed, and utilisation and device memory are again device-level. The
+figure can lag by a sampling interval, a poll interval and the write budget
+together; the sample's time says how old it is.
+
+Freshness is checked on every page/table refresh, even if the background sweep
+has stopped. Last-known numbers remain visible for stale or undated samples,
+but neither contributes to fresh usage totals. A recent collection timestamp
+does not establish the age of an undated sample from an older remote version.
+The authenticated `/api/v1/fleet/jobs` response applies the same rules to
+`resource_observation.status` and includes `age_seconds` (unknown is `null`).
+Its original `sample_at` and `collected_at` timestamps remain unchanged;
+`age_unknown` explicitly identifies readings whose freshness cannot be proved.
+
+A red banner names each host whose queue could not be read this sweep
+(unreachable, failed listing, or administratively down). Its jobs are
+missing from the live table and every total until a sweep reads it again.
+An amber banner names a driver whose resource samples could not be read;
+its jobs are listed with `collector error`.
+
+**Trends and per-host load.** Under the totals, three sparklines draw this
+console's recent sweeps: running jobs; CPU, with measured cores (solid)
+against what running jobs declared (dashed); and measured RSS in GiB.
+They cover up to the last 240 sweeps, about two hours at the default
+interval, kept in the console's memory only, so a restart starts them
+afresh. Measured values come from samples fresh at each sweep. A dot under
+a point marks a partial sweep: a running job had no fresh sample, or a host
+was not listed. A dip there is missing data, not idle work, and a sweep
+with no value at all breaks the line rather than drawing a zero. GPUs have
+no trend yet.
+
+Below them, one row per host gives:
+
+* running jobs;
+* the CPUs they declared against the daemon's configured budget;
+* the cores measured by fresh samples, marked `*` with the coverage when
+  some running job had none;
+* measured RSS against the host's total and currently free memory.
+
+A scheduler lane reads `not sampled`, since its jobs run on compute nodes the
+watchdog does not see. A host whose queue was not listed reads
+`not listed in this snapshot: unknown, not idle`. The host filter narrows
+this table; the other filters do not, since it describes hosts rather than
+jobs.
+
+**Last known.** When an unlisted host was listed by an earlier sweep of this
+console, the jobs it showed then appear in a separate *Last known* table
+under the live one, with the time of that listing. They are not current:
+they may have finished, failed or been requeued since. They are in no
+count or total, their runtime is as of the listing rather than growing,
+and their measured usage is not shown. Another failed sweep keeps the
+original listing time; a successful listing replaces them; after 24 hours
+they are dropped. The filters apply to them too. They are kept in the
+console's memory only, so a console restart forgets them, and keeping them
+costs no request to any host. `/api/v1/fleet/jobs` returns them under
+`last_known` (per host: `host`, `observed_at`, `reason`, `jobs`), outside
+`jobs` and `count`; `/api/v1/fleet` gives each host's `last_known_count`
+and `last_known_at`.
+
+Measurements come from the same rows as `vq top --json`, read once per
+driver per sweep, and only from a driver that runs a direct job: locally on
+the console host, `vq top localhost --json` over SSH elsewhere. There is no
+request per job. The watchdog samples about every 5 s on the daemon host;
+the displayed age is relative to the page render, not to the sweep.
+
+---
+
+## What a refresh costs
+
+The background sweep reads each host once per refresh. For a daemon host it
+makes one queue listing, one overview, and one `vq top` if the host runs a
+direct job. A scheduler target shares its driver's reading. Page views and
+their filters, sorting and paging read the cached snapshot and contact no
+host. The number of remote calls therefore follows the number of hosts, never
+the number of jobs.
+
+`scripts/measure_fleet_console.py` measures this on a synthetic fleet. It runs
+the console's real sweep and its real jobs table. Only the SSH transport is
+replaced: each remote call is answered with the JSON the real command prints,
+after a simulated round trip. It reports the calls per sweep, the sweep
+durations, the render times of a few table requests, the machine, and its
+load:
+
+```sh
+PYTHONPATH=src .venv/bin/python scripts/measure_fleet_console.py \
+    --hosts 8 --jobs 250 --latency-ms 80 --sweeps 5
+```
+
+Measured with vq 0.26.44 on a 12-core arm64 macOS workstation, at a 1-minute
+load average of about 6 from other work. Every workload had 80 ms of
+simulated latency per remote call, 30 % of jobs running directly, and 5
+sweeps:
+
+| Workload | Rows | Remote calls per sweep | Sweep (median) | Default table, 200 rows | `state=running`, 50 rows | Search, page 2 of 100 | 2000 rows |
+|---|---|---|---|---|---|---|---|
+| `synthetic-8h-250j-80ms` | 2000 | 24 (8 + 8 + 8) | 0.29 s | 13 ms, 0.26 MB | 7 ms | 13 ms | 66 ms, 2.5 MB |
+| `synthetic-8h-1000j-80ms` | 8000 | 24 (8 + 8 + 8) | 0.42 s | 34 ms | 25 ms | 45 ms | 100 ms, 2.6 MB |
+| `synthetic-16h-250j-80ms` | 4000 | 48 (16 + 16 + 16) | 0.56 s | 20 ms | 12 ms | 23 ms | 77 ms, 2.5 MB |
+
+Read it as follows:
+
+* Four times the jobs per host left the calls unchanged. The sweep grew by
+  the time taken to decode and project the larger listings.
+* Twice the hosts doubled the calls. The sweep took about two rounds, because
+  it reads at most 8 hosts at once and three sequential 80 ms calls set each
+  host's floor.
+* Rendering made no remote call in any run.
+
+These numbers describe these workloads on that machine and nothing more. A
+real fleet's SSH round trips, its remote overview gathers and its hosts' load
+set its own refresh time. Run the script with your own host count, job count
+and a measured round trip before relying on a figure.
+
+## Campaigns in the console
+
+`/fleet/campaigns` shows the [calculation campaigns](campaigns.md) that
+`vq campaign run` drives on the console host as the console's own user.
+Each run registers its run directory under that user's vq state
+(`campaigns/<key>.json`: the campaign id and digest, and the absolute
+paths of the campaign file and run directory). The page reads each
+registered run's journal through the same evaluation as
+`vq campaign status`, so it never disagrees with the command line. It is
+read-only: retries and cleanup stay with `vq campaign retry` and
+`vq campaign cleanup`.
+
+Each campaign is drawn left to right, one column per dependency depth:
+
+* **Stages** are boxes coloured by status: `ready`, `waiting`, `running`,
+  `uncertain` (a submission whose answer was lost; the controller resends
+  it under its key), `succeeded`, `failed` and `blocked`.
+* **Edges** are solid for `success` and dashed for `completion`. An edge
+  that skips a column runs in the lane above the boxes, so it is not
+  mistaken for one through the stage in between.
+* **The table below the graph** gives each stage's latest attempt, linked
+  to its job's drill-down (logs and results), with the runtime the job's
+  queue recorded at dispatch ("ran vibeqc-release 0.26.0 @ <sha>"), and each
+  output's
+  publication: `verified`, `not published`, or the verification's verdict
+  (`digest_mismatch`, `missing`, …). It also lists why a stage is waiting
+  or blocked and the controller's next step, and which producer outputs
+  are kept for unfinished consumers.
+
+A campaign whose file has changed since the run was registered, whose
+journal cannot be read, or whose run directory is gone shows the reason
+instead of a graph. Paths are shown only as the run directory's name.
+Deleting a registration hides its campaign; the next `vq campaign run` for
+it registers it again. `/api/v1/fleet/campaigns` serves the same as JSON,
+behind the same login.
+
 ---
 
 ## Troubleshooting
@@ -433,8 +838,8 @@ was installed by hand, before `vq web install` existed. Re-run
 
 ## See also
 
-* [`fleet_dashboard_design.md`](fleet_dashboard_design.md) -- architecture and milestones.
-* [`web.md`](web.md) -- the single-host dashboard.
+* [`fleet_dashboard_design.md`](https://github.com/vibe-qc/vibe-queue/blob/main/docs/fleet_dashboard_design.md) -- what a console must preserve.
+* [`web.md`](web.md) -- the single-host dashboard, and the public fleet snapshot.
 * [`hosts.md`](hosts.md) -- configuring the fleet the console displays.
 * [`operations.md`](operations.md) -- day-to-day fleet operation.
 

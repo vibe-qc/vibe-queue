@@ -417,6 +417,98 @@ def _system_multi_user_evidence() -> dict[str, object]:
     }
 
 
+# A vq daemon process: ``vq daemon run``, ``python -m vq daemon run`` or
+# ``python -m vq.cli daemon run``, whatever interpreter or venv launched it.
+_DAEMON_RUN_ARGV = re.compile(r"(?:^|[\s/])vq(?:\.cli)?\s+daemon\s+run(?:\s|$)")
+
+
+def _state_root_for_environment(env: dict[str, str]) -> str | None:
+    """The single-user state root a process with ``env`` resolves (paths.state_root)."""
+    home = env.get("HOME")
+
+    def expand(value: str) -> str | None:
+        if value == "~" or value.startswith("~/"):
+            return None if not home else home + value[1:]
+        return value
+
+    if value := env.get(paths.ENV_STATE_DIR):
+        return expand(value)
+    base = expand(env.get("XDG_DATA_HOME") or "~/.local/share")
+    return None if base is None else str(Path(base) / "vq")
+
+
+def _linux_daemon_environments() -> list[tuple[int, dict[str, str]]]:
+    found: list[tuple[int, dict[str, str]]] = []
+    uid = os.getuid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+            command = " ".join(a.decode(errors="replace") for a in argv if a)
+            if not _DAEMON_RUN_ARGV.search(command):
+                continue
+            raw = (entry / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue  # exited, or not ours to read
+        env = dict(
+            item.decode(errors="replace").split("=", 1) for item in raw if b"=" in item
+        )
+        found.append((int(entry.name), env))
+    return found
+
+
+def _ps_daemon_environments() -> list[tuple[int, dict[str, str]]]:
+    listing = subprocess.run(
+        ["ps", "-U", str(os.getuid()), "-ww", "-o", "pid=,command="],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+        check=True,
+    ).stdout
+    found: list[tuple[int, dict[str, str]]] = []
+    for line in listing.splitlines():
+        pid_text, _, command = line.strip().partition(" ")
+        if not pid_text.isdigit() or int(pid_text) == os.getpid():
+            continue
+        command = command.strip()
+        if not _DAEMON_RUN_ARGV.search(command):
+            continue
+        shown = subprocess.run(
+            ["ps", "-E", "-ww", "-o", "command=", "-p", pid_text],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10,
+            check=False,
+        ).stdout.strip()
+        if not shown.startswith(command):
+            continue  # exited, or reused by another command
+        env = dict(
+            token.split("=", 1) for token in shown[len(command):].split()
+            if "=" in token
+        )
+        found.append((int(pid_text), env))
+    return found
+
+
+def running_daemon_state_roots() -> list[dict[str, object]] | None:
+    """This user's running vq daemons and the state root each one uses.
+
+    Read-only: ``/proc`` on Linux, ``ps -E`` elsewhere. Returns None when the
+    scan is not possible, which callers must treat as "unknown". A daemon
+    whose root cannot be derived is listed with ``state_root`` None.
+    """
+    try:
+        if Path("/proc/self/environ").exists():
+            found = _linux_daemon_environments()
+        else:
+            found = _ps_daemon_environments()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return [
+        {"pid": pid, "state_root": _state_root_for_environment(env)}
+        for pid, env in sorted(found)
+    ]
+
+
 def local_daemon_ping(
     timeout: float,
     *,
@@ -529,6 +621,15 @@ def local_daemon_ping(
         # system unit is inactive. Always sample it on verbose diagnostics so
         # an active root service overrides contradictory socket/config data.
         envelope["system_service"] = _systemd_multi_user_service_evidence()
+        # #64 B1: a remote_vq that resolves another state root than the
+        # host's daemon reads an empty second store. Single-user only: a
+        # multi-user client reaches the system daemon by its fixed socket.
+        envelope["state_roots"] = (
+            None if multi_user else {
+                "client": str(paths.state_root()),
+                "daemons": running_daemon_state_roots(),
+            }
+        )
     return exit_code, envelope
 
 

@@ -917,6 +917,9 @@ class TestWaitCLI:
             ("--poll-interval", "inf"),
             ("--timeout", "nan"),
             ("--timeout", "inf"),
+            ("--timeout", "nanh"),
+            ("--timeout", "infd"),
+            ("--timeout", "1e308h"),
         ],
     )
     def test_nonfinite_timing_options_are_rejected_before_command_work(
@@ -952,10 +955,17 @@ class TestWaitCLI:
                 0.25,
                 0.1,
             ),
+            (["--timeout", "30s"], 5.0, 30.0),
+            (["--timeout", "30m"], 5.0, 1800.0),
+            (["--timeout", "1.5h"], 5.0, 5400.0),
+            (["--timeout", "2d"], 5.0, 172800.0),
+            (["--timeout", "0.1s"], 5.0, 0.1),
+            (["--timeout", "0.002m"], 5.0, 0.12),
+            (["--timeout", "1e3"], 5.0, 1000.0),
+            (["--timeout", "1e2m"], 5.0, 6000.0),
         ],
-        ids=["minimum-poll-and-unbounded-timeout", "explicit-finite-values"],
     )
-    def test_positive_finite_timing_options_reach_wait_unchanged(
+    def test_timing_options_reach_wait_in_seconds(
         self,
         state_dir: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -994,6 +1004,42 @@ class TestWaitCLI:
 
         assert result.exit_code == 0, result.output
         assert observed == [(expected_poll, expected_timeout)]
+
+    @pytest.mark.parametrize("value", [
+        "0", "0s", "-1m", "0.01", "0.001m", "1e-999h", "1w", "1ms", "1h30m",
+        "01:30:00", "h", "", "tomorrow",
+    ])
+    def test_invalid_timeout_duration_is_rejected_before_command_work(
+        self, monkeypatch: pytest.MonkeyPatch, value: str,
+    ) -> None:
+        def unexpected(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("config read before duration validation")
+
+        monkeypatch.setattr(config, "load_config", unexpected)
+        result = CliRunner().invoke(main, ["wait", "localhost", "cli000000008",
+                                          "--timeout", value])
+
+        assert result.exit_code == 2, result.output
+        assert "Invalid value for '--timeout'" in result.output
+
+    @pytest.mark.parametrize("jobid", ["cli000000008", "b-abc123456789"])
+    def test_duration_is_converted_on_client_for_remote_and_broker_jobs(
+        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, jobid: str,
+    ) -> None:
+        (state_dir / "cfg" / "config.toml").write_text(
+            'default_host = "remote"\n[hosts.remote]\nssh = "remote"\n'
+        )
+        calls = []
+
+        def fake_wait(host: str, target: str, **kwargs: object) -> WaitResult:
+            calls.append((host, target, kwargs["timeout"]))
+            return WaitResult(jobid=target, state=JobState.COMPLETED, exit_code=0)
+
+        monkeypatch.setattr(cli_module, "wait_for_terminal", fake_wait)
+        result = CliRunner().invoke(main, ["wait", "remote", jobid, "--timeout", "2h"])
+
+        assert result.exit_code == 0, result.output
+        assert calls == [("remote", jobid, 7200.0)]
 
     def test_terminal_job_exits_with_zero_on_completed(
         self, state_dir: Path
@@ -1056,21 +1102,25 @@ class TestWaitCLI:
             == "increase_walltime"
         )
 
-    def test_timeout_exits_124(self, state_dir: Path) -> None:
-        _write_spec("cli000000003", state=JobState.RUNNING)
+    @pytest.mark.parametrize("timeout", ["0.3", "0.3s", "0.005m"])
+    def test_timeout_exits_124(self, state_dir: Path, timeout: str) -> None:
+        spec_path = _write_spec("cli000000003", state=JobState.RUNNING)
+        before = spec_path.read_bytes()
         result = CliRunner().invoke(
             main,
             [
                 "wait", "cli000000003",
                 "--poll-interval", "0.1",
-                "--timeout", "0.3",
+                "--timeout", timeout,
             ],
         )
         assert result.exit_code == 124
         assert "timed out" in result.stderr
+        assert spec_path.read_bytes() == before
 
+    @pytest.mark.parametrize("timeout", ["0.1", "0.1s"])
     def test_timeout_json_prints_machine_readable_result(
-        self, state_dir: Path
+        self, state_dir: Path, timeout: str,
     ) -> None:
         _write_spec(
             "cli000000006",
@@ -1086,7 +1136,7 @@ class TestWaitCLI:
                 "--poll-interval",
                 "0.1",
                 "--timeout",
-                "0.1",
+                timeout,
                 "--json",
             ],
         )

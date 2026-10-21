@@ -6,6 +6,10 @@ include:
     file: '$VIBE_QUEUE_CI_FILE'
     rules:
       - if: '$VIBE_QUEUE_CI_PROJECT || $VIBE_QUEUE_CI_REF || $VIBE_QUEUE_CI_FILE'
+  # The product owns admission; deployment commands remain external.
+  - local: '/.gitlab/ci/deploy-rules.yml'
+    rules:
+      - if: '$VIBE_QUEUE_CI_PROJECT || $VIBE_QUEUE_CI_REF || $VIBE_QUEUE_CI_FILE'
 
 # Portable build and validation rules.
 stages:
@@ -13,19 +17,26 @@ stages:
   - build
   - deploy
 
+variables:
+  # The QVF repository owns the format and the reference fixtures.
+  QVF_TAG: "v0.5.0"
 
+
+# CI qualifies candidates and publishes releases. No development ref creates a pipeline,
+# including manual, scheduled or API requests; dev updates use their own builder.
 workflow:
   auto_cancel:
     on_new_commit: conservative
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "release"'
     - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+      auto_cancel:
+        on_new_commit: none
     - when: never
 
 
 ruff:
+  interruptible: true
   stage: test
   image: python:3.13-slim-bookworm
   tags:
@@ -34,9 +45,12 @@ ruff:
     - pip install ruff==0.15.13
   script:
     - ruff check src/vq tests
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
 
 
 test:
+  interruptible: true
   stage: test
   image: python:3.13-slim-bookworm
   tags:
@@ -56,6 +70,10 @@ test:
     - useradd --no-create-home --uid 10001 --user-group vqtest
     - install -d -o vqtest -g vqtest "/tmp/vqtest-$CI_JOB_ID"
     - >-
+      git clone --depth 1 --branch "$QVF_TAG"
+      "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/${CI_PROJECT_NAMESPACE}/qvf.git"
+      "/tmp/vqtest-$CI_JOB_ID/qvf"
+    - >-
       runuser -u vqtest -- mkdir -p
       "/tmp/vqtest-$CI_JOB_ID/tmp"
       "/tmp/vqtest-$CI_JOB_ID/xdg-data"
@@ -67,12 +85,13 @@ test:
       "/tmp/vqtest-$CI_JOB_ID/vq-multi-user"
       "/tmp/vqtest-$CI_JOB_ID/pycache"
     - chown vqtest:vqtest "$CI_PROJECT_DIR"
+    - install -d -o vqtest -g vqtest "$CI_PROJECT_DIR/test-results"
     - >-
       runuser -u vqtest -- env HOME="/tmp/vqtest-$CI_JOB_ID"
       GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
       git config --global --add safe.directory "$CI_PROJECT_DIR"
   script:
-    - pip install -e ".[test,web]"
+    - pip install -e '.[test,web]'
     - >-
       runuser -u vqtest -- env -u PYTEST_ADDOPTS
       HOME="/tmp/vqtest-$CI_JOB_ID"
@@ -87,11 +106,22 @@ test:
       VQ_TEST_SANDBOX_ROOT="/tmp/vqtest-$CI_JOB_ID"
       VQ_TEST_SHORT_TMPDIR="/tmp/vqtest-$CI_JOB_ID/tmp"
       VQ_TEST_SYSTEM_CONFIG_FILE="/tmp/vqtest-$CI_JOB_ID/vq-config/system-config.toml"
+      VQ_TEST_QVF_ROOT="/tmp/vqtest-$CI_JOB_ID/qvf"
       VQ_WEB_TOKEN_FILE="/tmp/vqtest-$CI_JOB_ID/vq-config/web-token"
       GIT_CONFIG_GLOBAL="/tmp/vqtest-$CI_JOB_ID/.gitconfig"
       PYTHONPYCACHEPREFIX="/tmp/vqtest-$CI_JOB_ID/pycache"
       PYTHONPATH="$CI_PROJECT_DIR/src"
-      python -m pytest tests -q -p no:cacheprovider
+      python scripts/run_ci_tests.py --scope full
+      --junitxml="$CI_PROJECT_DIR/test-results/pytest.xml"
+  artifacts:
+    when: always
+    expire_in: 2 weeks
+    reports:
+      junit: test-results/pytest.xml
+  # Candidate qualification always runs the full suite, regardless of local
+  # smoke defaults or an inherited VQ_TEST_SCOPE setting.
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
 
 # --------------------------------------------------------------------
 # Documentation site: Sphinx + furo, published under
@@ -113,6 +143,7 @@ test:
 
 
 docs-build:
+  interruptible: true
   stage: build
   image: python:3.13-slim-bookworm
   tags:
@@ -147,7 +178,5 @@ docs-build:
       - public
     expire_in: 1 week
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == "release"'
     - if: '$CI_COMMIT_BRANCH =~ /^release-candidate\//'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'

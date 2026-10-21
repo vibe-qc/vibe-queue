@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from vq import cgroup
+from vq.daemon import Daemon
 
 
 def _capturing_run(
@@ -100,6 +101,16 @@ class TestScopeExistsManager:
 
 
 class TestStopScopeManager:
+    def test_daemon_reports_unconfirmed_cleanup(self, monkeypatch, caplog) -> None:
+        # Exercise only the teardown helper, without constructing a daemon or
+        # launching a process on the test host.
+        daemon = object.__new__(Daemon)
+        daemon.cgroup_enabled = True
+        daemon._multi_user = False
+        monkeypatch.setattr(cgroup, "stop_scope", lambda *a, **kw: False)
+        daemon._reap_scope("abc123")
+        assert "job abc123: could not confirm cgroup scope cleanup" in caplog.text
+
     def test_single_user_stops_in_user_manager(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

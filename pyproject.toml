@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vq"
-version = "0.26.7"
+name = "vibe-queue"
+version = "0.26.47"
 description = "Cross-machine job queue for vibe-qc workloads"
 readme = "README.md"
 authors = [{name = "Michael F. Peintinger", email = "mpei@vibe-qc.com"}]
@@ -29,7 +29,11 @@ vq = "vq.cli:main"
 [project.optional-dependencies]
 # pytest 8.2 introduced the session-wide PYTEST_VERSION ancestry marker used
 # by the fail-closed persistence boundary, including collection-time children.
-test = ["pytest>=8.2", "httpx>=0.27", "jsonschema>=4"]
+# httpx is consumed only by starlette's TestClient, which couples to httpx's
+# private modules and declares `httpx<0.29` -- but under its `full` extra, which
+# vq does not install, so that cap never applied here. Mirror it, and move it
+# when starlette's own bound moves (#76).
+test = ["pytest>=8.2", "httpx>=0.27,<0.29", "jsonschema>=4", "PyYAML>=6"]
 dev = ["ruff", "mypy"]
 # Read-only web UI dashboard (v0.5+). Optional install:
 #   pip install -e '.[web]'

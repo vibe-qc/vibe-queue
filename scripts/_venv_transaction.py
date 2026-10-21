@@ -78,7 +78,7 @@ def _assert_not_immutable_runtime_target(target: Path) -> None:
             f"refusing durable replacement of immutable runtime generation: {target}"
         )
     parts = target.parts
-    if len(parts) >= 4 and parts[-1] == ".venv" and parts[-2] == "source":
+    if len(parts) >= 4 and parts[-2] == "source":
         sha = parts[-3]
         if parts[-4] == "releases" and re.fullmatch(r"[0-9a-f]{40}", sha):
             raise TransactionError(

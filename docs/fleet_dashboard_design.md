@@ -1,5 +1,7 @@
 # Fleet console
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 The fleet console presents the queue's existing host, job and maintenance
 state. The product implementation, API and user interface remain in this
 repository. Real fleet topology, deployment configuration, accounts and
