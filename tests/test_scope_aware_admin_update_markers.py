@@ -283,3 +283,106 @@ def test_targeted_clear_preserves_an_independent_scheduler_lease(
     assert "marker cleared" in result.output
     assert admin.read_admin_update_markers() == [host_c]
     assert host_f not in admin.read_admin_update_markers()
+
+
+def test_clear_failed_runtime_slot_marker(state_dir: Path) -> None:
+    marker = admin.acquire_admin_update_marker(
+        envs=["runtime-slot:vibeqc-release"], host="localhost",
+    )
+    admin.transition_admin_update_state(
+        admin.ADMIN_UPDATE_STATE_FAILED, failure_reason="build failed",
+    )
+    result = CliRunner().invoke(
+        main, ["admin", "clear-update-marker", "localhost", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["cleared"] is True
+    assert payload["marker"]["marker_id"] == marker.marker_id
+    assert not admin.read_admin_update_markers()
+
+
+def test_clear_multiple_local_markers_requires_exact_selection(
+    state_dir: Path,
+) -> None:
+    first = admin.acquire_admin_update_marker(
+        envs=["runtime-slot:vibeqc-release"], host="localhost",
+    )
+    second = admin.acquire_admin_update_marker(
+        envs=["runtime-slot:vibeqc-dev"], host="localhost",
+    )
+    scheduler = admin.acquire_admin_update_marker(
+        envs=["scheduler:host_f"], host="host_f",
+    )
+    args = ["admin", "clear-update-marker", "localhost", "--json", "--force-live"]
+    ambiguous = CliRunner().invoke(main, args)
+    assert ambiguous.exit_code != 0
+    assert "multiple admin-update markers" in ambiguous.output
+    assert len(admin.read_admin_update_markers()) == 3
+    selected = CliRunner().invoke(main, [*args, "--marker-id", second.marker_id])
+    assert selected.exit_code == 0, selected.output
+    assert json.loads(selected.output)["marker"]["marker_id"] == second.marker_id
+    assert admin.read_admin_update_markers() == [first, scheduler]
+    wrong_scope = CliRunner().invoke(main, [*args, "--marker-id", scheduler.marker_id])
+    assert wrong_scope.exit_code != 0
+    assert "requested host scope" in wrong_scope.output
+    assert admin.read_admin_update_markers() == [first, scheduler]
+
+
+def test_exact_runtime_slot_selection_retains_live_marker(state_dir: Path) -> None:
+    marker = admin.acquire_admin_update_marker(
+        envs=["runtime-slot:vibeqc-release"], host="localhost",
+    )
+    result = CliRunner().invoke(
+        main,
+        ["admin", "clear-update-marker", "localhost", "--json",
+         "--marker-id", marker.marker_id],
+    )
+    assert result.exit_code != 0
+    assert "refusing to clear live" in json.loads(result.output)["error"]
+    assert admin.read_admin_update_markers() == [marker]
+
+
+@pytest.mark.parametrize("receipt", ["managed", "pause"])
+def test_exact_runtime_slot_selection_retains_protected_receipt(
+    state_dir: Path, receipt: str,
+) -> None:
+    marker = admin.acquire_admin_update_marker(
+        envs=["runtime-slot:vibeqc-release"], host="localhost",
+    )
+    if receipt == "managed":
+        marker.managed_transaction = {"schema": "test-managed-receipt"}
+    else:
+        # A legacy pause receipt lacks the exact namespace needed for recovery.
+        marker.pause_token = "admin-update-0123456789ab"
+    admin._write_admin_update_marker_atomic(marker)
+    result = CliRunner().invoke(
+        main,
+        ["admin", "clear-update-marker", "localhost", "--yes", "--force-live",
+         "--marker-id", marker.marker_id],
+    )
+    assert result.exit_code != 0
+    assert ("recover-update" if receipt == "managed" else "queue namespace") in result.output
+    assert admin.read_admin_update_markers() == [marker]
+
+
+def test_exact_marker_selection_delegates_to_remote(
+    state_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (state_dir / "cfg" / "config.toml").write_text(
+        'default_host = "localhost"\n[hosts.host_e]\nssh = "host_e"\n'
+    )
+    calls = []
+    monkeypatch.setattr(
+        "vq.cli._delegate_to_remote",
+        lambda host, cfg, *args: calls.append((host, args)) or "cleared\n",
+    )
+    result = CliRunner().invoke(
+        main,
+        ["admin", "clear-update-marker", "host_e", "--json",
+         "--marker-id", "exact-marker"],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [("host_e", (
+        "admin", "clear-update-marker", "--marker-id", "exact-marker", "--json", "localhost",
+    ))]

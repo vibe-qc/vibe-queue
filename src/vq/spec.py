@@ -27,7 +27,7 @@ import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
@@ -177,6 +177,16 @@ class ProgramRuntimePin(BaseModel):
     same value as ``VQ_PROGRAM_GIT_SHA``. Old and still-pending specs read it as
     ``None``.
     """
+    resolved_runtime_root: str | None = None
+    resolved_runtime_source: str | None = None
+    resolved_runtime_python: str | None = None
+    """Execution paths selected at dispatch; root identifies an immutable slot.
+
+    Scheduler pins record target paths, never driver-local paths, when their
+    verified launcher uses the managed generation layout.
+    A legacy QVF selection has no runtime root and retains its existing mutable
+    environment contract. Slot selections always name an exact generation.
+    """
     expected_import_version: str | None = None
     import_check: str | None = None
     import_symbols: list[str] = Field(default_factory=list)
@@ -192,6 +202,33 @@ class ProgramRuntimePin(BaseModel):
     artifact_identity: str | None = None
     """Immutable artifact identity — today the per-SHA wrapper path, which
     embeds version and SHA and is never mutated in place."""
+
+    managed_generation: dict[str, Any] | None = None
+    """Provider-authenticated identity and durable retained-generation reference."""
+
+    def without_resolution(self) -> ProgramRuntimePin:
+        """Copy submission intent without a previous execution's local selection."""
+        return self.model_copy(update={
+            "resolved_git_sha": None,
+            "resolved_runtime_root": None,
+            "resolved_runtime_source": None,
+            "resolved_runtime_python": None,
+        }, deep=True)
+
+
+class RuntimeBundlePin(BaseModel):
+    """The portable runtime generation a job runs with (#161).
+
+    ``root`` is a ``vq runtime-bundle deploy`` target on the execution host;
+    ``artifact_id`` the generation resolved and verified at submit. The daemon
+    re-verifies that generation before dispatch and never substitutes another,
+    so a later selection change or rollback only affects later jobs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    root: str = Field(min_length=2, max_length=4096, pattern=r"^/")
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class JobSpec(BaseModel):
@@ -209,11 +246,38 @@ class JobSpec(BaseModel):
     # accounting/thread cap. None preserves the historical one-task scheduler
     # shape. Additive: old specs read clean.
     scheduler_tasks: int | None = Field(default=None, ge=1)
+    # #168: GPUs for the job. On a scheduler target rendered as Torque's
+    # ``nodes=1:ppn=C:gpus=N`` or Slurm's ``--gpus=N`` (a job total either
+    # way). On a daemon host admitted against the daemon's --gpu-devices.
+    # None (the default) requests none; old specs read clean.
+    gpus: int | None = Field(default=None, ge=1)
+    # #168: the daemon devices a local GPU job was given, recorded with its
+    # RUNNING claim so a restarted daemon keeps them busy. None otherwise.
+    gpu_devices: list[str] | None = None
+    # #161: the verified portable runtime generation the job is bound to,
+    # resolved at submit (`--runtime-root`). None for every job that did not
+    # ask; old specs read clean.
+    runtime_bundle: RuntimeBundlePin | None = None
+    # #159: the `vq estimate --json` receipt (vq.resource-estimate/1) the job
+    # was submitted with (`--estimate`), its fingerprinted inputs checked
+    # against the payload. A record for later evaluation: it changes no
+    # resource or placement. None when none was given; old specs read clean.
+    resource_estimate: dict[str, Any] | None = None
+    # #159: what a calibration made of that estimate, when it was submitted as a
+    # vq.calibrated-estimate/1: the calibrated peak, multiplier, calibration id,
+    # hardware class and status. Never used for admission or placement.
+    resource_estimate_calibration: dict[str, Any] | None = None
     # v0.3: resource declarations. Optional in v2 (kept None for old specs
     # and for jobs submitted without explicit budgets); will become required
     # in v0.4 per SPEC.md once the watchdog is the assumed default.
     mem_mb: int | None = Field(default=None, ge=1)
+    # #159: where mem_mb came from when it was not declared: "calibrated-estimate"
+    # for `--mem-from-estimate` (a calibrated, job-scope estimate's peak in MiB).
+    mem_mb_source: Literal["calibrated-estimate"] | None = None
     wall_time_seconds: int | None = Field(default=None, ge=1)
+    # #159: "calibrated-estimate" when wall_time_seconds came from
+    # `--time-from-estimate` (the calibrated runtime upper bound, in whole minutes).
+    wall_time_source: Literal["calibrated-estimate"] | None = None
     # v0.5.29: dispatch priority. The daemon orders the pending queue by
     # (-priority, submitted_at): higher priority dispatches first; within
     # one priority level, FIFO by submission time (so the all-default
@@ -449,6 +513,16 @@ class JobSpec(BaseModel):
     # immediate cleanup); the sweep stamps this even for jobs that did NOT
     # pass --clean-tmp.
     workdir_swept_at: str | None = None
+    # #63 follow-up: why the daemon left a workdir in place when
+    # ``clean_workdir_on_terminal`` asked it to remove one (a symlinked root,
+    # a foreign owner, a record outside every root that job's workdir may
+    # sit under). It used to be appended to ``failure_reason``, which made a
+    # COMPLETED job report ``failure: ...`` and set ``"reason"`` in
+    # ``--json`` for a run that succeeded -- and after a scratch-root change
+    # that was *every* ``--clean-tmp`` job. This field says the same thing
+    # without claiming the job failed; ``failure_reason`` stays reserved for
+    # non-COMPLETED terminal transitions. Additive: older specs read clean.
+    workdir_cleanup_note: str | None = None
     state: JobState = JobState.PENDING
     submitted_at: str = Field(default_factory=utcnow_iso)
     submitter: str | None = None
@@ -512,6 +586,16 @@ class JobSpec(BaseModel):
     # records that remote-side reclaim so later archive/delete sweeps do not
     # keep issuing redundant SSH rm calls. None for local jobs, live scheduler
     # jobs, and older terminal scheduler specs not yet swept.
+    # #63: the absolute workspace path on the scheduler host this job was
+    # staged into, recorded BEFORE the submission boundary (the PENDING ->
+    # SUBMITTING write that precedes qsub/sbatch). Everything afterwards --
+    # restart reattachment, uncertain-submit reconciliation, retry, polling,
+    # log reads, fetch and remote cleanup -- uses this value instead of
+    # recomputing it from the host's current ``scratch_root``. Recomputing is
+    # what made changing that key strand every in-flight job's workspace.
+    # None for local jobs and for scheduler jobs dispatched before #63; the
+    # daemon binds those on its next observation of them.
+    scheduler_remote_workspace: str | None = None
     scheduler_remote_workspace_cleaned_at: str | None = None
     # Richer cluster-side detail from `qstat -f`, refreshed by the driver on each
     # detail poll (§18 item 2): which node(s) the job landed on, and how much of
@@ -520,6 +604,35 @@ class JobSpec(BaseModel):
     scheduler_exec_host: str | None = None
     scheduler_walltime_used: str | None = None
     scheduler_walltime_limit: str | None = None
+    # #168: from the same Torque/PBS detail poll, verbatim: the job's memory
+    # as the scheduler measures it (`resources_used.mem`) and its CPU time so
+    # far (`resources_used.cput`). Slurm reports no live job memory, so
+    # `scheduler_mem_used` stays None there; its CPU time comes from `sstat`
+    # as `H:MM:SS`. None for local jobs and until the scheduler reports them.
+    scheduler_mem_used: str | None = None
+    scheduler_cpu_used: str | None = None
+    # #168: Slurm's live `sstat` MaxRSS, as `<KiB>kb`: the peak RSS of the
+    # job's largest task among its running steps. A one-task peak, never the
+    # job's total memory; Slurm's `scheduler_cpu_used` comes from the same
+    # call (the running steps' CPU time so far).
+    scheduler_task_peak_rss: str | None = None
+    # #168: a running GPU job's newest complete `nvidia-smi` sample from its
+    # batch node, or for a daemon GPU job from its own devices (`vq.gpu-live/1`:
+    # the sampling clock's time and, per device shown, utilisation, memory and
+    # the job processes' memory). Device-level. The name predates daemon jobs.
+    scheduler_gpu_live: dict[str, Any] | None = None
+    # The scheduler's own verbatim explanation for a job that has not started
+    # -- Torque's `qstat -f` comment, Slurm's squeue Reason. Set while the
+    # cluster job is queued and cleared the moment it is not, so this never
+    # answers "why is it waiting" for a job that is already running. None for
+    # local jobs, and for a queued job whose scheduler offers no explanation.
+    scheduler_queued_reason: str | None = None
+    # #160: when qsub/sbatch accepted a scheduler job, and when the driver's
+    # poll first saw the cluster run it (poll granularity). Their difference
+    # is the job's queue wait, without staging. Unset for a job whose
+    # acceptance was recovered from remote evidence, and for local jobs.
+    scheduler_submitted_at: str | None = None
+    scheduler_started_at: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     # Optional liveness timestamp introduced with schema v2. Current scheduler
@@ -677,10 +790,10 @@ class JobSpec(BaseModel):
     # pre-flight didn't run or didn't produce a manifest.
     #
     # * ``expected_outputs`` — relative paths (within the workspace)
-    #   that the job is declared to produce. Used by ``vq fetch
-    #   --outputs-only`` to tar only the declared files instead of
-    #   the whole workspace, and by future ``vq watch`` to inotify
-    #   the workspace for missing-but-expected outputs.
+    #   that the job is declared to produce. ``vq output`` and
+    #   ``vq progress`` use them to find the job's output family.
+    #   ``vq fetch`` does not read them: it always transfers the
+    #   whole workspace, and there is no ``--outputs-only`` (#121).
     # * ``output_stem`` — bare basename of the job's output files
     #   (e.g. ``"output-h2o"``). Surfaced in ``vq status`` so the
     #   operator can correlate the vq job with the on-disk

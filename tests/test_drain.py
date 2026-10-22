@@ -26,6 +26,31 @@ from vq.cli import main
 from vq.spec import JobSpec, JobState
 from vq.submit import submit_local
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck": a
+# thread reaching its first statement, a thread finishing. A liveness guard,
+# not a timing claim -- its value carries no meaning beyond "longer than this
+# is certainly broken", and a healthy run clears it in milliseconds. At 1-5 s
+# these were sized like performance claims, which a host starved of CPU for
+# seconds at a time can miss; that is the shape #5 fixed in
+# tests/test_transport.py and #41 audits across the suite. Nothing it bounds
+# ends on its own, so unlike the reaping budget below it has no ceiling.
+_LIVENESS_SECONDS = 30.0
+
+# The placeholder command a dispatch-gate job runs: long enough to still be
+# running when the test that dispatched it kills it, and nothing more.
+_PLACEHOLDER_JOB_SECONDS = 10
+
+# The liveness guard for the reap of a dispatched job, which does have a
+# ceiling -- hence a constant of its own. The ``vq.resource_receipt`` wrapper
+# the daemon spawns leads the job's group and exits when the placeholder above
+# does, so a budget at or above that would let ``popen.wait()`` after
+# ``popen.kill()`` return because the job ended rather than because the kill
+# landed. Derived from the sleep so it cannot drift past it. Raising it means
+# raising the placeholder first -- which also lengthens how long the job's own
+# ``sleep`` outlives the test, because ``popen.kill()`` reaches the wrapper and
+# not the command it forked into the group.
+_JOB_REAP_SECONDS = _PLACEHOLDER_JOB_SECONDS / 2
+
 
 @pytest.fixture
 def state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -43,7 +68,7 @@ def _write_pending(jobid: str, *, cpus: int = 1, mem_mb: int | None = None) -> J
     workspace.mkdir(parents=True, exist_ok=True)
     spec = JobSpec(
         id=jobid,
-        command=["sleep", "10"],
+        command=["sleep", str(_PLACEHOLDER_JOB_SECONDS)],
         cwd=str(workspace),
         cpus=cpus,
         mem_mb=mem_mb,
@@ -594,7 +619,7 @@ class TestDaemonRespectsDrain:
         for rj in list(d._running.values()):
             rj.popen.kill()
             with contextlib.suppress(Exception):
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_JOB_REAP_SECONDS)
 
     def test_partial_drain_max_jobs_caps_below_daemon(
         self, state: Path, monkeypatch: pytest.MonkeyPatch
@@ -614,7 +639,7 @@ class TestDaemonRespectsDrain:
         for rj in list(d._running.values()):
             rj.popen.kill()
             with contextlib.suppress(Exception):
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_JOB_REAP_SECONDS)
 
     def test_partial_drain_max_cpus_blocks_big_jobs(
         self, state: Path, monkeypatch: pytest.MonkeyPatch
@@ -637,7 +662,7 @@ class TestDaemonRespectsDrain:
         for rj in list(d._running.values()):
             rj.popen.kill()
             with contextlib.suppress(Exception):
-                rj.popen.wait(timeout=2)
+                rj.popen.wait(timeout=_JOB_REAP_SECONDS)
 
 
 class TestDrainCLI:
@@ -2164,7 +2189,13 @@ class TestReadOnlyDrainSnapshot:
             if not launched:
                 launched = True
                 worker.start()
-                assert writer_started.wait(timeout=1)
+                # Liveness only: writer_started is set before the writer
+                # touches drain at all (#41).
+                assert writer_started.wait(timeout=_LIVENESS_SECONDS)
+                # Deliberately short, and left alone. This is a negative
+                # probe -- load can only make it less strict, never make
+                # it fail -- and the substantive claim is the one the
+                # snapshot assertions below make, which no budget times.
                 time.sleep(0.05)
                 assert not writer_done.is_set()
             return original_read(path)
@@ -2172,7 +2203,7 @@ class TestReadOnlyDrainSnapshot:
         monkeypatch.setattr(drain, "_strict_snapshot_json", interleaved_read)
 
         snapshot = drain.read_locked_drain_snapshot()
-        worker.join(timeout=5)
+        worker.join(timeout=_LIVENESS_SECONDS)
 
         assert not worker.is_alive()
         assert writer_errors == []

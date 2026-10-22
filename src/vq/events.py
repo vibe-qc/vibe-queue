@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -90,29 +91,46 @@ def append_event(
         )
 
 
-def read_events(workspace: Path) -> list[dict[str, Any]]:
-    """Return the parsed event log (all records, in order) or [] if absent.
+def read_events(
+    workspace: Path, *, kinds: tuple[str, ...] = (), tail: int = 0,
+) -> list[dict[str, Any]]:
+    """Return matching event records in append order, or [] if absent.
 
-    Corrupt / partially-written lines are skipped with a warning logged;
-    callers see only well-formed records.
+    Empty ``kinds`` selects every kind. ``tail`` keeps the last N matches;
+    zero returns all matches. Filtering precedes the limit, and a bounded
+    tail retains only N records in memory while scanning the log.
+
+    Corrupt / partially-written lines and JSON values that are not objects
+    are skipped with a warning logged. Object fields stay forward-compatible.
     """
+    if tail < 0:
+        raise ValueError("event tail must be nonnegative")
     path = workspace / "_vq" / "events.jsonl"
     if not path.exists():
         return []
-    out: list[dict[str, Any]] = []
+    out: deque[dict[str, Any]] = deque(maxlen=tail or None)
     with path.open(encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError as e:
                 log.warning(
                     "events.jsonl line %d at %s malformed: %s",
                     lineno, path, e,
                 )
-    return out
+                continue
+            if not isinstance(record, dict):
+                log.warning(
+                    "events.jsonl line %d at %s malformed: expected a JSON object",
+                    lineno, path,
+                )
+                continue
+            if not kinds or record.get("kind") in kinds:
+                out.append(record)
+    return list(out)
 
 
 def state_transition(

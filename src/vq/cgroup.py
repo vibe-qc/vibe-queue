@@ -107,6 +107,7 @@ def wrap_command(
     unit_name: str | None = None,
     run_as_uid: int | None = None,
     run_as_gid: int | None = None,
+    device_allow: list[str] | None = None,
 ) -> list[str]:
     """Return a systemd-run-wrapped argv that runs ``cmd`` in a transient
     scope with the given memory + CPU caps, or ``cmd`` unchanged if
@@ -142,7 +143,15 @@ def wrap_command(
     **mandatory**: it is applied even when no resource caps are set,
     and a missing ``systemd-run`` raises ``RuntimeError`` rather than
     silently returning a command that would run as root.
+
+    ``device_allow`` (#168 GPU isolation) closes the scope's device policy to
+    the standard pseudo-devices plus these nodes or classes, read-write. Only
+    a system-mode scope can enforce it; asking for it otherwise raises
+    ``RuntimeError`` rather than starting a job that is not isolated.
     """
+    if device_allow is not None and run_as_uid is None:
+        raise RuntimeError("GPU isolation needs a system-mode scope (a multi-user daemon); "
+                           "a user systemd manager cannot restrict devices")
     if run_as_uid is not None:
         # Multi-user: the wrap is the privilege-drop and is mandatory.
         # System-mode scope (no --user) + --uid/--gid; only root can
@@ -167,6 +176,9 @@ def wrap_command(
             args.append(f"--property=MemoryHigh={int(mem_mb * 0.9)}M")
         if cpus is not None:
             args.append(f"--property=CPUQuota={cpus * 100}%")
+        if device_allow is not None:
+            args.append("--property=DevicePolicy=closed")
+            args.extend(f"--property=DeviceAllow={device} rw" for device in device_allow)
         args.append("--")
         args.extend(cmd)
         return args
@@ -489,12 +501,17 @@ def scope_exists(unit_name: str, *, multi_user: bool = False) -> bool | None:
 
 
 def stop_scope(unit_name: str, *, multi_user: bool = False) -> bool:
-    """v0.5.51: best-effort ``systemctl stop <scope>`` for cleaning
+    """Best-effort ``systemctl stop <scope>`` for cleaning
     up a leaked-but-known scope before re-dispatching the same
     jobid. ``multi_user`` (v0.6.x) targets the system manager —
     a multi-user job scope is a system scope and ``systemctl
-    --user stop`` cannot reach it. Returns True on rc=0 (scope
-    stopped or wasn't actually loaded), False otherwise.
+    --user stop`` cannot reach it. Returns True when the stop completes
+    successfully, False otherwise.
+
+    The manager's stop grace can outlive our ten-second client wait. Killing
+    that client does not cancel the stop job or kill the scope's descendants.
+    On a timeout, escalate the whole scope to SIGKILL, then wait for the stop
+    to complete. Signal delivery alone is not successful cleanup.
 
     Conservative: not a replacement for ``--collect`` on the
     systemd-run call — just a recovery path for the
@@ -506,14 +523,32 @@ def stop_scope(unit_name: str, *, multi_user: bool = False) -> bool:
     binpath = _systemctl_path()
     if binpath is None:
         return False
+    manager = _systemctl_scope_argv(binpath, multi_user)
     try:
         proc = subprocess.run(
-            [*_systemctl_scope_argv(binpath, multi_user), "stop", unit_name],
+            [*manager, "stop", unit_name],
             capture_output=True,
             text=True,
             timeout=10,
             stdin=subprocess.DEVNULL,
         )
+    except subprocess.TimeoutExpired:
+        log.warning("scope %s did not stop within 10s; escalating to SIGKILL", unit_name)
+        try:
+            # systemctl kill defaults to all processes of the named unit,
+            # including descendants in different sessions/process groups.
+            killed = subprocess.run(
+                [*manager, "kill", "--signal=SIGKILL", unit_name],
+                capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+            )
+            if killed.returncode != 0:
+                return False
+            proc = subprocess.run(
+                [*manager, "stop", unit_name],
+                capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
