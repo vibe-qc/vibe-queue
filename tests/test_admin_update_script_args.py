@@ -154,6 +154,36 @@ class TestRunUpdateScriptExtraArgs:
         # Just the script path, no extra args.
         assert bash_argv[bi + 1:] == [str(git_dir / "scripts/update.sh")]
 
+    @pytest.mark.parametrize("source_bound", [False, True])
+    @pytest.mark.parametrize("ambient", [None, "0", "1"])
+    def test_fresh_slot_disables_product_pause_only_for_its_subprocess(
+        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch,
+        source_bound: bool, ambient: str | None,
+    ) -> None:
+        git_dir = state_dir / "repo"
+        _make_script(git_dir)
+        (git_dir / "scripts/update.sh").write_text(
+            "#!/bin/bash\nset -eu\n"
+            'printf "%s\\n" "${VIBEQC_VQ_COOPERATE-unset}"\n'
+            "bash -c 'printf \"%s\\\\n\" \"${VIBEQC_VQ_COOPERATE-unset}\"'\n"
+        )
+        if ambient is None:
+            monkeypatch.delenv("VIBEQC_VQ_COOPERATE", raising=False)
+        else:
+            monkeypatch.setenv("VIBEQC_VQ_COOPERATE", ambient)
+        errors: list[str] = []
+
+        rc, output, _ = admin._run_update_script(
+            git_dir, "scripts/update.sh", work_errors=errors,
+            source_bound=source_bound,
+        )
+
+        expected = "0" if source_bound else ambient or "unset"
+        assert rc == 0, output
+        assert errors == []
+        assert output.splitlines() == [expected, expected]
+        assert os.environ.get("VIBEQC_VQ_COOPERATE") == ambient
+
     def test_managed_admin_update_exports_deferred_restart_contract(
         self, state_dir: Path,
     ) -> None:
@@ -299,7 +329,7 @@ def legacy_install(tmp_path):
     (venv / 'bin').mkdir(parents=True)
     (venv / 'pyvenv.cfg').write_text('')
     (venv / 'bin/python').symlink_to(sys.executable)
-    metadata = venv / 'lib/python3.13/site-packages/vq-0.11.0.dist-info/direct_url.json'
+    metadata = venv / 'lib/python3.13/site-packages/vibe_queue-0.11.0.dist-info/direct_url.json'
     metadata.parent.mkdir(parents=True)
     metadata.write_text(json.dumps({'url': project.as_uri(), 'dir_info': {'editable': True}}))
     prog = config.VenvProgram(
@@ -334,7 +364,7 @@ def test_managed_adoption_refuses_ambiguous_provenance(legacy_install, damage):
     if damage == 'different-origin':
         metadata.write_text(json.dumps({'url': project.parent.as_uri()}))
     elif damage == 'duplicate-record':
-        other = metadata.parent.with_name('vq-0.12.0.dist-info')
+        other = metadata.parent.with_name('vibe_queue-0.12.0.dist-info')
         other.mkdir()
         (other / metadata.name).write_bytes(metadata.read_bytes())
     elif damage == 'symlink-only':
@@ -344,7 +374,7 @@ def test_managed_adoption_refuses_ambiguous_provenance(legacy_install, damage):
         other.write_bytes(data)
         metadata.symlink_to(other)
     elif damage == 'different-alias':
-        other = venv / 'lib64/python3.13/site-packages/vq-0.11.0.dist-info'
+        other = venv / 'lib64/python3.13/site-packages/vibe_queue-0.11.0.dist-info'
         other.mkdir(parents=True)
         (other / metadata.name).symlink_to(metadata)
         metadata.unlink()

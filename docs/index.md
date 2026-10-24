@@ -28,8 +28,10 @@ vq fetch <jobid> -o results/
 ```
 
 vq needs Python 3.12 or newer, and installs nothing on the remote host but
-itself. Its entire transport is SSH: if you can `ssh` to a machine, vq can
-queue work on it.
+itself. Direct remote submission uses SSH. The optional
+[submission gateway](gateway.md) also supports HTTPS clients through
+`vq remote`, with resumable uploads, logs, cancellation and verified result
+downloads. Its outbound connector can serve a broker behind a firewall.
 
 ---
 
@@ -75,6 +77,23 @@ job moves through, and the invariants you may rely on between versions.
 
 ---
 
+This manual follows the current source with package version **{{release}}**;
+source updates may precede deployment on a particular host.
+
+## Available workflows
+
+The current source includes direct and SSH submission, PBS/Slurm driver
+queues, an opt-in durable fleet broker and HTTPS gateway, immutable runtime
+slots and portable bundles, campaigns, resource-estimate receipts and
+placement explanations. The broker holds work
+until a configured daemon host has capacity; PBS/Slurm targets continue
+through their scheduler drivers. See [broker operation](operations.md#the-fleet-broker),
+[runtime slots](runtime_slots.md), [portable runtime bundles](portable_runtime_bundles.md),
+[gateway and relay](gateway.md), [campaigns](campaigns.md),
+[resource estimates](resource_estimation.md) and [placement](placement_policy.md).
+Availability on a particular machine depends on its installed version and
+operator configuration. A source feature does not enable itself on a host.
+
 ## What vq guarantees
 
 The three that matter most, because they are what the rest is built on:
@@ -102,10 +121,26 @@ moves onto the internet.
 * **Cutting a release** — [the release process](release_process.md), and
   [version compatibility](version_compatibility.md) for what a vq version
   means to a fleet
+* **What is next** — the
+  [roadmap](https://github.com/vibe-qc/vibe-queue/blob/main/docs/roadmap.md):
+  what is planned, and what is released but not yet proven on a host
+* **History and design records** — kept in the
+  [source tree](https://github.com/vibe-qc/vibe-queue/tree/main/docs), not
+  published here. Each says in its first paragraph what it is. Four are
+  history: `roadmap_history.md` (v0.1 to v0.9),
+  `v0_7_1_lamports_clock_design.md`, `pbs_dispatcher_backend_design.md` and
+  `wall_time_design.md`. Two record designs now implemented in increments, including remaining
+  limits: `design_immutable_venv_runtimes.md` and `design_broker.md`.
+  Their current user-facing instructions are in [runtime slots](runtime_slots.md)
+  and [broker operation](operations.md#the-fleet-broker). Where any of them
+  disagrees with `vq <command> --help`, the help is right.
 
-vq is part of a set: [vibe-qc](https://vibe-qc.com/docs/) computes,
-[vibe-view](https://github.com/vibe-qc/vibe-view) renders the results,
-and vq decides where the work runs. Each is usable without the others.
+The family workflow is sketch → submit → calculate → analyze:
+[vibe-sketch](https://vibe-qc.com/vibe-sketch/docs/) prepares structures and
+inputs, vq submits and tracks work, [vibe-qc](https://vibe-qc.com/docs/)
+computes, and [vibe-view](https://vibe-qc.com/vibe-view/docs/) analyzes the
+results. Each product has its own installation; local calculations can skip
+queue submission.
 
 ```{toctree}
 :hidden:
@@ -125,4 +160,6 @@ orchestration
 version_compatibility
 codenames
 release_process
+distribution
+testing
 ```

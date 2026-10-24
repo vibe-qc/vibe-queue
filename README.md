@@ -165,3 +165,9 @@ inherited `0.25.7`, the version the fleet was already running.
 Mozilla Public License 2.0. See [LICENSE](LICENSE).
 
 Copyright (c) 2026 Michael F. Peintinger and vibe-qc contributors.
+
+## Self-contained macOS package
+
+Apple Silicon users can use the [macOS package](packaging/macos/README.md),
+which includes Python, the CLI and web console dependencies. Build recipes
+remain available from Git; installed packages do not need Python or Homebrew.

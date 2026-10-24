@@ -1,0 +1,973 @@
+"""Explainable completion-time placement across daemon hosts and scheduler lanes (#160).
+
+A read-only planner. Given normalized target capability records and one
+job's requirements it first filters hard requirements, then ranks the
+targets that remain by predicted completion time::
+
+    staging + queue wait + execution + result transfer
+
+Every component is an interval with its source, or explicitly unknown.
+A rejected target lists every reason it was rejected; a target whose
+essential capability is stale or unknown is rejected, never chosen as
+the least bad of the ineligible. With no eligible target the job is held
+with those reasons.
+
+Nothing here reads the network or the clock, submits, or reserves. It is
+exposed through ``vq placement explain``, and through ``[broker] policy =
+"completion-time"`` (:mod:`vq.broker_completion`), which orders only the
+hosts the broker's capacity gates admit. ``vq submit auto`` is unchanged.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+FLEET_SCHEMA = "vq.placement-fleet/1"
+REQUEST_SCHEMA = "vq.placement-request/1"
+EXPLANATION_SCHEMA = "vq.placement-explanation/1"
+POLICY = "vq.completion-time/1"
+
+MAX_FILE_BYTES = 16 * 1024 * 1024
+#: A capability observed further in the future than this is clock skew,
+#: not data, and is refused like stale data.
+FUTURE_SKEW_SECONDS = 60.0
+
+Name = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+/-]{0,127}$")]
+Label = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")]
+Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+Positive = Annotated[float, Field(gt=0)]
+NonNegative = Annotated[float, Field(ge=0)]
+Count = Annotated[int, Field(ge=1)]
+
+#: Components of the predicted completion time, in the order they happen.
+COMPONENTS = ("staging", "queue_wait", "execution", "transfer")
+
+
+class PlacementError(ValueError):
+    """The fleet or request cannot be planned as they stand."""
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+
+class Interval(_Model):
+    low: NonNegative
+    high: NonNegative
+
+    @model_validator(mode="after")
+    def _ordered(self) -> Interval:
+        if self.high < self.low:
+            raise ValueError("an interval's high must not be below its low")
+        return self
+
+
+class WaitModel(Interval):
+    """A lane's expected queue wait and where that expectation came from.
+
+    Bounded history or an administrator's figure. A scheduler's own start
+    estimate is advisory and is labelled as such; nothing submits a probe
+    job to find out.
+    """
+
+    source: Literal["history", "declared", "scheduler-estimate"]
+
+
+class NodeShape(_Model):
+    """One compute node of the target, not the cluster or its login node."""
+
+    cpus: Count | None = None
+    mem_mb: Count | None = None
+    #: Scratch available to one job per node, including any applicable quota.
+    scratch_mb: Annotated[int, Field(ge=0)] | None = None
+    #: Whole GPUs on one node: 0 is known none, absent is unknown.
+    gpus: Annotated[int, Field(ge=0)] | None = None
+
+
+class FreeCapacity(_Model):
+    """What a daemon host could start right now."""
+
+    cpus: Annotated[int, Field(ge=0)] | None = None
+    mem_mb: Annotated[int, Field(ge=0)] | None = None
+    scratch_mb: Annotated[int, Field(ge=0)] | None = None
+    #: Devices not assigned to a job now (#168: gpu_devices minus used_gpus).
+    gpus: Annotated[int, Field(ge=0)] | None = None
+
+
+class Target(_Model):
+    name: Name
+    kind: Literal["daemon", "scheduler"]
+    #: When this record was observed (ISO 8601 with a zone offset).
+    observed_at: Annotated[str, Field(min_length=10, max_length=64)]
+    reachable: bool
+    maintenance: bool = False
+    #: The compute node's operating system; absent is unknown.
+    os: Label | None = None
+    arch: Label | None = None
+    isa_levels: list[Label] = Field(default_factory=list, max_length=32)
+    #: Runtime digests per program; the first listed is the lane's current one.
+    programs: dict[Label, list[Digest]] = Field(default_factory=dict, max_length=256)
+    #: Accounts allowed to submit; absent is unknown, an empty list permits none.
+    accounts: list[Label] | None = None
+    #: PBS queue or Slurm partition for this scheduler lane; absent is unknown.
+    queue: Label | None = None
+    #: Data-access labels available to a job; absent is unknown, empty means none.
+    data_access: list[Label] | None = Field(default=None, max_length=256)
+    #: License eligibility for the execution identity; absent is unknown.
+    licenses: list[Label] | None = Field(default=None, max_length=256)
+    node: NodeShape
+    max_nodes: Count = 1
+    max_walltime_seconds: Count | None = None
+    #: Positive evidence of no walltime cap; an absent limit alone is unknown.
+    walltime_unlimited: bool = False
+    free: FreeCapacity | None = None
+    queue_wait_seconds: WaitModel | None = None
+    #: Execution speed relative to the request's reference estimate.
+    speed_factor: Positive = 1.0
+    speed_source: Literal["benchmark", "declared", "assumed"] = "assumed"
+    staging_mb_per_second: Positive | None = None
+    transfer_mb_per_second: Positive | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Target:
+        if self.walltime_unlimited and self.max_walltime_seconds is not None:
+            raise ValueError(f"target {self.name}: walltime cannot be both limited and unlimited")
+        if self.kind == "daemon" and self.max_nodes != 1:
+            raise ValueError(f"target {self.name}: a daemon host is one node")
+        if self.kind == "daemon" and self.queue is not None:
+            raise ValueError(f"target {self.name}: a daemon host has no scheduler queue/partition")
+        if self.kind == "scheduler" and self.free is not None:
+            raise ValueError(
+                f"target {self.name}: a scheduler lane has no free-now capacity; "
+                "model its queue wait instead"
+            )
+        _parse_time(self.observed_at, f"target {self.name} observed_at")
+        return self
+
+
+class Fleet(_Model):
+    schema_name: Literal["vq.placement-fleet/1"]
+    targets: list[Target] = Field(min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def _unique(self) -> Fleet:
+        names = [t.name for t in self.targets]
+        if len(set(names)) != len(names):
+            raise ValueError("each target name may appear once")
+        return self
+
+
+class Request(_Model):
+    """One job's hard requirements and the estimates its ranking uses."""
+
+    schema_name: Literal["vq.placement-request/1"]
+    program: Label
+    #: An explicitly selected runtime is never substituted.
+    runtime_digest: Digest | None = None
+    os: Label | None = None
+    arch: Label | None = None
+    isa_level: Label | None = None
+    account: Label | None = None
+    #: An explicit PBS queue or Slurm partition; never inferred from target names.
+    queue: Label | None = None
+    required_data_access: list[Label] = Field(default_factory=list, max_length=256)
+    required_licenses: list[Label] = Field(default_factory=list, max_length=256)
+    cpus: Count
+    nodes: Count = 1
+    #: Optional explicit topology: each whole rank uses this many CPUs on one node.
+    mpi_ranks: Count | None = None
+    threads_per_rank: Count | None = None
+    mem_mb_per_node: Count | None = None
+    scratch_mb_per_node: Count | None = None
+    #: Whole GPUs per node; for a single-node vq job, its --gpus.
+    gpus_per_node: Count | None = None
+    #: The submitted walltime limit, independent of the execution estimate.
+    wall_time_seconds: Count | None = None
+    #: Execution time on a speed-1.0 target, e.g. from a calibrated estimate.
+    runtime_seconds: Interval | None = None
+    input_mb: NonNegative = 0.0
+    output_mb: NonNegative = 0.0
+
+    @model_validator(mode="after")
+    def _shape(self) -> Request:
+        if self.cpus < self.nodes:
+            raise ValueError("cpus must cover at least one per node")
+        if (self.mpi_ranks is None) != (self.threads_per_rank is None):
+            raise ValueError("mpi_ranks and threads_per_rank must be provided together")
+        if self.mpi_ranks is not None and self.threads_per_rank is not None:
+            if self.cpus != self.mpi_ranks * self.threads_per_rank:
+                raise ValueError("cpus must equal mpi_ranks * threads_per_rank")
+            if self.mpi_ranks < self.nodes:
+                raise ValueError("mpi_ranks must cover at least one rank per node")
+        return self
+
+    @property
+    def cpus_per_node(self) -> int:
+        if self.mpi_ranks is not None and self.threads_per_rank is not None:
+            return ((self.mpi_ranks + self.nodes - 1) // self.nodes) * self.threads_per_rank
+        return (self.cpus + self.nodes - 1) // self.nodes
+
+
+def _parse_time(value: str, what: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{what} is not an ISO 8601 time: {value!r}") from None
+    if parsed.tzinfo is None:
+        raise ValueError(f"{what} needs a zone offset: {value!r}")
+    return parsed
+
+
+def _read_json(path: Path) -> object:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(MAX_FILE_BYTES + 1)
+    except OSError as exc:
+        raise PlacementError(f"{path}: {exc.strerror or exc}") from None
+    if len(data) > MAX_FILE_BYTES:
+        raise PlacementError(f"{path}: larger than {MAX_FILE_BYTES} bytes")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PlacementError(f"{path}: not UTF-8 JSON: {exc}") from None
+
+
+def load_fleet(path: Path) -> Fleet:
+    return Fleet.model_validate(_read_json(path))
+
+
+def load_request(path: Path) -> Request:
+    return Request.model_validate(_read_json(path))
+
+
+def _short(digest: str) -> str:
+    return digest[:12]
+
+
+def _rejections(
+    target: Target, request: Request, *, age: float, max_age_seconds: float,
+) -> list[str]:
+    """Every hard requirement the target fails, in a fixed order."""
+    reasons: list[str] = []
+    if not target.reachable:
+        reasons.append("unreachable when observed")
+    if target.maintenance:
+        reasons.append("in maintenance")
+    if age > max_age_seconds:
+        reasons.append(f"observation is {age:.0f} s old (limit {max_age_seconds:.0f} s)")
+    elif age < -FUTURE_SKEW_SECONDS:
+        reasons.append(f"observation is {-age:.0f} s in the future: clock skew")
+    runtimes = target.programs.get(request.program)
+    if not runtimes:
+        reasons.append(f"program {request.program} is not available")
+    elif request.runtime_digest is not None and request.runtime_digest not in runtimes:
+        reasons.append(
+            f"runtime {_short(request.runtime_digest)} of {request.program} is not available "
+            f"(has {', '.join(_short(d) for d in runtimes)})"
+        )
+    if request.os is not None and target.os != request.os:
+        reasons.append(f"operating system {target.os or 'unknown'}, not {request.os}")
+    if request.arch is not None and target.arch != request.arch:
+        reasons.append(f"architecture {target.arch or 'unknown'}, not {request.arch}")
+    if request.isa_level is not None and request.isa_level not in target.isa_levels:
+        reasons.append(f"ISA level {request.isa_level} is not supported")
+    if request.account is not None:
+        if target.accounts is None:
+            reasons.append(f"permitted accounts unknown for requested account {request.account}")
+        elif request.account not in target.accounts:
+            reasons.append(f"account {request.account} is not permitted")
+    if request.queue is not None:
+        if target.kind != "scheduler":
+            reasons.append(f"queue/partition {request.queue} requires a scheduler target")
+        elif target.queue != request.queue:
+            reasons.append(f"queue/partition {target.queue or 'unknown'}, not {request.queue}")
+    if request.required_data_access:
+        required = set(request.required_data_access)
+        if target.data_access is None:
+            reasons.append(
+                f"data access unknown for required labels: {', '.join(sorted(required))}"
+            )
+        else:
+            reasons.extend(
+                f"data access {label} is not available"
+                for label in sorted(required - set(target.data_access))
+            )
+    if request.required_licenses:
+        required = set(request.required_licenses)
+        if target.licenses is None:
+            reasons.append(
+                f"license eligibility unknown for required labels: {', '.join(sorted(required))}"
+            )
+        else:
+            reasons.extend(
+                f"license {label} is not permitted"
+                for label in sorted(required - set(target.licenses))
+            )
+    if request.nodes > target.max_nodes:
+        reasons.append(f"needs {request.nodes} nodes; at most {target.max_nodes} per job")
+    if target.node.cpus is None:
+        reasons.append("CPUs per node unknown")
+    elif request.cpus_per_node > target.node.cpus:
+        reasons.append(
+            f"needs {request.cpus_per_node} CPUs per node; a node has {target.node.cpus}"
+        )
+    if request.mem_mb_per_node is not None:
+        if target.node.mem_mb is None:
+            reasons.append("memory per node unknown")
+        elif request.mem_mb_per_node > target.node.mem_mb:
+            reasons.append(
+                f"needs {request.mem_mb_per_node} MB per node; a node has {target.node.mem_mb}"
+            )
+    if request.scratch_mb_per_node is not None:
+        if target.node.scratch_mb is None:
+            reasons.append("scratch per node unknown")
+        elif request.scratch_mb_per_node > target.node.scratch_mb:
+            reasons.append(
+                f"needs {request.scratch_mb_per_node} MB scratch per node; "
+                f"a node has {target.node.scratch_mb}"
+            )
+    if request.gpus_per_node is not None:
+        if target.node.gpus is None:
+            reasons.append("GPUs per node unknown")
+        elif request.gpus_per_node > target.node.gpus:
+            reasons.append(
+                f"needs {request.gpus_per_node} GPUs per node; a node has {target.node.gpus}"
+            )
+    if request.wall_time_seconds is not None:
+        if target.max_walltime_seconds is None:
+            if not target.walltime_unlimited:
+                reasons.append("walltime limit unknown for an explicit walltime request")
+        elif request.wall_time_seconds > target.max_walltime_seconds:
+            reasons.append(
+                f"requested walltime {request.wall_time_seconds} s exceeds the "
+                f"{target.max_walltime_seconds} s walltime limit"
+            )
+    if request.runtime_seconds is not None:
+        execution_high = request.runtime_seconds.high / target.speed_factor
+        if request.wall_time_seconds is not None and execution_high > request.wall_time_seconds:
+            reasons.append(
+                f"predicted execution up to {execution_high:.0f} s exceeds the requested "
+                f"{request.wall_time_seconds} s walltime"
+            )
+        if target.max_walltime_seconds is not None and execution_high > target.max_walltime_seconds:
+            reasons.append(
+                f"predicted execution up to {execution_high:.0f} s "
+                f"exceeds the {target.max_walltime_seconds} s walltime limit"
+            )
+    return reasons
+
+
+#: One completion component: its report entry, and its interval when known.
+_Part = tuple[dict[str, object], tuple[float, float] | None]
+
+
+def _component(low: float, high: float, source: str) -> _Part:
+    return {"low": round(low, 3), "high": round(high, 3), "source": source}, (low, high)
+
+
+def _unknown(reason: str) -> _Part:
+    return {"unknown": True, "reason": reason}, None
+
+
+def _moving(mb: float, rate: float | None, what: str) -> _Part:
+    if mb == 0:
+        return _component(0.0, 0.0, "nothing to move")
+    if rate is None:
+        return _unknown(f"no {what} rate recorded for this target")
+    seconds = mb / rate
+    return _component(seconds, seconds, f"{mb:g} MB at {rate:g} MB/s")
+
+
+def _queue_wait(target: Target, request: Request) -> _Part:
+    if target.kind == "daemon" and target.free is not None:
+        free = target.free
+        fits_cpus = free.cpus is not None and request.cpus <= free.cpus
+        fits_mem = request.mem_mb_per_node is None or (
+            free.mem_mb is not None and request.mem_mb_per_node <= free.mem_mb
+        )
+        fits_scratch = request.scratch_mb_per_node is None or (
+            free.scratch_mb is not None and request.scratch_mb_per_node <= free.scratch_mb
+        )
+        fits_gpus = request.gpus_per_node is None or (
+            free.gpus is not None and request.gpus_per_node <= free.gpus
+        )
+        if fits_cpus and fits_mem and fits_scratch and fits_gpus:
+            return _component(0.0, 0.0, "fits the free capacity now")
+    if target.queue_wait_seconds is not None:
+        wait = target.queue_wait_seconds
+        return _component(wait.low, wait.high, wait.source)
+    if target.kind == "daemon":
+        return _unknown("does not fit the free capacity now and no wait model is recorded")
+    return _unknown("no queue-wait model for this lane")
+
+
+def _execution(target: Target, request: Request) -> _Part:
+    if request.runtime_seconds is None:
+        return _unknown("the request carries no runtime estimate")
+    estimate = request.runtime_seconds
+    return _component(
+        estimate.low / target.speed_factor, estimate.high / target.speed_factor,
+        f"reference estimate / speed {target.speed_factor:g} ({target.speed_source})",
+    )
+
+
+def explain(
+    fleet: Fleet, request: Request, *, now: datetime, max_age_seconds: float,
+    estimate: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """The placement decision for ``request`` over ``fleet``, fully explained.
+
+    Ranking: targets whose every component is known come first; then the
+    midpoint of the predicted completion, its upper bound, the faster
+    target, and the name, so equal inputs always give the same order.
+    """
+    if now.tzinfo is None:
+        raise PlacementError("now needs a zone offset")
+    if not math.isfinite(max_age_seconds) or max_age_seconds <= 0:
+        raise PlacementError("max_age_seconds must be finite and positive")
+    rejected: list[dict[str, object]] = []
+    eligible: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    for target in sorted(fleet.targets, key=lambda t: t.name):
+        age = (now - _parse_time(target.observed_at, "observed_at")).total_seconds()
+        reasons = _rejections(target, request, age=age, max_age_seconds=max_age_seconds)
+        if reasons:
+            rejected.append({"target": target.name, "kind": target.kind,
+                             "data_age_seconds": round(age, 3), "reasons": reasons})
+            continue
+        parts = {
+            "staging": _moving(request.input_mb, target.staging_mb_per_second, "staging"),
+            "queue_wait": _queue_wait(target, request),
+            "execution": _execution(target, request),
+            "transfer": _moving(request.output_mb, target.transfer_mb_per_second,
+                                "result transfer"),
+        }
+        components = {name: payload for name, (payload, _) in parts.items()}
+        known = [span for _, span in parts.values() if span is not None]
+        low = sum(span[0] for span in known)
+        high = sum(span[1] for span in known)
+        unknown = [name for name in COMPONENTS if parts[name][1] is None]
+        runtime = request.runtime_digest or target.programs[request.program][0]
+        candidate: dict[str, object] = {
+            "target": target.name,
+            "kind": target.kind,
+            "runtime_digest": runtime,
+            "data_age_seconds": round(age, 3),
+            "components": components,
+            # Over the known components only; ``complete`` says whether
+            # that is all of them.
+            "completion": {"low": round(low, 3), "high": round(high, 3),
+                           "complete": not unknown},
+            "unknown_components": unknown,
+        }
+        key = (len(unknown), (low + high) / 2.0, high, -target.speed_factor, target.name)
+        eligible.append((key, candidate))
+    eligible.sort(key=lambda item: item[0])
+    candidates = []
+    for rank, (_, candidate) in enumerate(eligible, start=1):
+        candidates.append({"rank": rank, **candidate})
+    selected = candidates[0] if candidates else None
+    return {
+        "schema_name": EXPLANATION_SCHEMA,
+        "policy": POLICY,
+        "now": now.isoformat(),
+        "max_age_seconds": max_age_seconds,
+        "request": request.model_dump(mode="json"),
+        "selected": None if selected is None else {
+            "target": selected["target"],
+            "runtime_digest": selected["runtime_digest"],
+            "completion": selected["completion"],
+        },
+        "held": None if selected is not None else "no eligible target; see rejected",
+        "candidates": candidates,
+        "rejected": rejected,
+        # #159: what an --estimate filled in; absent without one.
+        **({"estimate": estimate} if estimate is not None else {}),
+    }
+
+
+# --- a request completed from a calibrated estimate (#159) -----------------
+
+def request_with_estimate(
+    request: Request, document: object,
+) -> tuple[Request, dict[str, Any]]:
+    """``request`` with what a calibrated estimate says of its unset fields.
+
+    Only ``runtime_seconds`` and ``mem_mb_per_node``, and only when the
+    request leaves them unset: an explicit value always wins. The second
+    value reports, per field, ``filled`` (with the value), ``kept`` or
+    ``not filled`` and why, beside the estimate's identity.
+    """
+    from vq.estimate_calibration import CALIBRATED_SCHEMA, check_calibrated
+
+    if not isinstance(document, dict) or document.get("schema_name") != CALIBRATED_SCHEMA:
+        raise PlacementError("--estimate needs a calibrated estimate "
+                             "(`vq estimate --calibration ... --json`)")
+    try:
+        receipt, record = check_calibrated(document)
+    except ValueError as exc:
+        raise PlacementError(f"--estimate: {exc}") from None
+    fields: dict[str, dict[str, Any]] = {}
+    updates: dict[str, Any] = {}
+    if request.runtime_seconds is not None:
+        fields["runtime_seconds"] = {"source": "kept"}
+    elif record.get("runtime_status") != "calibrated":
+        fields["runtime_seconds"] = {"source": "not filled", "reason": record.get(
+            "runtime_reason") or "this calibrated estimate has no runtime part"}
+    else:
+        updates["runtime_seconds"] = {"low": float(receipt.runtime_seconds[0]),
+                                      "high": record["calibrated_runtime_upper_seconds"]}
+    scope = receipt.memory.scope
+    if request.mem_mb_per_node is not None:
+        fields["mem_mb_per_node"] = {"source": "kept"}
+    elif record.get("status") != "calibrated":
+        fields["mem_mb_per_node"] = {"source": "not filled", "reason": record.get("reason")}
+    elif scope == "node" or (scope == "job" and request.nodes == 1):
+        updates["mem_mb_per_node"] = -(-record["calibrated_peak_bytes"] // (1024 * 1024))
+    else:
+        fields["mem_mb_per_node"] = {"source": "not filled", "reason": (
+            f"a {scope}-scope figure is not memory per node"
+            + (f" of a {request.nodes}-node job" if scope == "job" else ""))}
+    for name, value in updates.items():
+        fields[name] = {"source": "filled", "value": value}
+    completed = Request.model_validate({**request.model_dump(mode="json"), **updates})
+    return completed, {
+        "estimate_sha256": record["estimate_sha256"],
+        "calibration_id": record["calibration_id"],
+        "hardware_class": record["hardware_class"],
+        "fields": dict(sorted(fields.items())),
+    }
+
+
+# --- a scheduler lane's queue wait from history (#160) ---------------------
+
+def queue_wait_history(
+    specs: list[Any], scheduler_target: str, *, now: datetime, days: float,
+    max_jobs: int, min_jobs: int,
+) -> tuple[dict[str, Any] | None, int]:
+    """The queue-wait interval this host's recorded jobs on a lane show.
+
+    Each job with both ``scheduler_submitted_at`` and ``scheduler_started_at``
+    waited their difference. Of the ``max_jobs`` most recent that started
+    within ``days`` of ``now``, the nearest-rank 10th to 90th percentile is
+    the interval (``source: history``). Fewer than ``min_jobs`` gives None.
+    The second value is how many waits were used, or found.
+    """
+    cutoff = now.timestamp() - days * 86400.0
+    waits: list[tuple[float, float]] = []
+    for spec in specs:
+        if spec.scheduler_target != scheduler_target:
+            continue
+        if not spec.scheduler_submitted_at or not spec.scheduler_started_at:
+            continue
+        try:
+            submitted = _parse_time(spec.scheduler_submitted_at, "submitted").timestamp()
+            started = _parse_time(spec.scheduler_started_at, "started").timestamp()
+        except ValueError:
+            continue
+        if not cutoff <= started <= now.timestamp() + FUTURE_SKEW_SECONDS or started < submitted:
+            continue
+        waits.append((started, started - submitted))
+    recent = sorted(wait for _started, wait in sorted(waits, reverse=True)[:max_jobs])
+    if len(recent) < min_jobs:
+        return None, len(recent)
+    count = len(recent)
+    low = recent[math.ceil(0.1 * count) - 1]
+    high = recent[math.ceil(0.9 * count) - 1]
+    return {"low": round(low, 3), "high": round(high, 3), "source": "history"}, count
+
+
+# --- a Slurm lane's shape from sinfo (#160) ---------------------------------
+
+#: ``sinfo --noheader --partition Q --format`` for :func:`lane_shape_from_sinfo`.
+SINFO_FORMAT = "%c|%m|%G|%l|%s"
+_UNLIMITED = {"infinite", "unlimited"}
+
+
+def _slurm_count(value: str, what: str) -> int:
+    # sinfo appends "+" when it folds unlike nodes into one row: a lower bound.
+    text = value.strip().rstrip("+")
+    if not text.isdigit():
+        raise PlacementError(f"sinfo {what} is not a count: {value!r}")
+    return int(text)
+
+
+def _slurm_gpus(gres: str) -> int:
+    total = 0
+    for entry in gres.strip().split(","):
+        entry = entry.split("(", 1)[0].strip()
+        if not entry or entry == "null" or not entry.startswith("gpu"):
+            continue
+        count = entry.rsplit(":", 1)[-1]
+        if not count.isdigit():
+            raise PlacementError(f"sinfo GRES has no GPU count: {gres!r}")
+        total += int(count)
+    return total
+
+
+def _slurm_seconds(value: str) -> int | None:
+    """A Slurm time limit in seconds; None for an unlimited one."""
+    text = value.strip()
+    if text.lower() in _UNLIMITED:
+        return None
+    days, _sep, clock = text.rpartition("-")
+    parts = clock.split(":")
+    if (days and not days.isdigit()) or not 1 <= len(parts) <= 3 or not all(
+            part.isdigit() for part in parts):
+        raise PlacementError(f"sinfo time limit is not a duration: {value!r}")
+    numbers = [int(part) for part in parts]
+    hours, minutes, seconds = ([0, numbers[0], 0] if len(numbers) == 1
+                               else [0, *numbers] if len(numbers) == 2 else numbers)
+    return (int(days or 0) * 86400) + hours * 3600 + minutes * 60 + seconds
+
+
+def lane_shape_from_sinfo(text: str) -> dict[str, Any]:
+    """What ``sinfo`` (:data:`SINFO_FORMAT`) says one job can get in a partition.
+
+    A partition with several node groups is described by its smallest, so a
+    job sized by the result fits any node. Returns ``node`` (cpus, mem_mb,
+    gpus), the walltime (``max_walltime_seconds`` or ``walltime_unlimited``)
+    and, when finite, ``max_nodes``.
+    """
+    rows = [line.split("|") for line in text.splitlines() if line.strip()]
+    if not rows:
+        raise PlacementError("sinfo lists no nodes in this partition")
+    if any(len(row) != 5 for row in rows):
+        raise PlacementError("sinfo output is not in the expected format")
+    limits = [_slurm_seconds(row[3]) for row in rows]
+    finite = [limit for limit in limits if limit is not None]
+    sizes = [row[4].strip().rpartition("-")[2] for row in rows]
+    shape: dict[str, Any] = {
+        "node": {"cpus": min(_slurm_count(row[0], "CPUs") for row in rows),
+                 "mem_mb": min(_slurm_count(row[1], "memory") for row in rows),
+                 "gpus": min(_slurm_gpus(row[2]) for row in rows)},
+        **({"max_walltime_seconds": min(finite), "walltime_unlimited": False} if finite
+           else {"max_walltime_seconds": None, "walltime_unlimited": True}),
+    }
+    if all(size.isdigit() for size in sizes):
+        shape["max_nodes"] = min(int(size) for size in sizes)
+    elif not all(size.lower() in _UNLIMITED for size in sizes):
+        raise PlacementError("sinfo job-size limit is not a node count")
+    return shape
+
+
+# --- a Torque/PBS lane's shape from qstat -Qf and pbsnodes (#160) ----------
+
+_PBS_MEMORY_UNITS = {"b": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4}
+
+
+def _pbs_seconds(value: str) -> int:
+    parts = value.strip().split(".", 1)[0].split(":")
+    if not 1 <= len(parts) <= 4 or not all(part.isdigit() for part in parts):
+        raise PlacementError(f"qstat walltime is not a duration: {value!r}")
+    total = 0
+    for scale, part in zip((86400, 3600, 60, 1)[-len(parts):], parts, strict=True):
+        total += scale * int(part)
+    return total
+
+
+def _pbs_memory_mb(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+)\s*([kmgt]?b)?\s*", value.lower())
+    if match is None:
+        raise PlacementError(f"pbsnodes memory is not a size: {value!r}")
+    return int(match[1]) * _PBS_MEMORY_UNITS[match[2] or "b"] // 1024**2
+
+
+def _pbs_records(text: str, header: str | None = None) -> dict[str, dict[str, str]]:
+    """``name -> {attribute: value}`` from ``pbsnodes -a`` or ``qstat -Qf``."""
+    from vq.scheduler_probe import _unfold_qstat
+
+    records: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for line in _unfold_qstat(text).splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            name = line.strip()
+            if header is not None:
+                name = name.partition(":")[2].strip() if name.startswith(header) else ""
+            current = records.setdefault(name, {}) if name else None
+            continue
+        key, sep, value = line.strip().partition("=")
+        if sep and current is not None:
+            current[key.strip()] = value.strip()
+    return records
+
+
+def lane_shape_from_pbs(queue: str, qstat_text: str,
+                        pbsnodes_text: str | None) -> tuple[dict[str, Any], str | None]:
+    """What a Torque/PBS queue's limits and its nodes say one job can get.
+
+    ``qstat -Qf QUEUE`` gives the walltime and node-count maxima and whether
+    the queue runs jobs. The node shape is the smallest of the usable nodes
+    the queue routes to, in ``pbsnodes -a``: those carrying every property
+    its ``resources_default.neednodes`` names (Torque), or those whose
+    ``queue`` is QUEUE (PBS Pro). The second value says why no node shape
+    was read, or is None.
+    """
+    from vq.scheduler_probe import _PBS_UNUSABLE_STATES, _neednodes_lanes
+
+    attrs = _pbs_records(qstat_text, header="Queue:").get(queue)
+    if attrs is None:
+        raise PlacementError(f"qstat -Qf does not describe queue {queue}")
+    shape: dict[str, Any] = {}
+    if "resources_max.walltime" in attrs:
+        shape["max_walltime_seconds"] = _pbs_seconds(attrs["resources_max.walltime"])
+        shape["walltime_unlimited"] = False
+    nodect = attrs.get("resources_max.nodect", "").strip()
+    if nodect:
+        if not nodect.isdigit() or int(nodect) < 1:
+            raise PlacementError(f"qstat resources_max.nodect is not a count: {nodect!r}")
+        shape["max_nodes"] = int(nodect)
+    switches = [attrs.get(name, "").strip().lower() for name in ("enabled", "started")]
+    shape["maintenance"] = "false" in switches
+    properties = set(_neednodes_lanes(attrs.get("resources_default.neednodes", "")))
+    if pbsnodes_text is None:
+        return shape, "no pbsnodes reading"
+    routed = []
+    for node in _pbs_records(pbsnodes_text).values():
+        state = node.get("state", "").lower()
+        if any(bad in state for bad in _PBS_UNUSABLE_STATES):
+            continue
+        carried = {p.strip() for p in node.get("properties", "").split(",") if p.strip()}
+        if (properties and properties <= carried) or node.get("queue", "").strip() == queue:
+            routed.append(node)
+    if not routed:
+        return shape, (f"no usable node carries {', '.join(sorted(properties))}" if properties
+                       else f"queue {queue} names no node property and no usable node is in it")
+    cpus, mems, gpus = [], [], []
+    for node in routed:
+        np = node.get("resources_available.ncpus", node.get("np", "")).strip()
+        if not np.isdigit():
+            raise PlacementError(f"pbsnodes CPUs are not a count: {np!r}")
+        cpus.append(int(np))
+        status = dict(item.partition("=")[::2] for item in node.get("status", "").split(","))
+        memory = node.get("resources_available.mem", status.get("physmem"))
+        if memory is None:
+            raise PlacementError("pbsnodes gives a routed node no memory")
+        mems.append(_pbs_memory_mb(memory))
+        count = node.get("resources_available.ngpus", node.get("gpus", "0")).strip()
+        if not count.isdigit():
+            raise PlacementError(f"pbsnodes GPUs are not a count: {count!r}")
+        gpus.append(int(count))
+    shape["node"] = {"cpus": min(cpus), "mem_mb": min(mems), "gpus": min(gpus)}
+    return shape, None
+
+
+# --- a daemon's deployed runtimes from its deployment root (#160/#161) -----
+
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def runtimes_from_generations(listing: object) -> tuple[dict[str, list[str]], list[str]]:
+    """The verified generations a ``vq.runtime-generations/1`` listing proves, per program.
+
+    Each program's list starts with the root's current selection when that is
+    one of them, then the rest in identity order. Unverified generations, and
+    programs a placement record cannot name, are left out; the second value
+    says which programs were skipped and why.
+    """
+    if not isinstance(listing, dict) or listing.get("schema") != "vq.runtime-generations/1":
+        raise PlacementError("not a vq.runtime-generations/1 listing")
+    current = listing.get("current")
+    entries = listing.get("generations")
+    if not isinstance(entries, list):
+        raise PlacementError("the listing's generations are malformed")
+    runtimes: dict[str, list[str]] = {}
+    skipped: list[str] = []
+    for entry in entries:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("artifact_id"), str)
+                or not _DIGEST.fullmatch(entry["artifact_id"])
+                or type(entry.get("verified")) is not bool
+                or not isinstance(entry.get("program"), (str, type(None)))):
+            raise PlacementError("the listing's generations are malformed")
+        program = entry.get("program")
+        if not entry["verified"] or program is None:
+            continue
+        if not _LABEL.fullmatch(program):
+            skipped.append(f"program {program!r} is not a placement label")
+            continue
+        runtimes.setdefault(program, []).append(entry["artifact_id"])
+    for ids in runtimes.values():
+        ids.sort(key=lambda identity: (identity != current, identity))
+    return runtimes, skipped
+
+
+# --- a fleet file from live evidence (#160) ---------------------------------
+
+def _capacity_figure(answer: dict[str, Any], key: str) -> int | None:
+    value = answer.get(key)
+    if value is not None and (type(value) is not int or value < 0):
+        raise PlacementError(f"capacity answer {key} must be a non-negative integer or null")
+    return value
+
+
+def capacity_target(fleet: dict[str, Any], name: str) -> dict[str, Any]:
+    """The daemon target ``name`` of ``fleet``, which a capacity answer may describe."""
+    target: dict[str, Any] | None = next(
+        (t for t in fleet["targets"] if t["name"] == name), None)
+    if target is None:
+        raise PlacementError(f"capacity for {name}: no such target in the base fleet")
+    if target["kind"] != "daemon":
+        raise PlacementError(f"capacity for {name}: a scheduler lane has no capacity answer")
+    return target
+
+
+def fleet_with_capacity(base: dict[str, Any], answers: dict[str, object], *,
+                        unreachable: dict[str, float] | None = None) -> dict[str, Any]:
+    """``base`` with each named daemon target's live ``vq broker capacity`` answer.
+
+    The answer overlays that target's observation time, reachability,
+    free-now capacity (only when its admission is open and its queue ready),
+    GPUs per node and programs the daemon reports unavailable; everything else
+    is the operator's record. ``base`` must be a valid fleet, and each
+    overlaid value is checked, so the result is one too. ``unreachable``
+    names daemons that gave no answer, with when (epoch seconds): they are
+    recorded unreachable then, with nothing free.
+    """
+    from vq.broker_capacity import CAPACITY_SCHEMA, evidence_from_payload
+    from vq.config import PROGRAM_STATUS_OK
+
+    Fleet.model_validate(base)
+    fleet: dict[str, Any] = json.loads(json.dumps(base))
+    for name, when in sorted((unreachable or {}).items()):
+        if name in answers:
+            raise PlacementError(f"capacity for {name}: both an answer and no answer")
+        target = capacity_target(fleet, name)
+        target["observed_at"] = datetime.fromtimestamp(when, tz=UTC).isoformat()
+        target["reachable"] = False
+        target.pop("free", None)
+    for name, answer in sorted(answers.items()):
+        target = capacity_target(fleet, name)
+        if not isinstance(answer, dict) or answer.get("schema") != CAPACITY_SCHEMA:
+            raise PlacementError(f"capacity for {name}: not a {CAPACITY_SCHEMA} answer")
+        evidence = evidence_from_payload(name, answer, observed_at=0.0)
+        if evidence.error is not None:
+            raise PlacementError(f"capacity for {name}: {evidence.error}")
+        sampled_at = answer.get("sampled_at")
+        if not isinstance(sampled_at, (int, float)) or isinstance(sampled_at, bool) \
+                or not math.isfinite(sampled_at):
+            raise PlacementError(f"capacity for {name}: sampled_at must be a finite time")
+        # Validated above: the figures are as old as the daemon's snapshot.
+        age = float(answer.get("snapshot_age_seconds") or 0.0)
+        target["observed_at"] = datetime.fromtimestamp(
+            sampled_at - age, tz=UTC).isoformat()
+        snapshot = evidence.snapshot
+        target["reachable"] = snapshot.daemon_healthy and snapshot.state_root_agreement
+        free = {"cpus": _capacity_figure(answer, "free_cpus"),
+                "mem_mb": _capacity_figure(answer, "free_mem_mb"),
+                "gpus": _capacity_figure(answer, "free_gpus")}
+        gpus = _capacity_figure(answer, "gpus")
+        if snapshot.admission_open and snapshot.queue_ready:
+            target["free"] = {**(target.get("free") or {}), **free}
+        else:
+            target.pop("free", None)  # not free to start now
+        if gpus is not None:
+            target["node"]["gpus"] = gpus
+        for program, status in evidence.programs.items():
+            if status != PROGRAM_STATUS_OK:
+                target.get("programs", {}).pop(program, None)
+    return fleet
+
+
+Explanation = dict[str, Any]
+
+
+def explanation_json(explanation: Explanation) -> str:
+    return json.dumps(explanation, indent=2, sort_keys=True, allow_nan=False) + "\n"
+
+
+def _duration(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}"
+
+
+def _span(component: dict[str, Any]) -> str:
+    if component.get("unknown"):
+        return "unknown"
+    low, high = component["low"], component["high"]
+    return _duration(low) if low == high else f"{_duration(low)}-{_duration(high)}"
+
+
+def explanation_text(explanation: Explanation) -> str:
+    request = explanation["request"]
+    lines = [
+        f"placement for {request['program']}: {request['cpus']} CPUs on {request['nodes']} "
+        f"node(s), {request['mem_mb_per_node'] or 'unstated'} MB per node",
+    ]
+    if request.get("os") is not None:
+        lines.append(f"requested operating system: {request['os']}")
+    if request.get("account") is not None:
+        lines.append(f"requested account: {request['account']}")
+    if request.get("queue") is not None:
+        lines.append(f"requested queue/partition: {request['queue']}")
+    if request.get("required_data_access"):
+        lines.append(f"required data access: {', '.join(request['required_data_access'])}")
+    if request.get("required_licenses"):
+        lines.append(f"required licenses: {', '.join(request['required_licenses'])}")
+    if request.get("mpi_ranks") is not None:
+        lines.append(f"requested layout: {request['mpi_ranks']} MPI rank(s), "
+                     f"{request['threads_per_rank']} thread(s) per rank")
+    if request.get("scratch_mb_per_node") is not None:
+        lines.append(f"requested scratch: {request['scratch_mb_per_node']} MB per node")
+    if request.get("gpus_per_node") is not None:
+        lines.append(f"requested GPUs: {request['gpus_per_node']} per node")
+    if request.get("wall_time_seconds") is not None:
+        lines.append(f"requested walltime: {_duration(request['wall_time_seconds'])}")
+    estimate = explanation.get("estimate")
+    if estimate is not None:
+        lines.append(f"estimate {estimate['estimate_sha256'][:12]} (calibration "
+                     f"{estimate['calibration_id'][:12]} on {estimate['hardware_class']}):")
+        for name, field in estimate["fields"].items():
+            if field["source"] == "filled":
+                value = field["value"]
+                shown = (f"{value['low']:g}-{value['high']:g} s" if isinstance(value, dict)
+                         else f"{value} MB")
+                lines.append(f"  {name}: filled, {shown}")
+            elif field["source"] == "kept":
+                lines.append(f"  {name}: kept from the request")
+            else:
+                lines.append(f"  {name}: not filled ({field['reason']})")
+    selected = explanation["selected"]
+    if selected is None:
+        lines.append(f"HELD: {explanation['held']}")
+    else:
+        lines.append(
+            f"selected {selected['target']} (runtime {_short(selected['runtime_digest'])}); "
+            f"predicted completion {_span(selected['completion'])}"
+            + ("" if selected["completion"]["complete"] else " plus unknown components")
+        )
+    lines.append("")
+    header = ("RANK", "TARGET", "COMPLETION", "STAGING", "QUEUE WAIT", "EXECUTION",
+              "TRANSFER", "DATA AGE")
+    rows = [
+        (str(c["rank"]), c["target"],
+         _span(c["completion"]) + ("" if c["completion"]["complete"] else " + unknown"),
+         *(_span(c["components"][name]) for name in COMPONENTS),
+         f"{c['data_age_seconds']:.0f} s")
+        for c in explanation["candidates"]
+    ]
+    if rows:
+        widths = [max(len(r[i]) for r in [header, *rows]) for i in range(len(header))]
+        lines.extend("  ".join(r[i].ljust(widths[i]) for i in range(len(header))).rstrip()
+                     for r in [header, *rows])
+        unknown = [
+            f"  {c['target']} {name}: {c['components'][name]['reason']}"
+            for c in explanation["candidates"] for name in c["unknown_components"]
+        ]
+        if unknown:
+            lines += ["", "Unknown components (ranked after complete predictions):", *unknown]
+    if explanation["rejected"]:
+        lines += ["", "Rejected:"]
+        for item in explanation["rejected"]:
+            lines.append(f"  {item['target']}: {'; '.join(item['reasons'])}")
+    return "\n".join(lines) + "\n"

@@ -50,6 +50,12 @@ specific to vibe-qc is a summary with a link, not a second copy.
 (when-to-use-vq)=
 (when-not-to-use-vq)=
 
+For HTTPS submission without client SSH access, the optional
+[gateway and `vq remote` client](https://vibe-qc.com/vibe-queue/docs/gateway.html)
+provide resumable uploads, status, logs, cancellation and verified result
+downloads. Relay mode connects a broker through outbound requests. These
+routes require operator configuration; the SSH examples below remain valid.
+
 ## When to reach for the queue
 
 * **The laptop runs out of cores or RAM.** Supercells, dense k-meshes,
@@ -60,8 +66,10 @@ specific to vibe-qc is a summary with a link, not a second copy.
   terminal state, and which vibe-qc checkout produced the number.
 * **You are running many jobs.** A sweep that takes hours is exactly where
   losing track becomes expensive.
-* **You want the box to survive a greedy job.** On Linux, vq caps CPU and
-  memory with cgroup v2 rather than with a heuristic.
+* **You want the box to survive a greedy job.** On a Linux host whose systemd
+  user manager delegates memory control, vq caps CPU and memory with cgroup v2
+  rather than with a heuristic. Elsewhere it falls back to polling and signals;
+  see [cgroup setup](https://vibe-qc.com/vibe-queue/docs/cgroup-setup.html).
 
 Not worth it for a three-second molecule on the laptop, and not the right
 shape for interactive work: for notebooks, use the
@@ -74,8 +82,7 @@ shape for interactive work: for notebooks, use the
 
 ## Install it once, on both sides
 
-vq is installed from **its own repository**. Clone it before installing:
-
+vq is installed from **its own repository**, not from your vibe-qc checkout.
 Clone the public source snapshot over HTTPS:
 
 ```sh
@@ -99,7 +106,7 @@ for source archives and mirror availability.
 
 You need it on the laptop you submit from and on the machine that runs the
 work. It needs Python 3.12 or newer, and it installs nothing on the remote
-host but itself: the entire transport is SSH, so if you can `ssh` to a
+host but itself. Direct remote submission uses SSH, so if you can `ssh` to a
 machine, vq can queue work on it.
 
 For how the four toolset installs relate, including what each uninstall
@@ -182,8 +189,8 @@ branch = "main"
 import_check = "vibeqc"
 description = "vibe-qc development (main branch)"
 # Which [hosts.X.branches] names this environment serves, so that
-# `vq admin update vibeqc-dev` pauses only the jobs routed through it
-# rather than the whole queue.
+# `vq admin update vibeqc-dev` pauses only jobs submitted with those
+# `--branch` names rather than the whole queue.
 provides_branches = ["main", "dev"]
 
 [programs.vibeqc-release]
@@ -196,10 +203,17 @@ description = "vibe-qc release (latest tag)"
 provides_branches = ["release", "latest"]
 ```
 
-A job submitted with `--program vibeqc-dev` gets `VQ_PROGRAM_BIN`,
-`VQ_PROGRAM_PYTHON` and `VQ_PROGRAM_GIT_DIR` in its environment, so the
-payload can call `"$VQ_PROGRAM_BIN/vibeqc"` without hard-coding this host's
-paths. Prefer that to a literal checkout path in every script.
+`provides_branches` matches the name a job was submitted with under `--branch`.
+A job submitted with `--program` or `--python` alone carries no branch name, so
+that narrower pause does not see it.
+
+When the daemon on that host runs it, a job submitted with
+`--program vibeqc-dev` gets `VQ_PROGRAM_BIN`, `VQ_PROGRAM_PYTHON` and
+`VQ_PROGRAM_GIT_DIR` in its environment, so the payload can call
+`"$VQ_PROGRAM_BIN/vibeqc"` without hard-coding this host's paths. Prefer that
+to a literal checkout path in every script. A job sent to a PBS or Slurm host
+does not get them, because those paths belong to the driver. `--program` names
+the program and records it on the job; it never rewrites your command.
 
 (submission-forms)=
 
@@ -231,11 +245,19 @@ Queue it, watch it, fetch it:
 
 ```sh
 vq submit compute water.py          # prints a job id
-vq queue                            # what is happening right now
+vq queue                            # the jobs on the host, archived ones hidden
 vq status <jobid>                   # one job, with the tail of its output
 vq wait <jobid>                     # block until it reaches a terminal state
-vq fetch <jobid> -o results/        # bring the workspace back
+vq fetch <jobid> -o results/         # bring the workspace back
 ```
+
+The examples on this page write their outputs next to the script, in the
+workspace. A plain `vq fetch` brings those files back and succeeds when the
+host proves the separate scratch directory is empty. A job that writes into
+`$VQ_WORKDIR` wants `--workdir` instead. If scratch contains files or cannot
+be checked, the plain command copies the workspace but exits with a hint to
+choose: `--workdir` for scratch results, or `--workspace` when only the
+workspace is wanted.
 
 Declaring what the job needs gets it scheduled honestly rather than
 conservatively, because an undeclared job is charged an assumed footprint:
@@ -248,31 +270,42 @@ vq submit compute --cpus 8 --mem-mb 16000 --time-limit 04:00:00 water.py
 `vq wait` returning does **not** mean the calculation succeeded. It means the
 job reached a terminal state, and `failed`, `killed`, `oom_killed`,
 `starved`, `time_exceeded`, `interrupted` and `aborted_by_queue` are all
-terminal. Check the state.
+terminal. Check the state, or use the exit status: `vq wait` exits with the job's
+own exit code for `completed` and `failed`, with 1 for every other terminal
+state, and with 124 when `--timeout` runs out. Zero still means only that the
+process exited 0, not that the SCF converged.
 ```
 
 (multi-venv-branch-routing-v0-5-6)=
 
 ## Choosing which vibe-qc runs the job
 
-Three mechanisms, from loosest to strictest.
+Two mechanisms choose the interpreter, from loosest to strictest.
 
 ```sh
 # By interpreter path.
 vq submit compute --python /home/USER/vibeqc-dev/.venv/bin/python water.py
 
-# By branch name, resolved through [hosts.compute.branches].
-# Single-file submits only, and mutually exclusive with --python.
+# By branch name, resolved through [hosts.compute.branches]. It names an
+# interpreter, so it is mutually exclusive with --python. With -d or -c the
+# interpreter is put in front of your command.
 vq submit compute --branch release water.py
+```
 
-# By registered program, which also stamps a provenance identity.
-vq submit compute water.py --program vibeqc-release
+`--program` does not choose an interpreter. It attaches a registered program's
+identity to the job, and with `--expected-sha` it verifies that program's
+checkout. Pair it with `--branch` or `--python`, so that the interpreter is the
+one the program names:
+
+```sh
+# By registered program, plus the interpreter that program names.
+vq submit compute --program vibeqc-release --branch release water.py
 ```
 
 For a number you intend to publish, pin the source revision as well:
 
 ```sh
-vq submit compute water.py --program vibeqc-release \
+vq submit compute --program vibeqc-release --branch release water.py \
     --expected-sha 0123456789abcdef0123456789abcdef01234567
 ```
 
@@ -306,8 +339,12 @@ the server:
 vq fetch compute <jobid> --name job.qvf -o results/
 ```
 
-That publishes `results/job.qvf` atomically. Retrying is idempotent only when
-the existing file is byte-identical: vq will not overwrite a different result.
+That publishes `results/job.qvf` atomically: the transfer is staged and then
+renamed into place, so a reader never sees a half-written container. Fetching
+again refreshes it. An existing copy is replaced with the newly fetched bytes,
+and an identical one is left where it is. vq refuses only a destination it
+cannot safely replace, such as a symlink, or a directory where the artifact is
+a file.
 
 (vq-core-preflight)=
 
@@ -320,11 +357,13 @@ vq submit localhost --vibeqc-preflight water.py
 The flag runs your script once with `VIBEQC_DRY_RUN=1` before queueing,
 harvests the resulting `.system` manifest, and records the declared artefacts
 on the job spec. The queue then knows what the job will write before it writes
-it, so fetch can be selective and progress can be reported per declared
-artefact instead of by tarring the whole workspace.
+it, so `vq output` and `vq progress` can follow the declared artefacts. Fetch is
+unaffected: it brings back the whole workspace, or one file you name with
+`--name`.
 
-It costs a second or two at submit time, and it executes your Python file, so
-it is opt-in. Three limits worth knowing:
+It executes your Python file at submit time, so it is opt-in. The dry run is
+bounded rather than cheap by assumption: vq abandons it after ten seconds and
+queues the job anyway. Four limits worth knowing:
 
 * It is meaningful only for scripts that go through `vibeqc.run_job`. Other
   scripts are a no-op, and a preflight failure is non-fatal.
@@ -333,6 +372,9 @@ it is opt-in. Three limits worth knowing:
   explicitly first, then submit normally.
 * It is disabled inside `--array` and `--chain`, which run one source many
   times.
+* For a local submit, the dry run and the job use vq's own Python unless you
+  pass `--python` or `--branch`. If vibe-qc is not importable there, the dry run
+  does nothing (it is non-fatal) and the job itself then fails on the import.
 
 You can always run the same dry run by hand, which is a cheap way to see the
 file family a calculation will produce without paying for the SCF:
@@ -364,22 +406,24 @@ instead reads a file literally named `INPUT` in the working directory. The
 wrapper hides both conventions and restores the workspace on exit.
 
 ```sh
-# Parallel CRYSTAL14, 14 MPI ranks by default.
+# Parallel CRYSTAL14. The rank count is explicit; there is no default.
 vq submit compute -d ./calc --cpus 14 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh INPUT.d12
+    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 14 INPUT.d12
 
 # Serial, no mpirun startup cost.
 vq submit compute -d ./calc --cpus 1 \
     -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --serial INPUT.d12
 
-# A specific rank count.
-vq submit compute -d ./calc --cpus 8 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 8 INPUT.d12
-
 # PROPERTIES post-processing rather than an SCF.
-vq submit compute -d ./prop --cpus 14 \
-    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --properties prop.d3
+vq submit compute -d ./prop --cpus 8 \
+    -- bash /home/USER/vibe-queue/contrib/run-crystal.sh --np 8 \
+       --properties prop.d3
 ```
+
+A parallel run needs `--np N`; the wrapper refuses to guess one and exits
+rather than picking a rank count for you. Use `--serial` for a single core.
+Keep `--np` and `--cpus` in agreement, as with ORCA below: the first is what
+the wrapper launches, the second is what the queue reserves.
 
 `--demo` selects the CRYSTAL23 demo binaries. It is serial only, so combining
 it with `--np` is rejected, and it is capped at ten atoms per primitive cell.
@@ -420,6 +464,13 @@ binary = "/home/USER/xtb-dist/bin/xtb"
 description = "xtb 6.7.1 GFN-xTB / GFN-FF semiempirical"
 ```
 
+`--program xtb` checks that the name is registered and records it on the job;
+you still name the executable in the command:
+
+```sh
+vq submit compute --program xtb -d ./calc -- /home/USER/xtb-dist/bin/xtb input.xyz
+```
+
 PySCF needs nothing special: it is installed in the vibe-qc test extra, so a
 PySCF script submits exactly like a vibe-qc one.
 
@@ -429,7 +480,7 @@ PySCF script submits exactly like a vibe-qc one.
 ## Getting results back
 
 ```sh
-vq fetch <jobid> -o results/            # the workspace
+vq fetch <jobid> -o results/               # the workspace
 vq fetch <jobid> --name job.qvf -o results/   # one named artifact
 vq fetch --workdir <jobid>              # the per-job scratch directory
 vq fetch-all compute -o results/        # every terminal job on a host
@@ -438,7 +489,10 @@ vq fetch-all compute -o results/        # every terminal job on a host
 A fetched directory is what you would have had if you had run the job locally,
 including the `.bibtex` and `.references` files that
 [citations](citations.md) explains how to use, plus vq's own `stdout.log` and
-`stderr.log`.
+`stderr.log`, and a `_vq/` directory that records the job's events, its exit
+code and how the fetch went. If a file could not be read, or a symlink pointed
+outside the workspace, the rest still arrives, the command prints `PARTIAL`,
+and `_vq/fetch-exclusions.json` names what is missing.
 
 The `.system` manifest records what produced the number, which is the part
 worth keeping when you come back to a result months later:
@@ -490,4 +544,4 @@ Everything below is vq's own documentation, not vibe-qc's:
 * [Install and maintain the vibe toolset](../toolset_lifecycle.md).
 * [Jupyter Lab integration](jupyter.md), for interactive work, which is the
   shape vq is deliberately bad at.
-* [vibe-queue on GitLab](https://github.com/vibe-qc/vibe-queue).
+* [vibe-queue on GitHub](https://github.com/vibe-qc/vibe-queue).

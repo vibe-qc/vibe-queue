@@ -156,6 +156,9 @@ RELEASE_CODENAMES: dict[str, str] = {
     # changelog, a documentation site, this catalogue, and a release
     # procedure. The bazaar is the open half of the essay's pairing.
     "0.26.0": "Raymond's Bazaar",
+    # Bertrand Meyer, Design by Contract: the 1.0 documented stable interface
+    # and compatibility boundary, rather than a promise of every future feature.
+    "1.0.0": "Meyer's Contract",
 
     # --- Provisional: re-confirm the delivered concept before tagging ---
     "0.27.0": "Fidge's Timestamp",

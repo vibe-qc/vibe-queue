@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -1444,6 +1445,32 @@ def format_overview_text(overview: HostOverview) -> str:
     return "\n".join(lines)
 
 
+#: Keys of a slot transaction's receipt that the overview JSON carries. The
+#: rest of that receipt (the registry and service files' bytes and inode
+#: identities that recovery replays) stays in the owner-only marker file on
+#: the host; it is recovery evidence, not status.
+_SLOT_RECEIPT_STATUS_KEYS = ("root", "sha", "staged")
+
+
+def _admin_marker_json(payload: dict[str, Any]) -> dict[str, Any]:
+    """An admin-update marker for JSON output: its receipt without file bytes."""
+    raw = payload.get("managed_transaction")
+    if isinstance(raw, dict) and isinstance(raw.get("slot_transaction"), dict):
+        context = raw["slot_transaction"]
+        payload = {**payload, "managed_transaction": {
+            **raw,
+            "slot_transaction": {key: context.get(key) for key in _SLOT_RECEIPT_STATUS_KEYS},
+        }}
+    return payload
+
+
+def _admin_marker_snapshot_json(payload: dict[str, Any]) -> dict[str, Any]:
+    marker = payload.get("marker")
+    if isinstance(marker, dict):
+        payload = {**payload, "marker": _admin_marker_json(marker)}
+    return payload
+
+
 def format_overview_json(overview: HostOverview) -> dict[str, Any]:
     """Single dict for the JSON output. Stable schema — every field
     appears with its documented type even when None. Mirrors
@@ -1464,9 +1491,12 @@ def format_overview_json(overview: HostOverview) -> dict[str, Any]:
         "recent_terminal_counts": overview.recent_terminal_counts,
         "daemon_health": (asdict(overview.daemon_health) if overview.daemon_health else None),
         "envs": [asdict(e) for e in overview.envs],
-        "admin_marker": (asdict(overview.admin_marker) if overview.admin_marker else None),
+        "admin_marker": (
+            _admin_marker_json(asdict(overview.admin_marker)) if overview.admin_marker else None
+        ),
         "admin_markers": [
-            asdict(snapshot) for snapshot in _admin_marker_snapshots(overview)
+            _admin_marker_snapshot_json(asdict(snapshot))
+            for snapshot in _admin_marker_snapshots(overview)
         ],
         "admin_marker_stale_reason": overview.admin_marker_stale_reason,
         "admin_marker_status": overview.admin_marker_status,
@@ -1521,6 +1551,208 @@ def format_overview_json(overview: HostOverview) -> dict[str, Any]:
         "mem_available_mb": overview.mem_available_mb,
     }
     return payload
+
+
+def _placement_rank(
+    *, host: str, free_cpus: int, mem_available_mb: int | None,
+    pending_cpus: int, idle_seconds: int | None,
+    job_cpus: int | None, job_mem_mb: int | None,
+) -> tuple[int, int, int, int, int, int, str]:
+    """Shared ordering; callers own eligibility and effective headroom.
+
+    Legacy auto-placement permits unknown RAM and insufficient headroom. The
+    broker first rejects those cases, then uses exactly the same ordering.
+    """
+    mem_fits = job_mem_mb is None or mem_available_mb is None or mem_available_mb >= job_mem_mb
+    cpu_fits = job_cpus is None or free_cpus >= job_cpus
+    return (
+        -int(mem_fits), -int(cpu_fits), -(mem_available_mb or 0), -free_cpus,
+        pending_cpus, -(idle_seconds if idle_seconds is not None else -1), host,
+    )
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+@dataclass(frozen=True)
+class BrokerPlacementRequest:
+    """Resolved resource demand for one held job; not a JobSpec wire model."""
+
+    cpus: int
+    mem_mb: int
+    pool: str | None = None
+    wall_time_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("cpus", "mem_mb"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"broker {name} demand must be a positive integer")
+        if self.wall_time_seconds is not None and (
+            not _finite_number(self.wall_time_seconds) or self.wall_time_seconds <= 0
+        ):
+            raise ValueError("broker wall time must be finite and positive")
+
+
+@dataclass(frozen=True)
+class BrokerCapacitySnapshot:
+    """Job-specific effective admission headroom supplied by a future collector.
+
+    Free resources include all tighter limits, existing work and reservations
+    not yet accounted for by the target. None means unknown, never unlimited.
+    Admission includes administrative holds, program availability and quotas;
+    queue_ready confirms this job would not wait behind the target FIFO.
+    observed_at and the caller's now must share one clock basis. This model
+    performs no discovery and does not turn a HostOverview into admission proof.
+    """
+
+    host: str
+    observed_at: float
+    free_cpus: int | None
+    free_mem_mb: int | None
+    free_jobs: int | None
+    reachable: bool = False
+    daemon_healthy: bool = False
+    state_root_agreement: bool = False
+    admission_open: bool = False
+    queue_ready: bool = False
+    is_scheduler_host: bool = False
+    scheduler_admission: bool = False
+    max_request_cpus: int | None = None
+    authority: dict[str, str] | None = None
+    runtime_pins: dict[str, str] | None = None
+    pools: frozenset[str] = frozenset()
+    max_wall_time_seconds: float | None = None
+    pending_cpus: int = 0
+    idle_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class BrokerPlacementDecision:
+    """Advice and deterministic evidence, not a committed reservation."""
+
+    host: str | None
+    blockers: tuple[tuple[str, str], ...]
+    ranking: tuple[tuple[int, int, int, int, int, int, str], ...]
+
+
+def _broker_observation_policy(now: float, max_age_seconds: float) -> None:
+    if not _finite_number(now) or not _finite_number(max_age_seconds) or max_age_seconds <= 0:
+        raise ValueError("broker observation time must be finite and maximum age positive")
+
+
+def broker_host_blocker(
+    snapshot: BrokerCapacitySnapshot, request: BrokerPlacementRequest,
+    *, now: float, max_age_seconds: float,
+) -> str | None:
+    """Return why a held job cannot run now, or None for an eligible snapshot.
+
+    This is deliberately stricter than client-side auto-placement. Even an
+    eligible result requires a durable reservation and target recheck in B4.
+    """
+    _broker_observation_policy(now, max_age_seconds)
+    if snapshot.is_scheduler_host and not snapshot.scheduler_admission:
+        return "scheduler-unsupported"
+    for confirmed, reason in (
+        (snapshot.reachable, "unreachable"),
+        (snapshot.daemon_healthy, "daemon-not-ready"),
+        (snapshot.state_root_agreement, "state-root-unverified"),
+        (snapshot.admission_open, "admission-blocked"),
+        (snapshot.queue_ready, "queue-not-ready"),
+    ):
+        if confirmed is not True:
+            return reason
+    if not _finite_number(snapshot.observed_at):
+        return "snapshot-invalid"
+    age = now - snapshot.observed_at
+    if age < 0:
+        return "snapshot-future"
+    if age > max_age_seconds:
+        return "snapshot-stale"
+    if request.pool is not None and request.pool not in snapshot.pools:
+        return "pool-mismatch"
+    if snapshot.max_wall_time_seconds is not None:
+        limit = snapshot.max_wall_time_seconds
+        if not _finite_number(limit) or limit <= 0:
+            return "capacity-invalid"
+        if request.wall_time_seconds is None:
+            return "wall-time-unknown"
+        if request.wall_time_seconds > limit:
+            return "wall-time-exceeded"
+    if snapshot.is_scheduler_host:
+        if snapshot.max_request_cpus is not None:
+            if type(snapshot.max_request_cpus) is not int or snapshot.max_request_cpus < 1:
+                return "capacity-invalid"
+            if request.cpus > snapshot.max_request_cpus:
+                return "cpus-exceeded"
+        # These are scheduler admission slots, not invented cluster CPU/RAM.
+        if snapshot.free_jobs is None:
+            return "capacity-unknown"
+        if type(snapshot.free_jobs) is not int:
+            return "capacity-invalid"
+        return "job-slots-insufficient" if snapshot.free_jobs < 1 else None
+    headroom = (snapshot.free_cpus, snapshot.free_mem_mb, snapshot.free_jobs)
+    if any(value is None for value in headroom):
+        return "capacity-unknown"
+    if (
+        any(type(value) is not int for value in headroom)
+        or type(snapshot.pending_cpus) is not int or snapshot.pending_cpus < 0
+        or (snapshot.idle_seconds is not None
+            and (type(snapshot.idle_seconds) is not int or snapshot.idle_seconds < 0))
+    ):
+        return "capacity-invalid"
+    # Narrow optional values after the unknown check, without substituting
+    # guessed capacity for absent information.
+    assert snapshot.free_cpus is not None
+    assert snapshot.free_mem_mb is not None
+    assert snapshot.free_jobs is not None
+    if snapshot.free_cpus < request.cpus:
+        return "cpus-insufficient"
+    if snapshot.free_mem_mb < request.mem_mb:
+        return "memory-insufficient"
+    if snapshot.free_jobs < 1:
+        return "job-slots-insufficient"
+    return None
+
+
+def place_broker_job(
+    snapshots: list[BrokerCapacitySnapshot], request: BrokerPlacementRequest,
+    *, now: float, max_age_seconds: float,
+) -> BrokerPlacementDecision:
+    """Rank eligible daemon hosts for one job without I/O, clock reads or mutation.
+
+    No candidate means keep holding. The caller must record/debit a reservation
+    before evaluating the next job; this function supplies no placement loop.
+    """
+    _broker_observation_policy(now, max_age_seconds)
+    hosts: set[str] = set()
+    blockers: list[tuple[str, str]] = []
+    ranks: list[tuple[int, int, int, int, int, int, str]] = []
+    for snapshot in snapshots:
+        if not isinstance(snapshot.host, str) or not snapshot.host.strip():
+            raise ValueError("broker snapshot must name a host authority")
+        if snapshot.host in hosts:
+            raise ValueError("duplicate broker host authority")
+        hosts.add(snapshot.host)
+        reason = broker_host_blocker(snapshot, request, now=now, max_age_seconds=max_age_seconds)
+        if reason is not None:
+            blockers.append((snapshot.host, reason))
+            continue
+        if snapshot.is_scheduler_host:
+            ranks.append((0, 0, 0, 0, 0, 0, snapshot.host))
+            continue
+        assert snapshot.free_cpus is not None
+        ranks.append(_placement_rank(
+            host=snapshot.host, free_cpus=snapshot.free_cpus,
+            mem_available_mb=snapshot.free_mem_mb, pending_cpus=snapshot.pending_cpus,
+            idle_seconds=snapshot.idle_seconds, job_cpus=request.cpus, job_mem_mb=request.mem_mb,
+        ))
+    ranks.sort()
+    return BrokerPlacementDecision(
+        host=ranks[0][-1] if ranks else None,
+        blockers=tuple(sorted(blockers)), ranking=tuple(ranks),
+    )
 
 
 def recommend_host(
@@ -1589,33 +1821,11 @@ def recommend_host(
         # real core headroom for the job.
         return -committed
 
-    def _mem_fits(o: HostOverview) -> int:
-        # No estimate, or a host with no RAM reading (off Linux / never
-        # sampled) → impose no memory constraint (1); let the core ranking
-        # decide. A host whose known free RAM can't hold the estimate → 0
-        # (OOM risk), so it loses to any host that can.
-        if job_mem_mb is None or o.mem_available_mb is None:
-            return 1
-        return 1 if o.mem_available_mb >= job_mem_mb else 0
-
-    # Ascending sort; every "more is better" term negated. RAM-fit first (the
-    # OOM guard — the binding constraint for QC), then core-fit (dispatch now
-    # vs queue), then most free RAM (spread memory), then most free cores,
-    # fewest queued cpus, most idle, host. Unknown free RAM maps to 0 headroom
-    # — a host we can't confirm sorts below one we can, without being excluded.
     def _rank(o: HostOverview) -> tuple[int, int, int, int, int, int, str]:
-        free_cpus = _free_cpus(o)
-        cpu_fits = 1 if (job_cpus is None or free_cpus >= job_cpus) else 0
-        idle = o.idle_seconds if o.idle_seconds is not None else -1
-        mem_avail = o.mem_available_mb or 0
-        return (
-            -_mem_fits(o),
-            -cpu_fits,
-            -mem_avail,
-            -free_cpus,
-            o.pending_cpus,
-            -idle,
-            o.host,
+        return _placement_rank(
+            host=o.host, free_cpus=_free_cpus(o), mem_available_mb=o.mem_available_mb,
+            pending_cpus=o.pending_cpus, idle_seconds=o.idle_seconds,
+            job_cpus=job_cpus, job_mem_mb=job_mem_mb,
         )
 
     candidates.sort(key=_rank)

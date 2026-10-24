@@ -8,11 +8,15 @@ import json
 import time
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from vq import admission, capacity, config, drain, events, rpc
 from vq.daemon_control import is_daemon_serving
+from vq.final_usage import format_final_usage, read_final_usage
+from vq.gpu_usage import format_gpu_live, format_gpu_usage, read_gpu_usage
 from vq.host import is_local_host
 from vq.listing import (
+    SCHEDULER_COLLECTION_PHASES,
     effective_queue_state,
     normalized_scheduler_phase,
     normalized_scheduler_target,
@@ -23,7 +27,10 @@ from vq.listing import (
 )
 from vq.logs import read_system_progress
 from vq.logs import tail_file as _tail_file
-from vq.scheduler_dispatch import scheduler_dispatcher_for
+from vq.scheduler_dispatch import (
+    bound_remote_workspace,
+    scheduler_dispatcher_for,
+)
 from vq.spec import (
     JobSpec,
     JobState,
@@ -251,6 +258,18 @@ def show_status(
             )
     if spec.scheduler_tasks is not None:
         lines.append(f"sched_tasks:  {spec.scheduler_tasks}")
+    if spec.gpus is not None:
+        lines.append(f"gpus:         {spec.gpus}")
+    if spec.mem_mb_source == "calibrated-estimate":
+        lines.append(f"mem_mb:       {spec.mem_mb} (from the calibrated estimate)")
+    if spec.wall_time_source == "calibrated-estimate":
+        lines.append(f"wall_time:    {spec.wall_time_seconds}s (from the calibrated estimate)")
+    if spec.runtime_bundle is not None:
+        lines.append(f"runtime:      generation {spec.runtime_bundle.artifact_id[:12]} "
+                     f"of {spec.runtime_bundle.root}")
+    if spec.resource_estimate is not None:
+        lines.append(f"estimate:     {_format_estimate(spec.resource_estimate)}"
+                     f"{_format_calibration(spec.resource_estimate_calibration)}")
     # v0.9.2: queue position for a PENDING job — how many pending jobs sort
     # ahead of it in the daemon's dispatch order. Answers the documented
     # "my job sits in pending, where am I in line?" question. Best-effort:
@@ -392,6 +411,12 @@ def show_status(
         lines.append(f"scheduler:    {' '.join(scheduler_bits)}")
         lines.append(f"sched_state:  {_scheduler_state_label(spec)}")
         lines.append(f"fetch_state:  {_scheduler_fetch_state_label(spec)}")
+        # The scheduler's own answer to "why has this not started yet", shown
+        # next to the queued state it explains. Without it a job that can
+        # never be scheduled is indistinguishable from one that is merely
+        # next in line.
+        if spec.scheduler_queued_reason:
+            lines.append(f"queued_why:   {spec.scheduler_queued_reason}")
         if spec.scheduler_exec_host:
             lines.append(f"exec_host:    {spec.scheduler_exec_host}")
         walltime = _format_scheduler_walltime(
@@ -400,6 +425,9 @@ def show_status(
         )
         if walltime:
             lines.append(f"sched_wall:   {walltime}")
+        usage = _format_scheduler_usage(spec)
+        if usage:
+            lines.append(f"sched_use:    {usage}")
         walltime_warning = _format_scheduler_walltime_warning(
             spec.scheduler_walltime_used,
             spec.scheduler_walltime_limit,
@@ -454,6 +482,20 @@ def show_status(
         lines.append(f"finished:     {spec.finished_at}")
     if spec.exit_code is not None:
         lines.append(f"exit_code:    {describe_exit_code(spec.exit_code)}")
+    # #168: what the finished command measurably used, from its receipt.
+    if spec.is_terminal:
+        usage_line = format_final_usage(read_final_usage(workspace))
+        if usage_line is not None:
+            lines.append(f"usage:        {usage_line}")
+        gpu_line = (format_gpu_usage(read_gpu_usage(workspace, spec.gpus))
+                    if spec.gpus is not None else None)
+        if gpu_line is not None:
+            lines.append(f"gpu use:      {gpu_line}")
+    # #168: a running GPU job's newest GPU sample, from the driver's poll.
+    if not spec.is_terminal and spec.gpus is not None:
+        live_line = format_gpu_live(spec.scheduler_gpu_live, spec.gpus)
+        if live_line is not None:
+            lines.append(f"gpu now:      {live_line}")
     # v0.24: live calculation progress from the .system manifest.
     if not spec.is_terminal:
         progress = _read_progress_from_system(spec, cfg=cfg)
@@ -464,6 +506,11 @@ def show_status(
     # exit-code-says-it-all case stays uncluttered.
     if spec.failure_reason:
         lines.append(f"failure:      {spec.failure_reason}")
+    # #63 follow-up: an opt-in workdir cleanup that was refused is operator
+    # news, but it is not a failure of the job -- a COMPLETED job says so
+    # here rather than under ``failure:``.
+    if spec.workdir_cleanup_note:
+        lines.append(f"workdir:      {spec.workdir_cleanup_note}")
     # v0.12.0: crash feedback. The captured stderr tail tells the operator
     # WHY a calculation died (traceback / CRYSTAL or ORCA error) inline,
     # no fetch-and-grep. Indented so it reads as the cause of the failure.
@@ -616,6 +663,17 @@ def show_status_json(
         spec,
         scheduler_missing_marker=scheduler_missing_marker,
     )
+    # #168: measured wall time, CPU time and peak RSS from the finished
+    # command's receipt; null while the job runs or when it left none.
+    payload["resource_usage"] = (
+        read_final_usage(workspace) if spec.is_terminal else None
+    )
+    # #168: what the job's GPUs did, from its nvidia-smi samples. Only a job
+    # that requested GPUs carries the key, so other payloads are unchanged.
+    if spec.gpus is not None:
+        payload["gpu_usage"] = (
+            read_gpu_usage(workspace, spec.gpus) if spec.is_terminal else None
+        )
     if spec.state == JobState.PENDING:
         with contextlib.suppress(Exception):
             from vq.listing import list_jobs
@@ -1250,9 +1308,22 @@ def _runtime_workdir(spec: JobSpec) -> str | None:
 
 
 def _scheduler_runtime_workdir(spec: JobSpec) -> str | None:
+    """The scheduler workspace this job is bound to, not a fresh derivation.
+
+    #63 records the workspace on the spec before the submission boundary
+    precisely so a later ``scratch_root`` change cannot move a live job.
+    Recomputing it here published the *new* root as ``runtime_workdir`` --
+    the agent contract's name for ``$VQ_WORKDIR`` -- and
+    ``checkpoint_qvf_path`` is derived from it, so a polling agent watched a
+    checkpoint path nothing would ever write. The derivation stays as the
+    fallback for a job dispatched before the binding existed, which is what
+    :func:`~vq.scheduler_dispatch.bound_remote_workspace` means.
+    """
+    if spec.scheduler_remote_workspace:
+        return spec.scheduler_remote_workspace
     with contextlib.suppress(Exception):
         host_cfg = config.load_config().host(spec.scheduler_target or "")
-        return scheduler_dispatcher_for(host_cfg).remote_workspace(spec.id)
+        return bound_remote_workspace(scheduler_dispatcher_for(host_cfg), spec)
     return None
 
 
@@ -1445,11 +1516,14 @@ def pending_blockers(
     if spec.scheduler_target is not None:
         if cap.max_scheduler_jobs is None:
             return reasons
+        # The daemon's gate: allocations the scheduler reported finished,
+        # whose artifacts are still being collected, hold no slot (#170).
         active = [
             s
             for s in all_specs
             if s.scheduler_target is not None
             and s.state in _SCHEDULER_ACTIVE_STATES
+            and s.scheduler_state not in SCHEDULER_COLLECTION_PHASES
         ]
         scheduler_active = len(active)
         if scheduler_active >= cap.max_scheduler_jobs:
@@ -1886,6 +1960,60 @@ def _terminal_states() -> frozenset[JobState]:
     """Imported lazily to keep the module-import surface small."""
     from vq.spec import TERMINAL_STATES  # noqa: PLC0415
     return TERMINAL_STATES
+
+
+def _format_estimate(receipt: dict[str, Any]) -> str:
+    """One line for the estimate a job was submitted with (#159)."""
+    features = receipt.get("features")
+    features = features if isinstance(features, dict) else {}
+    memory = receipt.get("memory")
+    memory = memory if isinstance(memory, dict) else {}
+    peak = memory.get("peak_bytes")
+    peak_text = f"{peak / 1024**2:.0f} MiB" if isinstance(peak, int) else "unknown"
+    evidence = receipt.get("input_sha256")
+    return (f"{features.get('method') or 'method unknown'}; memory {peak_text} "
+            f"({memory.get('scope', 'unspecified')} scope, {receipt.get('calibration')}); "
+            f"evidence {evidence[:12] if isinstance(evidence, str) else 'unknown'}")
+
+
+def _format_calibration(record: dict[str, Any] | None) -> str:
+    """#159: what a calibration made of the job's estimate, or nothing."""
+    if not isinstance(record, dict):
+        return ""
+    calibration = str(record.get("calibration_id") or "")[:12]
+    if record.get("status") != "calibrated":
+        return f"; uncalibrated by {calibration} ({record.get('reason')})"
+    peak = record.get("calibrated_peak_bytes")
+    peak_text = f"{peak / 1024**2:.0f} MiB" if isinstance(peak, int) else "unknown"
+    bound = ", a lower bound" if record.get("multiplier_is_lower_bound") else ""
+    return (f"; calibrated {peak_text} (x{record.get('multiplier')}{bound}, calibration "
+            f"{calibration} on {record.get('hardware_class')})")
+
+
+def _format_scheduler_usage(spec: JobSpec) -> str | None:
+    """The scheduler's own reading of a job's memory and CPU time (#168).
+
+    Torque/PBS reports the job's memory in use; Slurm's ``sstat`` only the
+    peak of its largest task, labelled as such. CPU is shown as time and,
+    with the walltime, as average busy cores over the run so far, which is
+    not a current reading.
+    """
+    from vq.scheduler_dialect import slurm_cpu_seconds, torque_memory_mb
+
+    parts = []
+    mem = torque_memory_mb(spec.scheduler_mem_used)
+    if mem is not None:
+        parts.append(f"mem {mem:.0f} MB")
+    task_peak = torque_memory_mb(spec.scheduler_task_peak_rss)
+    if task_peak is not None:
+        parts.append(f"largest-task peak {task_peak:.0f} MB")
+    cpu = slurm_cpu_seconds(spec.scheduler_cpu_used) if spec.scheduler_cpu_used else None
+    if cpu is not None:
+        wall = (_hms_to_seconds(spec.scheduler_walltime_used)
+                if spec.scheduler_walltime_used else None)
+        average = f" ({cpu / wall:.1f} cores avg)" if wall else ""
+        parts.append(f"cpu {spec.scheduler_cpu_used}{average}")
+    return " · ".join(parts) + " (scheduler-reported)" if parts else None
 
 
 def _format_scheduler_walltime(used: str | None, limit: str | None) -> str | None:

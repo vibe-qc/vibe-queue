@@ -20,7 +20,7 @@ simultaneously:
 
 * sshd from workstation → rejected (no key)
 * sshd from compute-a → rejected (no key)
-* sshd from voyager (jump-host) → rejected (no key)
+* sshd from jump-a (jump host) → rejected (no key)
 * root ssh → hardened off
 * Cockpit / web admin → not installed
 * IPMI / BMC → not configured
@@ -79,7 +79,7 @@ includes a "Terminal" pane that gives you a real shell.
 using PAM (not the SSH key system). When sshd is broken / locked
 out, Cockpit usually still works.
 
-**Setup:** see [`contrib/setup-recovery-channels.sh`](../contrib/setup-recovery-channels.sh).
+**Setup:** see [`contrib/setup-recovery-channels.sh`](https://github.com/vibe-qc/vibe-queue/blob/main/contrib/setup-recovery-channels.sh).
 Idempotent; safe to re-run. The short version:
 
 ```sh
@@ -125,7 +125,7 @@ user-level process can wipe `/etc/ssh/recovery_authorized_keys`
 `cloud-init` running as your user can affect it. Even if your
 primary account's home dir gets nuked, this path stays open.
 
-**Setup:** see [`contrib/setup-recovery-channels.sh`](../contrib/setup-recovery-channels.sh).
+**Setup:** see [`contrib/setup-recovery-channels.sh`](https://github.com/vibe-qc/vibe-queue/blob/main/contrib/setup-recovery-channels.sh).
 Set `RECOVERY_USER` to your chosen local recovery account explicitly. For example:
 
 ```sh
@@ -257,7 +257,7 @@ muscle-memory inventory of "machines I can use."
 
 ## Pointers
 
-- [`contrib/setup-recovery-channels.sh`](../contrib/setup-recovery-channels.sh) — the idempotent bootstrap script
+- [`contrib/setup-recovery-channels.sh`](https://github.com/vibe-qc/vibe-queue/blob/main/contrib/setup-recovery-channels.sh) — the idempotent bootstrap script
 - `vq admin audit-recovery HOST` — the audit verb (v0.7.5)
 - `docs/multi_user_deployment.md` — the existing multi-user daemon install runbook (adjacent but separate concern)
 - `HANDOVER_compute-d_RECOVERY.md` — the dropbox doc capturing the 2026-05-26 incident (delete after compute-d is fixed)

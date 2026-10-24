@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 
 import click
 
@@ -61,6 +61,8 @@ from vq import (
 from vq import (
     throttle as throttle_module,
 )
+from vq.benchmark_cli import benchmark
+from vq.campaign_cli import campaign
 from vq.cleanup import (
     archive_workspace,
     cleanup_scheduler_remote_workspace,
@@ -97,6 +99,7 @@ from vq.doctor import (
     scheduler_probe_check_from_payload as _scheduler_probe_check_from_payload,  # noqa: F401
 )
 from vq.fetch import (
+    FETCH_EXCLUSIONS_SIDECAR,
     BulkFetchResult,
     bulk_fetch,
     emit_artifact_tar,
@@ -110,6 +113,7 @@ from vq.fetch import (
     fetch_workdir_remote,
     mark_terminal_fetch,
     prepare_remote_bulk_fetch,
+    read_fetch_exclusions,
     require_fresh_fetch_manifest,
     require_workspace_artifact_selection,
 )
@@ -154,6 +158,7 @@ from vq.pause_resume import (
     resume_scheduler_all,
     resume_scheduler_job,
 )
+from vq.placement_cli import placement
 from vq.resubmit import (
     ResubmitOverrides,
     resubmit_local,
@@ -161,6 +166,7 @@ from vq.resubmit import (
     resubmit_state,
     resubmit_state_remote,
 )
+from vq.runtime_bundle_cli import runtime_bundle
 from vq.scheduler_dispatch import (
     SchedulerDispatcher,
     SchedulerError,
@@ -176,6 +182,7 @@ from vq.spec import (
     JobState,
     ProgramRuntimePin,
     signal_name_for_exit,
+    utcnow_iso,
 )
 from vq.spec_access import resolve_authorized_spec
 from vq.status import (
@@ -489,6 +496,11 @@ def _submit_receipt(
                 # target, else a slurm-cluster submit during a pbs-cluster rebuild
                 # reads "held" while it dispatches normally.
                 scope = admin_module.admin_update_markers_scope()
+                receipt["background_admin_updates"] = [
+                    {"envs": marker.envs, "host": marker.host, "state": marker.state}
+                    for marker in admin_module.read_admin_update_markers()
+                    if admin_module.admin_update_marker_scope(marker) == frozenset()
+                ]
                 target = (
                     host
                     if host_cfg is not None and host_cfg.scheduler != "local"
@@ -537,6 +549,11 @@ def _narrate_submit_receipt(receipt: dict[str, object]) -> None:
     assert isinstance(holds, list)
     for hold in holds:
         click.echo(f"  note: dispatch is held — {hold}", err=True)
+    if receipt.get("background_admin_updates"):
+        click.echo(
+            "  note: a runtime replacement is building or needs recovery; "
+            "eligible current-runtime jobs may dispatch", err=True,
+        )
     nxt = receipt["next"]
     assert isinstance(nxt, list)
     click.echo(f"  next: {' | '.join(nxt)}", err=True)
@@ -1053,6 +1070,21 @@ def _resolve_job_host(
     """
     if explicit_host is not None:
         return explicit_host
+    from vq import broker_relay
+
+    if broker_relay.is_broker_job_id(jobid):
+        # #64: a broker job id belongs to a broker, never to a run queue.
+        brokers = sorted(name for name, host in cfg.hosts.items() if host.broker)
+        if len(brokers) == 1:
+            return brokers[0]
+        if not brokers and cfg.broker.enabled:
+            return "localhost"
+        raise click.UsageError(
+            f"{jobid} is a broker job id: name the broker host, e.g. "
+            f"`HOST {jobid}`"
+            + (f" (brokers: {', '.join(brokers)})" if brokers else
+               " (no [hosts.*] entry sets broker = true)")
+        )
     try:
         default = cfg.resolve_host(None)
     except config.ConfigError as e:
@@ -1142,6 +1174,41 @@ def _pick_auto_host(
             "Inspect with `vq overview --all`."
         )
     return chosen
+
+
+def _estimate_option(path: Path | None, text: str | None) -> dict[str, Any] | None:
+    """The estimate `vq submit --estimate` attaches, validated (#159).
+
+    Either a raw `vq.resource-estimate/1` receipt or a
+    `vq.calibrated-estimate/1` that wraps one; returned in the same form.
+    """
+    if path is None and text is None:
+        return None
+    if path is not None and text is not None:
+        raise click.UsageError("--estimate and --estimate-json are mutually exclusive")
+    from vq import resource_estimate as estimates
+    from vq.submit import split_estimate_document
+
+    try:
+        if path is not None:
+            with path.open("rb") as handle:
+                # A calibrated estimate is its receipt plus a small wrapper.
+                raw = handle.read(estimates.MAX_RECEIPT_BYTES + 64 * 1024 + 1)
+            text = raw.decode("utf-8", errors="replace")
+        assert text is not None
+        try:
+            document = json.loads(text)
+        except ValueError:
+            document = None
+        if isinstance(document, dict) and document.get("schema_name") == (
+                "vq.calibrated-estimate/1"):
+            receipt, calibration = split_estimate_document(document)
+            assert calibration is not None
+            return {**calibration, "estimate": receipt}
+        return estimates.receipt_record(estimates.load_receipt(text))
+    except (OSError, ValueError) as exc:
+        message = str(exc).removeprefix("--estimate: ")
+        raise click.UsageError(f"--estimate: {message}") from None
 
 
 def _auto_estimate_job_mem_mb(cfg: config.Config, rest: list[str]) -> int | None:
@@ -1253,7 +1320,18 @@ def _remote_admin_update_environment(
         )
         for name, (default, zero_allowed) in _FORWARDED_ADMIN_TIMEOUT_ENV_RULES.items()
     }
-    return {name: str(value) for name, value in values.items()}
+    forwarded = {name: str(value) for name, value in values.items()}
+    # #133: ssh does not carry the operator's shell environment, so a
+    # parallelism cap set on the driver never reached the host's build.
+    level = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "").strip()
+    if level:
+        if re.fullmatch(r"[1-9][0-9]{0,3}", level) is None:
+            raise click.UsageError(
+                f"CMAKE_BUILD_PARALLEL_LEVEL={level!r} is not a positive integer; "
+                "fix or unset it before a remote update forwards it"
+            )
+        forwarded["CMAKE_BUILD_PARALLEL_LEVEL"] = level
+    return forwarded
 
 
 def _validated_remote_admin_outer_timeout_override() -> float | None:
@@ -2122,6 +2200,36 @@ def _delegate_job_lookup(
         raise
 
 
+def _binary_stdout() -> IO[bytes]:
+    """Return a byte sink for this process's stdout, without asking Click.
+
+    Replaces ``click.get_binary_stream("stdout")``, which Click 8.5 deprecated
+    and Click 9.0 removes (#71). For this case Click's wrapper resolved to
+    ``_find_binary_writer(sys.stdout)``, which is two rules: hand back
+    ``sys.stdout`` itself when it is already a byte sink, otherwise its
+    ``.buffer``. Both are kept below. Nothing else of the wrapper applies here:
+    only Click's *text* streams consult a Windows console shim, and vq supports
+    Linux and macOS; and nothing was cached, so ``sys.stdout`` is resolved per
+    call and a redirection installed after import is still honoured.
+
+    ``sys.stdout.buffer`` covers every stdout this path actually meets -- a real
+    stdout, the ``TextIOWrapper`` pytest's capture installs, and the
+    ``_NamedTextIOWrapper`` Click's own ``CliRunner`` installs, whose ``.buffer``
+    is the very object Click handed back. The fallback is for a ``sys.stdout``
+    replaced by a bare binary object, which has no ``.buffer`` and takes bytes
+    directly.
+
+    Callers write already-encoded bytes straight through. Do not route remote
+    log output through a text stream: a chunk boundary can split a multi-byte
+    sequence, so a decode/encode round trip would corrupt it.
+    """
+    stream: Any = sys.stdout
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        return cast("IO[bytes]", buffer)
+    return cast("IO[bytes]", stream)
+
+
 def _stream_delegated_job_lookup(
     cfg: config.Config,
     host: str,
@@ -2139,8 +2247,10 @@ def _stream_delegated_job_lookup(
             raise click.UsageError(str(e)) from None
         try:
             with transport.stream_remote_vq(host_cfg, *remote_args) as stream:
-                stdout = click.get_binary_stream("stdout")
-                for chunk in iter(lambda: stream.stdout.read(65536), b""):
+                stdout = _binary_stdout()
+                # read1, not read: on a pipe read(n) waits for n bytes or EOF,
+                # so a quiet follow would print nothing until 64 KiB piled up.
+                for chunk in iter(lambda: stream.stdout.read1(65536), b""):
                     stdout.write(chunk)
                     stdout.flush()
         except transport.RemoteError as e:
@@ -2533,6 +2643,7 @@ def _aggregate_per_host_json(
     per_host_fn: Callable[[str], str],
     *,
     parallel: bool | None = None,
+    failed_hosts: list[str] | None = None,
 ) -> dict[str, object]:
     """v0.7.6 *Tanenbaum's Mailbox*: JSON sibling of
     :func:`_aggregate_per_host`.
@@ -2543,6 +2654,8 @@ def _aggregate_per_host_json(
     ``{"error": "<message>"}`` so one bad host doesn't break the
     aggregate; the caller is responsible for raising a
     ``ClickException`` if any failures should exit non-zero.
+    When supplied, ``failed_hosts`` also records hosts whose response cannot
+    be decoded, without duplicating failures already recorded by the caller.
 
     Parallel by default (same envelope as the text-mode aggregator);
     honours ``VQ_FANOUT_SERIAL=1`` and the ``parallel`` kwarg.
@@ -2577,6 +2690,8 @@ def _aggregate_per_host_json(
             payload[h] = _json.loads(raw)
         except _json.JSONDecodeError as e:
             payload[h] = {"error": f"remote returned invalid JSON: {e}"}
+            if failed_hosts is not None and h not in failed_hosts:
+                failed_hosts.append(h)
     return payload
 
 
@@ -2744,11 +2859,228 @@ def main(ctx: click.Context) -> None:
         "tar-workdir",
         "tar-artifact",
         "runtime-python",
+        "runtime-launcher",
+        "estimate",
+        "estimate-evaluate",
+        "estimate-calibrate",
+        "estimate-collect",
+        "runtime-bundle",
+        "benchmark",
+        "placement",
+        "campaign",
     ):
         # The tar-* commands are streaming-tar internal verbs that write
         # binary to stdout. The daemon group delays setup so EUID-0 `run` can
         # validate its privilege mode before creating a client log.
         _setup_cli_invocation_logging()
+
+
+main.add_command(runtime_bundle)
+main.add_command(benchmark)
+main.add_command(placement)
+main.add_command(campaign)
+
+
+@main.command("estimate")
+@click.argument("manifest", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--input", "inputs", multiple=True,
+              type=click.Path(exists=True, path_type=Path),
+              help="Fingerprint an input file without executing it, or every regular file "
+              "under a directory (links are left out); repeat for more. At most 64 files.")
+@click.option("--features", "features_file",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Optional JSON resource features supplied by the operator.")
+@click.option("--memory-mb", type=click.IntRange(min=1), help="Explicit job limit in MiB.")
+@click.option("--calibration", "calibration_file", default=None, metavar="CALIBRATION",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Apply a `vq estimate-calibrate` document: --json then prints a "
+              "vq.calibrated-estimate/1 that wraps the unchanged receipt with its "
+              "calibrated peak. Needs --hardware-class.")
+@click.option("--hardware-class", default=None, metavar="LABEL",
+              help="The hardware class the job will run on, as the calibration groups it.")
+@click.option("--json", "as_json", is_flag=True)
+def estimate(
+    manifest: Path, inputs: tuple[Path, ...], features_file: Path | None,
+    memory_mb: int | None, calibration_file: Path | None, hardware_class: str | None,
+    as_json: bool,
+) -> None:
+    """Explain resources from an existing vibe-qc dry-run .system MANIFEST.
+
+    This read-only preview never executes input, changes scientific settings,
+    submits a job, or alters placement. Unknown quantities remain unknown.
+    """
+    from vq import estimate_calibration
+    from vq.resource_estimate import estimate_vibeqc
+
+    if (calibration_file is None) != (hardware_class is None):
+        raise click.UsageError("--calibration and --hardware-class go together")
+    calibrated: dict[str, Any] | None = None
+    try:
+        receipt = estimate_vibeqc(
+            manifest, inputs=inputs, features_file=features_file, memory_mb=memory_mb,
+        )
+        if calibration_file is not None and hardware_class is not None:
+            calibrated = estimate_calibration.apply(
+                receipt, estimate_calibration.load(calibration_file),
+                hardware_class=hardware_class)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        click.echo(json.dumps(calibrated, indent=2, sort_keys=True) if calibrated is not None
+                   else receipt.model_dump_json(indent=2))
+        return
+    click.echo(f"vibeqc {receipt.program_version or '(version unknown)'}; uncalibrated")
+    click.echo(f"Method: {receipt.features.method or 'unknown'}; "
+               f"basis functions: {receipt.features.nbf or 'unknown'}")
+    peak = receipt.memory.peak_bytes
+    click.echo(f"Program memory: {str(peak) + ' bytes' if peak else 'unknown'} "
+               f"(scope: {receipt.memory.scope}; headroom: {receipt.memory.headroom})")
+    click.echo(f"Job memory: {receipt.effective_job_memory_bytes or 'unknown'} bytes")
+    click.echo("Runtime and scratch: unknown")
+    if calibrated is not None:
+        if calibrated["status"] == "calibrated":
+            bound = " (a lower bound)" if calibrated["multiplier_is_lower_bound"] else ""
+            click.echo(f"Calibrated memory: {calibrated['calibrated_peak_bytes']} bytes "
+                       f"(x{calibrated['multiplier']:g}{bound}, calibration "
+                       f"{calibrated['calibration_id'][:12]} on {hardware_class})")
+        else:
+            click.echo(f"Calibrated memory: uncalibrated ({calibrated['reason']})")
+        if calibrated["runtime_status"] == "calibrated":
+            bound = (" (a lower bound)" if calibrated["runtime_multiplier_is_lower_bound"]
+                     else "")
+            click.echo(f"Calibrated runtime upper bound: "
+                       f"{calibrated['calibrated_runtime_upper_seconds']:g} s "
+                       f"(x{calibrated['runtime_multiplier']:g}{bound})")
+        else:
+            click.echo(f"Calibrated runtime: uncalibrated ({calibrated['runtime_reason']})")
+    for warning in receipt.warnings:
+        click.echo(f"Note: {warning}")
+    click.echo(f"Evidence SHA256: {receipt.input_sha256}")
+
+
+@main.command("estimate-evaluate")
+@click.argument("set_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--calibration", "calibration_file", default=None, metavar="CALIBRATION",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Also judge the estimates times their group's multiplier from a "
+              "`vq estimate-calibrate` document. SET_FILE must be held out: the "
+              "calibration's training set, or any of its cases, is refused.")
+@click.option("--json", "as_json", is_flag=True, help="Print the full report as JSON.")
+def estimate_evaluate(set_file: Path, calibration_file: Path | None, as_json: bool) -> None:
+    """Evaluate estimates against measured usage on a held-out SET_FILE.
+
+    SET_FILE (vq.estimate-evaluation-set/1) pairs `vq estimate --json`
+    receipts with the jobs' resource-usage.json receipts, outcomes and
+    hardware classes; paths are relative to it. Reports memory
+    underprediction and runtime coverage per method and hardware class, as
+    bounds where cases cannot be decided. Read-only; nothing is submitted.
+    """
+    from vq import estimate_calibration
+    from vq.estimate_evaluation import evaluate, report_json, report_text
+
+    try:
+        calibration = (estimate_calibration.load(calibration_file)
+                       if calibration_file is not None else None)
+        report = evaluate(set_file, calibration)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(report_json(report) if as_json else report_text(report), nl=False)
+
+
+@main.command("estimate-calibrate")
+@click.argument("training_set", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-o", "--output", "output", required=True, metavar="CALIBRATION",
+              type=click.Path(dir_okay=False, path_type=Path),
+              help="Where to write the vq.estimate-calibration/1 document; never overwritten.")
+@click.option("--min-cases", default=5, show_default=True, type=click.IntRange(min=1),
+              help="Decided cases a group needs to be calibrated. Choose it before "
+              "fitting, never after looking at an evaluation.")
+@click.option("--json", "as_json", is_flag=True, help="Print the document as JSON.")
+def estimate_calibrate(training_set: Path, output: Path, min_cases: int,
+                       as_json: bool) -> None:
+    """Fit memory and runtime calibration on TRAINING_SET, for a held-out evaluation.
+
+    TRAINING_SET is a vq.estimate-evaluation-set/1 used only for fitting.
+    Per estimator, program version, method, algorithm, memory scope and
+    hardware class, the multiplier is the worst observed/predicted peak ratio
+    among decided cases, never below 1: exact where the measurement compares
+    (a rank-scope estimate or a single process), a lower bound otherwise.
+    Runtime groups, without the memory scope, get the worst wall/upper-bound
+    ratio the same way: exact for a completed run, a lower bound for one
+    stopped at or past its bound. A group with fewer than --min-cases decided
+    cases stays uncalibrated.
+    Judge it with `vq estimate-evaluate HELD_OUT --calibration CALIBRATION`;
+    no receipt, admission or placement changes.
+    """
+    from vq import estimate_calibration
+
+    if output.exists() or output.is_symlink():
+        raise click.ClickException(f"{output} exists; a calibration is never overwritten")
+    try:
+        document = estimate_calibration.fit(training_set, min_cases=min_cases)
+        output.write_text(estimate_calibration.document_json(document))
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        click.echo(estimate_calibration.document_json(document), nl=False)
+        return
+    click.echo(f"calibration {document['calibration_id'][:12]} written to {output} "
+               f"(training set {document['training_set_id']}):")
+    for group in document["groups"]:
+        evidence = f"{group['exact']} exact, {group['lower_bounds']} lower-bound"
+        result = (f"x{group['multiplier']:g}"
+                  + (" (a lower bound)" if group["multiplier_is_lower_bound"] else "")
+                  if group["status"] == "calibrated"
+                  else f"uncalibrated (fewer than {min_cases} decided)")
+        click.echo(f"  {group['program']} {group['program_version'] or '?'} "
+                   f"{group['method'] or '?'} {group['memory_scope']} on "
+                   f"{group['hardware_class']}: {group['cases']} case(s), {evidence}: {result}")
+    if document["runtime_groups"]:
+        click.echo("runtime upper bounds:")
+    for group in document["runtime_groups"]:
+        evidence = f"{group['exact']} exact, {group['lower_bounds']} lower-bound"
+        result = (f"x{group['multiplier']:g}"
+                  + (" (a lower bound)" if group["multiplier_is_lower_bound"] else "")
+                  if group["status"] == "calibrated"
+                  else f"uncalibrated (fewer than {min_cases} decided)")
+        click.echo(f"  {group['program']} {group['program_version'] or '?'} "
+                   f"{group['method'] or '?'} on {group['hardware_class']}: "
+                   f"{group['cases']} case(s), {evidence}: {result}")
+
+
+@main.command("estimate-collect")
+@click.argument("out_dir", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--hardware-class", required=True, metavar="LABEL",
+              help="The hardware class these jobs ran on, as evaluation groups it.")
+@click.option("--set-id", default=None, metavar="ID",
+              help="The set's identifier (default: the output directory's name).")
+@click.option("--json", "as_json", is_flag=True, help="Print the summary as JSON.")
+def estimate_collect(out_dir: Path, hardware_class: str, set_id: str | None,
+                     as_json: bool) -> None:
+    """Assemble a held-out evaluation set from this host's finished jobs.
+
+    Every finished job in the local queue that was submitted with `vq submit
+    --estimate` contributes one case: its estimate receipt, its
+    resource-usage.json and its outcome. OUT_DIR receives set.json beside
+    estimates/ and usage/, ready for `vq estimate-evaluate OUT_DIR/set.json`.
+    Run it on the host whose queue holds the jobs and can read their
+    workspaces. OUT_DIR must not exist or be empty. Read-only for the queue.
+    """
+    from vq import estimate_collect as collector
+    from vq.listing import list_jobs
+
+    try:
+        summary = collector.collect(
+            list_jobs("localhost", multi_user=config.system_multi_user_enabled()), out_dir,
+            hardware_class=hardware_class, set_id=set_id or out_dir.name)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        click.echo(json.dumps(summary, indent=2, sort_keys=True))
+        return
+    click.echo(f"{summary['cases']} case(s) written to {summary['set']}")
+    for item in summary["skipped"]:
+        click.echo(f"skipped {item['job']}: {item['reason']}")
 
 
 @main.command("runtime-python")
@@ -2770,6 +3102,28 @@ def runtime_python(root: Path, expected_sha: str | None, arguments: tuple[str, .
 
     try:
         exec_current_python(root, list(arguments), expected_sha=expected_sha)
+    except (RuntimeSlotError, OSError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@main.command("runtime-launcher")
+@click.option("--root", required=True, type=click.Path(path_type=Path))
+@click.option("--python", "bootstrap_python", required=True, type=click.Path(path_type=Path),
+              help="Retained base Python 3.12+; venv symlinks resolve to their base binary.")
+@click.argument("arguments", nargs=-1, type=click.UNPROCESSED)
+def runtime_launcher(root: Path, bootstrap_python: Path, arguments: tuple[str, ...]) -> None:
+    """Print a standalone current-generation launcher for review and installation.
+
+    The script needs only the named base Python and the runtime store. For a
+    queue CLI, supply -- -I -m vq; for a program interpreter, omit fixed arguments.
+    Save stdout outside the legacy checkout and store, review it, then make it
+    executable. Repoint existing consumers explicitly. This command changes
+    no files or services. The store must already have a verified current slot.
+    """
+    from vq.runtime_slots import RuntimeSlotError, render_launcher
+
+    try:
+        click.echo(render_launcher(root, bootstrap_python, list(arguments)), nl=False)
     except (RuntimeSlotError, OSError) as exc:
         raise click.ClickException(str(exc)) from None
 
@@ -2825,6 +3179,12 @@ def self_update(
     no host, environment, force, or no-restart option: service provenance
     selects the local vq environment, concurrent rollout/update ownership is
     refused, and a verified daemon restart is part of success.
+
+    A serving program with runtime_slot_root is updated as an immutable
+    generation: config.toml is rewritten as a whole (values kept, comments
+    and layout not), and config.toml, the user service file and the runtime
+    pointers must be owner-controlled plain files, not symlinks, or the
+    update refuses before preparing anything.
     """
     if (expected_sha is None) == (accepted_report is None):
         raise click.UsageError(
@@ -2887,40 +3247,37 @@ def self_update(
                     )
                 expected_sha = report.pins["vq"].sha
             assert expected_sha is not None
-            repo = Path(prog.git_dir)
-            fetch_rc, fetch_output = admin_module._run_git_fetch_sha(
-                repo, expected_sha, prog.branch,
-            )
-            if fetch_rc != 0:
-                raise admin_module.AdminError(
-                    "could not fetch the exact self-update target before "
-                    f"ancestry validation: {fetch_output[-1000:]}"
-                )
-            current_sha = admin_module.current_source_sha(repo)
-            if current_sha is None:
-                raise admin_module.AdminError(
-                    "could not resolve the current self-update checkout SHA"
-                )
-            if current_sha != expected_sha:
-                current_before_target = fleet_release.git_is_ancestor(
-                    repo, current_sha, expected_sha,
-                )
-                target_before_current = fleet_release.git_is_ancestor(
-                    repo, expected_sha, current_sha,
-                )
-                if current_before_target is True:
-                    pass
-                elif target_before_current is True:
+            serving = prog
+            if prog.runtime_slot_root is not None:
+                from vq import runtime_daemon
+
+                serving = runtime_daemon.admit(cfg, prog, _probe)
+            with admin_module.self_update_ancestry_source(prog, expected_sha) as repo:
+                current_sha = admin_module.current_source_sha(Path(serving.git_dir))
+                if current_sha is None:
                     raise admin_module.AdminError(
-                        "self-update target is older than the currently "
-                        "installed checkout; this managed interface only "
-                        "permits forward, exact-descendant updates"
+                        "could not resolve the current self-update checkout SHA"
                     )
-                else:
-                    raise admin_module.AdminError(
-                        "self-update target and current checkout are divergent "
-                        "or ancestry could not be proved; refusing the move"
+                if current_sha != expected_sha:
+                    current_before_target = fleet_release.git_is_ancestor(
+                        repo, current_sha, expected_sha,
                     )
+                    target_before_current = fleet_release.git_is_ancestor(
+                        repo, expected_sha, current_sha,
+                    )
+                    if current_before_target is True:
+                        pass
+                    elif target_before_current is True:
+                        raise admin_module.AdminError(
+                            "self-update target is older than the currently "
+                            "installed checkout; this managed interface only "
+                            "permits forward, exact-descendant updates"
+                        )
+                    else:
+                        raise admin_module.AdminError(
+                            "self-update target and current checkout are divergent "
+                            "or ancestry could not be proved; refusing the move"
+                        )
             result = admin_module.update_env(
                 env,
                 cfg,
@@ -3026,24 +3383,63 @@ def source_identity() -> None:
 @click.option(
     "--keep",
     type=click.IntRange(min=1),
-    default=admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP,
-    show_default=True,
+    default=None,
+    help=(
+        "Stages to keep. Default: "
+        f"{admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP} for helper "
+        f"generations, {admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP} with "
+        "--runtime-source."
+    ),
+)
+@click.option(
+    "--runtime-source",
+    is_flag=True,
+    help=(
+        "STAGE_ROOT is a 'runtime-source' upload staging root "
+        "(<scratch_root>/.vq-admin/runtime-source), whose stages sit one per "
+        "program with no 'generations' level."
+    ),
 )
 @click.option("--preserve", type=click.Path(path_type=Path))
 @click.option("--json", "as_json", is_flag=True, help="Emit structured JSON.")
 def source_stage_prune(
     stage_root: Path,
-    keep: int,
+    keep: int | None,
+    runtime_source: bool,
     preserve: Path | None,
     as_json: bool,
 ) -> None:
-    """Prune recognized immutable scheduler-helper stage generations."""
+    """Prune recognized scheduler stage directories.
+
+    Without --runtime-source this prunes immutable scheduler-helper stage
+    generations, which a deploy never prunes on its own: another deployment
+    may still be using an older one.
+
+    With --runtime-source it prunes source-upload staging instead. Those belong
+    to exactly one deploy each, so a deploy that verifies now reclaims its own;
+    this reclaims what older vq left behind and what failed deploys kept.
+    """
     try:
-        result = admin_module.prune_scheduler_stage_generations(
-            stage_root,
-            keep=keep,
-            preserve=preserve,
-        )
+        if runtime_source:
+            result = admin_module.prune_runtime_source_stages(
+                stage_root,
+                keep=(
+                    admin_module.RUNTIME_SOURCE_STAGES_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
+        else:
+            result = admin_module.prune_scheduler_stage_generations(
+                stage_root,
+                keep=(
+                    admin_module.SCHEDULER_STAGE_GENERATIONS_TO_KEEP
+                    if keep is None
+                    else keep
+                ),
+                preserve=preserve,
+            )
     except admin_module.AdminError as exc:
         raise click.ClickException(str(exc)) from None
     payload = asdict(result)
@@ -3067,6 +3463,31 @@ def _finite_positive_seconds(
     if not math.isfinite(value) or value <= 0:
         raise click.BadParameter("must be a finite number greater than zero")
     return value
+
+
+def _wait_timeout_seconds(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> float | None:
+    """Convert the CLI duration before any host resolution or wait work."""
+    if value is None:
+        return None
+    amount = value.strip()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    multiplier = units.get(amount[-1:])
+    if multiplier is not None:
+        amount = amount[:-1]
+    try:
+        seconds = float(amount) * (multiplier or 1)
+    except ValueError:
+        raise click.BadParameter(
+            "expected seconds or a number followed by s, m, h, or d (e.g. 30m)"
+        ) from None
+    _finite_positive_seconds(ctx, param, seconds)
+    if seconds < 0.1:
+        raise click.BadParameter("must be at least 0.1 seconds")
+    return seconds
 
 
 _MAX_TOP_WATCH_INTERVAL_SECONDS = 86_400.0
@@ -3274,6 +3695,119 @@ def doctor(
         raise SystemExit(1)
 
 
+def _cleanup_leftovers(host: str | None, older_than_str: str | None, execute: bool) -> None:
+    """``vq cleanup [HOST] --leftovers``: see vq.leftovers."""
+    from vq import cleanup as cleanup_module
+    from vq import leftovers
+
+    cfg = config.load_config()
+    host = _resolve_host(cfg, host)
+    if not is_local_host(host):
+        args = ["cleanup", "localhost", "--leftovers"]
+        if older_than_str:
+            args += ["--older-than", older_than_str]
+        if execute:
+            args.append("-x")
+        click.echo(_delegate_to_remote(host, cfg, *args), nl=False)
+        return
+    older_than = (
+        cleanup_module.parse_age(older_than_str).total_seconds()
+        if older_than_str else leftovers.DEFAULT_MIN_AGE_SECONDS
+    )
+    found = leftovers.find(cfg, older_than_seconds=older_than,
+                           multi_user=_multi_user_active(cfg))
+    if not found:
+        click.echo("no leftovers")
+        return
+    failed = 0
+    for item in found:
+        verdict = "remove" if item.removable else "keep"
+        line = (f"{verdict:6} {item.kind:15} age={item.age_seconds / 86400:.1f}d  "
+                f"{item.path}  {item.reason}")
+        if item.removable and execute:
+            try:
+                leftovers.remove(item, cfg)
+                line = line.replace("remove", "removed", 1)
+            except Exception as exc:  # noqa: BLE001 - continue with the rest
+                failed += 1
+                line += f"  FAILED: {exc}"
+        click.echo(line)
+    removable = sum(item.removable for item in found)
+    if not execute and removable:
+        click.echo(f"dry run: {removable} removable; re-run with -x to remove them")
+    if failed:
+        raise SystemExit(1)
+
+
+def _cleanup_orphans(
+    host: str | None, older_than_str: str | None, include_unowned: bool, execute: bool,
+) -> None:
+    """``vq cleanup HOST --orphans``: see the option help and #91."""
+    from vq import cleanup as cleanup_module
+    from vq import driver_identity
+
+    cfg = config.load_config()
+    if host is None:
+        raise click.UsageError("--orphans needs the scheduler HOST whose jobs root to list")
+    host_cfg = cfg.host(host)
+    if host_cfg.scheduler == "local":
+        raise click.UsageError(f"{host!r} is not a scheduler host")
+    older_than = (
+        cleanup_module.parse_age(older_than_str).total_seconds()
+        if older_than_str else cleanup_module.DEFAULT_ORPHAN_MIN_AGE_SECONDS
+    )
+    dispatcher = scheduler_dispatcher_for(host_cfg)
+    try:
+        found = cleanup_module.find_orphan_workspaces(
+            dispatcher,
+            local_ids=cleanup_module.local_job_ids(multi_user=_multi_user_active(cfg)),
+            driver_id=driver_identity.driver_id(),
+            older_than_seconds=older_than,
+            include_unowned=include_unowned,
+        )
+        archives = cleanup_module.find_stray_archives(
+            dispatcher,
+            live_ids=cleanup_module.local_live_job_ids(all_users=_multi_user_active(cfg)),
+            older_than_seconds=older_than,
+        )
+    except Exception as exc:  # noqa: BLE001 - report and refuse, never guess
+        click.echo(f"vq cleanup --orphans: {exc}", err=True)
+        raise SystemExit(2) from None
+    if not found and not archives:
+        click.echo(f"{host}: no orphaned scheduler workspaces or transfer archives")
+        return
+    failed = 0
+    for archive in archives:
+        verdict = "remove" if archive.removable else "keep"
+        line = (f"{verdict:6} {archive.path}  age={archive.age_seconds / 86400:.1f}d  "
+                f"{archive.reason}")
+        if archive.removable and execute:
+            try:
+                dispatcher.remove_transfer_archive(archive.path)
+                line = line.replace("remove", "removed", 1)
+            except Exception as exc:  # noqa: BLE001 - continue with the rest
+                failed += 1
+                line += f"  FAILED: {exc}"
+        click.echo(line)
+    for orphan in found:
+        verdict = "remove" if orphan.removable else "keep"
+        line = (f"{verdict:6} {orphan.job_id}  age={orphan.age_seconds / 86400:.1f}d  "
+                f"owner={orphan.owner}  {orphan.reason}")
+        if orphan.removable and execute:
+            try:
+                cleanup_module.remove_orphan_workspace(dispatcher, orphan)
+                line = line.replace("remove", "removed", 1)
+            except Exception as exc:  # noqa: BLE001 - continue with the rest
+                failed += 1
+                line += f"  FAILED: {exc}"
+        click.echo(line)
+    removable = sum(o.removable for o in found) + sum(a.removable for a in archives)
+    if not execute and removable:
+        click.echo(f"dry run: {removable} removable; re-run with -x to remove them")
+    if failed:
+        raise SystemExit(1)
+
+
 def _scheduler_workspace_reaper(
     cfg: config.Config,
 ) -> Callable[[JobSpec], None]:
@@ -3291,7 +3825,7 @@ def _scheduler_workspace_reaper(
             spec,
             job_id=spec.scheduler_job_id or spec.id,
         )
-        dispatcher.cleanup_remote_workspace(handle)
+        dispatcher.cleanup_remote_workspace(handle, vq_job_id=spec.id)
 
     return _reap
 
@@ -3418,8 +3952,8 @@ def programs(
 
     Human output columns:
       NAME      registry name (what you'd refer to in commands)
-      KIND      binary | venv | import
-      STATUS    OK, MISSING or UNHEALTHY
+      KIND      binary | venv | import | scheduler
+      STATUS    OK, MISSING, UNHEALTHY or SCHEDULER_ONLY
       DETAIL    path / git_dir / module being checked, or the reason
 
     MISSING means work dispatched here will fail: the binary, interpreter
@@ -3428,20 +3962,23 @@ def programs(
     healthcheck_command did not pass; healthcheck_status says whether the
     healthcheck could not start (a configuration problem), timed out, or
     ran and failed. Both are not OK, so --require treats them alike.
+    SCHEDULER_ONLY registers a name for scheduler dispatch without a local
+    installation. It does not probe the target and does not pass --require.
 
     \b
     --json output schema (one object per program, in a JSON array;
     common fields plus kind-specific fields):
       common:    name, kind, status, reason, description
       binary:    binary       (absolute path)
-      venv:      python, git_dir, branch, update_script,
-                 healthcheck_command, healthcheck_status,
+      venv:      python, git_dir, branch, install_script, update_script,
+                 extras, healthcheck_command, healthcheck_status,
                  import_check, import_symbols, import_version,
                  current_git_sha, current_git_describe,
                  current_git_branch, current_git_dirty
       import:    python, import_check, import_symbols, import_version
-    Empty registry -> empty array `[]`. status is "OK", "MISSING" or
-    "UNHEALTHY". healthcheck_status is "ok", "not-configured", "not-run"
+      scheduler: no additional fields
+    Empty registry -> empty array `[]`. status is "OK", "MISSING",
+    "UNHEALTHY" or "SCHEDULER_ONLY". healthcheck_status is "ok", "not-configured", "not-run"
     (an earlier check failed), "could-not-start", "timed-out" or "failed".
     Stable schema; v0.6.0's `vq admin update` will consume it too.
 
@@ -3519,8 +4056,8 @@ def programs(
     def _query_one(h: str, *, as_json: bool) -> str:
         """v0.5.36: per-host programs rendering. Local hosts read the
         config in-process; remote hosts delegate via SSH (the registry
-        lives on the host that actually has the binaries -- see the
-        chat-onboarding doc + docs/hosts.md). JSON is forwarded so
+        lives on the host that actually has the binaries -- see
+        docs/operations.md). JSON is forwarded so
         the aggregate can preserve each host's machine-readable payload."""
         if is_local_host(h):
             if as_json:
@@ -3980,6 +4517,17 @@ def scheduler_probe(host: str, as_json: bool) -> None:
 
     Turns an unknown scheduler into a detected one for the per-host config,
     instead of guessing the dialect at build time.
+
+    It also reports schedulable capacity per host and per lane, read from
+    ``pbsnodes -a`` or ``sinfo -N``: the largest request that could start now,
+    and the largest the usable nodes could ever run. A lane is a SLURM
+    partition, or a PBS node property. On PBS a lane is only a scheduling lane
+    when some queue's ``resources_default.neednodes`` routes to it, which is
+    read from ``qstat -Qf``; the report names that queue. A lane no queue
+    declares is marked ``[inferred]`` -- the figures are true of the nodes
+    carrying the property, but nothing proves a queue sends work there. In
+    ``--json`` the same distinction is ``capacity.groups[].authority``
+    (``partition`` / ``queue_default`` / ``node_property``).
     """
     from vq import scheduler_probe as probe_mod  # noqa: PLC0415
 
@@ -4000,6 +4548,29 @@ def scheduler_probe(host: str, as_json: bool) -> None:
 def _program_record(name: str, prog: config.ProgramConfig) -> dict[str, object]:
     """Build the JSON record for one program. Schema is documented in
     the `vq programs` docstring; keep them in sync."""
+    binding: dict[str, object] = {}
+    if isinstance(prog, config.VenvProgram) and prog.runtime_slot_execution:
+        binding = {
+            "runtime_slot_execution": True,
+            "runtime_slot_root": prog.runtime_slot_root,
+            "runtime_slot_build_input": prog.runtime_slot_build_input,
+            "build_git_dir": prog.git_dir,
+            "build_python": prog.python,
+        }
+        try:
+            if prog.runtime_slot_build_input == "current":
+                # The next generation is built from the active one (#72).
+                selected = prog.execution_program()
+                binding["build_git_dir"] = selected.git_dir
+                binding["build_python"] = selected.python
+            prog = prog.execution_program()
+        except config.ConfigError as exc:
+            return {
+                "name": name, "kind": prog.kind,
+                "status": config.PROGRAM_STATUS_MISSING, "reason": str(exc),
+                "description": prog.description, "python": None, "git_dir": None,
+                **binding,
+            }
     available = prog.availability_status()
     record: dict[str, object] = {
         "name": name,
@@ -4007,6 +4578,7 @@ def _program_record(name: str, prog: config.ProgramConfig) -> dict[str, object]:
         "status": available.status,
         "reason": available.reason,
         "description": prog.description,
+        **binding,
     }
     if isinstance(prog, config.BinaryProgram):
         record["binary"] = prog.binary
@@ -4014,7 +4586,9 @@ def _program_record(name: str, prog: config.ProgramConfig) -> dict[str, object]:
         record["python"] = prog.python
         record["git_dir"] = prog.git_dir
         record["branch"] = prog.branch
+        record["install_script"] = prog.install_script
         record["update_script"] = prog.update_script
+        record["extras"] = list(prog.extras)
         record["healthcheck_command"] = prog.healthcheck_command
         record["healthcheck_status"] = available.healthcheck_status
         record["import_check"] = prog.effective_import_check()
@@ -4283,6 +4857,7 @@ def queue(
                             s,
                             h,
                             capacity_snapshot=capacity_snapshot,
+                            include_usage=True,
                         )
                         for s in specs
                     ],
@@ -4375,7 +4950,7 @@ def queue(
             )
 
         specs: list[JobSpec] = []
-        projected_rows: list[JobSpec | dict[str, object]] = []
+        projected_rows: list[dict[str, object]] = []
         malformed_count = 0
         malformed_running_count = 0
         for raw in raw_specs:
@@ -4421,15 +4996,17 @@ def queue(
             ):
                 continue
             specs.append(spec)
-            projected_rows.append(spec)
+            projected = _queue_json_row(spec, h)
+            # The receipt belongs to the driver. Never read a remote spec's
+            # cwd on this client while projecting a scheduler alias.
+            if "resource_usage" in raw:
+                projected["resource_usage"] = raw["resource_usage"]
+            if "gpu_usage" in raw:  # #168: the driver's reading, likewise
+                projected["gpu_usage"] = raw["gpu_usage"]
+            projected_rows.append(projected)
         if as_json:
             return _json.dumps(
-                [
-                    _queue_json_row(row, h)
-                    if isinstance(row, JobSpec)
-                    else row
-                    for row in projected_rows
-                ],
+                projected_rows,
                 indent=2,
                 sort_keys=True,
                 default=str,
@@ -4498,6 +5075,7 @@ def _queue_json_row(
     host: str,
     *,
     capacity_snapshot: capacity_module.DaemonCapacity | None = None,
+    include_usage: bool = False,
 ) -> dict[str, object]:
     """Add queue-monitor derived fields to a JobSpec JSON row."""
     row = spec.model_dump(mode="json")
@@ -4518,6 +5096,16 @@ def _queue_json_row(
     row["configured_capacity_overages"] = [
         overage.to_payload() for overage in overages
     ]
+    if include_usage:
+        from vq.final_usage import read_final_usage
+        from vq.gpu_usage import read_gpu_usage
+
+        row["resource_usage"] = read_final_usage(Path(spec.cwd)) if spec.is_terminal else None
+        if spec.gpus is not None:
+            # #168: only jobs that requested GPUs carry it.
+            # Only the summary recorded at fetch: a listing never parses samples.
+            row["gpu_usage"] = (read_gpu_usage(Path(spec.cwd), spec.gpus, summary_only=True)
+                                if spec.is_terminal else None)
     return row
 
 
@@ -4893,6 +5481,28 @@ def status(
     if scheduler_driver is not None:
         host = scheduler_driver
 
+    broker_job = _broker_job_locally(jobid) if is_local_host(host) else None
+    if broker_job is not None:
+        from vq import broker_relay
+
+        broker_cfg, record = broker_job
+        try:
+            view = broker_relay.status_payload(broker_cfg, record)
+        except ValueError as exc:  # BrokerStoreError: target no longer configured
+            _broker_fail(exc)
+        if as_json:
+            click.echo(json.dumps(view, indent=2, sort_keys=True, default=str))
+            return
+        for key in ("broker_job_id", "state", "target_host", "target_job_id"):
+            click.echo(f"{key}: {view[key]}")
+        if "operator_action" in view:
+            click.echo(f"OPERATOR ACTION: {view['operator_action']}")
+        target = view.get("target_status")
+        if isinstance(target, dict):
+            click.echo(f"target state: {target.get('effective_state') or target.get('state')}")
+        elif "target_status_error" in view:
+            click.echo(f"target status unavailable: {view['target_status_error']}")
+        return
     if is_local_host(host):
         try:
             mu = _multi_user_active(cfg)
@@ -4940,7 +5550,10 @@ def status(
             searched_host=requested_host,
             inferred=inferred_default_host,
         )
-        if as_json:
+        from vq import broker_relay
+
+        if as_json and not broker_relay.is_broker_job_id(jobid):
+            # A broker job's JSON is the broker's view, not a JobSpec.
             text = _json_status_with_requested_handle_host(text, requested_host)
         click.echo(text, nl=False)
 
@@ -5057,6 +5670,30 @@ def logs_cmd(
     elif only_stderr:
         stream = "stderr"
 
+    broker_job = _broker_job_locally(jobid) if is_local_host(host) else None
+    if broker_job is not None:
+        from vq import broker_relay, broker_store
+
+        argv = ["logs", "localhost", "{target}", "-n", str(tail)]
+        if follow:
+            argv.append("-f")
+        if only_stdout:
+            argv.append("--stdout")
+        elif only_stderr:
+            argv.append("--stderr")
+        if as_json:
+            argv.append("--json")
+        try:
+            if follow:
+                broker_relay.follow_logs(
+                    *broker_job, *argv,
+                    notify=lambda message: click.echo(message, err=True),
+                )
+            else:
+                click.echo(broker_relay.proxy_text(*broker_job, *argv), nl=False)
+        except (broker_store.BrokerStoreError, transport.RemoteError) as exc:
+            _broker_fail(exc)
+        return
     if is_local_host(host):
         try:
             mu = _multi_user_active(cfg)
@@ -5428,6 +6065,14 @@ def progress_cmd(
 @click.argument("host_or_jobid")
 @click.argument("jobid_if_host", required=False)
 @click.option(
+    "--kind", "kinds", multiple=True, metavar="KIND",
+    help="Show only this exact event kind. Repeat to include several kinds.",
+)
+@click.option(
+    "-n", "--tail", type=click.IntRange(min=0), default=0, show_default=True,
+    help="Show the last N matching events in timeline order (0 = all matches).",
+)
+@click.option(
     "--json",
     "as_json",
     is_flag=True,
@@ -5438,6 +6083,8 @@ def events_cmd(
     host_or_jobid: str,
     jobid_if_host: str | None,
     as_json: bool,
+    kinds: tuple[str, ...],
+    tail: int,
 ) -> None:
     """Show a job's lifecycle event timeline.
 
@@ -5446,6 +6093,7 @@ def events_cmd(
       vq events JOBID                # timeline, one line per event
       vq events HOST JOBID           # explicit host
       vq events JOBID --json         # raw records
+      vq events JOBID --kind state_transition -n 10  # last ten transitions
 
     The daemon records a structured event per lifecycle transition —
     submitted, dispatched, every state change, kill requests, watchdog
@@ -5475,9 +6123,9 @@ def events_cmd(
         try:
             mu = _multi_user_active(cfg)
             if as_json:
-                text = show_events_json(host, jobid, multi_user=mu)
+                text = show_events_json(host, jobid, multi_user=mu, kinds=kinds, tail=tail)
             else:
-                text = show_events(host, jobid, multi_user=mu)
+                text = show_events(host, jobid, multi_user=mu, kinds=kinds, tail=tail)
         except FileNotFoundError as e:
             raise click.UsageError(str(e)) from None
         except NotImplementedError as e:
@@ -5486,6 +6134,10 @@ def events_cmd(
         return
 
     remote_args: list[str] = ["events", "localhost", jobid]
+    for kind in kinds:
+        remote_args.extend(["--kind", kind])
+    if tail:
+        remote_args.extend(["--tail", str(tail)])
     if as_json:
         remote_args.append("--json")
     click.echo(_delegate_to_remote(host, cfg, *remote_args), nl=False)
@@ -6060,6 +6712,96 @@ def _exec_tail_remote(
     "the vq thread/accounting cap. Use for MPI jobs such as ORCA %pal nprocs.",
 )
 @click.option(
+    "--gpus",
+    "gpus",
+    default=None,
+    type=click.IntRange(min=1),
+    metavar="N",
+    help="GPUs for the job. On a scheduler target Torque renders "
+    "nodes=1:ppn=CPUS:gpus=N and Slurm --gpus=N, a job total either way; the job "
+    "samples nvidia-smi on its node, and vq status shows its GPU use while it "
+    "runs and once it has finished. For PBS Pro ngpus or a GPU type, use the "
+    "host's submit_extra. On a daemon host the job waits for N of the daemon's "
+    "--gpu-devices and sees only those in CUDA_VISIBLE_DEVICES; it is refused "
+    "unless that host's running daemon lists enough devices, and never "
+    "auto-placed or brokered.",
+)
+@click.option(
+    "--runtime-root",
+    "runtime_root",
+    default=None,
+    type=str,
+    metavar="PATH",
+    help="Bind the job to a portable runtime deployed with `vq runtime-bundle "
+    "deploy` at PATH on the execution host. On a daemon host the current "
+    "generation, or --runtime-artifact, is verified at submit and recorded; "
+    "the daemon runs the job on exactly that generation, exported as "
+    "VQ_RUNTIME_PAYLOAD and VQ_RUNTIME_ARTIFACT, or fails it if it is gone. "
+    "A later selection change or rollback affects only later jobs. On a "
+    "scheduler target PATH is on the cluster and --runtime-artifact is "
+    "required; the job script verifies that generation on its node and "
+    "fails with exit code 126, its command not started, if it does not hold.",
+)
+@click.option("--managed-native-sha256", default=None, metavar="SHA256",
+              help="Require this native digest with --managed-generation.")
+@click.option("--managed-content-sha256", default=None, metavar="SHA256",
+              help="Require this execution-content digest with --managed-generation.")
+@click.option(
+    "--managed-generation", default=None, metavar="FULL_SHA",
+    help="Explicitly reserve an existing managed scheduler generation through its "
+    "reviewed provider. Requires --program, --idempotency-key and retry 0. "
+    "Unsupported providers refuse; current serving and portable bundles are unchanged.",
+)
+@click.option(
+    "--runtime-artifact",
+    "runtime_artifact",
+    default=None,
+    type=str,
+    metavar="ID",
+    help="With --runtime-root: bind this generation (its full SHA256 identity) "
+    "instead of the current selection. Required on a scheduler target.",
+)
+@click.option(
+    "--estimate",
+    "estimate_file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    metavar="RECEIPT",
+    help="Attach a `vq estimate --json` receipt to the job, for later "
+    "evaluation against what it measurably used (`vq estimate-collect`). Every "
+    "input file the receipt fingerprinted must be in this submission, by "
+    "content, or the submission is refused. A `vq estimate --calibration` "
+    "document is accepted too and its calibrated peak recorded beside the "
+    "receipt. On its own it changes no resource or placement (see "
+    "--mem-from-estimate and --time-from-estimate). A broker refuses it.",
+)
+@click.option("--estimate-json", "estimate_json", default=None, hidden=True)
+@click.option(
+    "--mem-from-estimate",
+    "mem_from_estimate",
+    is_flag=True,
+    default=False,
+    help="Set the job's memory limit from a calibrated, job-scope --estimate "
+    "(`vq estimate --calibration ... --json`): its calibrated peak, rounded up "
+    "to MiB, exactly as if given with --mem-mb. Refused with --mem-mb, an "
+    "uncalibrated or raw estimate, or another memory scope.",
+)
+@click.option("--mem-mb-source", "mem_mb_source_wire", default=None, hidden=True,
+              type=click.Choice(["calibrated-estimate"]))
+@click.option(
+    "--time-from-estimate",
+    "time_from_estimate",
+    is_flag=True,
+    default=False,
+    help="Set the job's wall-time limit from a calibrated --estimate "
+    "(`vq estimate --calibration ... --json`): its calibrated runtime upper "
+    "bound, rounded up to whole minutes, exactly as if given with --time-limit. "
+    "Refused with --time-limit or --wall-time-seconds, or a raw estimate or "
+    "one whose runtime is uncalibrated.",
+)
+@click.option("--wall-time-source", "wall_time_source_wire", default=None, hidden=True,
+              type=click.Choice(["calibrated-estimate"]))
+@click.option(
     "--mem-mb",
     "mem_mb",
     default=None,
@@ -6214,11 +6956,11 @@ def _exec_tail_remote(
     default=None,
     type=str,
     metavar="PATH",
-    help="Python interpreter for single-file submit (default: vq's own "
+    help="Python interpreter to run the job with (default: vq's own "
     "interpreter locally; host_cfg.remote_python remotely). For remote "
-    "hosts the path is interpreted on the *remote* machine. "
-    "Rejected with --dir/--compressed -- put the interpreter in the "
-    "explicit command instead. Mutually exclusive with --branch.",
+    "hosts the path is interpreted on the *remote* machine. A single-file "
+    "submit runs FILE with it; with --dir/--compressed it is put in front "
+    "of the explicit command. Mutually exclusive with --branch.",
 )
 @click.option(
     "--branch",
@@ -6230,8 +6972,9 @@ def _exec_tail_remote(
     "[hosts.X.branches] table (e.g. --branch release vs --branch "
     "main when the host has both a release-tagged and a dev clone "
     "of vibe-qc, each in its own venv). Aliases are resolved "
-    "through [hosts.X.branch_aliases]. Single-file submit only; "
-    "mutually exclusive with --python. v0.5.47: the branch name "
+    "through [hosts.X.branch_aliases]. Like --python, the interpreter "
+    "runs a single FILE or is put in front of a --dir/--compressed "
+    "command. Mutually exclusive with --python. v0.5.47: the branch name "
     "is also stamped on the JobSpec as ``spec.branch`` so "
     "``vq admin update <env>`` can do surgical pause scoping "
     "via ``provides_branches``.",
@@ -6522,6 +7265,17 @@ def _exec_tail_remote(
     "daemon; users target the cluster with --host, not this flag.",
 )
 @click.option(
+    "--allow-helper-mismatch",
+    "allow_helper_mismatch",
+    is_flag=True,
+    default=False,
+    help="Queue for a scheduler host even when its remote vq helper is not "
+    "this driver's source tree and the driver sets [fleet] "
+    "strict_helper_identity = true. By default such a submit only warns, "
+    "naming both identities (`vq doctor HOST`, scheduler_remote_vq). A helper "
+    "that did not answer is always a warning, not a refusal.",
+)
+@click.option(
     "--json",
     "submit_json",
     is_flag=True,
@@ -6539,6 +7293,18 @@ def submit(
     archive: str | None,
     cpus: int,
     scheduler_tasks: int | None,
+    gpus: int | None,
+    runtime_root: str | None,
+    runtime_artifact: str | None,
+    managed_generation: str | None,
+    managed_native_sha256: str | None,
+    managed_content_sha256: str | None,
+    estimate_file: Path | None,
+    estimate_json: str | None,
+    mem_from_estimate: bool,
+    mem_mb_source_wire: str | None,
+    time_from_estimate: bool,
+    wall_time_source_wire: str | None,
     mem_mb: int | None,
     wall_time_seconds: int | None,
     time_limit: str | None,
@@ -6571,6 +7337,7 @@ def submit(
     host_opt: str | None,
     vibeqc_preflight: bool,
     scheduler_target: str | None,
+    allow_helper_mismatch: bool,
     submit_json: bool,
     positional: tuple[str, ...],
 ) -> None:
@@ -6633,6 +7400,37 @@ def submit(
             )
         wall_time_seconds = _parse_time_limit(time_limit)
 
+    # #159: an opt-in memory limit from a calibrated estimate, derived before
+    # placement so `vq submit auto` fits by it like an explicit --mem-mb.
+    mem_mb_source = mem_mb_source_wire
+    if mem_from_estimate:
+        if mem_mb is not None:
+            raise click.UsageError("--mem-from-estimate and --mem-mb are mutually exclusive; "
+                                   "an explicit limit stays authoritative")
+        document = _estimate_option(estimate_file, estimate_json)
+        if document is None:
+            raise click.UsageError("--mem-from-estimate needs --estimate")
+        try:
+            mem_mb = submit_module.mem_mb_from_calibrated_estimate(document)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from None
+        mem_mb_source = "calibrated-estimate"
+    # #159: likewise an opt-in wall-time limit from its calibrated runtime bound.
+    wall_time_source = wall_time_source_wire
+    if time_from_estimate:
+        if wall_time_seconds is not None:
+            raise click.UsageError("--time-from-estimate and --time-limit/--wall-time-seconds "
+                                   "are mutually exclusive; an explicit limit stays "
+                                   "authoritative")
+        document = _estimate_option(estimate_file, estimate_json)
+        if document is None:
+            raise click.UsageError("--time-from-estimate needs --estimate")
+        try:
+            wall_time_seconds = submit_module.wall_time_from_calibrated_estimate(document)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from None
+        wall_time_source = "calibrated-estimate"
+
     cfg = config.load_config()
     try:
         requested_target = submit_module._resolve_requested_submit_target(
@@ -6672,6 +7470,14 @@ def submit(
             f"it, or submit to a different host."
         )
 
+    _broker_host_entry = None if is_local_host(host) else cfg.hosts.get(host)
+    if (
+        _broker_host_entry is not None
+        and _broker_host_entry.broker
+        and (branch_name or branch_name_passthrough)
+    ):
+        raise click.UsageError(f"{host} is a broker; a broker job cannot use --branch")
+
     # Branch lookup is against the requested host, before a scheduler target
     # is rewritten to its driver.
     try:
@@ -6703,6 +7509,46 @@ def submit(
     archive = payload.archive
     command = payload.command
     is_qvf_input = payload.is_qvf_input
+
+    broker_entry = None if is_local_host(host) else cfg.hosts.get(host)
+    if broker_entry is not None and broker_entry.broker:
+        # #64: relay into the broker's held queue, before any check that
+        # assumes the job's queue is this host's.
+        from vq import broker_relay
+
+        _submit_via_broker(
+            host, broker_entry,
+            broker_relay.RelayRequest(
+                command=tuple(command or ()), cpus=cpus, mem_mb=mem_mb,
+                wall_time_seconds=wall_time_seconds, priority=priority,
+                auto_resume=auto_resume, retry=retry,
+                job_name=_normalize_job_name_option(job_name),
+                program=program_name,
+                expected_sha=expected_sha.strip() if expected_sha is not None else None,
+                tags=tuple(tags), clean_workdir_on_terminal=clean_tmp,
+                rerun_until_file_exists=rerun_until_file_exists, rerun_max=rerun_max,
+                pool=pool_opt, idempotency_key=idempotency_key,
+            ),
+            input_file=input_file, directory=directory, archive=archive,
+            python=python_path,
+            refused={
+                "--array": array > 1, "--chain": chain > 1,
+                "--depends-on": bool(depends_on), "--depends-on-any": bool(depends_on_any),
+                "--at": at_iso is not None, "--refresh": refresh_before is not None,
+                "--branch": bool(branch_name or branch_name_passthrough),
+                "--scheduler-tasks": scheduler_tasks is not None,
+                "--gpus": gpus is not None,
+                "--runtime-root": runtime_root is not None,
+                "--estimate": estimate_file is not None or estimate_json is not None,
+                "--scheduler-target": scheduler_target is not None,
+                "--wait-submitted/--wait/--fetch": bool(
+                    wait_submitted or wait_for_done or fetch_on_done),
+                "--vibeqc-preflight": vibeqc_preflight,
+                "a .qvf input": is_qvf_input or qvf_force,
+            },
+            as_json=submit_json,
+        )
+        return
 
     job_name = _normalize_job_name_option(job_name)
     if expected_sha is not None:
@@ -6790,6 +7636,15 @@ def submit(
         python=python_path,
         cpus=cpus,
         scheduler_tasks=scheduler_tasks,
+        gpus=gpus,
+        runtime_root=runtime_root,
+        runtime_artifact=runtime_artifact,
+        managed_generation=managed_generation,
+        managed_native_sha256=managed_native_sha256,
+        managed_content_sha256=managed_content_sha256,
+        estimate=_estimate_option(estimate_file, estimate_json),
+        mem_mb_source=mem_mb_source,
+        wall_time_source=wall_time_source,
         mem_mb=mem_mb,
         wall_time_seconds=wall_time_seconds,
         priority=priority,
@@ -6812,6 +7667,7 @@ def submit(
         refresh_before=refresh_before,
         qvf_force=qvf_force,
         idempotency_key=idempotency_key,
+        allow_helper_mismatch=allow_helper_mismatch,
     )
     try:
         classified_target = submit_module._classify_submit_target(
@@ -6825,6 +7681,11 @@ def submit(
         raise click.UsageError("--submission-timeout must be finite")
     if wait_submitted and classified_target.scheduler_target is None:
         raise click.UsageError("--wait-submitted requires a scheduler target")
+    if (gpus is not None and requested_target.auto_selected
+            and classified_target.scheduler_target is None):
+        # #168: the auto pick weighs CPUs and memory, never GPUs.
+        raise click.UsageError("--gpus cannot be auto-placed onto a daemon host: "
+                               "name the host whose daemon has the devices")
     capacity_warnings: list[str] = []
 
     def _record_submit_warning(message: str) -> None:
@@ -6841,6 +7702,16 @@ def submit(
             request=submit_request,
         )
         host = submit_plan.target.execution_host
+        if submit_plan.target.scheduler_target is not None and is_local_host(host):
+            # This machine drives the scheduler host, so it is the one that
+            # must be able to poll the job through the host's helper (#127).
+            # A remote driver runs the same check when the relay reaches it.
+            submit_module._refuse_stale_scheduler_helper(
+                cfg,
+                submit_plan.target.scheduler_target,
+                allow_mismatch=allow_helper_mismatch,
+                warning_sink=_record_submit_warning,
+            )
         multi_user = _multi_user_active(cfg) if is_local_host(host) else False
         jobids = submit_module._execute_submit_plan(
             submit_plan,
@@ -8666,6 +9537,18 @@ def kill(
     if scheduler_driver is not None:
         host = scheduler_driver
 
+    broker_job = _broker_job_locally(jobid) if is_local_host(host) else None
+    if broker_job is not None:
+        from vq import broker_relay, broker_store
+
+        try:
+            if restart_after_update:
+                click.echo(broker_relay.kill_and_resubmit(broker_job[0], jobid, reason=reason))
+                return
+            click.echo(broker_relay.kill(broker_job[0], jobid, reason=reason))
+        except (broker_store.BrokerStoreError, transport.RemoteError) as exc:
+            _broker_fail(exc)
+        return
     if is_local_host(host):
         try:
             msg = kill_job(
@@ -8718,13 +9601,15 @@ def kill(
     "--timeout",
     "wait_timeout",
     default=None,
-    type=click.FloatRange(min=0.1),
-    callback=_finite_positive_seconds,
-    metavar="SECONDS",
+    type=str,
+    callback=_wait_timeout_seconds,
+    metavar="DURATION",
     help="Finite max wait. If the job hasn't reached a terminal state within "
-    "this many seconds, exit 124 (matches GNU `timeout`) and "
+    "this duration, exit 124 (matches GNU `timeout`) and "
     "leave the job running. The timeout message includes the last "
-    "pause/scheduler/walltime detail seen when available. Default: wait forever.",
+    "pause/scheduler/walltime detail seen when available. Accepts seconds or "
+    "a number with s/m/h/d suffix (e.g. 30m, 1.5h); minimum 0.1 seconds. "
+    "Default: wait forever.",
 )
 @click.option(
     "--json",
@@ -8746,6 +9631,7 @@ def wait(
       vq wait HOST JOBID
       vq wait JOBID                       (uses default_host)
       vq wait JOBID --timeout 3600        (1-hour cap)
+      vq wait JOBID --timeout 1.5h        (90-minute cap)
       vq wait JOBID --poll-interval 1     (tight loop for tests)
       vq wait JOBID --json                (machine-readable outcome)
 
@@ -8766,6 +9652,10 @@ def wait(
     The wait loop polls; it does NOT push the wait into the
     daemon. Ctrl-C cancels the WAIT only — `vq kill JOBID`
     if you want to abort the job.
+
+    A broker job (b-...) is waited for through its broker. It
+    stays pending until placed, then ends with its target job's
+    state; one cancelled before placement ends as KILLED.
 
     Composable with the rest of the queue:
 
@@ -9203,8 +10093,9 @@ def resubmit(
     "explicit_workspace",
     is_flag=True,
     help="Explicitly fetch only the submitted workspace, even when a local "
-    "daemon stores output artifacts in a separate --workdir. Mutually "
-    "exclusive with --workdir and --name.",
+    "daemon job wrote to its separate --workdir. Without it, such a fetch "
+    "exits 1 after copying; a job whose workdir is provably empty needs "
+    "neither flag. Mutually exclusive with --workdir and --name.",
 )
 @click.option(
     "--json",
@@ -9291,7 +10182,19 @@ def fetch(
                 handle["submitted_at"] = spec.submitted_at
         return handle
 
+    # The job whose tree lands: a broker job's is its placed target job's.
+    fetched_identity = {"jobid": jobid}
+
     def _fetch_from(resolved_host: str) -> tuple[Path, dict[str, str | None]]:
+        from vq import broker_relay
+
+        if is_local_host(resolved_host) and broker_relay.is_broker_job_id(jobid):
+            raise click.UsageError(
+                f"{jobid} is a broker job: its results are on the target it was "
+                "placed on; fetch it from a client with `vq fetch BROKER "
+                f"{jobid}`, or on this broker with `vq broker show {jobid}` to "
+                "find the target job"
+            )
         if is_local_host(resolved_host):
             if artifact_name is not None:
                 dst = fetch_artifact_local(
@@ -9323,10 +10226,14 @@ def fetch(
                 host_cfg, jobid, artifact_name, output_dir,
                 **({"workdir": True, "subdir": artifact_subdir} if fetch_workdir else {}),
             )
-        elif fetch_workdir:
-            dst = fetch_workdir_remote(host_cfg, jobid, output_dir)
         else:
-            dst = fetch_remote(host_cfg, jobid, output_dir)
+            # A broker job is asked for by its b- id and verified as the
+            # placed target job it is (#64).
+            identity = _broker_fetch_identity(host_cfg, jobid) or {"jobid": jobid}
+            fetched_identity["jobid"] = identity["jobid"]
+            dst = (fetch_workdir_remote if fetch_workdir else fetch_remote)(
+                host_cfg, identity.pop("jobid"), output_dir, **identity,
+            )
         return dst, _queue_handle_for(resolved_host)
 
     try:
@@ -9369,7 +10276,7 @@ def fetch(
         try:
             manifest = require_fresh_fetch_manifest(
                 dst,
-                jobid=jobid,
+                jobid=fetched_identity["jobid"],
                 source_kind="workdir" if fetch_workdir else "workspace",
             )
             if not fetch_workdir and not explicit_workspace:
@@ -9380,6 +10287,11 @@ def fetch(
             ) from None
     fetched_at = manifest.get("fetched_at") if manifest else None
     stale = bool(manifest.get("stale")) if manifest else False
+    # (#62): a partial tree is a successful fetch of an INCOMPLETE workspace.
+    # It must never read as a whole one, so the count is on the success line
+    # and the list is named there too.
+    excluded = manifest.get("excluded_count") if manifest else None
+    excluded_count = excluded if isinstance(excluded, int) and excluded > 0 else 0
     if as_json:
         click.echo(
             json.dumps(
@@ -9396,6 +10308,8 @@ def fetch(
                     "destination": str(dst),
                     "fetched_at": fetched_at,
                     "stale": stale,
+                    "partial": excluded_count > 0,
+                    "excluded_count": excluded_count,
                     "queue_handle": queue_handle,
                 },
                 indent=2,
@@ -9405,6 +10319,13 @@ def fetch(
     else:
         suffix = f" (fetched_at={fetched_at})" if fetched_at else ""
         click.echo(f"{label} -> {dst}{suffix}")
+        if excluded_count:
+            click.echo(
+                f"PARTIAL: {excluded_count} entr"
+                f"{'y' if excluded_count == 1 else 'ies'} could not be "
+                f"fetched; see {dst / FETCH_EXCLUSIONS_SIDECAR}",
+                err=True,
+            )
 
 
 def _exit_suffix(exit_code: int | None) -> str:
@@ -9424,26 +10345,148 @@ def _print_fetch_all_results(label: str, results: list[BulkFetchResult]) -> bool
     state + crash-tail hint inline (closing the loop with the v0.12.0
     crash-feedback field), so the sweep doubles as a failure report.
     Returns True if any job errored.
+
+    (#62) A job whose tree landed incomplete is tagged ``[PARTIAL: N
+    excluded]`` on its own line and counted separately in the summary. It is
+    NOT counted as failed: the tree is there, and the sweep's exit code stays
+    a statement about jobs it could not fetch at all.
     """
     fetched = [r for r in results if r.outcome == "fetched"]
     skipped = [r for r in results if r.outcome == "skipped"]
     errored = [r for r in results if r.outcome == "error"]
+    partial = [r for r in fetched if r.excluded_count]
     for r in fetched:
         name = f"{r.job_name} " if r.job_name else ""
         tag = ""
         if r.state and r.state != "completed":
             tag = f"  [{r.state.upper()}"
             tag += f": {r.failure_hint}]" if r.failure_hint else "]"
+        if r.excluded_count:
+            tag += f"  [PARTIAL: {r.excluded_count} excluded]"
         click.echo(f"fetched {name}{r.jobid} -> {r.detail}{tag}")
     for r in errored:
         click.echo(f"ERROR   {r.jobid}: {r.detail}", err=True)
     parts = [f"{len(fetched)} fetched"]
+    if partial:
+        parts.append(f"{len(partial)} partial")
     if skipped:
         parts.append(f"{len(skipped)} skipped (already present)")
     if errored:
         parts.append(f"{len(errored)} failed")
     click.echo(f"{label}: {', '.join(parts)}")
+    if partial:
+        click.echo(
+            f"{label}: {len(partial)} fetched tree(s) are INCOMPLETE; each "
+            f"names what is missing in its {FETCH_EXCLUSIONS_SIDECAR}",
+            err=True,
+        )
     return bool(errored)
+
+
+FETCH_ALL_REPORT_SCHEMA = "vq.fetch-all-report.v1"
+FETCH_ALL_REPORT_RELPATH = Path("_vq") / "fetch-all-report.json"
+
+
+def _fetch_all_report_payload(
+    *,
+    output_dir: Path,
+    states: set[str] | None,
+    rows: list[tuple[str, BulkFetchResult]],
+    unreachable: list[tuple[str, str]],
+) -> dict[str, object]:
+    """The machine-readable coverage record for one `vq fetch-all` run (#62).
+
+    A summary LINE is not a manifest. A consumer of the fetched corpus could
+    see 423 directories and have no way to name the five that are missing, or
+    to tell a job that failed to fetch from one that was never selected —
+    unless it re-parsed the log. This is that record: every selected job, its
+    outcome, and for a partial tree the entries it does not contain.
+    """
+    jobs: list[dict[str, object]] = []
+    for host, result in rows:
+        entry: dict[str, object] = {
+            "jobid": result.jobid,
+            "job_name": result.job_name,
+            "host": host,
+            "outcome": result.outcome,
+            "state": result.state,
+            "detail": result.detail,
+            "partial": bool(result.excluded_count),
+            "excluded_count": result.excluded_count,
+            "excluded": None,
+        }
+        if result.outcome == "fetched":
+            entry["destination"] = result.detail
+            if result.excluded_count:
+                payload = read_fetch_exclusions(Path(result.detail))
+                if payload is not None:
+                    entry["excluded"] = payload.get("excluded")
+        jobs.append(entry)
+    counted = [result for _host, result in rows]
+    return {
+        "schema": FETCH_ALL_REPORT_SCHEMA,
+        "generated_at": utcnow_iso(),
+        "vq_version": __version__,
+        "output_dir": str(output_dir),
+        "states": sorted(states) if states else None,
+        "hosts": sorted({host for host, _result in rows}),
+        "unreachable_hosts": [
+            {"host": host, "error": error} for host, error in unreachable
+        ],
+        "totals": {
+            "selected": len(counted),
+            "fetched": sum(1 for r in counted if r.outcome == "fetched"),
+            "partial": sum(
+                1 for r in counted if r.outcome == "fetched" and r.excluded_count
+            ),
+            "skipped": sum(1 for r in counted if r.outcome == "skipped"),
+            "failed": sum(1 for r in counted if r.outcome == "error"),
+        },
+        "jobs": jobs,
+    }
+
+
+def _write_fetch_all_report(path: Path, payload: dict[str, object]) -> None:
+    """Write the sweep report atomically beside the corpus.
+
+    Best effort at the call site: a corpus that landed must not be reported as
+    a failure because its index could not be written. The caller warns.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def _emit_fetch_all_report(
+    output_dir: Path,
+    report_path: Path | None,
+    *,
+    states: set[str] | None,
+    rows: list[tuple[str, BulkFetchResult]],
+    unreachable: list[tuple[str, str]],
+) -> None:
+    """Write the sweep report, or say on stderr why it could not be written."""
+    if report_path is not None and report_path.name.lower() == "none":
+        return
+    destination = (
+        report_path if report_path is not None else output_dir / FETCH_ALL_REPORT_RELPATH
+    )
+    payload = _fetch_all_report_payload(
+        output_dir=output_dir,
+        states=states,
+        rows=rows,
+        unreachable=unreachable,
+    )
+    try:
+        _write_fetch_all_report(destination, payload)
+    except OSError as exc:
+        click.echo(f"could not write fetch-all report to {destination}: {exc}", err=True)
+        return
+    click.echo(f"report -> {destination}")
 
 
 @main.command(name="fetch-all")
@@ -9479,11 +10522,21 @@ def _print_fetch_all_results(label: str, results: list[BulkFetchResult]) -> bool
     "exclusive with HOST). A host that is unreachable or errors is "
     "reported and skipped so one bad host does not abort the rest.",
 )
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Where to write the machine-readable sweep report. Default: "
+    f"<output_dir>/{FETCH_ALL_REPORT_RELPATH.as_posix()}. Pass 'none' to "
+    "write no report.",
+)
 def fetch_all(
     host: str | None,
     output_dir: Path,
     states: tuple[str, ...],
     all_hosts: bool,
+    report_path: Path | None,
 ) -> None:
     """Fetch ALL terminal jobs' workspaces from a host (or every host).
 
@@ -9508,6 +10561,15 @@ def fetch_all(
     cleaned-up workspace) and, under ``--all-hosts``, a whole unreachable host
     are reported inline and do not abort the rest, and the command exits
     non-zero if anything errored. Archived jobs are not included.
+
+    A job whose workspace holds files vq cannot read, or links it must not
+    follow, lands as a PARTIAL tree: the rest of the workspace is fetched and
+    the tree's ``_vq/fetch-exclusions.json`` names every entry that is
+    missing. That counts as fetched, not failed — the alternative loses the
+    whole job over one file — but it is flagged on the job's line and in the
+    summary. Every run also writes a machine-readable report (see
+    ``--report``) so a downstream consumer can state its own coverage without
+    parsing this output.
     """
     cfg = config.load_config()
 
@@ -9599,6 +10661,8 @@ def fetch_all(
     # bad config) is reported and skipped so one bad host never sinks the
     # sweep. For a single explicit host the error propagates as usual.
     aggregate: list[BulkFetchResult] = []
+    rows: list[tuple[str, BulkFetchResult]] = []
+    unreachable: list[tuple[str, str]] = []
     any_error = False
     for h in hosts:
         try:
@@ -9610,23 +10674,45 @@ def fetch_all(
             TypeError,
         ) as e:
             if not all_hosts:
+                # (#62) Even a single-host sweep that dies at the host level
+                # leaves a report saying so, rather than nothing at all.
+                _emit_fetch_all_report(
+                    output_dir,
+                    report_path,
+                    states=selected,
+                    rows=rows,
+                    unreachable=[*unreachable, (h, str(e))],
+                )
                 raise click.ClickException(str(e)) from None
             click.echo(f"{h}: SKIPPED ({e})", err=True)
+            unreachable.append((h, str(e)))
             any_error = True
             continue
         any_error |= _print_fetch_all_results(h, res)
         aggregate.extend(res)
+        rows.extend((h, r) for r in res)
 
     if all_hosts and len(hosts) > 1:
         tf = sum(1 for r in aggregate if r.outcome == "fetched")
+        tp = sum(1 for r in aggregate if r.outcome == "fetched" and r.excluded_count)
         ts = sum(1 for r in aggregate if r.outcome == "skipped")
         te = sum(1 for r in aggregate if r.outcome == "error")
         tot = [f"{tf} fetched"]
+        if tp:
+            tot.append(f"{tp} partial")
         if ts:
             tot.append(f"{ts} skipped")
         if te:
             tot.append(f"{te} failed")
         click.echo(f"all-hosts total: {', '.join(tot)}")
+
+    _emit_fetch_all_report(
+        output_dir,
+        report_path,
+        states=selected,
+        rows=rows,
+        unreachable=unreachable,
+    )
 
     if any_error:
         raise SystemExit(1)
@@ -9647,8 +10733,12 @@ def fetch_all(
     "--delete",
     "mode_delete",
     is_flag=True,
-    help="Delete eligible jobs: remove spec + workspace + archive (if any). "
-    "Job vanishes from `vq queue`. Requires --older-than.",
+    help="Delete eligible jobs: remove spec + workspace + workdir + archive "
+    "(whichever exist). The workdir goes too since #63 — it is usually the "
+    "bulk of the bytes — at the path the job recorded, including under a "
+    "scratch root this host has since been configured away from, and only "
+    "when that path is still the per-job directory named for the job. Job "
+    "vanishes from `vq queue`. Requires --older-than.",
 )
 @click.option(
     "--restore",
@@ -9698,6 +10788,38 @@ def fetch_all(
     help="v0.5.17: print current auto-cleanup policy and exit.",
 )
 @click.option(
+    "--orphans",
+    "orphans",
+    is_flag=True,
+    help="List job workspaces under scheduler host HOST's jobs root that no "
+    "local spec records. With -x, remove those this driver stamped that are "
+    "older than --older-than (default 14d) and not queued or running (#91). "
+    "Also lists stray upload/result transfer archives there.",
+)
+@click.option(
+    "--leftovers",
+    "leftovers_mode",
+    is_flag=True,
+    help="List leftovers of interrupted admin updates and fetches on this host "
+    "(admin backups/failed targets beside registered venvs, fetch staging in "
+    "vq's job trees) older than --older-than (default 1d). -x removes them.",
+)
+@click.option(
+    "--include-unowned",
+    "include_unowned",
+    is_flag=True,
+    help="With --orphans: also remove unstamped workspaces (made before #91 "
+    "or by an unknown driver). Never removes another driver's workspaces.",
+)
+@click.option(
+    "--auto-run-due",
+    "auto_run_due",
+    is_flag=True,
+    hidden=True,
+    help="Internal (#90): run the persisted auto-cleanup policy's sweep on "
+    "this host if it is due. The daemon starts this while jobs are active.",
+)
+@click.option(
     "--archive-after",
     "archive_after_str",
     metavar="DUR",
@@ -9727,9 +10849,10 @@ def fetch_all(
     "workdir_max_age_str",
     metavar="DUR",
     default=None,
-    help="Auto-cleanup: remove terminal-job workdirs older than DUR. "
-    "Format: '14d' / '4h' / '600s' etc. Only meaningful with "
-    "--auto-enable.",
+    help="Auto-cleanup: remove terminal-job workdirs older than DUR, in "
+    "every workdir root vq manages — the scratch root and, until it is "
+    "empty, the pre-#63 one under the state root. Format: '14d' / '4h' / "
+    "'600s' etc. Only meaningful with --auto-enable.",
 )
 @click.option(
     "--reason",
@@ -9794,6 +10917,10 @@ def cleanup(
     auto_enable: bool,
     auto_disable: bool,
     auto_status: bool,
+    auto_run_due: bool,
+    orphans: bool,
+    include_unowned: bool,
+    leftovers_mode: bool,
     archive_after_str: str | None,
     delete_after_str: str | None,
     interval_str: str | None,
@@ -9819,9 +10946,38 @@ def cleanup(
     Default mode (no flag) lists terminal-state jobs with their finished_at
     age and on-disk size — useful before deciding what `--older-than`
     threshold to apply.
+
+    \b
+    Sizes cover three trees, and #63 added the middle one:
+      WORKSPACE  the submitted job's cwd, under <scratch_root>/jobs
+      WORKDIR    the job's $VQ_WORKDIR, under <scratch_root>/workdirs
+      ARCHIVE    the tarball, under <state_root>/archive
+    Each job is measured at the path it recorded, so jobs dispatched before
+    the scratch root was split out of the state root are counted where they
+    actually are. --archive tars the workspace only; --delete removes all
+    three.
     """
     # v0.5.17: --auto-* flags are mutually exclusive with the
     # one-shot --archive/--delete/--restore modes.
+    if orphans:
+        _cleanup_orphans(host, older_than_str, include_unowned, execute)
+        return
+    if leftovers_mode:
+        _cleanup_leftovers(host, older_than_str, execute)
+        return
+    if include_unowned:
+        raise click.UsageError("--include-unowned only applies with --orphans")
+    if auto_run_due:
+        from vq.cleanup import run_due_auto_cleanup
+
+        cfg = config.load_config()
+        counts = run_due_auto_cleanup(
+            multi_user=_multi_user_active(cfg),
+            scheduler_workspace_reaper=_scheduler_workspace_reaper(cfg),
+        )
+        click.echo(json.dumps({"due": counts is not None, "counts": counts or {}},
+                              sort_keys=True))
+        return
     auto_count = sum([auto_enable, auto_disable, auto_status])
     if auto_count > 1:
         raise click.UsageError(
@@ -10131,7 +11287,7 @@ def cleanup(
                     scheduler_reaper,
                     queue_dir=c_queue_dir,
                 )
-                delete_job(c.spec, queue_dir=c_queue_dir)
+                delete_job(c.spec, queue_dir=c_queue_dir, owner_uid=c.uid)
         except Exception as e:  # noqa: BLE001 -- collect per-job, keep going
             failures.append((c.spec.id, str(e)))
     if failures:
@@ -10161,6 +11317,22 @@ def _hidden_tar_error_message(error: Exception) -> str:
 )
 def mark_fetched(jobid: str, submitted_at: str, state_name: str) -> None:
     """Internal: acknowledge one exact terminal workspace fetch."""
+    broker_job = _broker_job_locally(jobid)
+    if broker_job is not None:
+        from vq import broker_relay
+
+        try:
+            click.echo(broker_relay.forward_mark_fetched(*broker_job, submitted_at, state_name))
+        except broker_relay.TargetLacksMarkFetched:
+            # Answer exactly as that older target would, so the client keeps
+            # its compatible "warn and succeed" path end to end.
+            click.echo(broker_relay.OLD_MARK_FETCHED_ERROR, err=True)
+            raise SystemExit(2) from None
+        except (FileNotFoundError, transport.RemoteError, ValueError) as exc:
+            # ValueError covers BrokerStoreError (a target no longer configured).
+            click.echo(_hidden_tar_error_message(exc), err=True)
+            raise SystemExit(1) from None
+        return
     multi_user = _multi_user_active()
     try:
         marked_at = mark_terminal_fetch(
@@ -10183,16 +11355,40 @@ def mark_fetched(jobid: str, submitted_at: str, state_name: str) -> None:
 
 @main.command("tar-workspace", hidden=True)
 @click.argument("jobid")
-def tar_workspace(jobid: str) -> None:
+@click.option("--fetch-protocol-token", hidden=True, default=None)
+def tar_workspace(jobid: str, fetch_protocol_token: str | None) -> None:
     """Internal: emit the local workspace tarball for JOBID on stdout.
 
     Used by ``vq fetch <remote-host> JOBID``: the local side ssh's into
     the remote and runs this verb, piping the resulting tar stream
     through tarfile to extract it locally.
     """
+    if fetch_protocol_token is not None and (
+        len(fetch_protocol_token) != 32
+        or any(char not in "0123456789abcdef" for char in fetch_protocol_token)
+    ):
+        raise click.BadParameter("expected 32 lowercase hexadecimal characters",
+                                 param_hint="--fetch-protocol-token")
+    broker_job = _broker_job_locally(jobid)
+    if broker_job is not None:
+        from vq import broker_relay
+
+        argv = ["tar-workspace"]
+        if fetch_protocol_token is not None:
+            argv += ["--fetch-protocol-token", fetch_protocol_token]
+        try:
+            broker_relay.stream_workspace(*broker_job, *argv)
+        except (FileNotFoundError, transport.RemoteError, ValueError) as exc:
+            # ValueError covers BrokerStoreError (a target no longer configured).
+            click.echo(_hidden_tar_error_message(exc), err=True)
+            raise SystemExit(1) from None
+        return
     multi_user = _multi_user_active()
     try:
-        emit_workspace_tar(jobid, multi_user=multi_user)
+        if fetch_protocol_token is None:
+            emit_workspace_tar(jobid, multi_user=multi_user)
+        else:
+            emit_workspace_tar(jobid, multi_user=multi_user, protocol_token=fetch_protocol_token)
     except (
         config.ConfigError,
         FileNotFoundError,
@@ -10208,7 +11404,8 @@ def tar_workspace(jobid: str) -> None:
 
 @main.command("tar-workdir", hidden=True)
 @click.argument("jobid")
-def tar_workdir(jobid: str) -> None:
+@click.option("--fetch-protocol-token", hidden=True, default=None)
+def tar_workdir(jobid: str, fetch_protocol_token: str | None) -> None:
     """v0.7.7: emit the local workdir tarball for JOBID on stdout.
 
     Used by ``vq fetch <remote-host> JOBID --workdir``: the local side
@@ -10217,9 +11414,32 @@ def tar_workdir(jobid: str) -> None:
     ``tar-workspace`` but tars ``spec.workdir`` (v0.6.54's per-job
     scratch directory) instead of ``spec.cwd``.
     """
+    if fetch_protocol_token is not None and (
+        len(fetch_protocol_token) != 32
+        or any(char not in "0123456789abcdef" for char in fetch_protocol_token)
+    ):
+        raise click.BadParameter("expected 32 lowercase hexadecimal characters",
+                                 param_hint="--fetch-protocol-token")
+    broker_job = _broker_job_locally(jobid)
+    if broker_job is not None:
+        from vq import broker_relay
+
+        argv = ["tar-workdir"]
+        if fetch_protocol_token is not None:
+            argv += ["--fetch-protocol-token", fetch_protocol_token]
+        try:
+            broker_relay.stream_workspace(*broker_job, *argv)
+        except (FileNotFoundError, transport.RemoteError, ValueError) as exc:
+            # ValueError covers BrokerStoreError (a target no longer configured).
+            click.echo(_hidden_tar_error_message(exc), err=True)
+            raise SystemExit(1) from None
+        return
     multi_user = _multi_user_active()
     try:
-        emit_workdir_tar(jobid, multi_user=multi_user)
+        if fetch_protocol_token is None:
+            emit_workdir_tar(jobid, multi_user=multi_user)
+        else:
+            emit_workdir_tar(jobid, multi_user=multi_user, protocol_token=fetch_protocol_token)
     except (
         config.ConfigError,
         FileNotFoundError,
@@ -10237,6 +11457,19 @@ def tar_workdir(jobid: str) -> None:
 @click.option("--subdir", default=None)
 def tar_artifact(jobid: str, name: str, workdir: bool, subdir: str | None) -> None:
     """Internal: emit one named artifact from the explicit source directory."""
+    broker_job = _broker_job_locally(jobid)
+    if broker_job is not None:
+        from vq import broker_relay
+
+        argv = ["tar-artifact", name, *(["--workdir"] if workdir else []),
+                *(["--subdir", subdir] if subdir is not None else [])]
+        try:
+            broker_relay.stream_workspace(*broker_job, *argv)
+        except (FileNotFoundError, transport.RemoteError, ValueError) as exc:
+            # ValueError covers BrokerStoreError (a target no longer configured).
+            click.echo(_hidden_tar_error_message(exc), err=True)
+            raise SystemExit(1) from None
+        return
     multi_user = _multi_user_active()
     try:
         emit_artifact_tar(jobid, name, multi_user=multi_user, workdir=workdir, subdir=subdir)
@@ -10287,8 +11520,6 @@ def build_env(
                 "queued build-env baseline and target must be full SHAs"
             )
         prog = admin_module._resolve_venv_program(env, cfg)
-        from vq import auto_update as auto_update_module
-
         with (
             admin_module.admin_update_ownership(),
             admin_module.toolset_lifecycle_lock(
@@ -10301,46 +11532,14 @@ def build_env(
                     "queued branch update cannot authoritatively prove this "
                     "environment is different from the serving vq daemon"
                 )
-            current_sha = admin_module.current_source_sha(Path(prog.git_dir))
-            if current_sha != baseline_sha:
-                raise admin_module.AdminError(
-                    "queued branch update baseline is stale: current HEAD is "
-                    f"{current_sha or 'unknown'}, receipt expected {baseline_sha}"
+            if prog.runtime_slot_root is not None:
+                result = _build_env_runtime_slot(
+                    env, cfg, prog, baseline_sha, expected_sha,
                 )
-            fetch_rc, fetch_detail = auto_update_module._fetch_origin(
-                Path(prog.git_dir),
-            )
-            if fetch_rc != 0:
-                raise admin_module.AdminError(
-                    f"queued branch target refresh failed: {fetch_detail}"
+            else:
+                result = _build_env_checkout(
+                    env, cfg, prog, baseline_sha, expected_sha,
                 )
-            if not prog.branch:
-                raise admin_module.AdminError(
-                    "queued branch update target has no configured branch"
-                )
-            observed_target = auto_update_module._rev_parse(
-                Path(prog.git_dir), f"origin/{prog.branch}",
-            )
-            if observed_target != expected_sha:
-                raise admin_module.AdminError(
-                    "queued branch target is stale: origin/"
-                    f"{prog.branch} is {observed_target or 'unknown'}, receipt "
-                    f"expected {expected_sha}"
-                )
-            if auto_update_module._is_ancestor(
-                Path(prog.git_dir), baseline_sha, expected_sha,
-            ) is not True:
-                raise admin_module.AdminError(
-                    "queued branch target is not a proven descendant of its "
-                    "baseline"
-                )
-            result = admin_module.update_env(
-                env,
-                cfg,
-                host="localhost",
-                expected_sha=expected_sha,
-                restart_daemon=False,
-            )
     except admin_module.AdminError as e:
         click.echo(f"build-env: {env!r} could not start: {e}", err=True)
         raise SystemExit(2) from None
@@ -10350,9 +11549,411 @@ def build_env(
     click.echo(f"build-env: {env} rebuilt OK")
 
 
+def _build_env_runtime_slot(
+    env: str, cfg: config.Config, prog: config.VenvProgram,
+    baseline_sha: str, expected_sha: str,
+) -> admin_module.UpdateResult:
+    """Queued branch update of a slot-rooted program, reading only.
+
+    The baseline is the active generation and the target is read with
+    ``ls-remote``; no published generation or build checkout is fetched into.
+    Ancestry is proven inside the new unpublished generation (#72).
+    """
+    from vq import auto_update as auto_update_module
+    from vq.runtime_slots import RuntimeSlotError
+
+    try:
+        remote_dir, _source, current_sha = auto_update_module._slot_drift_sources(prog)
+    except RuntimeSlotError as exc:
+        raise admin_module.AdminError(str(exc)) from exc
+    if current_sha != baseline_sha:
+        raise admin_module.AdminError(
+            "queued branch update baseline is stale: the active generation is "
+            f"{current_sha}, receipt expected {baseline_sha}"
+        )
+    if not prog.branch:
+        raise admin_module.AdminError(
+            "queued branch update target has no configured branch"
+        )
+    observed_target, detail = auto_update_module._ls_remote_branch(remote_dir, prog.branch)
+    if observed_target != expected_sha:
+        raise admin_module.AdminError(
+            f"queued branch target is stale: origin/{prog.branch} is "
+            f"{observed_target or 'unknown'}{f' ({detail})' if detail else ''}, "
+            f"receipt expected {expected_sha}"
+        )
+    with admin_module.slot_build_requires_ancestor(baseline_sha):
+        return admin_module.update_env(
+            env, cfg, host="localhost", expected_sha=expected_sha,
+            restart_daemon=False,
+        )
+
+
+def _build_env_checkout(
+    env: str, cfg: config.Config, prog: config.VenvProgram,
+    baseline_sha: str, expected_sha: str,
+) -> admin_module.UpdateResult:
+    """Queued branch update of an in-place checkout."""
+    from vq import auto_update as auto_update_module
+
+    current_sha = admin_module.current_source_sha(Path(prog.git_dir))
+    if current_sha != baseline_sha:
+        raise admin_module.AdminError(
+            "queued branch update baseline is stale: current HEAD is "
+            f"{current_sha or 'unknown'}, receipt expected {baseline_sha}"
+        )
+    fetch_rc, fetch_detail = auto_update_module._fetch_origin(
+        Path(prog.git_dir),
+    )
+    if fetch_rc != 0:
+        raise admin_module.AdminError(
+            f"queued branch target refresh failed: {fetch_detail}"
+        )
+    if not prog.branch:
+        raise admin_module.AdminError(
+            "queued branch update target has no configured branch"
+        )
+    observed_target = auto_update_module._rev_parse(
+        Path(prog.git_dir), f"origin/{prog.branch}",
+    )
+    if observed_target != expected_sha:
+        raise admin_module.AdminError(
+            "queued branch target is stale: origin/"
+            f"{prog.branch} is {observed_target or 'unknown'}, receipt "
+            f"expected {expected_sha}"
+        )
+    if auto_update_module._is_ancestor(
+        Path(prog.git_dir), baseline_sha, expected_sha,
+    ) is not True:
+        raise admin_module.AdminError(
+            "queued branch target is not a proven descendant of its "
+            "baseline"
+        )
+    return admin_module.update_env(
+        env,
+        cfg,
+        host="localhost",
+        expected_sha=expected_sha,
+        restart_daemon=False,
+    )
+
+
 @main.group()
 def admin() -> None:
     """Queue admin verbs: refresh registered envs, etc. (v0.5.20+)."""
+
+
+@admin.command("retire-checkout")
+@click.argument("env")
+@click.option("--apply-plan", metavar="SHA256",
+              help="Delete the checkout of this reviewed plan, after revalidating it.")
+@click.option("--launcher", "launchers", multiple=True, metavar="PATH",
+              help="A launcher file that may name the checkout (repeatable). Any "
+              "that does blocks; give the same list with --apply-plan.")
+def admin_retire_checkout(env: str, apply_plan: str | None, launchers: tuple[str, ...]) -> None:
+    """Plan (default) or apply deleting ENV's legacy build checkout.
+
+    Only for a registration with runtime_slot_build_input = "current" and an
+    active verified generation. The read-only JSON plan names the checkout,
+    its HEAD and upstream, its size and every blocker: a registration still
+    building from it, a service or the running daemon using it, a live job
+    naming it, an admin marker, an unfinished or unreadable migrate-runtime
+    transaction of the registration family, a launcher or registry file that
+    names it (the loaded registry, one bound by a migration, or one declared
+    with --launcher), uncommitted changes, stashes, or commits not on any
+    remote. Only the retiring registrations' own git_dir/python are exempt,
+    listed as compatibility_paths; they stay in the registry as path
+    templates. service_files and service_file_sha256 record the service
+    scan in both the plan and receipt. --apply-plan re-plans under the admin
+    and lifecycle ownership, refuses on any change, deletes the tree and
+    writes a receipt.
+
+    Migrations are found through the receipt index migrate-runtime writes;
+    one applied by an older vq is not seen, so declare its launchers.
+
+    \b
+    Exit codes:
+      0  a plan without blockers, or an apply that removed the tree
+      1  a plan with blockers, or an apply that ran but left the tree
+      2  a refusal: not retirable, changed since the plan, or blocked
+    """
+    from vq import checkout_retirement
+    from vq.admin import AdminError
+
+    cfg = config.load_config()
+    try:
+        if apply_plan:
+            result = checkout_retirement.apply(env, cfg, apply_plan, launchers=launchers)
+        else:
+            result = checkout_retirement.plan(env, cfg, launchers=launchers)
+    except (checkout_retirement.RetirementError, AdminError) as exc:
+        click.echo(f"vq admin retire-checkout: {exc}", err=True)
+        raise SystemExit(2) from None
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if apply_plan and not result.get("removed"):
+        raise SystemExit(1)
+    if not apply_plan and result.get("blockers"):
+        raise SystemExit(1)
+
+
+@admin.command("runtime-bindings")
+@click.argument("host")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print JSON (the only format; accepted for symmetry).")
+@click.option("--record-migration", "record_path", type=click.Path(path_type=Path),
+              default=None, metavar="RECEIPT",
+              help="Attach a vq.runtime-migration-record/1 receipt to HOST's "
+                   "runtime status rows instead of printing bindings.")
+@click.option("--record-inventory", "inventory_path", type=click.Path(path_type=Path),
+              default=None, metavar="RECORD",
+              help="Attach a vq.runtime-inventory-record/1 summary to HOST's "
+                   "runtime status rows instead of printing bindings.")
+def admin_runtime_bindings(
+    host: str, as_json: bool, record_path: Path | None, inventory_path: Path | None,
+) -> None:
+    """Print this driver's runtime bindings for scheduler HOST (read-only).
+
+    The binding-relevant subset of this driver's config for HOST (remote_vq,
+    remote_python, branches, branch_aliases, each program's non-empty command_wrapper,
+    each scheduler_runtime_deployments block, fleet_role, scheduler_driver),
+    its digest, and this driver's runtime status rows for HOST. Only paths and
+    commands: any other key is left out. A runtime migration compares these
+    across every authority that binds HOST (#72).
+
+    With --record-migration, store a completed migration's receipt on HOST's
+    status rows; nothing else in config or state changes. --record-inventory
+    does the same for a participant's inventory summary (store, current,
+    previous, launcher schema), which `vq admin status HOST` shows.
+    """
+    from vq import runtime_participant
+
+    del as_json
+    cfg = config.load_config()
+    try:
+        if record_path is not None and inventory_path is not None:
+            raise runtime_participant.ParticipantError(
+                "--record-migration and --record-inventory are exclusive")
+        for path, recorder in ((record_path, runtime_participant.record_migration),
+                               (inventory_path, runtime_participant.record_inventory)):
+            if path is None:
+                continue
+            raw = sys.stdin.buffer.read() if str(path) == "-" else path.read_bytes()
+            record = runtime_participant.parse_document(raw)
+            keys = recorder(host, record)
+            click.echo(json.dumps({"recorded": keys}, indent=2, sort_keys=True))
+            return
+        payload = runtime_participant.runtime_bindings(cfg, host)
+    except (runtime_participant.ParticipantError, config.ConfigError, OSError) as exc:
+        click.echo(f"vq admin runtime-bindings: {exc}", err=True)
+        raise SystemExit(2) from None
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+@admin.command("runtime-retention")
+@click.argument("env")
+@click.option("--keep", type=click.IntRange(min=0), default=2, show_default=True,
+              help="Verified generations to keep besides current, previous and "
+                   "every referenced one (previous is optional with --drop-previous).")
+@click.option("--drop-previous", is_flag=True,
+              help="Allow removing an unused previous generation and its rollback pointer. "
+                   "Use with --keep 0 to retain only current and referenced generations.")
+@click.option("--retain", "retain", multiple=True, metavar="SHA",
+              help="Also keep this generation (e.g. named by a fixed-SHA launcher). "
+                   "Repeatable.")
+@click.option("--apply-plan", metavar="SHA256",
+              help="Delete the candidates of this reviewed plan, after revalidating it.")
+@click.option("--schedule", is_flag=True,
+              help="Opt ENV in to retention with --keep on every auto-cleanup sweep.")
+@click.option("--unschedule", is_flag=True, help="Remove ENV from scheduled retention.")
+def admin_runtime_retention(
+    env: str, keep: int, retain: tuple[str, ...], apply_plan: str | None,
+    schedule: bool, unschedule: bool, drop_previous: bool,
+) -> None:
+    """Plan (default) or apply removal of ENV's old runtime generations.
+
+    Without --apply-plan this is read-only JSON: every generation under the
+    program's runtime_slot_root with its size and why it is kept or proposed,
+    the live-job and service census, blockers, and the plan id. Always kept:
+    current, previous (unless --drop-previous), anything a started local job,
+    a service definition or the running daemon references, every --retain SHA,
+    and the --keep newest others. A started job whose generation cannot be
+    proven keeps everything.
+
+    --apply-plan re-plans under the admin and lifecycle ownership, refuses if
+    anything changed, removes exactly the candidates and writes a receipt under
+    the state root. It is never run by an update or activation (#74).
+    """
+    from vq import runtime_retention
+    from vq.admin import AdminError
+
+    cfg = config.load_config()
+    if schedule or unschedule:
+        if drop_previous:
+            raise click.UsageError("--drop-previous requires a one-off reviewed plan; "
+                                   "it cannot be scheduled or unscheduled")
+        if sum(map(bool, (schedule, unschedule, apply_plan, retain))) > 1:
+            raise click.UsageError(
+                "--schedule/--unschedule take only --keep; --retain and "
+                "--apply-plan are for one-off runs"
+            )
+        try:
+            current = runtime_retention.read_schedule()
+            if schedule:
+                runtime_retention.plan(env, cfg, keep=keep)  # refuses a non-slot program
+                current[env] = keep
+            else:
+                current.pop(env, None)
+            runtime_retention.write_schedule(current)
+        except runtime_retention.RetentionError as exc:
+            click.echo(f"vq admin runtime-retention: {exc}", err=True)
+            raise SystemExit(2) from None
+        click.echo(json.dumps({"schedule": current}, indent=2, sort_keys=True))
+        from vq.cleanup import read_auto_cleanup_policy
+
+        if schedule and read_auto_cleanup_policy() is None:
+            click.echo(
+                "note: auto-cleanup is not enabled on this host, so the schedule "
+                "is inert until `vq cleanup --auto-enable ...`", err=True,
+            )
+        return
+    try:
+        if apply_plan:
+            result = runtime_retention.apply(
+                env, cfg, apply_plan, keep=keep, retain=retain, drop_previous=drop_previous,
+            )
+        else:
+            result = runtime_retention.plan(
+                env, cfg, keep=keep, retain=retain, drop_previous=drop_previous,
+            )
+    except (runtime_retention.RetentionError, AdminError) as exc:
+        click.echo(f"vq admin runtime-retention: {exc}", err=True)
+        raise SystemExit(2) from None
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+    if apply_plan and result.get("failed"):
+        raise SystemExit(1)
+
+
+@admin.command("runtime-registry", hidden=True)
+def admin_runtime_registry() -> None:
+    """Serve one bounded registry operation from a migration coordinator."""
+    from vq import runtime_registry_remote
+    from vq.runtime_participant import parse_document
+
+    try:
+        raw = sys.stdin.buffer.read(runtime_registry_remote.LIMIT + 1)
+        result = runtime_registry_remote.handle(parse_document(raw))
+        click.echo(json.dumps(result, sort_keys=True))
+    except (OSError, ValueError, KeyError, TypeError, config.ConfigError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@admin.command("migrate-runtime")
+@click.option("--manifest", type=click.Path(path_type=Path))
+@click.option("--prepare-plan", metavar="SHA256")
+@click.option("--apply-plan", metavar="SHA256")
+@click.option("--receipt-dir", type=click.Path(path_type=Path))
+@click.option("--resume", is_flag=True)
+@click.option("--rollback", is_flag=True)
+@click.option("--acknowledge", is_flag=True,
+              help="Participant transactions only: terminal acknowledgement after a "
+                   "fully recorded apply. Grants no cleanup. A participant that "
+                   "refuses leaves the transaction applied; repeat --acknowledge.")
+def admin_migrate_runtime(
+    manifest: Path | None, prepare_plan: str | None, apply_plan: str | None,
+    receipt_dir: Path | None, resume: bool, rollback: bool, acknowledge: bool,
+) -> None:
+    """Plan a runtime migration; default is read-only JSON.
+
+    The plan's status names the next step: preparation_required (run
+    --prepare-plan), ready (run --apply-plan) or blocked. A blocked plan lists
+    its blockers and exits 1; prepare and apply refuse it until the blockers
+    are resolved and the plan is made again.
+
+    Preparation builds at the final generation path without activation. Apply
+    requires the resulting reviewed plan digest and a new external receipt
+    directory. Resume and rollback use only that durable receipt.
+
+    A vq.runtime-rebind/1 manifest replaces existing canonical launcher
+    bootstraps and may select current build input for an already bound local
+    registration. It requires the active verified generation and changes no
+    runtime pointers or services.
+
+    A manifest with ``participants`` (#72) plans with one inventory per
+    participant; --prepare-plan returns a ready plan whose ``ready_id`` is what
+    --apply-plan takes.
+    """
+    from vq import runtime_migration
+    from vq.admin import AdminError
+    from vq.runtime_slots import RuntimeSlotError
+
+    try:
+        if sum(bool(x) for x in (prepare_plan, apply_plan, resume, rollback, acknowledge)) > 1:
+            raise ValueError("choose only one of prepare, apply, resume, rollback or acknowledge")
+        if resume or rollback or acknowledge:
+            if manifest is not None or receipt_dir is None:
+                raise ValueError("recovery requires only --receipt-dir and "
+                                 "--resume/--rollback/--acknowledge")
+            result = runtime_migration.recover(receipt_dir, rollback=rollback,
+                                               acknowledge=acknowledge)
+        else:
+            if manifest is None:
+                raise ValueError("--manifest is required for planning, preparation and apply")
+            if bool(apply_plan) != bool(receipt_dir):
+                raise ValueError("--apply-plan and --receipt-dir must be supplied together")
+            request = runtime_migration.read_manifest(manifest)
+            if prepare_plan:
+                result = runtime_migration.prepare(request, prepare_plan)
+            elif apply_plan:
+                assert receipt_dir is not None
+                result = runtime_migration.apply(request, apply_plan, receipt_dir)
+            else:
+                result = runtime_migration.plan(request)
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        if result.get("blockers"):
+            raise SystemExit(1)
+    except (OSError, ValueError, config.ConfigError, AdminError, RuntimeSlotError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@admin.command("repair-state-paths")
+@click.option("--state-root", type=click.Path(path_type=Path), required=True)
+@click.option("--from-root", "old_root", type=click.Path(path_type=Path), required=True)
+@click.option("--to-root", "new_root", type=click.Path(path_type=Path), required=True)
+@click.option("--job", "jobs", multiple=True, help="Limit the plan to exact job IDs.")
+@click.option("--dry-run", is_flag=True, help="Explicit read-only mode (the default).")
+@click.option("--json", "as_json", is_flag=True, help="Explicit JSON output (the default).")
+@click.option("--apply-plan", metavar="SHA256", help="Apply only this reviewed plan digest.")
+@click.option(
+    "--receipt-dir", type=click.Path(path_type=Path), help="New external receipt directory.",
+)
+def admin_repair_state_paths(
+    state_root: Path, old_root: Path, new_root: Path, jobs: tuple[str, ...],
+    dry_run: bool, as_json: bool, apply_plan: str | None, receipt_dir: Path | None,
+) -> None:
+    """Plan terminal-record path repair; default is read-only JSON.
+
+    OLD must directly alias NEW through the reviewed compatibility symlink.
+    Apply preserves exact original records before replacing any path fields.
+    No daemon, artifact, configuration, or scheduler workspace is changed.
+    """
+    from vq.state_path_repair import apply_repair, plan_repair
+
+    try:
+        if dry_run and apply_plan:
+            raise ValueError("--dry-run cannot be combined with --apply-plan")
+        if bool(apply_plan) != bool(receipt_dir):
+            raise ValueError("--apply-plan and --receipt-dir must be supplied together")
+        plan = plan_repair(state_root, old_root, new_root, jobs=jobs)
+        if apply_plan is not None:
+            assert receipt_dir is not None
+            result = apply_repair(plan, expected_plan_id=apply_plan, receipt_dir=receipt_dir)
+        else:
+            result = plan
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        if plan["blockers"]:
+            raise SystemExit(1)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 def _rollout_update_runner(
@@ -10375,19 +11976,15 @@ def _rollout_update_runner(
 
 def _fleet_snapshots(
     cfg: config.Config,
+    selection: fleet_rollout.HostSelection | None = None,
 ) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    """The three read-only sweeps, with this fleet's doctor budget if it set one.
-
-    Calls `collect_snapshots()` with no arguments when nothing is configured,
-    so the default path is byte-identical to what it always was -- a fleet
-    that never hit pbs-cluster's slow login node should see no change at all, and
-    neither should the fakes in the test suite.
-    """
-    if cfg.fleet.check_timeout_seconds is None:
-        return fleet_rollout.collect_snapshots()
-    return fleet_rollout.collect_snapshots(
-        check_timeout_seconds=cfg.fleet.check_timeout_seconds,
-    )
+    """Read required host health with this fleet's configured doctor budget."""
+    kwargs: dict[str, Any] = {}
+    if selection is not None and selection.scoped:
+        kwargs["hosts"] = fleet_rollout.snapshot_hosts(cfg, selection)
+    if cfg.fleet.check_timeout_seconds is not None:
+        kwargs["check_timeout_seconds"] = cfg.fleet.check_timeout_seconds
+    return fleet_rollout.collect_snapshots(**kwargs)
 
 
 def _emit_rollout_error(
@@ -10547,6 +12144,66 @@ def _echo_legacy_reconciliation_preview(
     )
 
 
+def _tracking_from_reentry(
+    cfg: config.Config,
+    report: fleet_release.FleetReleaseReport,
+    values: tuple[str, ...],
+    *,
+    commit_time: Callable[[str, str], int | None],
+) -> tuple[fleet_rollout.TrackingTarget, ...]:
+    """Rebuild the parent's resolved tracking heads from re-entry argv."""
+    shas: dict[str, str] = {}
+    for value in values:
+        program, sep, sha = value.partition("=")
+        if not sep or program in shas:
+            raise fleet_rollout.FleetRolloutError(
+                f"malformed --tracking-sha {value!r}"
+            )
+        shas[program] = sha
+    if set(shas) != set(cfg.fleet_tracking_lanes):
+        raise fleet_rollout.FleetRolloutError(
+            "driver re-entry tracking heads do not match [fleet_tracking_lanes]: "
+            f"got {sorted(shas)}, configured {sorted(cfg.fleet_tracking_lanes)}"
+        )
+    targets = []
+    for program, branch in sorted(cfg.fleet_tracking_lanes.items()):
+        pin_name = fleet_rollout.PROGRAM_PINS[program]
+        if pin_name not in report.pins:
+            raise fleet_rollout.FleetRolloutError(
+                f"report has no {pin_name} pin for tracked program {program}"
+            )
+        # build_plan validates the SHA and re-proves descent from the pin.
+        targets.append(
+            fleet_rollout.TrackingTarget(
+                program=program,
+                pin_name=pin_name,
+                branch=branch,
+                sha=shas[program],
+                committed_at=(
+                    commit_time(pin_name, shas[program])
+                    if fleet_rollout._SOURCE_SHA.fullmatch(shas[program])
+                    else None
+                ),
+            )
+        )
+    return tuple(targets)
+
+
+def _rollout_controller_program(prog: config.VenvProgram) -> config.VenvProgram:
+    """The registration the rollout controller runs as (#146).
+
+    A slot-executed vibeqc-queue runs its verified slot generation, which is
+    re-resolved on each call, so a re-entry after a driver update execs the
+    newly selected slot. Anything else is the registration itself.
+    """
+    try:
+        return prog.execution_program()
+    except config.ConfigError as exc:
+        raise fleet_rollout.FleetRolloutError(
+            f"could not resolve the rollout controller's runtime slot: {exc}"
+        ) from exc
+
+
 @admin.command("rollout-latest")
 @click.option(
     "--dry-run",
@@ -10575,8 +12232,9 @@ def _echo_legacy_reconciliation_preview(
     help="v0.24.x: act on HOST only. Repeatable. Keeps single-host recovery "
     "inside the accepted report's pinned path instead of a hand-typed "
     "`vq admin update <env> <host> --expected-sha <40-hex>`. The driver's own "
-    "vq lane is always evaluated. Selection is host-granular, so a host's "
-    "lanes stay bracketed by one drain exactly as in an unscoped run. "
+    "vq lane is always evaluated. Selection is host-granular, so a scheduler "
+    "host's lanes stay bracketed by one hold exactly as in an unscoped run; a "
+    "local host is not drained (#182). "
     "Mutually exclusive with --skip.",
 )
 @click.option(
@@ -10589,6 +12247,19 @@ def _echo_legacy_reconciliation_preview(
     "always evaluated. Mutually exclusive with --only.",
 )
 @click.option(
+    "--only-tracking",
+    "only_tracking",
+    is_flag=True,
+    default=False,
+    help="Advance only the lanes in [fleet_tracking_lanes] to their branch "
+    "heads, resolved once for this run. Release lanes, scheduler helpers, host "
+    "vq lanes and untracked programs are left alone (their updates reported as "
+    "deferred, their blocks not stopping the refresh). A host whose own vq is "
+    "not on its report pin gets no tracked update either. The driver's own vq "
+    "lane is still evaluated first, as in every rollout. Composes with "
+    "--only/--skip; never marks the rollout complete.",
+)
+@click.option(
     "--json",
     "as_json",
     is_flag=True,
@@ -10598,6 +12269,25 @@ def _echo_legacy_reconciliation_preview(
 )
 @click.option("--resume", hidden=True, default=None)
 @click.option(
+    "--tracking-sha",
+    "tracking_shas",
+    hidden=True,
+    multiple=True,
+    metavar="PROGRAM=SHA",
+)
+@click.option(
+    "--abandon-host",
+    "abandon_host",
+    metavar="HOST",
+    default=None,
+    help="Owner-side recovery (#96), with --resume ROLLOUT: release ROLLOUT's "
+    "owned hold on HOST when every action for HOST is still not-run, or ended "
+    "in a verified, harvested failure (#144), and a supported read-only drain "
+    "snapshot proves HOST inactive. Records the abandonment in the journal, "
+    "executes nothing on HOST, and exits; the next rollout plans HOST "
+    "normally.",
+)
+@click.option(
     "--supersede-plan-hold",
     "supersede_plan_hold",
     nargs=2,
@@ -10605,8 +12295,10 @@ def _echo_legacy_reconciliation_preview(
     metavar="ROLLOUT HOST",
     help="Recovery-only: permanently cover one exact obsolete plan-bound "
     "scheduler hold after a strictly newer accepted plan proves every "
-    "scheduler lane healthy at its exact SHA and a supported read-only drain "
-    "snapshot proves the target inactive. Writes one idempotent journal "
+    "scheduler lane healthy at its exact SHA, either the new pin or the "
+    "obsolete rollout's own pin (with every operation of that rollout on the "
+    "host settled), and a supported read-only drain snapshot proves the "
+    "target inactive. Writes one idempotent journal "
     "receipt, executes no rollout action, and exits. Repeatable: one obsolete "
     "rollout can retain a hold per scheduler lane (pbs-cluster retains six), and "
     "each pair is proved and recorded exactly as it is on its own. Stops at "
@@ -10631,9 +12323,12 @@ def admin_rollout_latest(
     verify_only: bool,
     only_hosts: tuple[str, ...],
     skip_hosts: tuple[str, ...],
+    only_tracking: bool,
     as_json: bool,
     resume: str | None,
+    tracking_shas: tuple[str, ...],
     supersede_plan_hold: tuple[tuple[str, str], ...],
+    abandon_host: str | None,
     reconcile_legacy: bool,
 ) -> None:
     """Roll the newest accepted release report across the configured fleet.
@@ -10651,6 +12346,7 @@ def admin_rollout_latest(
       vq admin rollout-latest --verify-only       one convergence verdict
       vq admin rollout-latest --only workstation      recover one host, still pinned
       vq admin rollout-latest --skip compute-a         roll everything but one host
+      vq admin rollout-latest --only-tracking     advance branch-tracking lanes
       vq admin rollout-latest --supersede-plan-hold ROLLOUT HOST
       vq admin rollout-latest --reconcile-legacy --dry-run   preview it
       vq admin rollout-latest --reconcile-legacy             write it
@@ -10669,17 +12365,58 @@ def admin_rollout_latest(
             "driver re-entry acknowledgement is mutating and cannot be "
             "combined with --dry-run or --verify-only"
         )
-    if reconcile_legacy and (only_hosts or skip_hosts):
+    if reconcile_legacy and (only_hosts or skip_hosts or only_tracking):
         raise click.UsageError(
             "--reconcile-legacy is fleet-global recovery and cannot be "
-            "combined with --only or --skip"
+            "combined with --only, --skip or --only-tracking"
         )
+    if tracking_shas and resume is None:
+        raise click.UsageError(
+            "--tracking-sha is the driver re-entry protocol and needs --resume"
+        )
+    if abandon_host is not None:
+        if resume is None or any((
+            dry_run, verify_only, reconcile_legacy, only_hosts, skip_hosts,
+            supersede_plan_hold, only_tracking, tracking_shas,
+        )):
+            raise click.UsageError(
+                "--abandon-host needs --resume ROLLOUT and no other rollout option"
+            )
+        try:
+            abandoned = fleet_rollout.abandon_deferred_host(
+                rollout_id_value=resume, host=abandon_host,
+            )
+        except fleet_rollout.FleetRolloutError as exc:
+            raise click.ClickException(str(exc)) from None
+        payload = {
+            "schema": "vq.fleet.abandoned_host/1",
+            "status": "already-abandoned" if abandoned.replayed else "abandoned",
+            "rollout_id": abandoned.rollout_id,
+            "host": abandoned.host,
+            "actions": list(abandoned.actions),
+        }
+        if as_json:
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            failed = len(abandoned.failed_actions)
+            kinds = (
+                f"{len(abandoned.actions) - failed} never-started, "
+                f"{failed} verifiably failed"
+                if failed
+                else f"{len(abandoned.actions)} never-started"
+            )
+            click.echo(
+                f"{payload['status']}: {abandoned.host} in {abandoned.rollout_id} "
+                f"({kinds} action(s)); hold released"
+            )
+        return
     if supersede_plan_hold and (
         dry_run
         or verify_only
         or reconcile_legacy
         or only_hosts
         or skip_hosts
+        or only_tracking
         or resume is not None
     ):
         raise click.UsageError(
@@ -10710,6 +12447,7 @@ def admin_rollout_latest(
             cfg,
             only=only_hosts,
             skip=skip_hosts,
+            only_tracking=only_tracking,
         )
         configured_driver_hosts = {
             host.scheduler_driver
@@ -10730,9 +12468,14 @@ def admin_rollout_latest(
                 "rollout-latest requires a configured local "
                 "[programs.vibeqc-queue] lifecycle target"
             )
+        # A slot-executed registration runs the verified slot generation; its
+        # registered git_dir/python are only compatibility paths and may be
+        # retired (#146). execution_program() is the registration itself
+        # otherwise, so the legacy comparison is unchanged.
+        controller_prog = _rollout_controller_program(driver_prog)
         try:
             configured_repo = admin_module._canonical_lifecycle_checkout(
-                Path(driver_prog.git_dir)
+                Path(controller_prog.git_dir)
             )
             runtime_checkout = admin_module._canonical_lifecycle_checkout(repo)
         except admin_module.AdminError as exc:
@@ -10746,7 +12489,7 @@ def admin_rollout_latest(
                 f"({configured_repo} != {runtime_checkout})"
             )
         configured_target = admin_module._canonical_lifecycle_target(
-            Path(driver_prog.python).parent.parent
+            Path(controller_prog.python).parent.parent
         )
         running_target = admin_module._canonical_lifecycle_target(
             Path(sys.executable).parent.parent
@@ -10760,16 +12503,23 @@ def admin_rollout_latest(
 
         reports = fleet_release.report_repo(cfg)
         report_checkout = admin_module._canonical_lifecycle_checkout(reports)
+        try:
+            # Exactly what acquire_lifecycle_fence() below locks, so the
+            # handoff a predecessor passes matches it in every slot layout.
+            controller_lifecycle_keys = admin_module.toolset_lifecycle_resources(
+                [driver_prog],
+                extra_resources=(("checkout", str(report_checkout)),),
+            )
+        except admin_module.AdminError as exc:
+            raise fleet_rollout.FleetRolloutError(
+                f"could not bind rollout controller lifecycle resources: {exc}"
+            ) from exc
 
         inherited_reentry_fence = contextlib.ExitStack()
         inherited_reentry = inherited_reentry_fence.enter_context(
             fleet_rollout.adopt_rollout_reentry_handoff(
                 expected_rollout_id=resume,
-                expected_lifecycle_resources=tuple(sorted({
-                    ("checkout", str(configured_repo)),
-                    ("target", str(configured_target)),
-                    ("checkout", str(report_checkout)),
-                })),
+                expected_lifecycle_resources=controller_lifecycle_keys,
             )
         )
 
@@ -10834,6 +12584,47 @@ def admin_rollout_latest(
                 report, pin_name, repo, older, newer,
                 pin_repos=cfg.pin_source_repos,
             )
+
+        def commit_time(pin_name: str, sha: str) -> int | None:
+            return fleet_release.git_commit_time(
+                fleet_release.pin_repo(
+                    report, pin_name, repo, pin_repos=cfg.pin_source_repos,
+                ),
+                sha,
+            )
+
+        # #109: resolve each tracked branch head once for this invocation.
+        # A driver re-entry carries the heads its parent planned instead of
+        # fetching again, so the lanes deploy exactly what was planned.
+        tracking: tuple[fleet_rollout.TrackingTarget, ...] = ()
+        if tracking_shas:
+            tracking = _tracking_from_reentry(
+                cfg, report, tracking_shas, commit_time=commit_time,
+            )
+        elif cfg.fleet_tracking_lanes and not supersede_plan_hold:
+            try:
+                with admin_module.toolset_lifecycle_lock(
+                    [driver_prog], action="vq-rollout-tracking",
+                ):
+                    heads = fleet_release.resolve_branch_heads(
+                        report,
+                        fleet_rollout.tracking_branches(cfg),
+                        repo,
+                        pin_repos=cfg.pin_source_repos,
+                        runner=admin_module._mutating_git_run,
+                    )
+            except fleet_release.FleetReleaseError as exc:
+                if not verify_only:
+                    raise fleet_rollout.FleetRolloutError(str(exc)) from exc
+                # The verdict is judged against the pin; the heads only
+                # annotate it, so their absence must not withhold it.
+                click.echo(f"WARNING: tracking heads unavailable: {exc}", err=True)
+                heads = None
+            if heads is not None:
+                tracking = fleet_rollout.tracking_targets(cfg, heads)
+        # --verify-only judges a tracked lane against its report pin, so any
+        # healthy descendant is converged; the heads only annotate the verdict.
+        plan_tracking = () if verify_only else tracking
 
         try:
             target_vq_tree_sha256 = (
@@ -10984,12 +12775,13 @@ def admin_rollout_latest(
             )
             rc = fleet_rollout.reenter_after_driver(
                 str(reconciliation.driver_reentry_rollout_id),
-                python=driver_prog.python,
+                python=_rollout_controller_program(driver_prog).python,
                 reentry_handoff=reentry_handoff,
                 pass_fds=reentry_fds,
                 as_json=as_json,
                 selection=selection,
                 reconcile_legacy=reconcile_legacy,
+                **({"tracking": tracking} if tracking else {}),
             )
             raise SystemExit(rc)
         reconciled_failed_hosts = {
@@ -11005,7 +12797,7 @@ def admin_rollout_latest(
                 "rollout-latest to reconcile the newer report"
             )
         admin_snapshot, program_snapshot, doctor_snapshot = (
-            _fleet_snapshots(cfg)
+            _fleet_snapshots(cfg, selection)
         )
         plan = fleet_rollout.build_plan(
             cfg,
@@ -11015,6 +12807,7 @@ def admin_rollout_latest(
             doctor=doctor_snapshot,
             ancestry=ancestry,
             target_vq_tree_sha256=target_vq_tree_sha256,
+            tracking=plan_tracking,
         )
         driver_ssh = cfg.host(plan.driver).ssh
         if not is_local_host(driver_ssh):
@@ -11186,6 +12979,7 @@ def admin_rollout_latest(
                     doctor=doctor_snapshot,
                     ancestry=ancestry,
                     target_vq_tree_sha256=target_vq_tree_sha256,
+                    tracking=plan_tracking,
                 )
                 driver_ssh = cfg.host(plan.driver).ssh
                 if not is_local_host(driver_ssh):
@@ -11320,6 +13114,13 @@ def admin_rollout_latest(
                 rollout_id=current_rollout_id,
                 selection=selection,
                 consoles=consoles,
+                tracking_lanes=fleet_rollout.tracking_lane_report(
+                    restricted,
+                    tracking,
+                    ancestry=ancestry,
+                    commit_time=commit_time,
+                    now=time.time(),
+                ),
             )
             if as_json:
                 click.echo(json.dumps(payload, indent=2, sort_keys=True))
@@ -11449,12 +13250,13 @@ def admin_rollout_latest(
             )
             rc = fleet_rollout.reenter_after_driver(
                 current_rollout_id,
-                python=driver_prog.python,
+                python=_rollout_controller_program(driver_prog).python,
                 reentry_handoff=reentry_handoff,
                 pass_fds=reentry_fds,
                 as_json=as_json,
                 selection=selection,
                 reconcile_legacy=reconcile_legacy,
+                **({"tracking": tracking} if tracking else {}),
             )
             raise SystemExit(rc)
 
@@ -11472,7 +13274,7 @@ def admin_rollout_latest(
             lifecycle_resources=controller_lifecycle_resources,
         )
         final_admin, final_programs, final_doctor = (
-            _fleet_snapshots(cfg)
+            _fleet_snapshots(cfg, selection)
         )
         verification = fleet_rollout.build_plan(
             cfg,
@@ -11482,6 +13284,7 @@ def admin_rollout_latest(
             doctor=final_doctor,
             ancestry=ancestry,
             target_vq_tree_sha256=target_vq_tree_sha256,
+            tracking=plan_tracking,
         )
         verification = fleet_rollout.fence_retained_legacy_holds(
             verification,
@@ -11789,7 +13592,11 @@ def _pin_deploy_identity(
     "install_script_args",
     multiple=True,
     metavar="FLAG",
-    help="Extra flag appended to the install_script invocation. Repeatable.",
+    help="Extra flag appended to the install_script invocation. Repeatable. "
+    "An `--extras` here sets the profile the venv is built with, as the "
+    "per-update request does for an update. When the program declares "
+    "`extras`, a profile that does not cover the declaration is refused "
+    "rather than silently widened.",
 )
 @click.option(
     "--force",
@@ -11840,6 +13647,40 @@ def admin_install(
 
     ENV must be a registered ``kind="venv"`` program carrying ``upstream`` and
     ``install_script``. HOST defaults to ``default_host``.
+
+    A program that declares ``extras`` has that floor applied here, not only on
+    the next managed update: vq appends ``--extras PROFILE`` to the installer,
+    resolved to the smallest profile covering both the declaration and whatever
+    the configured command asked for. It does that only for its own
+    ``scripts/install.sh`` or ``scripts/update.sh``, the same proof a managed
+    update requires before naming an install target. An install that cannot
+    apply the declaration is **refused** -- before the clone when the
+    ``install_script`` does not name one of those at all -- because a venv
+    provisioned without the runtime it declares is what the key exists to
+    prevent. Point ``install_script`` at the checkout's own installer, or drop
+    the declaration, provision, restore the declaration and apply it with:
+
+    \b
+      vq admin update ENV
+
+    That second route exists only where an ordinary update can apply the
+    floor, which since #85 means the program's ``update_script`` is vq's own
+    ``scripts/install.sh`` or ``scripts/update.sh``. On a program with no
+    ``update_script``, or a foreign one, an update runs what is configured and
+    applies no declaration, so the refusal names the missing piece for that
+    shape rather than a command that would do nothing -- and the note an
+    ordinary ``vq admin update`` prints says the same. The command carries no
+    flags: ``scripts/update.sh`` refuses a direct ``--recreate-venv`` without
+    ``--skip-git``, and the floor is applied without one. It also needs
+    ``scripts/update.sh`` to accept the venv, and it refuses one none of vq's
+    own scripts built, so it is real for an installer that wraps vq's
+    ``scripts/install.sh``.
+
+    A refusal after the clone leaves the checkout behind on the machine it ran
+    on, which the refusal names; empty ``git_dir`` there before provisioning
+    again. It leaves no admin-update marker.
+
+    A program that declares no extras is installed exactly as before.
 
     It refuses to write into an existing non-empty ``git_dir``: an existing
     checkout is somebody's work, and refreshing one is what ``vq admin
@@ -11968,7 +13809,16 @@ def admin_install(
     "this exact commit of the managed runtime repository instead of the "
     "live driver checkout. Fleet rollouts always pin the helper to the "
     "accepted report's vq identity. "
-    "The checkout is verified before and after the update script.",
+    "The checkout is verified before and after the update script. "
+    "For a scheduler-runtime deployment whose profile sets "
+    "`feed_source_mirror`, this commit is fed to that mirror unforced and "
+    "atomically (the immutable ref refs/vq/pins/<sha>, the lane's branch "
+    "pair, and the tags naming this commit). vq never force-pushes: if the "
+    "mirror's lane branch has moved past this commit, has diverged from it, "
+    "or holds one of its tags at another object, the feed is refused with "
+    "the mirror's own values and the mirror, the running runtime and the "
+    "LAST OK record are left unchanged. See docs/operations.md, 'Feeding "
+    "the source mirror'.",
 )
 @click.option(
     "--all-hosts",
@@ -12067,7 +13917,10 @@ def admin_install(
     "scheduler_update_command / scheduler_install_command. Forwarded "
     "transparently to remote hosts via --all-hosts. For a marked serving "
     "vq environment, profile changes require --recreate-venv and --extras "
-    "PROFILE; the managed transaction preserves its target and install mode.",
+    "PROFILE; the managed transaction preserves its target and install mode. "
+    "An `--extras` here sets the profile a declared `extras` floor is "
+    "resolved over, and a profile that does not cover the declaration is "
+    "refused rather than widened.",
 )
 @click.option(
     "--cluster-install",
@@ -12244,6 +14097,24 @@ def admin_update(
          invocation. A normal failure attempts that cleanup; a hard
          interruption retains the durable receipt and dispatch hold for
          explicit recovery rather than claiming that the queue resumed.
+
+    A program that declares ``extras`` has that floor applied at step 4,
+    wherever vq itself builds the environment -- the managed daemon
+    transaction, and any other program whose ``update_script`` is the
+    checkout's own ``scripts/install.sh`` or ``scripts/update.sh``. vq
+    appends ``--extras PROFILE`` last, resolved to the smallest published
+    profile covering both the declaration and whatever the run was going to
+    install anyway (the operator's ``--update-script-arg --extras``, else the
+    profile ``.vq-install-metadata`` records, else ``core``), so it can only
+    add capability. A profile that already covers the declaration is left
+    exactly as written, and a requested profile that does not cover it is
+    refused rather than silently widened.
+
+    With any other ``update_script`` the update runs exactly as it always
+    has and prints what it did not apply -- that script is free text which
+    has never heard of ``--extras``. ``vq doctor`` reports which programs are
+    in that position before one of them matters. A program that declares no
+    extras is updated exactly as before.
 
     DANGER -- pausing across a legacy in-place update is NOT safe on a venv
     host. A
@@ -12464,6 +14335,7 @@ def admin_update(
                     cfg, target, env=env, expected_sha=expected_sha,
                     expected_tag=expected_tag, remote_auth_args=tuple(auth_args),
                     stdin_data=remote_stdin, as_json=as_json,
+                    acknowledge_failed_marker=acknowledge_failed_marker,
                     update_script_args=update_script_args, show_output=show_output,
                     remote_timeout_env=remote_env, timeout=remote_timeout,
                 )
@@ -12538,6 +14410,8 @@ def admin_update(
                 remote_args.extend(["--tag", expected_tag])
             if cluster_install:
                 remote_args.append("--cluster-install")
+            if acknowledge_failed_marker:
+                remote_args.append("--acknowledge-failed-marker")
             if force:
                 remote_args.append("--force")
             if as_json:
@@ -12583,6 +14457,7 @@ def admin_update(
                 expected_tag=expected_tag,
                 install=cluster_install,
                 force=force,
+                acknowledge_failed_marker=acknowledge_failed_marker,
                 update_script_args=list(update_script_args),
                 drain_wait_seconds=drain_wait_seconds,
             )
@@ -12666,6 +14541,8 @@ def admin_update(
                 remote_args.append("--cluster-install")
             if expected_sha is not None:
                 remote_args.extend(["--expected-sha", expected_sha])
+            if acknowledge_failed_marker:
+                remote_args.append("--acknowledge-failed-marker")
             if force:
                 remote_args.append("--force")
             if as_json:
@@ -12701,6 +14578,7 @@ def admin_update(
                 cfg,
                 install=cluster_install,
                 force=force,
+                acknowledge_failed_marker=acknowledge_failed_marker,
                 update_script_args=list(update_script_args),
                 drain_wait_seconds=drain_wait_seconds,
                 expected_sha=expected_sha,
@@ -12784,7 +14662,7 @@ def admin_update(
             )
         failures: list[str] = []
 
-        def _update_one(h: str) -> str:
+        def _run_update_one(h: str) -> str:
             skipped = _admin_fanout_scheduler_skip(cfg, h, as_json=as_json)
             if skipped is not None:
                 return skipped
@@ -12797,6 +14675,7 @@ def admin_update(
                             admin_token=token,
                             restart_daemon=not no_restart_daemon,
                             force=force,
+                            acknowledge_failed_marker=acknowledge_failed_marker,
                             update_script_args=list(update_script_args),
                         )
                     except admin_module.AdminError as e:
@@ -12823,6 +14702,7 @@ def admin_update(
                         expected_sha=expected_sha,
                         restart_daemon=not no_restart_daemon,
                         force=force,
+                        acknowledge_failed_marker=acknowledge_failed_marker,
                         update_script_args=list(update_script_args),
                     )
                 except admin_module.AdminError as e:
@@ -12849,6 +14729,8 @@ def admin_update(
                 remote_args.extend(["--expected-sha", expected_sha])
             if no_restart_daemon:
                 remote_args.append("--no-restart-daemon")
+            if acknowledge_failed_marker:
+                remote_args.append("--acknowledge-failed-marker")
             if force:
                 remote_args.append("--force")
             if as_json:
@@ -12894,12 +14776,21 @@ def admin_update(
                     remote_env=host_remote_env,
                 ).rstrip()
             except click.UsageError:
-                # Auth/config lookup historically happened outside this try.
-                # Let the fanout envelope render it without reclassifying the
-                # host as a failed remote update.
+                # Preserve the usage error for the per-host envelope; the
+                # outer callback still counts this host as unsuccessful.
                 raise
             except click.ClickException:
                 failures.append(h)
+                raise
+
+        def _update_one(h: str) -> str:
+            try:
+                return _run_update_one(h)
+            except Exception:
+                # The aggregators display every ordinary exception and keep
+                # visiting other hosts. Count it before they consume it (#136).
+                if h not in failures:
+                    failures.append(h)
                 raise
 
         if as_json:
@@ -12909,11 +14800,12 @@ def admin_update(
             # so one bad host doesn't break parsing.
             # v0.7.6: fan-out in parallel via _aggregate_per_host_json.
             # The closure-captured ``failures`` list still tracks which
-            # hosts failed (list.append is thread-safe; the post-loop
-            # set check below tolerates non-deterministic append order).
+            # hosts failed (one callback per host; list.append is thread-safe).
             import json as _json
 
-            payload = _aggregate_per_host_json(cfg, _update_one, parallel=not serial)
+            payload = _aggregate_per_host_json(
+                cfg, _update_one, parallel=not serial, failed_hosts=failures,
+            )
             click.echo(_json.dumps(payload, indent=2, sort_keys=True))
             if failures:
                 raise click.ClickException(
@@ -12973,6 +14865,7 @@ def admin_update(
                     admin_token=token,
                     restart_daemon=not no_restart_daemon,
                     force=force,
+                    acknowledge_failed_marker=acknowledge_failed_marker,
                     update_script_args=list(update_script_args),
                 )
             except (
@@ -13014,8 +14907,8 @@ def admin_update(
                     expected_sha=expected_sha,
                     restart_daemon=not no_restart_daemon,
                     force=force,
-                    update_script_args=list(update_script_args),
                     acknowledge_failed_marker=acknowledge_failed_marker,
+                    update_script_args=list(update_script_args),
                 )
             except (
                 admin_module.AdminUpdateInProgress,
@@ -13126,8 +15019,6 @@ def admin_update(
         else:
             assert env is not None
             remote_args = ["admin", "update", env]
-            if acknowledge_failed_marker:
-                remote_args.append("--acknowledge-failed-marker")
             if expected_tag is not None:
                 remote_args.extend(["--tag", expected_tag])
             if expected_sha is not None:
@@ -13138,6 +15029,8 @@ def admin_update(
         )
         if no_restart_daemon:
             remote_args.append("--no-restart-daemon")
+        if acknowledge_failed_marker:
+            remote_args.append("--acknowledge-failed-marker")
         if force:
             remote_args.append("--force")
         if as_json:
@@ -13625,6 +15518,14 @@ def admin_observe_update(
             "admin",
             "observe-update",
             run_id,
+            # Explicit, for the same reason the delegated update appends a
+            # `localhost` positional and the driver's own poller passes this
+            # flag: the run lives on the host we are talking to. A target
+            # whose own default_host is another machine would otherwise
+            # forward the observation there and answer `missing` for a run
+            # that host has never heard of.
+            "--host",
+            "localhost",
             "--offset",
             str(offset),
             "--max-bytes",
@@ -13672,8 +15573,110 @@ def admin_observe_update(
         click.echo(observed.payload, nl=False)
 
 
+@admin.command("fence-idempotency-key")
+@click.argument("key")
+def admin_fence_idempotency_key(key: str) -> None:
+    """Settle a keyed submission here; forbid it forever if it never landed.
+
+    For a fleet broker (#64) whose keyed transfer to this host was refused or
+    lost its answer. Under the same per-key lock every keyed submit holds, it
+    prints JSON: ``"accepted"`` with the job id when a submission under KEY
+    was accepted (repairing its claim after a crash), or ``"fenced"`` after
+    durably recording KEY as refused, so a late copy of the request can never
+    be accepted. Repeatable. Also prints this host's state root, which the
+    broker checks against the one it recorded. Single-user hosts only; run
+    as the account that submits.
+    """
+    cfg = config.load_config()
+    if cfg.multi_user.enabled or config.system_multi_user_enabled():
+        raise click.UsageError(
+            "fence-idempotency-key is for a single-user broker target"
+        )
+    try:
+        result = submit_module.fence_idempotency_key(paths.queue_dir(), key)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(json.dumps({
+        "schema": "vq.idempotency-fence/1",
+        **result,
+        "state_root": str(paths.state_root()),
+    }, sort_keys=True))
+
+
+@admin.command("reconcile-operation")
+@click.argument("operation_id")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help="Read and check all the evidence, including the login-host "
+    "verification, and write nothing.",
+)
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the evidence and outcome as JSON.")
+def admin_reconcile_operation(operation_id: str, dry_run: bool, as_json: bool) -> None:
+    """Settle a rollout operation left outcome-unknown by a driver crash.
+
+    Run on the rollout driver. For a scheduler-runtime action with a
+    fixed-host detached build (#115): when `vq admin rollout-latest` refuses
+    with "durable operation OPERATION_ID has outcome unknown", this reads the
+    exact run the operation bound on its build host and requires its terminal
+    receipt to report success. It then runs the same independent login-host
+    verification as the update. Only when both pass does it record LAST OK,
+    clear the dead update's marker and record the operation's result. The
+    next `vq admin rollout-latest` harvests that result and releases the
+    host's hold.
+
+    It never relaunches or replays the build. A run that failed, is still
+    running, is gone, or does not match the local binding, a live update for
+    the same runtime, and a failed verification all leave the operation
+    blocked, and it says why.
+
+    \b
+      vq admin reconcile-operation OPERATION_ID --dry-run
+      vq admin reconcile-operation OPERATION_ID
+      vq admin rollout-latest --only HOST
+    """
+    cfg = config.load_config()
+    try:
+        outcome = admin_module.reconcile_detached_scheduler_operation(
+            operation_id, cfg, dry_run=dry_run,
+        )
+    except admin_module.AdminError as exc:
+        raise click.ClickException(str(exc)) from None
+    payload = outcome.to_json_payload()
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        update = outcome.update
+        click.echo(f"operation {outcome.operation_id} ({outcome.host}:{outcome.program})")
+        click.echo(f"  bound run: {outcome.remote_run_dir} (rc=0)")
+        click.echo(
+            f"  verification: rc={update.verify_rc} sha={update.actual_sha} "
+            f"tag={update.actual_tag} active_path={update.active_path}"
+        )
+        for error in update.work_errors:
+            click.echo(f"  error: {error}")
+        if outcome.recorded:
+            click.echo(
+                "reconciled: LAST OK recorded"
+                + (", stale marker cleared" if outcome.marker_cleared else "")
+                + "; run `vq admin rollout-latest` to release the hold"
+            )
+        elif dry_run and update.success:
+            click.echo("dry run: the evidence is sufficient; nothing was written")
+    if not outcome.update.success:
+        raise SystemExit(1)
+
+
 @admin.command("clear-update-marker")
 @click.argument("host", required=False)
+@click.option(
+    "--marker-id",
+    default=None,
+    help="Select the exact marker_id shown by admin status within HOST's "
+    "scope. Required when that scope contains multiple markers.",
+)
 @click.option(
     "-y",
     "--yes",
@@ -13708,6 +15711,7 @@ def admin_observe_update(
 )
 def admin_clear_update_marker(
     host: str | None,
+    marker_id: str | None,
     yes: bool,
     as_json: bool,
     force_live: bool,
@@ -13721,6 +15725,7 @@ def admin_clear_update_marker(
       vq admin clear-update-marker CLUSTER   (routes to its scheduler_driver)
       vq admin clear-update-marker -y        (skip confirmation)
       vq admin clear-update-marker --force-live
+      vq admin clear-update-marker HOST --marker-id ID
 
     The marker is written at the start of `vq admin update` and cleared only
     after terminal proof. If the update is interrupted, it persists and
@@ -13793,8 +15798,35 @@ def admin_clear_update_marker(
             candidates = [
                 item
                 for item in markers
-                if all(":" not in env for env in item.envs)
+                if item.envs and all(
+                    ":" not in env
+                    or (
+                        env.startswith("runtime-slot:")
+                        and len(env.split(":")) == 2
+                        and bool(env.split(":")[1])
+                    )
+                    for env in item.envs
+                )
             ]
+        if marker_id is not None:
+            candidates = [
+                item for item in candidates if item.marker_id == marker_id
+            ]
+            if not candidates:
+                raise click.UsageError(
+                    f"no admin-update marker with marker_id={marker_id!r} "
+                    f"in the requested host scope {host!r}; inspect "
+                    "`vq admin status HOST --json`"
+                )
+        if len(candidates) > 1:
+            raise click.UsageError(
+                "multiple admin-update markers match this host scope; "
+                "select one with --marker-id from `vq admin status HOST --json`: "
+                + ", ".join(
+                    f"{item.marker_id or '(legacy marker)'} ({', '.join(item.envs)})"
+                    for item in candidates
+                )
+            )
         marker = candidates[0] if candidates else None
         # An unreadable marker cannot be targeted safely, so preserve the
         # historical visible/refusal path only when no parseable lease exists.
@@ -13987,6 +16019,8 @@ def admin_clear_update_marker(
         return
     # SSH delegate.
     remote_args = ["admin", "clear-update-marker"]
+    if marker_id is not None:
+        remote_args.extend(["--marker-id", marker_id])
     if yes:
         remote_args.append("--yes")
     if as_json:
@@ -14003,11 +16037,31 @@ def admin_clear_update_marker(
 
 @admin.command("bootstrap-self-update")
 @click.argument("host")
-@click.option("--expected-sha", required=True, metavar="FULL_SHA")
-@click.option("--json", "as_json", is_flag=True)
-@click.option("--token", "cli_token", default=None)
-@click.option("--token-stdin", is_flag=True)
-@click.option("--token-file", type=click.Path(dir_okay=False), default=None)
+@click.option(
+    "--expected-sha", required=True, metavar="FULL_SHA",
+    help="The exact 40-hex vq commit to self-update HOST to.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+@click.option(
+    "--token",
+    "cli_token",
+    default=None,
+    metavar="TOKEN",
+    help="Bearer token for the admin gate in multi-user mode. Prefer stdin/file.",
+)
+@click.option(
+    "--token-stdin",
+    is_flag=True,
+    default=False,
+    help="Read the admin bearer token from one line on stdin.",
+)
+@click.option(
+    "--token-file",
+    type=click.Path(dir_okay=False),
+    default=None,
+    metavar="PATH",
+    help="Read the admin bearer token from an owner-only file.",
+)
 def admin_bootstrap_self_update(
     host: str,
     expected_sha: str,
@@ -14018,7 +16072,11 @@ def admin_bootstrap_self_update(
 ) -> None:
     """Bootstrap an older remote driver through authenticated current code.
 
-    HOST must be a canonical direct host. Its service manager selects the
+    HOST must be a canonical direct host: not this machine, a daemon host
+    (``scheduler = "local"``) rather than a scheduler host, with an absolute
+    ``remote_vq`` path, and a ``fleet_role`` other than ``alias`` or
+    ``excluded``. A refusal names this command and exits 2. Its service
+    manager selects the
     installation; the remote self-update owns the global rollout lock, exact
     forward ancestry check, durable receipt and verified daemon restart.
     No environment override or force mode is available.
@@ -14050,6 +16108,103 @@ def admin_bootstrap_self_update(
     except transport.RemoteError as exc:
         raise click.ClickException(str(exc)) from None
     click.echo(result, nl=False)
+
+
+@admin.command("reconcile-submit")
+@click.argument("jobid")
+@click.option("--owner-uid", default=None, help="Original owner UID for a multi-user daemon.")
+@click.option("--evidence", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--apply", "apply_evidence", is_flag=True,
+              help="Record the previewed authoritative evidence; never submit or cancel.")
+@click.option("--plan-digest", default=None, help="Exact digest returned by evidence preview.")
+@click.option("--attest-authoritative", is_flag=True,
+              help="Attest that the supplied raw record was verified with scheduler authority.")
+@click.option("--fence-unstarted", is_flag=True, default=False,
+              help="Fence the attempt so it can never start its command (#179); "
+              "attempts submitted with a start token only.")
+@click.option("--token-stdin", is_flag=True, default=False)
+@click.option("--token-file", type=click.Path(dir_okay=False), default=None)
+def admin_reconcile_submit(
+    jobid: str, owner_uid: str | None, evidence: Path | None,
+    apply_evidence: bool, plan_digest: str | None, attest_authoritative: bool,
+    fence_unstarted: bool, token_stdin: bool, token_file: str | None,
+) -> None:
+    """Preview or import exact positive accounting evidence on the owning driver.
+
+    No remote delegation or direct-file fallback: run this command on the
+    original driver. Empty qstat, missing files and partial accounting do not
+    prove non-admission. Currently supports a positive Torque qstat -f record.
+
+    With --fence-unstarted it instead previews (or with --apply and the
+    previewed --plan-digest, records) a start fence: the daemon claims the
+    attempt's start in its workspace, so a late admission exits without
+    running, and the job ends FAILED as "fenced before start". It never
+    submits or cancels, and a job that already claimed its own start is
+    resolved from its start marker instead.
+    """
+    from vq import rpc, scheduler_recovery
+
+    cfg = config.load_config()
+    multi_user = _multi_user_active(cfg)
+    arguments: dict[str, Any] = {"jobid": jobid, "owner_uid": owner_uid}
+    if fence_unstarted:
+        if evidence is not None or attest_authoritative:
+            raise click.UsageError(
+                "--fence-unstarted takes no --evidence or --attest-authoritative"
+            )
+        method = "get_scheduler_start_fence"
+        if apply_evidence:
+            if not plan_digest:
+                raise click.UsageError("fence apply requires the previewed --plan-digest")
+            method = "set_scheduler_start_fence"
+            arguments.update(
+                expected_plan_digest=plan_digest,
+                token=_resolve_admin_token(
+                    cfg, command_label="admin reconcile-submit", cli_token=None,
+                    token_stdin=token_stdin, token_file=token_file,
+                    multi_user=multi_user,
+                ),
+            )
+        elif plan_digest or token_stdin or token_file:
+            raise click.UsageError("apply-only options require --apply")
+        try:
+            result = rpc.call(method, arguments, multi_user=multi_user)
+        except (rpc.RPCError, ConnectionError) as exc:
+            raise click.ClickException(
+                f"owning daemon reconciliation unavailable: {exc}"
+            ) from exc
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if evidence is not None:
+        with evidence.open("rb") as stream:
+            raw = stream.read(scheduler_recovery.MAX_EVIDENCE_BYTES + 1)
+        if len(raw) > scheduler_recovery.MAX_EVIDENCE_BYTES:
+            raise click.UsageError("scheduler evidence file exceeds size limit")
+        try:
+            arguments["evidence"] = json.loads(raw)
+        except ValueError as exc:
+            raise click.UsageError("scheduler evidence is not valid JSON") from exc
+    method = "get_scheduler_submit_recovery"
+    if apply_evidence:
+        if evidence is None or not plan_digest or not attest_authoritative:
+            raise click.UsageError(
+                "apply requires --evidence, --plan-digest and --attest-authoritative"
+            )
+        method = "set_scheduler_submit_recovery"
+        arguments.update(
+            expected_plan_digest=plan_digest, attest_authoritative=True,
+            token=_resolve_admin_token(
+                cfg, command_label="admin reconcile-submit", cli_token=None,
+                token_stdin=token_stdin, token_file=token_file, multi_user=multi_user,
+            ),
+        )
+    elif plan_digest or attest_authoritative or token_stdin or token_file:
+        raise click.UsageError("apply-only options require --apply")
+    try:
+        result = rpc.call(method, arguments, multi_user=multi_user)
+    except (rpc.RPCError, ConnectionError) as exc:
+        raise click.ClickException(f"owning daemon reconciliation unavailable: {exc}") from exc
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
 
 
 @admin.command("recover-update")
@@ -15228,12 +17383,12 @@ def admin_auto_update(
             ), any_failed
         return _format_outcome_text(outcome), any_failed
 
-    # ----- --all-hosts: sequential per-host delegation -----
+    # ----- --all-hosts: per-host delegation -----
 
     if all_hosts:
         failures: list[str] = []
 
-        def _one_host(h: str) -> str:
+        def _run_one_host(h: str) -> str:
             skipped = _admin_fanout_scheduler_skip(cfg, h, as_json=as_json)
             if skipped is not None:
                 return skipped
@@ -15276,11 +17431,21 @@ def admin_auto_update(
                     token=token,
                 ).rstrip()
             except click.UsageError:
-                # Preserve the pre-helper boundary: auth/config lookup errors
-                # are rendered per host but are not remote-update failures.
+                # Preserve the usage error for the per-host envelope; the
+                # outer callback still counts this host as unsuccessful.
                 raise
             except click.ClickException:
                 failures.append(h)
+                raise
+
+        def _one_host(h: str) -> str:
+            try:
+                return _run_one_host(h)
+            except Exception:
+                # Both aggregators display ordinary exceptions and continue.
+                # Count the host before they consume its failure (#145).
+                if h not in failures:
+                    failures.append(h)
                 raise
 
         if as_json:
@@ -15288,7 +17453,7 @@ def admin_auto_update(
             # (same shape as `admin update --all-hosts --json`).
             import json as _json
 
-            payload = _aggregate_per_host_json(cfg, _one_host)
+            payload = _aggregate_per_host_json(cfg, _one_host, failed_hosts=failures)
             click.echo(_json.dumps(payload, indent=2, sort_keys=True))
             if failures:
                 raise click.ClickException(
@@ -15588,6 +17753,812 @@ def overview(
         click.echo(_overview_module.format_fleet_overview_json(overviews))
     else:
         click.echo(_overview_module.format_fleet_overview_text(overviews))
+
+
+@main.group("gateway")
+def gateway_group() -> None:
+    """HTTPS submission gateway (#163): per-project API keys.
+
+    Run on the broker host. Keys select a project and its policy, not an OS
+    identity: every gateway job runs under the broker's execution account,
+    so grant keys to a trusted group only (SECURITY.md).
+    """
+
+
+@gateway_group.group("key")
+def gateway_key_group() -> None:
+    """Issue, list, revoke and rotate gateway API keys."""
+
+
+def _gateway_projects() -> list[str]:
+    return list(config.load_config().gateway.projects)
+
+
+def _echo_gateway_key(key: Any, secret: str | None, as_json: bool) -> None:
+    payload = {**key.as_dict(), **({"api_key": secret} if secret else {})}
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    if secret:
+        click.echo(secret)
+        click.echo("Shown once; store it in the client's credential file.", err=True)
+    click.echo(f"{key.key_id} {key.principal} project={key.project} "
+               f"scopes={','.join(key.scopes)} expires={key.expires_at or 'never'}",
+               err=bool(secret))
+
+
+@gateway_key_group.command("create")
+@click.option("--principal", required=True, help="Who holds the key (a name, not an OS user).")
+@click.option("--project", required=True, help="A [gateway.projects] name.")
+@click.option("--scope", "scopes", multiple=True, required=True,
+              type=click.Choice(config.GATEWAY_SCOPES),
+              help="Repeat for each scope: submit, read, cancel, download.")
+@click.option("--expires-days", type=click.IntRange(1, 3650), default=90, show_default=True)
+@click.option("--json", "as_json", is_flag=True, default=False)
+def gateway_key_create(principal: str, project: str, scopes: tuple[str, ...],
+                       expires_days: int, as_json: bool) -> None:
+    """Issue one key. The key is printed once and never stored in plain text."""
+    from vq.gateway.keys import GatewayKeyError, KeyStore
+
+    try:
+        key, secret = KeyStore().create(principal=principal, project=project, scopes=scopes,
+                                        expires_days=expires_days,
+                                        projects=_gateway_projects())
+    except GatewayKeyError as exc:
+        raise click.ClickException(str(exc)) from None
+    _echo_gateway_key(key, secret, as_json)
+
+
+@gateway_key_group.command("list")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def gateway_key_list(as_json: bool) -> None:
+    """List keys with their grants; no secret or digest is shown."""
+    from vq.gateway.keys import GatewayKeyError, KeyStore
+
+    try:
+        keys = KeyStore().list()
+    except GatewayKeyError as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        click.echo(json.dumps([key.as_dict() for key in keys], indent=2, sort_keys=True))
+        return
+    for key in keys:
+        state = "revoked" if key.revoked_at else "active"
+        click.echo(f"{key.key_id} {state} {key.principal} project={key.project} "
+                   f"scopes={','.join(key.scopes)} expires={key.expires_at or 'never'} "
+                   f"last_used={key.last_used_at or 'never'}")
+
+
+@gateway_key_group.command("revoke")
+@click.argument("key_id")
+def gateway_key_revoke(key_id: str) -> None:
+    """Revoke a key; it fails on its next request."""
+    from vq.gateway.keys import GatewayKeyError, KeyStore
+
+    try:
+        key = KeyStore().revoke(key_id)
+    except GatewayKeyError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(f"revoked {key.key_id} ({key.principal}, project={key.project})")
+
+
+@gateway_key_group.command("rotate")
+@click.argument("key_id")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def gateway_key_rotate(key_id: str, as_json: bool) -> None:
+    """Issue a replacement with the same grant, then revoke KEY_ID."""
+    from vq.gateway.keys import GatewayKeyError, KeyStore
+
+    try:
+        key, secret = KeyStore().rotate(key_id, projects=_gateway_projects())
+    except GatewayKeyError as exc:
+        raise click.ClickException(str(exc)) from None
+    _echo_gateway_key(key, secret, as_json)
+
+
+@gateway_group.group("connector")
+def gateway_connector_group() -> None:
+    """Enroll, list and revoke relay connectors (#164). One per project."""
+
+
+@gateway_connector_group.command("enroll")
+@click.option("--project", required=True, help="A [gateway.projects] name.")
+def gateway_connector_enroll(project: str) -> None:
+    """Print a one-use enrollment token, valid for 10 minutes."""
+    from vq.gateway.keys import gateway_root
+    from vq.gateway.relay import ConnectorStore, RelayError
+
+    cfg = config.load_config()
+    if cfg.gateway.mode != "relay":
+        raise click.ClickException('connectors need [gateway] mode = "relay"')
+    try:
+        token = ConnectorStore(gateway_root()).create_enrollment(
+            project, projects=list(cfg.gateway.projects))
+    except RelayError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(token)
+    click.echo("One use, valid 10 minutes. On the broker host: "
+               "vq connector enroll URL < token-file", err=True)
+
+
+@gateway_connector_group.command("list")
+@click.option("--json", "as_json", is_flag=True, default=False)
+def gateway_connector_list(as_json: bool) -> None:
+    """List connectors and when each last reached the gateway."""
+    from vq.gateway.keys import gateway_root
+    from vq.gateway.relay import ConnectorStore
+
+    records = ConnectorStore(gateway_root()).list()
+    if as_json:
+        click.echo(json.dumps(records, indent=2, sort_keys=True))
+        return
+    for record in records:
+        state = "revoked" if record["revoked_at"] else "active"
+        click.echo(f"{record['connector_id']} {state} project={record['project']} "
+                   f"last_seen={record['last_seen_at'] or 'never'}")
+
+
+@gateway_connector_group.command("revoke")
+@click.argument("connector_id")
+def gateway_connector_revoke(connector_id: str) -> None:
+    """Revoke a connector; it can claim nothing more. Enroll a replacement after."""
+    from vq.gateway.keys import gateway_root
+    from vq.gateway.relay import ConnectorStore, RelayError
+
+    try:
+        record = ConnectorStore(gateway_root()).revoke(connector_id)
+    except RelayError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(f"revoked {connector_id} (project={record['project']})")
+
+
+@gateway_group.command("prune")
+@click.option("--dry-run", is_flag=True, default=False, help="List what would be removed.")
+def gateway_prune(dry_run: bool) -> None:
+    """Remove uploads and collected results past their project's retention."""
+    from vq.gateway.jobs import JobIndex
+    from vq.gateway.keys import gateway_root
+    from vq.gateway.results import ResultStore
+    from vq.gateway.uploads import UploadStore, prune_uploads
+
+    cfg = config.load_config()
+    retention = {name: project.result_retention_days
+                 for name, project in cfg.gateway.projects.items()}
+    root = gateway_root()
+    index = JobIndex(root)
+    by_job: dict[str, int] = {}
+    if index.root.exists():
+        for child in sorted(index.root.glob("b-*.json")):
+            owner = index.read(child.stem) or {}
+            days = retention.get(owner.get("project"))
+            if days is not None:
+                by_job[child.stem] = days
+    gone_results = ResultStore(root).prune(by_job, dry_run=dry_run)
+    gone_uploads = prune_uploads(UploadStore(root), retention, dry_run=dry_run)
+    verb = "would remove" if dry_run else "removed"
+    click.echo(f"{verb} {len(gone_results)} result set(s) and {len(gone_uploads)} upload(s)")
+    for name in [*gone_results, *gone_uploads]:
+        click.echo(f"  {name}")
+
+
+@gateway_group.command("serve")
+@click.option("--bind", default=None, help="Listen address; default [gateway] bind.")
+@click.option("--port", type=click.IntRange(1, 65535), default=None,
+              help="Listen port; default [gateway] port.")
+def gateway_serve(bind: str | None, port: int | None) -> None:
+    """Serve the gateway. Needs [gateway] and [broker] enabled on this host.
+
+    Loopback behind a TLS reverse proxy by default; with [gateway] tls_cert
+    and tls_key it terminates TLS itself. A plaintext non-loopback bind is
+    refused.
+    """
+    cfg = config.load_config()
+    if not cfg.gateway.enabled:
+        raise click.ClickException("[gateway] enabled = true is required on this host")
+    if cfg.gateway.mode == "local" and not cfg.broker.enabled:
+        raise click.ClickException(
+            "a local-mode gateway submits through the broker: [broker] enabled = true is "
+            "required (or set [gateway] mode = \"relay\" for an outbound connector)"
+        )
+    host = bind or cfg.gateway.bind
+    listen_port = port or cfg.gateway.port
+    tls = cfg.gateway.tls_cert is not None
+    if not tls and not _is_loopback_bind(host):
+        raise click.ClickException(
+            f"refusing a plaintext gateway on {host}: bind loopback behind a TLS reverse "
+            "proxy, or set [gateway] tls_cert and tls_key"
+        )
+    try:
+        import uvicorn
+
+        from vq.gateway.app import create_gateway_app
+    except ImportError as exc:  # pragma: no cover - depends on installed extras
+        raise click.ClickException(
+            f"the gateway needs the web extra (pip install 'vq[web]'): {exc}"
+        ) from None
+    log.info("vq gateway starting on %s:%s (tls=%s)", host, listen_port, tls)
+    uvicorn.run(
+        create_gateway_app(), host=host, port=listen_port, log_level="info",
+        ssl_certfile=cfg.gateway.tls_cert, ssl_keyfile=cfg.gateway.tls_key,
+    )
+
+
+@main.group("remote")
+def remote_group() -> None:
+    """Submit to and follow a vq submission gateway over HTTPS (#163).
+
+    Reads the gateway URL and your API key from an owner-only credentials file
+    (default ~/.config/vq/gateway-credentials.toml, or $VQ_GATEWAY_CREDENTIALS):
+
+        url = "https://gateway.example"
+        key = "vqk_..."
+    """
+
+
+def _remote_client(credentials: Path | None) -> Any:
+    from vq.gateway.client import ClientError, GatewayClient, load_credentials
+
+    try:
+        return GatewayClient(load_credentials(credentials))
+    except ClientError as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+_credentials_option = click.option(
+    "--credentials", type=click.Path(dir_okay=False, path_type=Path), default=None,
+    help="Credentials file (default ~/.config/vq/gateway-credentials.toml).",
+)
+
+
+def _remote_call(action: Callable[[], Any]) -> Any:
+    from vq.gateway.client import ClientError
+
+    try:
+        return action()
+    except ClientError as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@remote_group.command("submit", context_settings={"ignore_unknown_options": True})
+@click.argument("payload", type=click.Path(exists=True, path_type=Path))
+@click.option("--program", required=True)
+@click.option("--cpus", type=click.IntRange(1), required=True)
+@click.option("--mem-mb", type=click.IntRange(1), required=True)
+@click.option("--wall-time", "wall_time", type=click.IntRange(1), required=True,
+              help="Wall-time limit in seconds.")
+@click.option("--idempotency-key", "idempotency_key", required=True,
+              help="Your key for this logical job; reuse it to retry safely.")
+@click.option("--expected-sha", default=None)
+@click.option("--job-name", default=None)
+@click.option("--tag", "tags", multiple=True)
+@_credentials_option
+@click.argument("command", nargs=-1, required=True, type=click.UNPROCESSED)
+def remote_submit(payload: Path, program: str, cpus: int, mem_mb: int, wall_time: int,
+                  idempotency_key: str, expected_sha: str | None, job_name: str | None,
+                  tags: tuple[str, ...], credentials: Path | None,
+                  command: tuple[str, ...]) -> None:
+    """Upload PAYLOAD (a directory or .tar) and submit COMMAND under it.
+
+    Retrying with the same --idempotency-key never creates a second job.
+    """
+    from vq.gateway.client import pack
+
+    client = _remote_client(credentials)
+    archive, temporary = _remote_call(lambda: pack(payload))
+    try:
+        upload_id = _remote_call(lambda: client.upload(archive))
+    finally:
+        if temporary:
+            archive.unlink(missing_ok=True)
+    request = {"upload_id": upload_id, "command": list(command), "program": program,
+               "cpus": cpus, "mem_mb": mem_mb, "wall_time_seconds": wall_time,
+               "idempotency_key": idempotency_key, "tags": list(tags)}
+    if expected_sha:
+        request["expected_sha"] = expected_sha
+    if job_name:
+        request["job_name"] = job_name
+    job = _remote_call(lambda: client.submit(request))
+    click.echo(job["job_id"])
+    if job.get("replayed"):
+        click.echo("(already submitted under this idempotency key)", err=True)
+
+
+@remote_group.command("status")
+@click.argument("job_id", required=False)
+@_credentials_option
+def remote_status(job_id: str | None, credentials: Path | None) -> None:
+    """Show one job, or list your jobs, as JSON."""
+    client = _remote_client(credentials)
+    result = _remote_call(lambda: client.job(job_id) if job_id else client.jobs())
+    click.echo(json.dumps(result, indent=2, sort_keys=True))
+
+
+@remote_group.command("logs")
+@click.argument("job_id")
+@click.option("--stderr", "use_stderr", is_flag=True, default=False)
+@click.option("--follow", "-f", is_flag=True, default=False,
+              help="Keep polling for new output until the job is cancelled or "
+              "its results are ready.")
+@click.option("--interval", type=click.FloatRange(1.0, 300.0), default=5.0,
+              show_default=True)
+@_credentials_option
+def remote_logs(job_id: str, use_stderr: bool, follow: bool, interval: float,
+                credentials: Path | None) -> None:
+    """Print a job's stdout (or --stderr) from the gateway."""
+    client = _remote_client(credentials)
+    stream = "stderr" if use_stderr else "stdout"
+    offset = 0
+    while True:
+        window = _remote_call(
+            lambda at=offset: client.logs(job_id, stream=stream, offset=at)
+        )
+        if window["data"]:
+            click.echo(window["data"], nl=False)
+        offset = window["next_offset"]
+        if window.get("size") is not None and offset < window["size"]:
+            continue
+        if not follow:
+            return
+        if window["state"] == "cancelled":
+            return
+        if window.get("placed"):
+            from vq.gateway.client import ClientError
+
+            try:
+                if client.results(job_id).get("ready"):
+                    final = client.logs(job_id, stream=stream, offset=offset)
+                    click.echo(final["data"], nl=False)
+                    return
+            except ClientError as exc:
+                if exc.status != 403:
+                    raise click.ClickException(str(exc)) from None
+        time.sleep(interval)
+
+
+@remote_group.command("cancel")
+@click.argument("job_id")
+@_credentials_option
+def remote_cancel(job_id: str, credentials: Path | None) -> None:
+    """Cancel a job; repeatable."""
+    client = _remote_client(credentials)
+    result = _remote_call(lambda: client.cancel(job_id))
+    if result.get("stopped"):
+        click.echo(f"{job_id}: cancelled ({result['state']})")
+    else:
+        click.echo(f"{job_id}: cancellation recorded, but its transfer was in doubt; the "
+                   "gateway operator resolves it", err=True)
+        raise SystemExit(1)
+
+
+@remote_group.command("fetch")
+@click.argument("job_id")
+@click.argument("destination", type=click.Path(file_okay=False, path_type=Path))
+@click.option("--force", is_flag=True, default=False, help="Overwrite existing files.")
+@_credentials_option
+def remote_fetch(job_id: str, destination: Path, force: bool,
+                 credentials: Path | None) -> None:
+    """Download a finished job's results into DESTINATION, checking each digest."""
+    client = _remote_client(credentials)
+    written = _remote_call(lambda: client.fetch(job_id, destination, force=force))
+    click.echo(f"fetched {len(written)} file(s) into {destination}")
+
+
+@main.group("connector")
+def connector_group() -> None:
+    """The outbound connector to a relay-mode gateway (#164), on the broker host.
+
+    It only makes outbound HTTPS requests: it claims the project's jobs from
+    the gateway, admits them to this host's broker and reports their state.
+    """
+
+
+@connector_group.command("enroll")
+@click.argument("url")
+@click.option("--ca-file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Private CA bundle for the gateway's certificate.")
+def connector_enroll(url: str, ca_file: str | None) -> None:
+    """Enroll this host with the one-use token read from stdin."""
+    from vq.gateway import connector as gateway_connector
+    from vq.gateway.client import ClientError
+
+    token = click.get_text_stream("stdin").read().strip()
+    if not token:
+        raise click.UsageError("pipe the enrollment token on stdin")
+    try:
+        result = gateway_connector.enroll(url, token, ca_file=ca_file)
+    except ClientError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo(f"enrolled connector {result['connector_id']} for project "
+               f"{result['project']}; credentials saved")
+
+
+def _connector(cfg: Any) -> Any:
+    from vq.gateway import connector as gateway_connector
+    from vq.gateway.client import ClientError, GatewayClient
+
+    if not cfg.broker.enabled:
+        raise click.ClickException("the connector drives this host's broker: "
+                                   "[broker] enabled = true is required")
+    try:
+        return gateway_connector.Connector(cfg, GatewayClient(gateway_connector.load_credentials()))
+    except ClientError as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+@connector_group.command("run")
+@click.option("--once", is_flag=True, default=False, help="One claim pass, then exit.")
+def connector_run(once: bool) -> None:
+    """Claim, admit and report until stopped. Outbound connections only."""
+    from vq.gateway.client import ClientError
+
+    cfg = config.load_config()
+    connector = _connector(cfg)
+    backoff = 1.0
+    while True:
+        try:
+            summary = connector.run_once(wait_seconds=0.0 if once else cfg.connector.poll_seconds)
+            backoff = 1.0
+            if summary["claimed"]:
+                log.info("connector: %s", summary)
+            if once:
+                click.echo(json.dumps(summary, sort_keys=True))
+                return
+        except ClientError as exc:
+            if once:
+                raise click.ClickException(str(exc)) from None
+            log.warning("connector: gateway unreachable (%s); retrying in %.0fs", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(300.0, backoff * 2)
+
+
+@connector_group.command("rotate")
+def connector_rotate() -> None:
+    """Replace this host's connector key online; the old key works briefly."""
+    from vq.gateway.client import ClientError
+
+    try:
+        _connector(config.load_config()).rotate()
+    except ClientError as exc:
+        raise click.ClickException(str(exc)) from None
+    click.echo("connector key rotated")
+
+
+@main.group("broker")
+def broker_group() -> None:
+    """Fleet broker (#64): place jobs on daemon hosts from one coordinator."""
+
+
+@broker_group.command("capacity")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    default=False,
+    help="Emit the machine-readable capacity evidence a broker reads over SSH.",
+)
+@click.option(
+    "--program",
+    "programs",
+    multiple=True,
+    metavar="NAME",
+    help="Report the availability of only these programs (repeatable). "
+    "Without it every registered program is checked, which can be slow.",
+)
+@click.option("--scheduler-target", default=None, metavar="HOST",
+              help="Report this driver's PBS/Slurm target admission budget.")
+def broker_capacity(as_json: bool, programs: tuple[str, ...], scheduler_target: str | None) -> None:
+    """Report this host's admission evidence for broker placement. Read-only.
+
+    Admission is open only with positive evidence. The daemon must answer, a
+    running daemon must use this state root, and the daemon's own published
+    admission snapshot must be current and hold nothing. It holds for a
+    drain, an admin update, host memory pressure, a pending refresh, a
+    running build job or a changed config. A multi-user host is refused.
+    Headroom is the daemon's caps minus its local usage, which counts orphans
+    and killed jobs whose processes survive, bounded by live free memory.
+    The output also lists program statuses and every job ID this host
+    records. A broker never places a job here on anything less.
+    """
+    from vq import broker_capacity as capacity_evidence
+
+    payload = capacity_evidence.sample_local(
+        config.load_config(), programs=programs or None, scheduler_target=scheduler_target
+    )
+    if as_json:
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    admission = payload["admission"]
+    click.echo(f"admission: {'open' if admission['open'] else 'closed'}")
+    for reason in admission["reasons"]:
+        click.echo(f"  closed: {reason}")
+    click.echo(f"queue ready: {payload['queue_ready']} "
+               f"({payload['pending_local_jobs']} local job(s) pending)")
+    click.echo(f"free: cpus={payload['free_cpus']} mem_mb={payload['free_mem_mb']} "
+               f"jobs={payload['free_jobs']} gpus={payload['free_gpus']} "
+               f"(of {payload['gpus']})")
+    click.echo(f"state root: {payload['state_root'] or 'unproven'}")
+
+
+def _submit_via_broker(
+    host: str,
+    host_cfg: Any,
+    relay: Any,
+    *,
+    input_file: str | None,
+    directory: str | None,
+    archive: str | None,
+    python: str | None,
+    refused: dict[str, bool],
+    as_json: bool,
+) -> None:
+    """``vq submit`` to a ``broker = true`` entry: relay into its held queue."""
+    from vq import broker_relay
+
+    names = [name for name, used in refused.items() if used]
+    if names:
+        raise click.UsageError(
+            f"{host} is a broker; a broker job cannot use " + ", ".join(names)
+        )
+    try:
+        job_id = broker_relay.submit_via_broker(
+            host_cfg, relay, input_file=input_file, directory=directory,
+            archive=archive, python=python,
+        )
+    except broker_relay.BrokerRelayError as exc:
+        raise click.UsageError(str(exc)) from None
+    except (broker_relay.BrokerRelayUncertain, transport.RemoteError) as exc:
+        raise click.ClickException(str(exc)) from None
+    if as_json:
+        click.echo(json.dumps({"jobids": [job_id], "host": host, "broker": True}))
+    else:
+        click.echo(job_id)
+
+
+def _broker_fetch_identity(host_cfg: Any, jobid: str) -> dict[str, Any]:
+    """Fetch keywords for a broker job: ask by b- id, verify the target's id."""
+    from vq import broker_relay
+
+    if not broker_relay.is_broker_job_id(jobid):
+        return {}
+    try:
+        return {
+            "jobid": broker_relay.remote_target_job_id(host_cfg, jobid),
+            "remote_jobid": jobid,
+        }
+    except broker_relay.BrokerRelayError as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+def _broker_fail(exc: Exception) -> None:
+    raise click.ClickException(str(exc)) from None
+
+
+def _broker_job_locally(jobid: str) -> tuple[Any, Any] | None:
+    """On a broker host, the config and record for a ``b-...`` id; else None."""
+    from vq import broker_relay, broker_store
+
+    if not broker_relay.is_broker_job_id(jobid):
+        return None
+    try:
+        return broker_relay.resolve_local(jobid)
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    return None  # unreachable
+
+
+@broker_group.command("pass")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the pass report as JSON.")
+def broker_pass(as_json: bool) -> None:
+    """Run one broker placement pass now. Only on a host with [broker] enabled.
+
+    Collects capacity evidence from every [broker] target, finishes
+    interrupted work, settles charges, replays uncertain transfers at the
+    configured interval, then places held jobs in strict FIFO order. The
+    broker's daemon runs this every [broker] interval_seconds; a second pass
+    while one runs is refused.
+    """
+    from vq import broker_service, broker_store
+
+    try:
+        report = broker_service.run_pass(config.load_config())
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    if as_json:
+        click.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return
+    for host, target in report["targets"].items():
+        state = target["error"] or "; ".join(target["closed"]) or "open"
+        click.echo(f"target {host}: {state}")
+    for outcome in report["placements"]:
+        click.echo(f"{outcome['outcome']:14} {outcome['broker_job_id']} "
+                   f"{outcome['host'] or '-'} {outcome['detail'] or ''}".rstrip())
+    if report["head"]:
+        click.echo(f"head (waiting): {report['head']}; {len(report['waiting'])} behind it")
+    if report["stopped"]:
+        click.echo(f"stopped: {report['stopped']}")
+
+
+@broker_group.command("accept")
+@click.argument("payload", type=click.Path(path_type=Path, dir_okay=False))
+@click.argument("command", nargs=-1, required=True)
+@click.option("--cpus", type=click.IntRange(min=1), required=True,
+              help="CPUs the job needs on its target.")
+@click.option("--mem-mb", "mem_mb", type=click.IntRange(min=1), required=True,
+              help="Memory the job needs (MiB). Mandatory: the broker never "
+              "places a job whose memory is unknown.")
+@click.option("--wall-time-seconds", type=click.IntRange(min=1), default=None,
+              help="Wall-time limit forwarded to the target.")
+@click.option("--priority", type=int, default=0, help="Target priority.")
+@click.option("--retry", type=click.IntRange(min=0), default=0, help="Target retries.")
+@click.option("--auto-resume", is_flag=True, default=False, help="Target auto-resume.")
+@click.option("--job-name", default=None, help="Job name on the target.")
+@click.option("--program", default=None, help="Registered program the job runs.")
+@click.option("--expected-sha", default=None, help="Pin the program's SHA.")
+@click.option("--tag", "tags", multiple=True, help="Tag (repeatable).")
+@click.option("--clean-tmp", is_flag=True, default=False,
+              help="Clean the target workdir when the job ends.")
+@click.option("--rerun-until", default=None, help="Rerun until this file exists.")
+@click.option("--rerun-max", type=click.IntRange(min=0), default=10,
+              help="Most reruns for --rerun-until (0 disables reruns).")
+@click.option("--pool", default=None, help="Place only on hosts in this [pools] entry.")
+@click.option("--idempotency-key", default=None, metavar="KEY",
+              help="Name the submission: a repeat with the same KEY and the same "
+              "content prints the job it already created; other content under "
+              "KEY is refused.")
+def broker_accept(payload: Path, command: tuple[str, ...], **options: Any) -> None:
+    """Hold a relayed submission on this broker; print its broker job id.
+
+    PAYLOAD is a tar archive already on this host (a client's relay uploads
+    it); it is copied into the broker's store, so the caller may delete it
+    afterwards. COMMAND runs inside the unpacked archive on the chosen
+    target. Only on a host with [broker] enabled.
+    """
+    from vq import broker_service, broker_store
+
+    try:
+        intent = broker_store.BrokerIntent(
+            command=tuple(command),
+            cpus=options["cpus"],
+            mem_mb=options["mem_mb"],
+            wall_time_seconds=options["wall_time_seconds"],
+            priority=options["priority"],
+            auto_resume=options["auto_resume"],
+            retry=options["retry"],
+            job_name=options["job_name"],
+            program=options["program"],
+            expected_sha=options["expected_sha"],
+            tags=tuple(options["tags"]),
+            clean_workdir_on_terminal=options["clean_tmp"],
+            rerun_until_file_exists=options["rerun_until"],
+            rerun_max=options["rerun_max"],
+            pool=options["pool"],
+        )
+        record = broker_service.accept(
+            config.load_config(), payload, intent,
+            idempotency_key=options["idempotency_key"],
+        )
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    click.echo(record.broker_job_id)
+
+
+@broker_group.command("cancel")
+@click.argument("broker_job_id")
+@click.option("--reason", default="cancelled by the operator", show_default=True,
+              help="Recorded with the cancellation.")
+def broker_cancel(broker_job_id: str, reason: str) -> None:
+    """Cancel a broker job. Only on a host with [broker] enabled.
+
+    A held job is cancelled at once. A job whose transfer is in doubt is never
+    resent; `vq broker show` then names the target and key to check and kill
+    by hand. A placed job keeps the cancellation until its target job is
+    killed (`vq kill` through the broker).
+    """
+    from vq import broker_service, broker_store
+
+    try:
+        record = broker_service.cancel(config.load_config(), broker_job_id, reason=reason)
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    view = broker_service.record_view(record)
+    click.echo(f"{record.broker_job_id}: {record.state}")
+    if "operator_action" in view:
+        click.echo(f"OPERATOR ACTION: {view['operator_action']}")
+
+
+@broker_group.command("reconcile")
+@click.argument("broker_job_id")
+@click.option("--cancel", is_flag=True, default=False,
+              help="Cancel the job instead of holding it again when the target "
+              "fences the key.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the broker record's view as JSON.")
+def broker_reconcile(broker_job_id: str, cancel: bool, as_json: bool) -> None:
+    """Settle a transfer in doubt from its target's own fence (#64).
+
+    A job stays `transferring` when its target refused the keyed submit
+    (for example a program pin it lacks) or its answer was lost: the broker
+    cannot tell that apart from a submission that landed, and never sends it
+    elsewhere on doubt. This asks the recorded target, over SSH as the
+    operator, to fence the job's key under the same lock every keyed submit
+    holds, and requires the answer to come from the recorded state root.
+
+    \b
+    accepted  the first send landed: the job is placed on that target job
+    fenced    no copy can ever be accepted there: the job holds again for a
+              fresh placement, or is cancelled (--cancel, or an earlier
+              cancellation)
+
+    Only on a host with [broker] enabled; runs under the pass lock.
+    """
+    from vq import broker_service, broker_store
+
+    try:
+        record = broker_service.reconcile(
+            config.load_config(), broker_job_id, cancel=cancel,
+        )
+    except (broker_store.BrokerStoreError, transport.RemoteError) as exc:
+        _broker_fail(exc)
+    view = broker_service.record_view(record)
+    if as_json:
+        click.echo(json.dumps(view, indent=2, sort_keys=True, default=str))
+        return
+    click.echo(f"{record.broker_job_id}: {record.state}"
+               + (f" -> {view['target_host']} {view['target_job_id']}"
+                  if record.state == broker_store.STATE_PLACED else ""))
+    if record.state == broker_store.STATE_PLACED and record.cancellation is not None:
+        click.echo(f"cancellation is still recorded: `vq kill localhost {broker_job_id}` "
+                   "kills the target job")
+
+
+@broker_group.command("list")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit every broker job as JSON.")
+def broker_list(as_json: bool) -> None:
+    """List this broker's jobs, oldest first, with their state and target."""
+    from vq import broker_service, broker_store
+
+    try:
+        broker_service.require_enabled(config.load_config())
+        views, problems = broker_service.list_records()
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    if as_json:
+        click.echo(json.dumps({"jobs": views, "unusable": problems}, indent=2,
+                              sort_keys=True))
+        return
+    for view in views:
+        target = view["target_host"] or "-"
+        flag = "  OPERATOR ACTION (see show)" if "operator_action" in view else ""
+        click.echo(f"{view['broker_job_id']}  {view['state']:13} {target:16} "
+                   f"{view['target_job_id'] or '-'}{flag}")
+    for name, reason in sorted(problems.items()):
+        click.echo(f"UNUSABLE {name}: {reason}")
+
+
+@broker_group.command("show")
+@click.argument("broker_job_id")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the job's record summary as JSON.")
+def broker_show(broker_job_id: str, as_json: bool) -> None:
+    """Show one broker job: state, target, attempts, blockers, cancellation."""
+    from vq import broker_service, broker_store
+
+    try:
+        broker_service.require_enabled(config.load_config())
+        view = broker_service.show_record(broker_job_id)
+    except broker_store.BrokerStoreError as exc:
+        _broker_fail(exc)
+    if as_json:
+        click.echo(json.dumps(view, indent=2, sort_keys=True))
+        return
+    for key in ("broker_job_id", "state", "target_host", "target_job_id", "attempts"):
+        click.echo(f"{key}: {view[key]}")
+    for host, reason in sorted(view["blockers"].items()):
+        click.echo(f"blocker {host}: {reason}")
+    if "operator_action" in view:
+        click.echo(f"OPERATOR ACTION: {view['operator_action']}")
 
 
 @main.group("host")
@@ -16384,7 +19355,7 @@ def _launchd_daemon_plist(
 @click.option(
     "--manager",
     default=None,
-    type=click.Choice(["systemd-user", "systemd-system", "launchd"]),
+    type=click.Choice(["systemd-user", "systemd-system", "launchd-user"]),
     help="Service manager [default: detected].",
 )
 @click.option(
@@ -16417,6 +19388,15 @@ def _launchd_daemon_plist(
     "caps that [daemon] does not. Only after you have decided those caps are "
     "not wanted -- the generated unit will not carry them.",
 )
+@click.option(
+    "--allow-dropping-unit-environment",
+    is_flag=True,
+    default=False,
+    help="Proceed even though the existing unit sets environment the "
+    "generated unit cannot carry (EnvironmentFile=, PassEnvironment=, "
+    "UnsetEnvironment=, unparseable lines) or sets a vq root differently "
+    "from this shell. Those are dropped, and this install's roots win.",
+)
 def daemon_install(
     manager: str | None,
     unit_name: str | None,
@@ -16424,6 +19404,7 @@ def daemon_install(
     no_start: bool,
     dry_run: bool,
     allow_dropping_unit_flags: bool,
+    allow_dropping_unit_environment: bool,
 ) -> None:
     """Install the daemon as a supervised service on this host.
 
@@ -16443,6 +19424,13 @@ def daemon_install(
     are exactly what has dropped them before. If the unit being replaced
     hardcodes caps that ``[daemon]`` does not have, this refuses and prints
     the section to add.
+
+    It keeps the replaced unit's environment, which every job inherits:
+    systemd ``Environment=`` lines are copied verbatim (quoting, ``%h``
+    specifiers and all), launchd ``EnvironmentVariables`` by value (#125).
+    What it cannot carry -- ``EnvironmentFile=``, ``PassEnvironment=``,
+    ``UnsetEnvironment=``, a vq root set differently from this shell -- it
+    refuses on and names, like the caps.
     """
     from vq.web import install as service_install  # noqa: PLC0415
 
@@ -16456,6 +19444,7 @@ def daemon_install(
             start=not no_start,
             service_user=service_user,
             kind=kind,
+            preserve_environment=True,
         )
         try:
             cfg = config.load_config()
@@ -16484,6 +19473,19 @@ def daemon_install(
                 "then re-run. Or pass --allow-dropping-unit-flags if the caps "
                 "are not wanted."
             )
+        if plan.dropped_environment and not allow_dropping_unit_environment:
+            named = "\n".join(f"    {item}" for item in plan.dropped_environment)
+            raise service_install.InstallError(
+                f"the existing unit {plan.writes[0].path} sets environment "
+                "that installing now would drop or change:\n\n"
+                f"{named}\n\n"
+                "The daemon's environment is what every job inherits, so a "
+                "rewrite must not change it silently. Environment= "
+                "assignments are carried over verbatim; move the rest into "
+                "Environment= lines, or run this from a shell whose VQ_* "
+                "roots match the unit's, then re-run. Or pass "
+                "--allow-dropping-unit-environment if they are not wanted."
+            )
         if dry_run:
             click.echo(plan.render())
             click.echo("\n(dry run — nothing was written)")
@@ -16501,6 +19503,11 @@ def daemon_install(
             click.echo(
                 "note: dropped hardcoded caps "
                 f"{', '.join(dropped)} from the previous unit",
+                err=True,
+            )
+        for item in plan.dropped_environment:
+            click.echo(
+                f"note: dropped environment {item} from the previous unit",
                 err=True,
             )
     except service_install.InstallError as e:
@@ -16853,10 +19860,18 @@ def daemon_status() -> None:
             click.echo(f"daemon: running (pid {pid})")
     else:
         click.echo("daemon: not running")
-    click.echo(f"  pidfile: {paths.daemon_pidfile()}")
-    click.echo(f"  log:     {paths.daemon_logfile()}")
-    click.echo(f"  queue:   {paths.queue_dir()}")
-    click.echo(f"  jobs:    {paths.jobs_dir()}")
+    # One column for every value, and a space after every colon: the
+    # documented `awk '/scratch:/{print $2}'` idiom reads $2, which was the
+    # empty string for the one line that ran its path into the colon.
+    for label, value in (
+        ("pidfile", paths.daemon_pidfile()),
+        ("log", paths.daemon_logfile()),
+        ("queue", paths.queue_dir()),
+        ("scratch", paths.scratch_root()),
+        ("jobs", paths.jobs_dir()),
+        ("workdirs", paths.workdir_root()),
+    ):
+        click.echo(f"  {label + ':':<9} {value}")
     _echo_daemon_service_provenance()
 
 
@@ -17363,6 +20378,10 @@ def web_config(as_json: bool) -> None:
     default=False,
     help="Print every file and command, change nothing.",
 )
+@click.option(
+    "--allow-dropping-unit-environment", is_flag=True, default=False,
+    help="Explicitly allow environment settings that cannot be preserved to be dropped.",
+)
 def web_install(
     bind: str | None,
     port: int | None,
@@ -17375,6 +20394,7 @@ def web_install(
     service_user: str | None,
     no_start: bool,
     dry_run: bool,
+    allow_dropping_unit_environment: bool,
 ) -> None:
     """Install the console as a supervised service on this host.
 
@@ -17417,8 +20437,17 @@ def web_install(
             unit_name=name,
             start=not no_start,
             service_user=service_user,
+            preserve_environment=True,
         )
 
+        if plan.dropped_environment and not allow_dropping_unit_environment:
+            named = "\n".join(f"    {item}" for item in plan.dropped_environment)
+            raise web_install_mod.InstallError(
+                "the existing web unit sets environment that installing would drop or change:\n"
+                f"{named}\nMove these settings into supported Environment= assignments, "
+                "match the unit's VQ_* roots, or explicitly pass "
+                "--allow-dropping-unit-environment."
+            )
         if dry_run:
             click.echo(plan.render())
             if section:
@@ -17530,8 +20559,8 @@ def web_uninstall(
 def web_status(as_json: bool) -> None:
     """Report the installed console service and whether it has drifted.
 
-    Drift means the vq that installed the service is not the vq you are
-    running now — so the console is serving older code than is installed.
+    Drift means the recorded version or executable differs from this vq.
+    Review the unit and the selected runtime before reinstalling.
     A console cannot notice this on its own: every page it renders looks
     completely normal.
     """
@@ -17577,11 +20606,98 @@ def web_status(as_json: bool) -> None:
         click.echo(
             f"⚠️  drift: this console service was installed by vq "
             f"{status.installed_by_version}, but vq "
-            f"{status.running_version} is installed now. The running "
-            f"console is serving the older code.\n"
+            f"{status.running_version} is selected now. The recorded version "
+            f"or executable path differs; review the unit before reinstalling.\n"
             f"    Fix with:  vq web install",
             err=True,
         )
+
+
+@web.command("public-snapshot")
+@click.option(
+    "--out", "out_dir", required=True,
+    type=click.Path(file_okay=False, path_type=Path),
+    help="Directory to write fleet.json and index.html into (created if missing).",
+)
+@click.option(
+    "--stale-after", "stale_after", type=click.IntRange(min=60), default=None,
+    help="Seconds until the snapshot calls itself stale. "
+         "Default: [public_snapshot] stale_after_seconds (900).",
+)
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Print a JSON summary of what was written.")
+def web_public_snapshot(out_dir: Path, stale_after: int | None, as_json: bool) -> None:
+    """Write the public, read-only fleet snapshot (#66) as static files.
+
+    Sweeps the fleet with this operator's credentials, projects the result
+    through the vq.public-fleet/1 allowlist, and replaces DIR/fleet.json
+    and DIR/index.html atomically. It starts no server and opens no
+    listener: serve DIR read-only from a separate unprivileged account.
+
+    Only hosts named in [public_snapshot.hosts] appear, under that name,
+    and only calculations submitted with a public.<alias> tag. If the
+    sweep or the projection fails, nothing is written, and the previous
+    files age past their stale-after time.
+    """
+    from vq.web import fleet as fleet_mod  # noqa: PLC0415
+    from vq.web import public_snapshot as public_mod  # noqa: PLC0415
+
+    try:
+        cfg = config.load_config()
+    except config.ConfigError as e:
+        raise click.ClickException(str(e)) from None
+    public_cfg = cfg.public_snapshot
+    if stale_after is not None:
+        public_cfg = public_cfg.model_copy(update={"stale_after_seconds": stale_after})
+    if not public_cfg.hosts:
+        click.echo(
+            "vq: warning: [public_snapshot.hosts] names no host, so the snapshot "
+            "shows no machine.", err=True,
+        )
+    configured = set(cfg.hosts) or {"localhost"}
+    for key in public_cfg.hosts:
+        if key not in configured:
+            click.echo(
+                f"vq: warning: [public_snapshot.hosts] {key!r} is not a configured "
+                f"host; it is published as {public_cfg.hosts[key]!r} in state unknown.",
+                err=True,
+            )
+    try:
+        snapshot = fleet_mod.gather_fleet_snapshot(cfg)
+    except Exception as e:  # noqa: BLE001 — any sweep failure must leave the old files
+        raise click.ClickException(
+            f"fleet sweep failed, nothing written: {type(e).__name__}: {e}"
+        ) from None
+    try:
+        doc = public_mod.project_public_snapshot(snapshot, public_cfg)
+    except Exception as e:  # noqa: BLE001 — a malformed sweep must leave the old files
+        raise click.ClickException(
+            f"could not project the fleet snapshot, nothing written: "
+            f"{type(e).__name__}: {e}"
+        ) from None
+    try:
+        json_path, html_path = public_mod.write_public_snapshot(doc, out_dir)
+    except (OSError, ValueError) as e:
+        raise click.ClickException(f"could not write the snapshot: {e}") from None
+    hosts = doc["hosts"]
+    calcs = doc["calculations"]
+    assert isinstance(hosts, list) and isinstance(calcs, list)
+    if as_json:
+        click.echo(json.dumps({
+            "schema": doc["schema"],
+            "json": str(json_path),
+            "html": str(html_path),
+            "hosts": len(hosts),
+            "calculations": len(calcs),
+            "generated_at": doc["generated_at"],
+            "stale_after": doc["stale_after"],
+        }, indent=2))
+        return
+    click.echo(f"wrote {json_path} and {html_path}")
+    click.echo(
+        f"  {len(hosts)} machine(s), {len(calcs)} calculation(s); "
+        f"stale after {doc['stale_after']}"
+    )
 
 
 @web.group("user")
@@ -17820,6 +20936,15 @@ def _ensure_web_sidecar_running(
     "the legacy behaviour).",
 )
 @click.option(
+    "--gpu-devices",
+    default=None,
+    metavar="IDS",
+    help="Comma-separated GPU device IDs (as CUDA_VISIBLE_DEVICES names them) "
+    "this daemon may give to `vq submit --gpus` jobs. A GPU job waits for that "
+    "many free devices and sees only its own in CUDA_VISIBLE_DEVICES and "
+    "VQ_GPU_DEVICES. Default: [daemon] gpu_devices, else none (GPU jobs refused).",
+)
+@click.option(
     "--poll-interval",
     type=click.FloatRange(min=0.01),
     callback=_finite_positive_seconds,
@@ -17869,6 +20994,7 @@ def daemon_run(
     max_scheduler_jobs: int | None,
     max_mem_mb: int | None,
     default_job_mem_mb: int | None,
+    gpu_devices: str | None,
     poll_interval: float,
     run_web: bool,
     web_host: str,
@@ -17881,6 +21007,15 @@ def daemon_run(
     # it lands at the correct path.
     running_as_root = os.geteuid() == 0
     multi_user = False
+    gpu_device_ids: list[str] | None = None
+    gpu_isolation = False
+    gpu_isolation_allow: list[str] = []
+    if gpu_devices is not None:
+        try:
+            gpu_device_ids = config.gpu_device_list(
+                [d.strip() for d in gpu_devices.split(",")])
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint="--gpu-devices") from None
     notify_webhook_url: str | None = None
     notify_on_states: list[str] = []
     try:
@@ -17896,7 +21031,7 @@ def daemon_run(
         # unset (an explicit flag always wins). Keeps per-host caps in
         # the config file instead of hand-edited ExecStart lines, which
         # unit rewrites have repeatedly dropped.
-        filled = {}
+        filled: dict[str, object] = {}
         if max_cpus is None and cfg.daemon.max_cpus is not None:
             max_cpus = filled["max_cpus"] = cfg.daemon.max_cpus
         if max_jobs is None and cfg.daemon.max_jobs is not None:
@@ -17911,6 +21046,10 @@ def daemon_run(
             default_job_mem_mb = filled["default_job_mem_mb"] = (
                 cfg.daemon.default_job_mem_mb
             )
+        if gpu_device_ids is None and cfg.daemon.gpu_devices is not None:
+            gpu_device_ids = filled["gpu_devices"] = list(cfg.daemon.gpu_devices)
+        gpu_isolation = cfg.daemon.gpu_isolation
+        gpu_isolation_allow = list(cfg.daemon.gpu_isolation_allow)
         if filled:
             log.info("[daemon] config filled caps: %s", filled)
         notify_webhook_url = cfg.notifications.webhook_url
@@ -17964,18 +21103,26 @@ def daemon_run(
                 acknowledge_public_bind=web_i_understand_public_bind,
             )
 
-        Daemon(
-            max_cpus=max_cpus,
-            max_jobs=max_jobs,
-            max_scheduler_jobs=max_scheduler_jobs,
-            max_mem_mb=max_mem_mb,
-            default_job_mem_mb=default_job_mem_mb,
-            poll_interval=poll_interval,
-            notify_webhook_url=notify_webhook_url,
-            notify_on_states=notify_on_states,
-            multi_user=multi_user,
-            loop_hook=_web_loop_hook if run_web else None,
-        ).run()
+        try:
+            runner = Daemon(
+                max_cpus=max_cpus,
+                max_jobs=max_jobs,
+                max_scheduler_jobs=max_scheduler_jobs,
+                max_mem_mb=max_mem_mb,
+                default_job_mem_mb=default_job_mem_mb,
+                poll_interval=poll_interval,
+                notify_webhook_url=notify_webhook_url,
+                notify_on_states=notify_on_states,
+                multi_user=multi_user,
+                loop_hook=_web_loop_hook if run_web else None,
+                gpu_devices=gpu_device_ids,
+                gpu_isolation=gpu_isolation,
+                gpu_isolation_allow=gpu_isolation_allow,
+            )
+        except ValueError as exc:
+            # A cap or GPU setting this daemon cannot honour: say so, start nothing.
+            raise click.ClickException(str(exc)) from None
+        runner.run()
     finally:
         if web_proc is not None:
             _stop_web_sidecar(web_proc)

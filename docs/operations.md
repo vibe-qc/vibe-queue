@@ -1,5 +1,7 @@
 # Operations runbook
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 Recovery procedures for the rough edges between vq, systemd-user, and the
 hosts vq runs on. Most of this exists because we hit it once on
 2026-05-16 (see the post-mortem chapter at the end). The
@@ -106,6 +108,228 @@ and a daemon.
 
 ---
 
+## Where a host's disk went, and moving scratch (#63, v0.26.10+)
+
+**First, look in the right place.** vq keeps two roots:
+
+```sh
+vq daemon status        # prints queue, scratch, jobs and workdirs
+du -sh "$(vq daemon status | awk '/scratch:/{print $2}')"
+```
+
+The **state root** holds the queue, its locks, archives and the daemon's own
+files, and is never pruned. The **scratch root** holds `jobs/` (each job's
+working directory and results) and `workdirs/` (`$VQ_WORKDIR`), and is swept by
+age. They are separate by default from v0.26.10: `$VQ_SCRATCH_DIR`, else the
+`scratch_root` config key, else `<state root>-scratch`.
+
+They were one root before that, and the classification was wrong where it
+mattered: on two daemon hosts **over 99 % of the state root's footprint was job
+workdirs** — 132 GB of 138 on one, 81 GB of 84 on the other, most of it in a
+handful of directories — under a root the layout documents as durable. On a
+host that has not been migrated, expect the same shape and look under
+`<state root>/workdirs` before anything else.
+
+**`vq cleanup` sees workdirs now.** The listing has a WORKDIR column,
+`reclaimable` includes those bytes with the workdir total called out, and
+`--delete` removes the workdir as well as the workspace and the archive. It
+previously reported about 1 GB across ~1,200 terminal jobs on the host whose
+workdirs held 81 GB. `--archive` still tars the workspace only, and says so.
+
+**Turning the sweep on is usually the whole fix:**
+
+```sh
+vq cleanup HOST --auto-enable --workdir-max-age 14d --delete-after 90d
+vq cleanup HOST --auto-status
+```
+
+It never touches a job that is not terminal, ages terminal jobs by
+`finished_at` rather than by directory mtime, and visits every workdir root vq
+manages.
+
+**Moving the root.** Set it once, for the daemon and every CLI caller. The
+config key is the safer of the two, because both read the same file:
+
+```toml
+min_vq_version = "0.26.10"
+scratch_root = "/data/vq-scratch"
+```
+
+`min_vq_version` matters here: a vq that predates the key ignores unrecognized
+top-level keys by design, so without the floor an older build on the same host
+would keep resolving scratch under the state root while a newer one uses the
+key — a split store. Restart the daemon and check `vq daemon status`.
+
+Nothing moves when you change it. Every existing job keeps the `cwd` and
+`workdir` it recorded, only new dispatches use the new root, and cleanup,
+accounting and the sweep follow the records: a job's workspace and workdir are
+measured and removed at the path that job recorded, whether that is the current
+root, the pre-#63 root under the state root, or a root you have since
+configured away from. The age sweep walks the configured roots plus every root
+this host's own job records still name, so a second or third move does not
+hide the bytes from it.
+
+**What a changed root does leave behind** is any directory under a root you
+have configured away from that no job record names *at that path*. The sweep
+removes a directory there only when a record names exactly it, because the
+root may since have been repurposed and a name alone proves nothing. That
+leaves an *orphan* — one whose job record is already gone — and the directory
+of a job's earlier attempt when a retry recorded a new one under the current
+root. The sweep logs each at debug level and leaves it. `rm -rf` them yourself
+once you have checked `vq cleanup` reports nothing for that root. Draining the
+old root before moving again avoids the situation entirely.
+
+That records-not-recomputation posture is deliberate, and it is why a root
+moved *underneath* vq by other tooling needs `vq admin repair-state-paths`
+(#69, below) rather than a silent fallback. The full migration runbook is
+[the fleet layout](fleet_layout.md), phase 5.
+
+**A workdir vq did not create is never removed.** The recorded path must still
+be the per-job directory *named for that job* — `<root>/<jobid>`, where `cwd`
+and `workdir` are both written by vq itself and by nothing else; the root is
+opened `O_NOFOLLOW`; a symlinked entry, a non-directory, or an entry owned by
+another uid is refused and reported. In multi-user mode the queued spec is
+user-writable, so the record is evidence only and the deletion target is
+derived from the trusted owner and the job id — there the managed per-uid roots
+remain the authority. A refusal at terminal-cleanup time is recorded on the
+spec as `workdir_cleanup_note`, so `vq status <jobid>` explains it rather than
+only the daemon log; it is **not** a `failure:`, because a job that completed
+did not fail by keeping its scratch.
+
+**Scheduler hosts.** `hosts.<name>.scratch_root` is the same concept for the
+cluster vq submits to, and it is now safe to change under jobs in flight: each
+job records the workspace it was staged into before submission and every later
+step uses that path. Three things to expect after an upgrade:
+
+* the driver **refuses to adopt a changed `scratch_root`** for a host while a
+  job on it that may already be staged still predates the binding. It logs the
+  job ids and keeps using the root it last adopted, which it remembers across a
+  restart and a config reload — those are the two moments the phase 5 runbook
+  names, and the guard used to be silent on both. Such a job binds when the
+  driver *reattaches* to it, which is a driver start and not a poll tick, so
+  the refusal clears on the restart after the change rather than minutes later.
+  A host still held after that restart has a job that did not reattach, and
+  that job is the real problem.
+
+  A job that is merely **queued** does not hold the host. Nothing is staged
+  before dispatch, so a PENDING job on its first attempt has no workspace to
+  strand; counting it meant a host with a steady queue never adopted the
+  change at all.
+* **the first start after the upgrade cannot check the refusal**, because the
+  record it compares against is written by the driver itself and an older vq
+  wrote none. Set the key in the same window as the upgrade and that start has
+  nothing to compare to. It serves the configured root — there is no other
+  candidate — but it does **not** bind that host's pre-upgrade jobs to it and
+  does not record the root as adopted, so restoring the previous value in
+  `config.toml` and restarting the driver still repairs them. The restart is
+  what re-derives a running job's workspace; a reload does not. Once those
+  jobs drain the driver settles the doubt at its next lookup of the host.
+  Changing the key in a separate window from the upgrade avoids it entirely.
+* remote cleanup accepts a workspace staged under a *former* `scratch_root`, so
+  changing the key no longer leaves undeletable directories on the cluster.
+
+`vq doctor HOST` reports all of this as `scheduler_scratch_root`, from the
+driver's own record, the local config and the queue, with no SSH: `FAIL` while
+the host is held at a previous root or unconfirmed, and in either case only
+while a job that may already be staged still carries no recorded workspace,
+with the remedy in the message. The record is written only when the driver
+looks the host up, so a key changed on an idle host, or an unconfirmed host
+whose jobs have drained, passes before the record catches up. Run it where the driver keeps its state; elsewhere it reports "no
+record" rather than a verdict.
+
+---
+
+## Removing old runtime generations (#74)
+
+A program with `runtime_slot_root` gains one `releases/<sha>` generation per
+update, and no update ever deletes one. Reclaim them with a reviewed plan:
+
+```sh
+vq admin runtime-retention ENV --keep 2
+vq admin runtime-retention ENV --keep 2 --apply-plan PLAN_ID
+```
+
+The first command is read-only JSON. It lists every generation with its size,
+whether it is kept and why, the candidates with `reclaimable_bytes`, any
+blockers, and a `plan_id`. The following are always kept:
+
+- `current` and, by default, `previous`;
+- every generation a started local job references, through its dispatch
+  selection or command line;
+- on Linux, every generation a live process references (see below);
+- any generation named by the daemon's service definition or used by the
+  running daemon;
+- every `--retain SHA`, for example one named by a fixed-SHA launcher;
+- the `--keep` newest others;
+- incomplete generations, which are left to the build's own recovery.
+
+A started local job whose generation cannot be proven (for example one that
+went through a stable launcher before a later flip) keeps **every**
+generation until it ends, unless its processes prove it. Queued and scheduler
+jobs without explicit generation references do not hold generations of this
+store. A queued local command naming `previous` protects its target too.
+
+**Process evidence (Linux).** The plan reads `/proc`. For each of your
+processes it reads the executable, working directory, command line,
+environment (including the `VQ_RUNTIME_SLOT_SHA` the stable launcher exports),
+memory maps and open files. For other users' processes it reads only the
+command line. Any generation a live process names is kept with the reason
+`live process`, whether or not it belongs to a job. A started job with no
+recorded generation is proven by its process group, the `pgid` captured at
+dispatch. This works only when that group is alive and every member was read
+completely. The job then holds exactly what those processes name, so a busy
+host can reclaim everything else.
+A job whose group is gone, or has a member that could not be read (for
+example another user's process, or a non-dumpable one), still keeps every
+generation. The census reports
+`process_proven_jobs`, `process_scan` (false without `/proc`, where nothing
+changes), and `process_references`, a map from SHA to pids. The pids are
+informational and not part of the plan id, so a restarted helper does not
+invalidate a reviewed plan, while a new reference does. A service authority that cannot
+be read, or an unresolved admin update marker, is a blocker.
+
+`--apply-plan` repeats the plan under the admin-update ownership and the
+program's lifecycle locks, refuses when the plan id no longer matches, removes
+exactly the candidates, and writes a receipt to
+`<state root>/runtime-retention/`. Nothing is removed by an update or an
+activation. Scheduler-host packed publications are not covered by this command.
+
+To keep only the current verified runtime and any referenced generations:
+
+```sh
+vq admin runtime-retention ENV --keep 0 --drop-previous
+vq admin runtime-retention ENV --keep 0 --drop-previous --apply-plan PLAN_ID
+```
+
+`--drop-previous` makes an unused `previous` generation eligible for removal.
+It still preserves live-job, process and service references, explicit `--retain`
+holds, and incomplete generations. A service definition naming the `previous`
+pointer preserves its target. The current generation must pass content
+verification before this policy can be applied. Repeat the same options when
+applying; a changed policy, pointer or reference invalidates the reviewed plan.
+
+Before deleting the previous generation, apply clears and durably records the
+removal of its rollback pointer. Rollback then has no target until a subsequent
+activation establishes one. If deletion fails partway, the pointer stays cleared
+so it cannot name a partial generation; the receipt reports `previous_cleared`
+and any removal failures. A previous generation retained for another reason
+keeps its rollback pointer. This option is for reviewed one-off runs only;
+scheduled retention continues to protect `previous`.
+
+To stop forgetting, opt a program in to retention on every auto-cleanup sweep:
+
+```sh
+vq admin runtime-retention ENV --schedule --keep 2
+vq admin runtime-retention ENV --unschedule
+```
+
+Each sweep then plans and applies retention for every scheduled program with
+the same revalidation. It skips a program with blockers, or while an update
+owns the host, until the next sweep. The schedule lives in
+`<state root>/runtime-retention/schedule.json`, separate from the auto-cleanup
+policy file, so older vq versions keep reading that policy. It does nothing
+unless auto-cleanup is enabled (`vq cleanup --auto-enable ...`).
+
 ## `vq doctor` (v0.12.0+) - client preflight
 
 Scheduler status refreshes wait for a new main-loop observation in a separate
@@ -135,7 +359,9 @@ confirm the configured path, then repair the install or update
 `[hosts.HOST].remote_vq`. If the host should be ignored while it is being
 repaired, mark it down with
 `vq host down HOST --reason "remote_vq missing"`; restore it later with
-`vq host up HOST`.
+`vq host up HOST`. `vq host list` shows every configured host and which of them
+you have marked down, with the reason. The marks are your local view only and
+never touch the remote daemon.
 
 Scheduler hosts are daemonless by design. For those, `vq doctor` validates the
 configured `scheduler_driver` and pings the driver daemon instead of trying to
@@ -152,10 +378,75 @@ means vq can submit and poll, but the cluster scheduler is not dispatching
 work; pause new production submits and ask the cluster administrator to restart
 or re-enable PBS scheduling.
 
+On a single-user daemon host, `vq doctor` also reports `state_root_agreement`:
+whether the vq that `remote_vq` runs uses the same state root as the host's
+running daemon. The verbose daemon ping lists this user's running
+`vq daemon run` processes and the root each resolves from its environment
+(`/proc` on Linux, `ps -E` elsewhere). The check **fails** when a daemon runs
+and none uses the root vq resolves there. That happens on a host reached
+through a bare `vq` while its service runs a wrapper that exports
+`VQ_STATE_DIR`: status, overview and the console then read an empty second
+store. Point `remote_vq` at the wrapper, or export the same `VQ_STATE_DIR`.
+The check adds nothing on a multi-user host, when the host's vq predates it,
+or when the process scan is not possible.
+
+On the host it runs on, `vq doctor` also reports `declared_extras_routes`:
+for every venv program that declares `extras`, which of its configured scripts
+is vq's own, and therefore whether the declared floor has any route into that
+venv. A declaration reaches pip only through the checkout's own
+`scripts/install.sh` or `scripts/update.sh`, and config load cannot check
+where a configured command points -- at load time there may be no checkout to
+read. So a program whose installer is a site command loads clean and produces
+the failure the key exists to prevent: a console venv built without uvicorn
+whose unit fails on every start.
+
+The check **fails** only where both scripts were resolved and neither is vq's
+own, which is the state with no route at all. A program whose only vq script
+is its installer is OK and told that nothing re-applies the declaration after
+the provision. Where the checkout is absent or unreadable -- a host part-way
+through provisioning -- it reports that it could not answer and stays OK.
+Where no program declares `extras`, it says nothing at all.
+
+It is a local check: the scripts are files in a checkout, so only the host
+holding that checkout can answer, and `vq doctor REMOTE` leaves it out rather
+than answering from the driver's own `[programs.X]` registry. Run `vq doctor`
+on the host, or read `vq programs --json`, which carries `install_script` and
+`extras` for a fleet-wide audit. `vq doctor HOST --json` carries the
+per-program verdicts under the check's `programs` key.
+
 For scheduler hosts, `vq doctor HOST` also reports `scheduler_program_hooks`.
 Every `[hosts.HOST.scheduler_program_hooks.NAME]` key must have a matching
 `[programs.NAME]` entry; missing program registrations are failures so typoed
 per-program qsub hooks do not silently sit unused.
+
+A driver that has no local installation can register a scheduler-only name:
+
+```toml
+[programs.orca]
+kind = "scheduler"
+
+[programs.vibe-view]
+kind = "scheduler"
+```
+
+Keep the existing target-side `scheduler_program_hooks` and
+`scheduler_runtime_deployments` entries. This registration supplies identity
+only: it adds no executable, changes no wrapper, and claims no remote health.
+`vq programs localhost --json` reports `SCHEDULER_ONLY`; `--require NAME`
+does not accept that as a locally available program. Local submit and local
+dispatch refuse these names. Scheduler submissions still resolve managed
+runtime pins from the target registry or verified deployment record, and
+still refuse missing or mismatched identities. Local admin install/update
+requires a `venv` registration; manage scheduler runtimes through their
+configured scheduler deployment interface.
+
+Install a vq version supporting this kind on the driver before adopting the
+configuration; older loaders reject it. Preserve the external configuration
+backup and the original hook/wrapper bindings. Verify `vq doctor HOST --json`
+from the actual driver for each scheduler authority, then submit and fetch a
+bounded canary for each program through its existing command wrapper. Check
+the recorded runtime/source identity and command. A passing registration
+check alone is not per-program dispatch or fleet-migration acceptance.
 
 Scheduler configuration is fail-fast at config-load time. Fields that only make
 sense on daemonless scheduler hosts, such as `scratch_root`,
@@ -176,6 +467,12 @@ host reports a bounded canonical partition. A request above a configured
 maximum is rejected before staging and revalidated by the daemon before
 dispatch; vq never silently clamps it.
 
+Set `scheduler_max_cpus` alongside it for the widest job that lane can ever
+run. It rides the same `scheduler_lane` metadata and is bound to the same
+effective partition, and an unset value means unknown rather than unlimited.
+A request above it is **warned about and still submitted**, unlike the wall
+time: see the capacity section below for why the two differ.
+
 Use `--admin-update` before a maintenance run such as `vq admin update pbs-cluster`.
 For scheduler hosts this adds a check for `scheduler_update_command` and notes
 whether `scheduler_install_command` is also configured, so a missing cluster
@@ -184,6 +481,15 @@ scheduler host's configured `remote_vq --version`, which is the quickest way to
 verify the cluster-side helper after `vq admin update HOST`.
 
 ### Scheduler-side vq refresh for daemonless clusters
+
+HOME discovery, staged-source checksum reads, and helper readiness/provenance
+reads allow one bounded fresh SSH retry after a recognizable connection failure
+or observation timeout. Authentication and host-key refusals, unexplained exit
+255 and ordinary command failures do not trigger that retry. A persistent
+checksum transport failure remains unverified and does not restart the upload.
+Stage creation, build launch and cleanup commands keep their existing
+single-attempt behavior; this read recovery does not replay an uncertain write
+or establish that an unreachable host has recovered.
 
 Daemonless scheduler hosts do not have a normal `vq-daemon` checkout to refresh.
 The scheduler login host still needs a small vq install for operator probes and
@@ -262,6 +568,92 @@ active/previous runtimes or protected sync directories as part of staging
 maintenance. A routine update no longer requires moving forensic evidence out
 of `generations/` to protect it from automatic retention cleanup.
 
+**Source-upload staging is the one exception, and it is a different thing.**
+A build host that cannot reach the source repository has the exact commit
+uploaded to it, about 110 MB per deploy, under
+`<scratch_root>/.vq-admin/runtime-source/<program>/<sha>-<uuid>/`. That
+directory belongs to exactly one deploy: the driver re-archives the same SHA
+from git on demand, and nothing reads a stage once the build has consumed the
+archive. So a deploy that verifies removes its own, and a deploy that fails
+keeps its own for forensics while older ones are trimmed to
+`RUNTIME_SOURCE_STAGES_TO_KEEP`. The reasoning that retains a helper generation
+-- another deployment may still be using it -- does not apply to these, and
+nothing here prunes a helper generation or calls the prune verb on the host.
+Before this was added, a SLURM host had accumulated 235 stages, 26 GB, one per
+deploy since July, and the shared home went over quota.
+
+`vq source-stage-prune --runtime-source <scratch_root>/.vq-admin/runtime-source`
+is the operator-facing form, for what an older vq left behind or what failed
+deploys kept. Without `--runtime-source` the verb still reads only
+`STAGE_ROOT/generations/`, which is why it reported `removed=0` against these
+stages and the disk stayed full. Both forms only ever remove a directory whose
+name is exactly `<40 hex>-<32 hex>`; anything else under the root is reported
+as skipped and left in place.
+
+### Feeding the source mirror
+
+Before feeding, vq inspects the configured mirror without changing it. If that
+read times out or returns SSH exit 255, it retries once on a fresh connection
+with multiplex reuse disabled for that attempt. The shared SSH master remains
+untouched. This recovery applies to the read-only inspection; it does not
+automatically replay a push or runtime build after an ambiguous failure.
+
+A deployment profile with `feed_source_mirror` set pushes the accepted pin
+into the target's push-fed bare mirror before preparation, replacing the
+manual per-release feed step. **The feed never forces anything.** It is one
+unforced, `--atomic` `git push` from the driver's configured source checkout,
+carrying only:
+
+* `refs/vq/pins/<sha>`, the immutable per-pin ref. Its name is the commit it
+  names, so feeding it is a creation or an exact no-op. It can never require
+  a force and can never come to mean a different tree, and it keeps the
+  accepted pin addressable in the mirror however the branches later move.
+* this lane's branch pair — `refs/heads/release` and
+  `refs/remotes/origin/release` for `vibeqc-release`, or the `main` pair for a
+  branch-tip program. Atomically, because a lane whose branch and
+  remote-tracking ref disagree is exactly what the preparer fails closed on.
+* the tags that name this pin in the driver's clone. Not the whole tag
+  namespace: a deployment feeds one release identity.
+
+Everything else in the mirror is left byte-identical. Unrelated branches,
+unrelated tags, other pins' refs and notes are never named by a refspec, so
+nothing can move them — including a tag the driver's clone happens to hold at
+a different commit.
+
+Anything that would need a force is refused **before** the push, so the
+mirror is unchanged and the current runtime, the build and the canonical
+LAST OK record are all untouched. An operator sees the mirror's own values:
+
+```
+mirror feed: cluster-login:<mirror> has refs/heads/release at 9c1d0a2f4b77,
+the requested pin is 41b7e3c90ad2, and the mirror has already moved past this
+pin, so feeding it would rewind that branch. vq never force-pushes, so the
+feed is refused and the mirror is unchanged. Deploy the commit the mirror
+already carries, or have the mirror's owner move that branch back
+deliberately, then re-run. The pin itself stays addressable as
+refs/vq/pins/41b7e3c90ad2... once a feed of it succeeds.
+```
+
+**A legitimate but older accepted pin is refused, not silently upgraded.**
+That is the point: a forced feed used to resolve this case by rewinding the
+mirror, and the alternative failure — quietly building whatever newer tree
+the mirror has drifted to — would be worse. Deploy the commit the mirror
+already carries if that is what you meant; otherwise the mirror's owner moves
+the lane branch back deliberately, outside vq, and the deployment is re-run.
+vq will not do it for them, and there is no flag that makes it.
+
+The other refusals read the same way: a **diverged** lane branch, a mirror
+commit the driver's clone does not contain (so the driver cannot tell what
+feeding the pin would drop), and a **tag the mirror already holds at another
+object** — a tag is an identity, so vq neither moves one nor forces one. A
+requested `--tag` that does not name the requested commit in the driver's own
+clone is refused before the mirror is read at all.
+
+`vq admin update ... --json` reports the exact refspecs in
+`mirror_feed_refspecs` and the per-pin ref in `mirror_pin_ref`; both also
+appear in the update transcript under `mirror feed refspecs (unforced,
+atomic)`. The atomic push needs git >= 2.4 on the mirror's host.
+
 Immutable venv updates likewise retain all other runtime generations after
 both new activation and verified-slot reuse. The low-level slot reclamation
 primitive is not an update step. Any separate retention operation needs a
@@ -298,6 +690,60 @@ does not wait behind the remainder of an old, lower-priority queue snapshot.
 This is an admission checkpoint, not a submission latency guarantee: individual
 SSH calls and queue-directory scans still contribute to elapsed time.
 
+### What a queue-directory scan costs
+
+The daemon re-walks its queue directory on every tick. Two of those passes —
+the deferred scheduler-reattach retry and dispatch itself — go through one
+shared scan, and from v0.26.10 that scan leaves out every **settled** row: one
+in a terminal state with no scheduler transaction that could still be open
+(#22). Such a row costs one `stat` per pass rather than an open, a JSON parse
+and a model validation, so per-tick admission cost follows the live queue
+rather than everything the host has ever run. The pass that first sees a row
+still reads it in full — that is what proves it settled and records the on-disk
+identity later passes compare — so the first tick after a daemon start, and the
+startup walk that precedes it, still cost what they always did.
+
+The third pass, the pause-intent sweep, globs the directory itself and so got
+nothing from that scan. From v0.26.10 the daemon hands it the same verdict
+(#82): a settled row whose bytes have not changed since a full read found it
+settled **and** free of any durable pause intent costs the sweep one `stat`
+too. So all three per-tick walks now follow the live queue. A settled row that
+does carry an intent — what a `vq pause` killed before SIGSTOP leaves behind
+when its job exits underneath it — is never skipped, because finishing it is
+the sweep's purpose; arming an intent rewrites the row, so it also always
+changes the identity and puts the row back on the very next sweep. Measured on
+a synthetic 100 live + 16,000 retained queue
+(`scripts/benchmark_pause_intent_sweep.py`), the sweep drops from 0.489 s to
+0.122 s per tick, 4.0x, which takes it from the largest single term in a tick
+to less than the admission scan beside it.
+
+Consequences for an operator:
+
+* **Neither `vq cleanup --archive` nor `--delete` is the lever for dispatch
+  latency any more.** Archive to reclaim disk; delete to discard history. A
+  driver that keeps every job it has ever run now pays for its live queue on
+  each tick either way.
+* **A row you touch comes straight back.** A `--restore`, a `vq fetch` read
+  stamp or a hand edit rewrites the spec, which changes its identity, so the
+  next pass reads it again before deciding anything.
+* **Ambiguity is never aged out.** A terminal row whose scheduler submit is
+  unresolved keeps its reservation and stays on the scan at any age, and the
+  startup walk reads every row so a leaked process group is still reaped.
+* **The pause-intent sweep is a separate walk**, and it is no longer
+  proportional to the retained total either. It still globs the directory
+  itself, but it is handed the settled-row verdict the daemon's own scan
+  recorded, so a settled row costs it a `stat` as well. It stays *first* in
+  the tick, ahead of polling and the watchdog, so the verdict it uses is the
+  previous tick's — or, on the first tick of a daemon's life, the startup
+  walk's. The cost of that ordering is bounded at one extra full read per row,
+  once: a row that settles only after a tick's scan has passed it is read once
+  more by the next sweep.
+* **What still reads every row, deliberately.** The startup walk, and the exact
+  proofs behind `vq admin update` — pause admission and token clearance — which
+  scan every row under its lock, including terminal rows. The skip belongs to
+  the repeating sweep alone and cannot be handed to a scan that has not asked
+  for the unlocked hint: doing so is refused outright rather than honoured.
+
 If compilation is only allowed on a specific cluster node, set
 `scheduler_update_host` to that SSH target. Job submission and qstat polling
 still use the scheduler host's normal `ssh` / `remote_scheduler_host`; only the
@@ -313,6 +759,17 @@ check_timeout_seconds` widens the rollout sweep's budget for exactly that
 reason (see `docs/orchestration.md`), and a probe that runs out of it is
 reported as a timeout — retryable, never a wrong SHA.
 
+`vq source-identity` is read-only and needs no daemon. It prints one line of
+JSON and exits 0 whenever it produced an answer, so a missing or stale marker is
+a field, not an exit status. The keys are `version`; `source_tree_sha256`, a
+digest of the installed vq package's files (bytecode and the two provenance
+markers left out, so an editable and a regular install hash alike), or `null`
+with the reason in `source_tree_sha256_error`; and `source_sha`, the
+package-local `SOURCE-SHA` marker, or `null` with the reason in
+`source_sha_error`. That reason is `no SOURCE-SHA marker installed`, or a
+message that the marker's recorded tree no longer matches the package beside it.
+`vq source-sha` and `vq source-tree-sha256` print one of the two values each.
+
 Fleet venv refreshes are intentionally separate from scheduler-host refreshes.
 `vq admin update ENV --all-hosts` and `vq admin auto-update ENV --all-hosts`
 update hosts that run vq daemons. Daemonless scheduler targets stay visible in
@@ -322,7 +779,68 @@ daemon while still reminding the operator that the cluster-side vq install has a
 separate maintenance step.
 
 `vq scheduler-probe HOST --json` emits the same scheduler-client probe in a
-monitor-friendly shape. `vq programs HOST` and `vq admin status HOST` render
+monitor-friendly shape.
+
+The probe also reports **schedulable capacity** for a PBS or SLURM host, read
+from `pbsnodes -a` or `sinfo -N`. It answers two different questions, and the
+difference is what tells a job that is waiting from one that will wait forever:
+
+- `max_cpus_now` — the largest request that could **start right now**. A wider
+  request is admitted and then queues.
+- `max_cpus_when_free` — the largest request the nodes the scheduler can still
+  use could **ever** run. A wider request queues indefinitely, however long you
+  wait, because no usable node is that wide even when idle.
+
+Both are repeated per lane (`groups`), alongside a per-node census with each
+node's width, free cores and state. A node that is merely busy stays `usable`;
+only one the scheduler will not place work on at all (PBS `down`/`offline`,
+SLURM `drain`/`fail`/`maint`) counts as unusable, and the report names those
+nodes. If the census cannot be read, `capacity.error` is set and every figure
+is `null`: an unreadable census never reads as "nothing is free".
+
+A lane is a SLURM partition, or a PBS node property — and those are not the
+same kind of fact, so each lane says which it is. On SLURM the partition *is*
+the scheduling lane. On PBS, the authority for which property a queue routes
+to is that queue's `resources_default.neednodes`, read from `qstat -Qf` on the
+same read-only pass that already reads `enabled` / `started`:
+
+```
+  capacity: largest job that can start now: 64 cpu(s); largest the usable nodes could ever run: 128
+  nodes: 3 usable, 1 unusable
+    gpu: now=64 when-free=64 (1 usable, 0 unusable) [queue: gpu]
+    narrow: now=18 when-free=20 (1 usable, 0 unusable) [inferred]
+    wide: now=64 when-free=128 (2 usable, 1 unusable) [queue: batch]
+  [inferred]: a node property no queue's resources_default.neednodes names
+```
+
+A lane marked `[queue: NAME]` is one a queue declares it routes to, and `NAME`
+is the queue to submit to for that row's capacity. A lane marked `[inferred]`
+is a node property nothing routes to as far as vq can see: its figures are
+still true of the nodes carrying the property, but no queue has been shown to
+send work there — set `resources_default.neednodes` on the queue if you want
+that lane attributed. Every lane comes back `[inferred]` at a site that sets
+no such defaults, and also when `qstat -Qf` could not be read at all. SLURM
+partitions carry no marker; nothing about them is inferred.
+
+`--json` spells the same distinction as `capacity.groups[].authority`
+(`partition`, `queue_default` or `node_property`) with `capacity.groups[].queues[]`
+naming the routing queues, and the probe's own `queues[].default_neednodes`
+carries each queue's raw attribute so an attribution can be audited against
+the scheduler's own words. A PBS node is listed in every lane it has a property
+for — `capacity.nodes[].lanes[]` — because PBS lists a node's properties in no
+meaningful order and singling one out invents a membership the scheduler never
+stated.
+
+Declare the figure you want enforced as `scheduler_max_cpus` on the scheduler
+host. `vq submit` then **warns** when a request is wider than the lane can ever
+run, naming both numbers, and submits anyway. It warns rather than refusing
+because the declared width goes stale the moment a node returns to service, and
+refusing on a stale number would reject work the cluster can now run. Leaving
+it unset warns about nothing: unknown is not unlimited.
+
+Sizing a wave against these figures is what prevents the failure this was
+built for — a full-node request whose only node of that width was offline,
+queued for six days while the local ledger recorded it as running. `vq programs HOST` and `vq admin status HOST` render
 daemonless scheduler hosts as scheduler targets rather than SSHing to them for a
 remote `vq` daemon. `vq daemon ping HOST` and `vq daemon health HOST` do the
 same lower in the stack: the scheduler host is represented as a wrapper around
@@ -409,7 +927,16 @@ driver. Scheduler-backed jobs do not consume that local cap, CPU budget, or
 memory budget because they run on the cluster. Use `--max-scheduler-jobs` only
 when you want a separate limit on the number of scheduler jobs the driver keeps
 submitted, queued, or running at once. If unset, scheduler submissions are
-unlimited from vq's side and are governed by the batch scheduler. A full
+unlimited from vq's side and are governed by the batch scheduler. A job counts
+against that limit until a successful poll reports its allocation finished.
+From then on, while vq probes its exit marker and collects its artifacts
+(`finishing`, `marker_probe_failed`, `fetch_failed`, `artifacts_unavailable`),
+it holds no slot, so a slow or failing transfer does not block the next
+submission. It stays tracked until collection completes, and a later poll that
+finds the job live again takes the slot back. A failed poll records its error
+without erasing the last collection phase, so a daemon restart keeps the slot
+released. `vq status` reports the same count when it says scheduler admission
+is blocked. A full
 `vq drain HOST` still blocks all new dispatch owned by the driver; partial
 `vq drain --max-jobs N` is a local-process cap and is not a runtime scheduler
 submission throttle.
@@ -422,6 +949,12 @@ submission throttle.
   compatibility key, plus `scheduler_state` and `scheduler_status_label`.
 * `fetch_state` says whether the scheduler workspace is still live remotely,
   waiting for the exit-marker and copy-back fence, or already staged locally.
+
+Result collection retries a dropped or stalled SSH connection twice on a fresh,
+unmultiplexed connection, as the staging upload does. The remote result
+archive's cleanup is best effort: if it cannot reach the host, the fetch still
+succeeds and the leftover `<job>.result-<id>.tar` is found by the
+transfer-archive sweep.
 
 `vq overview HOST` treats only an exact last `sched_state=running` as
 confirmed execution. Queued, held, and unpolled jobs remain effective pending
@@ -481,6 +1014,130 @@ workspace, and is reconciled without submitting again. Treat that state as an
 accepted-or-unknown scheduler mutation: inspect its bound receipt and marker;
 do not manually replay the submit command.
 
+The remote wrapper also creates `<workspace>.submit-once.attempt` exclusively
+before invoking the scheduler. It retains the attempt ID, queue job ID, workspace,
+dialect, observation time and a digest of the scheduler argv. A concurrent call,
+an existing receipt, or even an incomplete attempt file refuses replay as
+**outcome unknown**, never as scheduler rejection. Proven-terminal command retry
+rotates this exact file together with the old receipt and markers; ordinary
+terminal workspace retention removes it too. Read retries and failed artifact
+collection do not clear it.
+
+This fence prevents a second scheduler invocation; its presence or absence does
+not prove scheduler acceptance or non-admission, and its argv digest is not a
+runtime attestation. Existing jobs without this file remain unknown when their
+receipts and markers are missing. External accounting import and operator
+non-admission reconciliation still require authoritative evidence tied to the
+original attempt; an empty live queue or a missing file is insufficient.
+
+#### Importing authoritative acceptance after a lost submit response
+
+On the **original driver**, `vq admin reconcile-submit JOBID` reads the exact
+original binding and its `binding_digest`. It does not contact the scheduler or
+change a job. Multi-user drivers require `--owner-uid UID`, checked against the
+daemon-owned submission authority. Changed commands, resources, workspace,
+retry attempt or runtime pins invalidate the binding.
+
+An authenticated operator can import one positive **Torque `qstat -f` record**
+obtained from the scheduler authority (including an authoritative historical
+record in the same format). Save this JSON privately, inserting the original
+binding digest and the unmodified raw record:
+
+```json
+{
+  "schema": "vq.scheduler-recovery-evidence/1",
+  "decision": "accepted",
+  "binding_digest": "<digest returned by the original driver>",
+  "format": "torque-qstat-f",
+  "record": "<complete raw single-job qstat -f record>",
+  "record_sha256": "<SHA-256 of the UTF-8 record string>",
+  "source": "<where, when and from whom the authoritative record was obtained>",
+  "captured_at": "2026-10-14T12:00:00+00:00",
+  "account": "<verified scheduler account>",
+  "server": "<server suffix in the full scheduler job ID>",
+  "scheduler_utc_offset": "+00:00",
+  "attestation": "I verified this record with the authoritative scheduler operator."
+}
+```
+
+The record must contain a full, non-array scheduler ID, matching `Job_Owner`,
+`Job_Name`, exact `Output_Path` and `Error_Path` in the original workspace,
+recognized `job_state`, and `qtime` within the original attempt's evidence
+window. `scheduler_utc_offset` is the server's UTC offset **at admission** for
+its local `qtime`; English ctime and epoch seconds are supported. The account,
+server, historical offset and source authority are the operator's assertions.
+The daemon checks their consistency and retains them; it does not independently
+authenticate the scheduler or attest the remote runtime from a text record.
+Verify those facts before making the explicit attestation.
+
+```sh
+vq admin reconcile-submit JOBID --evidence acceptance.json
+vq admin reconcile-submit JOBID --evidence acceptance.json \
+  --apply --plan-digest <preview-plan-digest> --attest-authoritative
+```
+
+Add `--owner-uid UID` on both commands for a multi-user driver and supply its
+admin token through the supported environment, `--token-file` or `--token-stdin`
+on apply. There is no direct-file fallback if the daemon is unavailable.
+The daemon locks the original spec, revalidates the preview digest, and durably
+records the raw evidence, original runtime binding, operator identity when
+available, authentication mode and application time in its private
+`scheduler-recovery/` journal. Ordinary audit entries contain only the job ID
+and plan digest. Repeating an identical application is idempotent. A conflicting
+application is refused; journals remain separate across proven-terminal retries.
+
+`applied: true` means the journal is durable, not that collection is complete.
+The normal reconciler attaches the positively identified existing allocation;
+it never submits a replacement. Conflicting receipt/start-marker IDs, including
+ones discovered later, retain an unknown reservation for operator resolution.
+The journal survives a crash between recording evidence and attaching the job.
+Keep journals with the driver state backup; they contain private job details.
+
+Negative/non-admission imports are **not supported**: they need complete
+scheduler accounting coverage and authoritative proof that no submit remains
+in flight. A missing job, expired accounting window or retained attempt file
+provides neither. Such jobs remain unknown with capacity and runtime retention
+intact. Other scheduler dialects and array allocations are also refused.
+
+#### Fencing an uncertain attempt so it can never start (#179)
+
+vq cannot prove a lost submission was never admitted, but it can prove an
+attempt never ran. Since #179 the daemon issues a random start token for every
+single-job scheduler attempt before calling qsub/sbatch, and keeps it in its
+private state. The job script's first action, before any marker, trap or
+command, is an exclusive hard-link claim on `_vq/attempt-<token>.claim` in the
+workspace. A job that finds anything other than its own start claim exits
+without running and leaves only an `attempt-<token>.refused-start.*` note.
+A Torque rerun of the same admitted job keeps running as before. A late older
+attempt also stops when the staged `job.pbs` belongs to a newer attempt.
+
+For such an attempt left in `submit_outcome_unknown`, on the original driver:
+
+```sh
+vq admin reconcile-submit JOBID --fence-unstarted
+vq admin reconcile-submit JOBID --fence-unstarted \
+  --apply --plan-digest <preview-plan-digest>
+```
+
+Apply records a private intent under the spec lock (`scheduler-start-fence/`).
+The reconciler then places the claim `fenced <token> <fence-id>` in the
+original workspace:
+- **The fence wins:** the job becomes `FAILED` with scheduler state
+  `submit_fenced_unstarted` and a reason saying it never ran. It is neither a
+  scheduler rejection nor proven non-admission, and it is never retried
+  automatically. Its reservation is released.
+- **The job claimed its own start first:** the fence is moot. The job-start
+  marker resolves the job as accepted.
+- **Foreign claim content:** preserved as `submit_evidence_conflict`.
+- **Unreachable host or unsafe workspace:** the job stays unknown, and the
+  reconciler retries on the next pass.
+
+Nothing is submitted or cancelled, and a repeated apply is idempotent. A
+fence and a positive import exclude each other for the same attempt. Attempts
+submitted before #179 have no token and can only be resolved by positive
+evidence. A later retry of a fenced job is a separately requested attempt with
+a new token.
+
 For client-side response-loss protection on a single logical submission, use
 an application-generated key:
 
@@ -512,6 +1169,44 @@ one. For a non-terminal scheduler row such as `poll_failed`, the single-job
 fetch command attempts a best-effort live snapshot and fails loudly if the
 workspace is unavailable. It does not prove terminal state and does not stamp a
 terminal fetch time. `fetch-all` remains terminal-only.
+
+A fetch is not all-or-nothing. A workspace file the fetching account cannot
+read, and an archive member the tar extraction filter refuses (an absolute
+symlink out of the workspace, for instance), are skipped and listed in the
+fetched tree's `_vq/fetch-exclusions.json` instead of failing the job, and the
+tree's `_vq/fetch-manifest.json` carries `partial: true` with the count. That
+counts as a successful fetch — the alternative loses a whole workspace over one
+file — but `vq fetch` prints a `PARTIAL` line and `vq fetch-all` tags the row
+and counts partials in its summary. Each `vq fetch-all` run also writes
+`<output_dir>/_vq/fetch-all-report.json` naming every selected job, its
+outcome, and each partial tree's exclusions; `--report PATH` moves it and
+`--report none` declines it. Use that report, not the directory count, when
+stating the coverage of a fetched corpus.
+
+Fetch reserves three generated control files: `_vq/terminal-diagnosis.json`,
+`_vq/fetch-exclusions.json`, and `_vq/fetch-manifest.json`. A raw workspace or
+archive containing one of these paths, or a non-directory `_vq`, fails with a
+path-specific metadata-collision error. The source and any previous fetched
+destination are preserved. Ordinary lifecycle files inside `_vq` still fetch.
+Whole-tree remote fetch requires a negotiated provenance response: the receiver
+passes a fresh token through the hidden `--fetch-protocol-token` option, and
+the emitter binds the tar stream to it. Older remotes reject this option and
+must be updated before a new client can fetch their workspace or workdir.
+Missing, malformed or replayed responses fail explicitly without replacing a
+previous destination; there is no silent partial fallback. This request binding
+prevents a raw archived sidecar from being mistaken for generated metadata.
+Artifact-only fetches are unchanged.
+
+A negotiated remote stream may carry one canonical regular file for each emitter-generated
+diagnosis and exclusions sidecar; duplicate, aliased, or non-file controls are
+refused before the staged tree replaces a previous fetch. A previously fetched
+tree used as a new raw workspace therefore needs an explicit operator decision
+about its control files; fetch does not silently overwrite or exclude them.
+
+Only a positively identified same-job destination is reported as an
+already-present skip. Other destination collisions, per-job filesystem errors,
+and malformed archives produce error rows and leave the rest of the bulk sweep
+running. Malformed archives remain failed jobs, not partial successes.
 
 Cleanup handles the duplicate scheduler-side workspace after results have been
 copied back. At the auto-cleanup archive threshold, vq removes the remote
@@ -617,14 +1312,17 @@ snapshot, not to whatever the registry currently expects. This catches a job
 that sat pending while a mutable checkout advanced, including the case where an
 operator also updated the registry pin. The job is marked failed with a
 `runtime pin mismatch before dispatch` reason instead of starting an off-pin
-calculation.
+calculation. Configured SHA pins longer than the 12-character display
+abbreviation are checked against the full commit identity. Every expected digit
+must match, case-insensitively; an extra suffix beyond the commit is a mismatch.
 
 For one-off docs/example artifact jobs, pass `--expected-sha SHA` with
-`--program NAME`. The CLI accepts at least 7 hex characters, validates the
-program checkout before queueing, and records the host-validated canonical
-12-character SHA on the spec. That makes later dispatch failures and fetched
-diagnostics say exactly which checkout the job was meant to use, even when the
-operator typed a shorter prefix.
+`--program NAME`. The CLI accepts 7–40 hex characters and validates the
+program checkout before queueing. It records the host-validated canonical
+12-character SHA for shorter prefixes and preserves longer submitted pins in
+lower case, checking all their digits against the full commit SHA. That makes
+later dispatch failures and fetched diagnostics identify the intended checkout
+without discarding the precision of an explicit pin.
 
 Scientific payloads that write their own producer/result JSON should copy
 `VQ_PROGRAM_GIT_SHA` into that record and treat its absence as fatal when exact
@@ -843,6 +1541,86 @@ runner are contained by the same host-local observation boundary, so another
 host and local dispatch still make progress. The first warning names both the
 vq job ID and scheduler handle.
 
+### A scheduler host that does not answer vq's polls
+
+Some poll failures are not the scheduler's answer at all: ssh never completed a
+connection. In the daemon log they read `Connection timed out during banner
+exchange`, `kex_exchange_identification: Connection closed by remote host`, or a
+connection refused, reset or unroutable — always `exit 255`, and always with the
+same message for every job on that host, because one batched poll carries them
+all. The symptom an operator sees is a host whose jobs all sit in
+`vq queue -s poll_failed` while `ssh HOST qstat` from a shell still works: the
+cluster is fine and only the daemon's own connections are being turned away.
+
+A host under that load often fails a second way as well, and vq now treats the
+two alike: the connection is accepted and then nothing comes back, so vq's own
+120-second poll timeout expires and the attempt's outcome is never learned.
+That is not evidence of a healthy host either, and it is just as
+load-dependent.
+
+vq answers both symptoms by leaving the host alone for a while instead of
+re-contacting it as fast as the failures return. Each deferral is announced:
+
+```
+WARNING vq.daemon: scheduler poll to pbs-cluster did not complete its
+connection (3 attempt(s) in a row without an answer from the host); deferring
+its next observation by 120s. Jobs there keep their last known state and are
+never terminalized by a failed poll.
+```
+
+An attempt whose outcome was lost rather than refused reads `did not come back
+with an outcome vq could read` in the same line, and counts in the same run.
+
+The wait starts at 30 seconds, doubles for each further attempt that does not
+reach the host, and stops growing at 5 minutes; the first poll that reaches the
+host clears it, and a poll that succeeds logs that polling has resumed. What
+ends a run is evidence that the host **answered**, not that the failure changed
+shape: a rejected key (`Permission denied (publickey)`), a missing `qstat` or
+an unparseable table returns the host to the ordinary cadence at once, because
+those are standing faults that waiting cannot fix and should stay visible. A
+scheduler client that reports it could not reach its own server is handled the
+same way as ssh reporting the same thing: in both cases nothing was observed
+and another attempt this instant is worth no more than the one that just
+failed.
+
+The wait belongs to the **host** — not to a job, not to a dispatcher, and not
+to the host's current queue:
+
+* A job submitted in the meantime does not reopen a host that is not
+  answering, and the wait never applies to another host.
+* Editing `config.toml` does not reset it. A reload rebuilds a target's
+  dispatcher while its in-flight jobs keep the generation they were submitted
+  with; the wait, the single in-flight observation and the fetch turn are all
+  keyed on the target's configured name, so one host stays one host.
+* The host's jobs finishing does not reset it either. A campaign that keeps
+  submitting would otherwise hand a silent host a fresh 30-second run every
+  time its queue emptied for a tick. A host with no running job is forgotten
+  only after a full 5-minute ceiling with no attempt made.
+
+What the deferral does **not** do: it never cancels, terminalizes, fetches or
+re-stamps anything. A deferred pass makes no observation and claims none, so a
+job's lifecycle stays `RUNNING` and its `scheduler_state` stays `poll_failed`
+with the diagnostic from the last real attempt. Submission and result fetch are
+not deferred either — only the read-only poll is. The cost of the deferral is
+observation latency on that host, bounded by the 5-minute ceiling, and the job
+detail shown for it is stale for at most that long.
+
+An explicit `vq show <id> --refresh` against a job on a waiting host does not
+break the wait: vq's own connections are part of what the host is turning away,
+so a refresh in a shell loop would be a way around the pacing that is
+protecting it. The refresh is answered straight away and names the cause —
+`scheduler_host_poll_deferred` — instead of reporting that the job was not
+observed, or timing out against a wait vq itself chose. The remaining interval
+is on the deferral warning above.
+
+If a host stays in this state, the question to take to the site is what is
+turning connections away: a login node's sshd `MaxStartups` throttle, a gateway
+saturated by other traffic, or the driver host itself being too loaded to
+complete a handshake within `ConnectTimeout`. `vq doctor HOST --verbose` probes
+the same transport from a quiet context, and comparing its result with the
+daemon's while recording the driver's load average is the measurement that
+distinguishes those.
+
 Use `vq usage HOST` when you need a retained-history accounting summary for a
 host or scheduler target. It reports CPU-hours and wall-hours by tag by default;
 `--by submitter`, `--by host`, and `--by none` switch the grouping, and `--json`
@@ -890,6 +1668,13 @@ calculation was frozen. `vq resume HOST JOBID` and `vq resume HOST --all` releas
 those holds with `qrls` and preserve the usual `paused_by` / held-time
 accounting. To stop an already-running scheduler job, use `vq kill HOST JOBID`
 and resubmit.
+
+A kill is recorded from the driver's last poll, so it can reach a job the
+scheduler has just finished. When the scheduler's accounting then reports
+the job's own end (Slurm `COMPLETED` or `FAILED`, not `CANCELLED`), the
+daemon keeps that outcome and exit code rather than `killed`, and records the
+ignored request as an event (#126). Torque's qstat cannot prove this, so
+there a late kill still reads `killed`.
 
 ---
 
@@ -1086,6 +1871,38 @@ be empty while its writer is live. Vq's own read-only status and update-script
 cleanliness probes disable optional Git index refreshes, while checkout and
 other required mutations retain their normal locks.
 
+**Serving environment in an immutable runtime slot (#73).** When the daemon's
+program has `runtime_slot_root`, `vq self-update` and single-environment
+`vq admin update` prepare the new generation at its final path while the old
+daemon keeps running, then rebind the registry and the user service in one
+recoverable transaction (see `design_immutable_venv_runtimes.md`,
+"Serving-daemon generations"). Two things to know before the first such update:
+
+* **The registry file is rewritten as a whole.** Every `[programs.<alias>]`
+  that shares the daemon's checkout or interpreter gets
+  `runtime_slot_execution = true`, and `config.toml` is re-serialized from its
+  parsed values. The values are preserved exactly (the transaction refuses if
+  they are not), but comments and layout are not: keep a commented copy under
+  version control if you want them.
+* **The bound files must be plain, owner-controlled files.** `config.toml`, the
+  `vq-daemon.service` unit or `com.vq.daemon.plist` agent, and the runtime
+  root's `current`/`previous` pointers must be regular files or symlinks owned
+  by you, in directories that only you can write, reached through no symlinked
+  path component. A symlinked `config.toml` or unit file (a dotfiles checkout,
+  say) or a group-writable config directory is refused before anything is
+  prepared, with an error naming the file and the rule.
+
+After moving the daemon to a slot, its registration can also set
+`runtime_slot_build_input = "current"` (#142). Preparation then clones from the
+active verified generation and keeps its upstream, install profile and exact
+SHA checks. Restart, rollback and interrupted-update recovery use the retained
+generations even when the registered checkout is absent. Upgrade the vq used
+for updating and recovery to a version supporting this serving input before
+setting it; earlier versions refuse it. This setting does not repoint existing
+launchers, `remote_vq` commands, web services or shell entry points, and does
+not authorize deleting the checkout. Review those consumers and the
+`vq admin retire-checkout` plan first.
+
 An older accepted report or SHA is rejected. This first-class managed surface
 only permits an exact descendant (or the already-installed commit), because an
 older checkout can predate the inherited lifecycle transaction protocol.
@@ -1123,16 +1940,41 @@ update exits non-zero with the recovery recipe pointer rather than
 silently leaving the daemon on stale code. Recover user-systemd
 first, then `systemctl --user restart vq-daemon` manually.
 
-**Post-restart readiness window scales with the state dir.** After
+**Post-restart readiness no longer waits for the startup walk.** After
 the restart, the update polls the daemon's RPC until it answers
-with the expected source identity. The window is 60 s base plus 25 ms
-per queued job spec, capped at 600 s -- a restarted daemon scans
-every `queue/*.json` before its RPC socket answers, so a driver
-carrying thousands of jobs legitimately needs minutes, not seconds
-(#53: a 21,683-spec queue exceeded the previous 247 s window under load,
-causing a valid install to roll back). That queue now gets the full 600 s
-allowance; verification returns as soon as readiness and provenance pass.
-The allowance does not guarantee a startup duration. Override it with
+with the expected source identity. From v0.26.10 a daemon publishes that
+socket **before** it reconciles surviving jobs, so readiness and provenance
+are answerable within seconds of process start whatever the queue holds
+(#67: a driver supervising 175 live scheduler jobs over an 18,013-spec queue
+took 9 min 51 s to finish reattaching -- each scheduler job is probed over
+its own SSH round trip -- and a valid install was rolled back although
+nothing was wrong with it). Dispatch still waits for the walk; only
+readiness was decoupled from it.
+
+**The readiness window still scales with the state dir**, because that
+ordering fix is not always the code doing the waiting: `vq admin update`
+never re-execs, so the window in force is whichever version is already in
+memory, and a managed rollback restarts the *previous* install, which does
+scan before it answers. The window is 60 s base, plus 25 ms per queued job
+spec, plus 2.5 s per live scheduler job, capped at 1800 s -- such a daemon
+walks every `queue/*.json` **and** rebuilds one handle per live cluster job,
+each over its own connection to the scheduler host (#53: a 21,683-spec queue
+exceeded the previous 247 s window under load, causing a valid install to
+roll back; #67: 5 min 20 s went on reattachment alone, which the spec-only
+model did not count at all, against a 600 s ceiling no formula could reach).
+The scheduler count uses one directory inventory and at most 5 s of content
+reads, checking the budget between records. If it reads `k` of `N` records and
+finds `L` live scheduler jobs, it allows for `L + (N - k)` jobs while the rest
+remain unread. This is a conservative bound for that inventory, **not** an
+estimated live count: filesystem order need not be representative. A completed
+scan uses its observed live count; a record whose content cannot be read adds
+one unknown job instead of being called inactive. An unavailable directory inventory selects
+the 1800 s cap and logs that no count was established; an absent queue is empty.
+The content budget cannot interrupt a single filesystem call, does not bound the
+metadata inventory, and does not predict jobs added after the snapshot.
+
+Verification returns as soon as readiness and provenance pass. The allowance
+does not guarantee a startup duration. Override it with
 `VQ_DAEMON_HEALTH_TIMEOUT` (finite positive seconds) in the client environment
 if the driver still needs longer. The local rollout driver action and fresh
 driver re-entry inherit this variable. For example:
@@ -1144,6 +1986,39 @@ VQ_DAEMON_HEALTH_TIMEOUT=900 vq admin rollout-latest
 This does not configure remote hosts' readiness windows. A timeout or an
 identity mismatch still fails verification and invokes managed rollback;
 the longer allowance changes neither rollback nor service-stop semantics.
+
+**Liveness evidence controls the bounded extension.**
+When the scaled window expires and the daemon has never answered RPC at all,
+the update asks the service manager whether a daemon process exists (#67).
+If one does, the wait continues to at most **three times that host's own
+window**, never past an absolute 3600 s, re-asking the service manager ten
+times along the way -- a startup that outran its allowance is not an
+unhealthy daemon, and rolling it back costs the driver more downtime than
+waiting. The extension is a multiple of the window rather than a flat number
+of seconds on purpose: a host whose allowance is seconds has nothing to scan,
+so an expiry there is real and is not stretched. If no daemon process exists,
+verification fails immediately with a message saying so, rather than waiting
+out the rest of the window: that is a failed start, and
+`VQ_DAEMON_HEALTH_TIMEOUT` will not help it. Once the daemon has answered
+even once, the window is never extended -- the socket is up, and a missing or
+mismatched source identity is an answer, not a slow start. A service manager
+that is unavailable or returns ambiguous state does **not** prove the daemon
+stopped: it permits the same bounded extension, with a diagnostic preserving
+that uncertainty. Liveness alone never proves startup progress. The ceiling
+bounds scheduled waiting; a query already in progress has its own timeout and
+can finish past the deadline. No further liveness query starts after that deadline.
+
+An actual start, restart, or rollback retains the full identity settling window:
+the outgoing daemon can still answer before the replacement starts. Checks
+that only observe an existing daemon (pre-update identity recovery and terminal
+receipt recovery) stop on the first answering mismatch. These calls have no
+pending restart that could change the identity. Silence may still wait for a
+first answer; strict SHA and tree checks remain required.
+
+Because `vq admin update` runs in the interpreter that was loaded **before**
+the install, a change to these allowances governs the *next* update on a
+host, not the one that ships it. `VQ_DAEMON_HEALTH_TIMEOUT` is the only lever
+that applies to the run in progress.
 
 ### Historical pre-v0.5.42 manual recipe
 
@@ -1256,20 +2131,15 @@ will be picked up by the daemon's reaper on restart.
 ## Host hangs / hard reset
 
 If the box becomes completely unresponsive (SSH refuses, console
-frozen, load average climbing past nproc, swap thrashing), assume
-memory pressure. Most common cause on the fleet has been
-unbounded `ninja` parallelism during a `vibe-qc` rebuild -- see the
-2026-05-16 post-mortem.
+frozen, load average climbing past nproc, swap thrashing), check for
+memory pressure, including excessive build parallelism and exhausted swap.
 
 ### Hard-reset recovery checklist
 
 After the box boots, in order:
 
 ```sh
-# 1. Network — NordVPN sometimes re-engages killswitch + autoconnect
-#    on reboot, blocking inbound SSH on the public route. (compute-d)
-nordvpn set autoconnect off
-nordvpn status
+# 1. Verify network access using the site's private recovery instructions.
 
 # 2. User-systemd healthy? No zombies?
 pgrep -laf 'systemd --user'
@@ -1302,24 +2172,22 @@ Override any of those per-flag at resubmit time
 
 ## Preventing the next hard reset
 
-These all landed on 2026-05-16 as direct responses to the
-post-mortem. If a host on the fleet doesn't have them, it's at
-risk.
+Use these safeguards when configuring build and job execution:
 
-* **vq daemon path** (v0.5.41): admin update injects
-  `CMAKE_BUILD_PARALLEL_LEVEL` capped at 6 + `nice -n 19 ionice -c
-  3` argv prefix. See `admin._safe_build_parallelism` /
-  `admin._build_niceness_prefix`.
-* **Interactive path** (2026-05-16, vibe-qc side):
-  `scripts/update.sh` self-re-execs under `nice -n 19 ionice -c 3`
-  and exports `CMAKE_BUILD_PARALLEL_LEVEL` capped at 8. Same
-  formula as the daemon path but slightly looser cap because the
-  user is watching.
+* **vq daemon path**: admin update runs the script under a `nice -n 19
+  ionice -c 3` argv prefix (`admin._build_niceness_prefix`). Since #133 it no
+  longer injects `CMAKE_BUILD_PARALLEL_LEVEL`. Its MemTotal-based level
+  overrode the product helper's sizing and OOM-killed a host's build whose
+  MemAvailable was far below MemTotal. The product's build helper now sizes
+  parallelism from available memory per build phase. An operator-set
+  `CMAKE_BUILD_PARALLEL_LEVEL` passes through, and `vq admin update HOST`
+  forwards the driver's value to the remote update, since ssh does not carry
+  the operator's shell environment.
+* **Interactive path** (vibe-qc side): `scripts/update.sh` self-re-execs
+  under `nice -n 19 ionice -c 3` and sizes its own build parallelism.
 * **Per-job cgroup MemoryMax** (v0.5.x): each `vq submit`'d job
   runs in its own transient `vq-job-*.scope` with a memory cap.
-  This is the protection layer that's *always* on, and it's why
-  the queue path has never caused an OOM -- only interactive
-  builds and admin-update have.
+  Verify that cgroup limits are enabled for the selected execution path.
 
 If you ever find a build path that ISN'T capped, file it: there
 should be no unbounded `ninja -j` invocation anywhere in the
@@ -1592,6 +2460,13 @@ as a live marker with a recent heartbeat instead of a stale/failed marker:
 
 Fleet views use the same host-side diagnosis. `vq overview` text output shows
 `marker_status`, PID status, summary, and heartbeat when a marker is present;
+An admin-update marker in `vq overview --json` (and in the fleet console's
+`/api/v1/fleet`) carries its managed-update receipt without the file bytes an
+immutable-slot transaction retains for recovery: `managed_transaction.
+slot_transaction` is reduced to `root`, `sha` and `staged`. The full receipt
+stays in the owner-only marker file on the host, where `vq admin
+recover-update` reads it.
+
 `vq overview --json` includes `admin_marker_status`,
 `admin_marker_pid_status`, `admin_marker_summary`, `admin_marker_action`,
 `admin_marker_heartbeat_status`, and
@@ -1721,7 +2596,41 @@ the old-remote fallback and `VQ_ADMIN_NO_DETACH=1` apply unchanged. Only
 `auto-update --dry-run` stays attached: it changes nothing, so there is
 nothing for a dropped session to interrupt.
 
+### Concurrent scheduler runtime builds
+
+A scheduler runtime update releases driver-wide admin ownership while its
+remote build runs. The source checkout fence covers mirror feed, archive
+staging and tag resolution. It ends once the remote command is bound to its
+exact source, before the build wait: report refresh and another target can
+then use that checkout. During preparation, physical aliases still contend.
+Caller-owned outer fences remain held, and the runtime marker continues to
+exclude a competing update of the same target. No local source is read during
+remote verification, staging cleanup or result persistence.
+
+The running driver's checkout and interpreter environment retain shared read
+locks during this window. Other readers can proceed, but a self-update or
+direct lifecycle mutation of those files cannot. Report/self-update operations
+that already hold outer admin ownership, and installations whose driver
+resources cannot be identified, retain the broader serialization.
+
+After the remote build returns, the updater reacquires admin ownership before
+verification and result persistence, and revalidates the state registry's
+identity. It keeps its exact marker lease throughout. A failed build retains
+its recovery marker; a changed registry refuses finalization. Concurrent builds
+do not imply that a newer runtime has been delivered or accepted: those claims
+still require the corresponding verified delivery receipt.
+
 ### Lost SSH response: reconcile before another update
+
+Detached scheduler observation and retained-request reads retry a timeout or
+SSH exit 255 once with multiplex reuse disabled. The retry reads the same run
+and output offset; it does not restart the build or change the shared SSH
+master. Launch, termination and cleanup commands are not automatically replayed.
+
+A legacy detached scheduler build that loses observation retains its run and
+reports an unknown outcome, including when its wall deadline arrives before
+the observation grace expires. A failed or malformed last poll must not trigger
+remote termination or cleanup. Reconcile the retained run before retrying.
 
 A mutating remote admin command is attempted once. SSH exit 255, an observer
 timeout, or a local SSH helper terminated by signal can happen after the remote
@@ -1752,6 +2661,70 @@ A failure that says the local SSH process was not started is different: no
 remote mutation was attempted. A normal remote nonzero exit is also an
 authoritative result and retains its specific error. Read-only auto-update
 dry-runs do not receive mutation guidance.
+
+### A deferred host's leftover hold blocks every plan (#96)
+
+A finished rollout that deferred a scheduler host keeps its owned plan-bound
+hold there. Every later `rollout-latest` refuses with "retains an owned hold
+on HOST". `--supersede-plan-hold` cannot help: it needs health evidence at the
+new pins, and only a rollout of that host produces that. The owning rollout
+can abandon the host instead:
+
+```sh
+vq admin rollout-latest --resume ROLLOUT --abandon-host HOST
+```
+
+This is allowed only while every action of ROLLOUT for HOST is still
+`not-run` with no operation attempt, and the hold carries its exact control
+binding. A supported read-only drain snapshot must show no claim on HOST other
+than ROLLOUT's own lease. A legacy claim or another owner's lease refuses. The
+journal then records the abandonment on the hold and those actions, and the
+hold is released with an exact-owner `drain --release`. Nothing is executed on
+HOST, and the next rollout plans it normally. Re-running the command reports
+`already-abandoned` without contacting the host.
+
+Since #144 a host whose started actions all failed verifiably can be abandoned
+the same way. Each such action must be `failed`, every attempt harvested, and
+its durable operation completed with an executed nonzero exit. A successful,
+running or outcome-unknown action still refuses. This is the recovery when a
+rollout stops after an update failed on a scheduler host and a newer report
+has since been accepted: its plan-bound holds on the host and every alias
+otherwise block every later plan. Abandon each held target, the canonical host
+and each alias, one invocation per target. The failure fence is not consumed
+by the abandonment. The next rollout that plans HOST, unscoped or with
+`--only HOST`, skips its updates once and consumes the fence. The run after
+that updates HOST from live state. Until then, `--dry-run` and
+`--verify-only` refuse on the unconsumed failure.
+
+A hold whose rollout did run actions on HOST is covered by
+`--supersede-plan-hold ROLLOUT HOST` instead. Since #130 it accepts each
+scheduler lane healthy (LAST OK, clean) at either the new report's pin or the
+obsolete rollout's own pin. The second case is the one a new pin creates: only
+a rollout can install it, and the old hold blocks that rollout. Old-pin
+evidence also requires every operation of ROLLOUT on that host to be settled
+(completed, harvested, no unacknowledged failure). The receipt marks those
+lanes `"basis": "historical"`, and a later validation checks them against
+ROLLOUT's own authenticated report.
+
+Since #138 a third case counts: a non-vq lane healthy at a commit that
+descends from the new pin, such as a dev lane deployed from `main`. It counts
+only when the planner itself proved the descent and skipped the lane as
+"newer descendant already deployed; no downgrade". The receipt marks the lane
+`"basis": "descendant"` and records the live SHA beside the pin. A vq lane
+ahead of its pin is release drift and never counts.
+
+A dry-run or `--verify-only` that meets such a hold refuses even when HOST is
+outside `--only`/`--skip`. The check is fleet-global on purpose, so a scoped
+preview cannot hide the hold. The refusal names the supersede command for a
+scheduler hold. Once the receipt is written, the preview no longer refuses.
+
+Since #99 a rollout does this itself when it finishes. Finalization releases
+every owned hold whose host still has only never-started actions, with the
+same proof and the same journal rows. A hold that fails the proof, for example
+because the snapshot shows another owner's lease on the host, is kept, and
+its hold record says why under `auto_release_refused`. `--abandon-host`
+remains the manual path for those holds and for journals written before this
+rule.
 
 ### Interrupted `rollout-latest`: adopt the operation, do not replay the lane
 
@@ -1814,6 +2787,18 @@ transcript. A verified nonzero result fences that host against replay in the
 same controller pass while independent hosts may finish. Only after a fresh
 plan durably records that host-local skip can a later explicit invocation
 authorize a new attempt.
+
+**A local host is not drained for its rollout step (#182).** Each
+`vq admin update` on a host with `scheduler = "local"` holds that host's
+dispatch itself, for exactly an in-place environment update or a serving-daemon
+transaction, and not while it builds an immutable replacement beside the
+current generation. `rollout-latest` therefore adds no outer drain there: the
+host keeps dispatching on its healthy current generation while its own
+replacement builds, and while later hosts update. Earlier versions held a full
+drain (`PAUSED FOR UPDATE`, `mode: full`) over the host's whole serial step. A
+full hold such a version journaled is released at the start of the next
+invocation, before any host runs, unless its host's operation is still live,
+outcome-unknown or a verified failure.
 
 Owned rollout holds follow the operation. A local full drain is confirmed by
 its exact `reason` and `set_at`; a scheduler claim is keyed by its exact owner.
@@ -1929,9 +2914,40 @@ outer admin action must still pass the independent login-host verification
 before LAST OK advances or the marker clears. Remote evidence does not create
 the outer operation's `result.json`, release a hold, or make recorder death
 replayable. If the recorder or outer child dies, global reconciliation still
-blocks on the local outcome-unknown action and does not positively query the
-remote receipt. Inspect the local binding, retained remote evidence, marker,
-logs, exact live identity, and drain; do not replay.
+blocks on the local outcome-unknown action and refuses replay.
+
+**Settling it from the remote receipt (#115).** On the driver, the owner
+reconciles such an operation explicitly:
+
+```sh
+vq admin reconcile-operation OPERATION_ID --dry-run   # evidence only
+vq admin reconcile-operation OPERATION_ID
+vq admin rollout-latest --only HOST                   # harvests it, releases the hold
+```
+
+The operation ID is the one the refusal names. The command never relaunches
+or replays anything. It requires all of the following:
+
+- the local operation is outcome-unknown, for a scheduler-runtime action,
+  and has its create-once detached binding;
+- the build host still holds that exact run, and the request it retained
+  rebuilds byte for byte from the local binding, which a read-only helper
+  action checks;
+- the run's terminal receipt reports success (rc 0, not timed out), and its
+  whole retained output matches the stored digest;
+- no admin update for that runtime is still running, and its marker records
+  no paused jobs or managed transaction;
+- the same independent login-host verification as the update passes for the
+  operation's own SHA and tag, and the retained build command carries that
+  SHA and tag.
+
+Only then does it record LAST OK and clear the dead update's marker. It then
+writes `reconciliation.json` (the binding digest, the remote result and the
+verification) and a terminal success with no child identity, which is
+accepted only alongside that receipt. `--dry-run` runs every check,
+including the verification, and writes nothing. A failed, running or missing
+run, a mismatched binding and a failed verification all leave the operation
+blocked, with the reason.
 
 This source increment excludes scheduler-helper actions, Slurm
 `update_allocation`, and manual commands without the validated outer context;
@@ -2143,6 +3159,62 @@ an isolated error without its state being revealed. Failure to establish a
 valid effective multi-user policy stops the command. Exact admin admission and
 token-reconciliation proofs still scan every row under its lock, including
 terminal rows; a bulk summary is never proof of recovery.
+
+Exact pause admission, pause-intent reconciliation and token-clearance proofs
+share a five-second **lock-wait admission deadline** across their nested scans
+and per-job rechecks. After that deadline, an uncontended lock can still be
+acquired immediately; a contended row is explicitly unresolved and adds no
+further wait. This bounds lock contention, **not the total scan or cleanup
+wall time**: reading and authorizing retained history can take longer.
+
+If interruption leaves a lock reachable through the original exception,
+cleanup can return without waiting forever for that same exception to unwind.
+A failed single or batch update retains its pause token and transaction marker,
+records both the cleanup failure and original exception, and unwinds. It never
+clears recovery authority because a row timed out. Inspect the failed update,
+then use `vq admin recover-update` for a managed receipt, or
+`vq admin clear-update-marker` for a pause-only receipt; the retry gets a fresh
+admission deadline and must prove the exact token clear. Other operators' paused
+jobs remain paused. Repeated-daemon reconciliation also uses a bounded sweep;
+unresolved intents remain available to its next pass.
+
+The daemon's own per-tick pause-intent sweep is not a proof, and it is the one
+caller that repeats forever, so it asks for the same saving in a narrower form:
+it reads each row before locking it and skips the ones carrying no pause
+intent. A row with an intent, and a row that cannot be read at all, still take
+the lock and the ownership check. An intent armed between that read and the
+lock is picked up by the next tick. The saving is off by default, so
+`pause_token_scope_with_proof`, which reconciles before it captures, keeps the
+exact locked scan.
+
+From v0.26.10 that sweep does not even read a retained row it has a verdict on
+(#82). The daemon's admission scan records which settled rows carry no durable
+pause intent, keyed on the spec's own `(st_mtime_ns, st_size, st_ino, st_dev)`,
+and the sweep skips exactly those paths whose bytes still match — one `stat`
+each. Everything else is swept as before: a row no pass has read, a settled row
+that already carries an intent, a row rewritten since (arming an intent is a
+rewrite, and every spec write is an atomic rename onto a fresh inode), and a
+row that cannot even be stat'ed. The skip is a negative hint about work to do
+and never authorization to signal a process: a row it declines still goes
+through the locked, authorized path. It is also inseparable from the unlocked
+read above — handing the verdict to a scan that has not asked for that read
+raises rather than skipping a row — so the exact admission and
+token-reconciliation proofs cannot inherit it and keep scanning every row under
+its lock, terminal rows included.
+
+Every bulk verb resolves the **effective authorization policy once for the
+operation** and checks each row against that. The policy is the half of an
+ownership decision that does not depend on the job row: the personal and system
+configs, and in multi-user mode the caller's group and passwd entries. Which
+rows are checked, in what order, and with what verdict is unchanged, and the
+final verdict on a row is still taken under that row's own lock. A policy that
+cannot be established still stops the command, now before the first lock is
+taken rather than on the first row. This is the per-operation boundary the
+single-job verbs already use: a revocation between two operations takes effect
+on the next one, and a revocation *during* one bulk scan no longer takes effect
+part-way through it, which previously depended on where in the queue the scan
+had reached.
+
 Scheduler pause/resume keeps the final mutation spec lock across the exact
 handle check, `qhold`/`qrls`, owner recheck, and spec commit. If an exact
 inverse fails, vq attempts to persist
@@ -2339,23 +3411,24 @@ distinct drift state, not every minute.
 
 ## ABORTED_BY_QUEUE with reason `pid_recycled` or `cgroup_scope_mismatch` (v0.5.50+)
 
-When you `vq status <jobid>` shows `state: aborted_by_queue` and
-the `terminal_reason:` field reads `pid_recycled` or
-`cgroup_scope_mismatch`, that's a new flavor of abort introduced
+When `vq status <jobid>` shows `state: aborted_by_queue` and its
+`failure:` line (`failure_reason` in `--json`, and `reason` inside its
+`terminal_diagnosis`) begins `pid_recycled:` or
+`cgroup_scope_mismatch:`, that's a new flavor of abort introduced
 by the audit § 1 / § 2 hardening sweep. Both are protective --
 they're the queue refusing to trust ambiguous state rather than
 risking a wrong-job kill or a misattributed exit code.
 
-| `terminal_reason` | What happened | What to do |
+| Reason prefix | What happened | What to do |
 |---|---|---|
 | `pid_recycled` | Spec recorded `pid=X` + `pid_start_time=T` at dispatch. On the next reattach attempt, `/proc/X/stat` field 22 had a different start time -- the OS recycled PID X to an unrelated process. The daemon won't claim the new process is our job. | Same as any ABORTED_BY_QUEUE: read stdout.log to see if useful output was produced; `vq resubmit` if needed. |
 | `cgroup_scope_mismatch` | Spec recorded that the job runs in `vq-job-<id>.scope` with a specific MainPID. On reattach `systemctl --user show vq-job-<id>.scope -p MainPID` returned a PID that doesn't match the spec. Same protective stance as pid_recycled, but at the cgroup layer. | Same recovery as above. Check `journalctl --user -u vq-daemon` for the cross-check log line -- sometimes it points at a scope-leak bug worth filing. |
 
-Both reasons land alongside the legacy reasons (`daemon_restart`,
-`pgid_missing`, …) in the terminal-states cheat sheet in
-[`handover.md`](handover.md). Pre-v0.5.50 these cases would have
-been silent -- the daemon would have re-attached to whatever PID
-was at `spec.pid` (which is wrong if it got recycled) and either
+The reason is free text on the same `failure:` line, as it is for the older
+aborts: a pgid that is gone after a daemon restart, no pgid recorded, or an
+orphan that exited without an exit-code marker. Before v0.5.50 the two cases in
+the table would have been silent -- the daemon would have re-attached to
+whatever PID was at `spec.pid` (which is wrong if it got recycled) and either
 killed the wrong process or misattributed the exit code.
 
 ---
@@ -2489,6 +3562,258 @@ scoped recovery.
 
 ---
 
+## The fleet broker
+
+One host, normally the coordinator, can hold submissions and place them on
+daemon hosts by CPU, memory and queue availability. It places them strictly
+first-in-first-out and does so late: a job waits on the broker until some
+target can run it now. The role is off unless the broker's own config
+enables it:
+
+```toml
+[broker]
+enabled = true
+targets = ["alpha", "beta"]   # daemon hosts, each machine once by its canonical entry
+```
+
+The other settings and their defaults are `interval_seconds = 60`,
+`max_age_seconds = 180`, `retry_interval_seconds = 300`,
+`collect_timeout_seconds = 60` and `policy = "capacity"`. `policy =
+"completion-time"` with an absolute `placement_fleet` orders the hosts that
+may run a job now by the placement planner instead; see
+[opt-in completion-time ordering](design_broker.md). Every target needs a vq with
+`vq broker capacity`, a single-user daemon, and SSH access from the broker as
+the operator. Run `vq broker capacity` on a target to see what the broker
+will see: it prints each closed gate. Admission is open only with positive
+evidence:
+
+- the daemon answers;
+- a running daemon uses the state root this vq resolves;
+- the daemon's own published admission snapshot holds nothing;
+- no local job is waiting.
+
+The daemon's snapshot holds for:
+
+- a drain touching local work;
+- an admin update;
+- host memory pressure;
+- a pending refresh;
+- a running build job;
+- a changed config.
+
+**What the broker's daemon does.** Every `interval_seconds` it runs
+`vq broker pass` as a separate process, which logs to
+`<state root>/broker-pass.log`. The pass asks every target for its evidence,
+then works through these steps in order:
+
+1. It finishes anything a crash interrupted.
+2. It settles the capacity promised to jobs that a target now lists.
+3. It resends a transfer whose outcome is unknown, with the same key and
+   only to the same host.
+4. It places held jobs oldest first. The first job that cannot run now
+   waits at the front, and nothing behind it goes first. A job skips a
+   host that is refused, unreachable or lacks its program, and falls back
+   to the next-ranked one.
+
+Run `vq broker pass` by hand to see one pass; a second pass while one runs
+is refused.
+
+```sh
+vq broker list                     # every broker job: state, target, target job
+vq broker show b-0123456789ab      # attempts, blockers, diagnostics
+vq broker cancel b-0123456789ab    # held: cancelled at once
+```
+
+When the fleet console runs on the broker, `/fleet/jobs` also lists these
+jobs under "Broker jobs", metadata only. A row shows:
+- the id, state, target, resources, name and times;
+- the **candidates** a placement attempt ranked, best first, with the target
+  it went to in bold (#160);
+- its blockers, or the operator action needed.
+
+Held jobs retain the latest placement refusal reasons across restarts; these
+are observations from the last pass, not a fresh capacity probe. A blocker
+shows as a reason code only, for example `completion-time` for a refusal by
+the completion-time policy. For the command, the full reasons and
+diagnostics, use `vq broker show`.
+
+**Submitting through the broker (clients).** A client needs SSH to the
+broker only. Add an entry for it with `broker = true`. Keep a separate
+entry if you also submit to that machine's own queue.
+
+```toml
+[hosts.fleet]
+ssh = "coordinator"
+broker = true
+```
+
+```sh
+vq submit fleet -d ./job --cpus 16 --mem-mb 64000 -- python run.py
+vq submit fleet calc.py --python /opt/vibeqc/bin/python --cpus 8 --mem-mb 16000
+vq status fleet b-0123456789ab        # broker record, then the target's own status
+vq logs fleet b-0123456789ab -n 100   # the target job's output, once placed
+vq fetch fleet b-0123456789ab -o out  # the workspace, streamed through the broker
+vq kill fleet b-0123456789ab          # cancel, and kill the target job once placed
+vq wait fleet b-0123456789ab          # block until the target job ends
+vq logs -f fleet b-0123456789ab       # follow it, once placed
+```
+
+A broker job needs `--mem-mb`. A single-file job needs an explicit
+`--python` that is valid on every target, because the broker picks the
+target and the client cannot know its interpreter. `--dir` and `-c` jobs
+need their command after `--`. `--pool` scopes placement to a `[pools]`
+entry on the broker. A broker job cannot carry these options, each of which
+is refused with its name:
+
+- `--array` and `--chain`;
+- dependencies;
+- `--at`, `--refresh` and `--branch`;
+- `--scheduler-target`;
+- the wait and fetch flags;
+- a `.qvf` input.
+
+If the broker's answer to a submission is lost, the relay says so and keeps
+the upload. Check `vq broker list` there before submitting again. A submission
+with `--idempotency-key KEY` avoids that check: the key names the broker job
+ID in advance, and submitting again with the same key and content returns
+that same job, never a second one. Different content under the same key is
+refused. With one
+`broker = true` entry, `vq status b-…` without a host goes to it. A fetched
+tree lands under the target job's ID.
+
+`vq wait fleet b-…` polls the broker. The job counts as pending while it is
+held or its transfer is in doubt. Once placed, it ends with the target job's
+state and exit code. A job cancelled before placement ends as `killed`. A
+timeout names the broker state, the blockers and any operator action.
+`vq logs --follow fleet b-…` waits while the job is not placed yet, saying
+so once, and then streams the target job's output until it ends. A job
+cancelled before placement is an error, since it never ran. `vq kill
+--resubmit fleet b-…` kills the job and then holds a fresh copy (a new `b-…`
+with the same payload and intent) for the broker to place afresh. It
+resubmits only once the old job provably stopped; a transfer in doubt is
+refused with its operator action, since resubmitting could run the work
+twice.
+
+**Recovery.**
+
+- **A job stuck at the front** (`vq broker pass` shows it as `head`): `show`
+  lists each host's blocker. Fix the host, or cancel the job.
+- **A pass that stops with a job's reason** (for example a payload that is
+  gone): cancel that job; the queue then moves on.
+- **An uncertain transfer** (`transferring` with diagnostics) is resent
+  until the target answers. It is never sent to another host.
+- **A job cancelled while its transfer was uncertain** shows `OPERATOR
+  ACTION` in `list` and the kill instruction in `show`. It is never resent,
+  because the first send may have landed.
+- **Settling a transfer in doubt** (a target that keeps refusing, or a
+  cancelled one): `vq broker reconcile b-…` on the broker asks the recorded
+  target to fence the job's key (#64). If the first send landed, the job
+  becomes `placed` on that target job. Otherwise the key is durably refused
+  there, so no late copy can be accepted, and the job holds again for a fresh
+  placement (`--cancel`, or an earlier cancellation, cancels it instead). The
+  target must answer from the recorded state root; otherwise nothing changes.
+- **Two targets with the same state root** are both skipped with `share one
+  state root`. List that machine once.
+
+The trust boundary, including that compromising the broker compromises
+every listed target, is in `SECURITY.md`, "Broker boundary". The design is in
+`docs/design_broker.md`.
+
+---
+
+## Dev lanes that track `main` instead of the release pin
+
+```toml
+# driver config.toml; also raise min_vq_version to the first release
+# that reads this key, so an older vq refuses instead of ignoring it
+
+[fleet_tracking_lanes]
+"vibeqc-dev" = "main"
+```
+
+```sh
+vq admin rollout-latest                  # release lanes to the pins, dev lanes to main's head
+vq admin rollout-latest --only-tracking  # advance only the tracking lanes
+vq admin rollout-latest --verify-only    # a tracking lane anywhere past its pin is converged
+```
+
+A report pins what was released. Which lanes follow a branch is fleet
+policy, so it lives in the driver config rather than in the report. Only
+`vibeqc-dev` and `vibe-view` can track a branch. `vibeqc-release` and vq
+itself always stay on their pins, and naming either one is a config error.
+`vibe-view` is the fleet's only viewer lane, so tracking it means no host runs
+the released viewer.
+
+**What a rollout does.** It fetches each tracked branch into the checkout its
+report pin resolves in (`[pin_source_repos]`), under the same lifecycle fence
+report discovery uses, and resolves the head to a full SHA **once**. The head
+must descend from the report pin, or the rollout stops with `does not contain
+the report's dev pin`; a tracked lane never moves behind what was released.
+Every lane of that program then deploys that exact SHA through the usual
+per-host path: `vq admin update vibeqc-dev HOST --expected-sha <head>`, meaning
+an atomic per-SHA runtime on scheduler hosts and the normal pause and update on
+direct hosts. The plan prints `tracking: vibeqc-dev follows main at <sha>`, and
+`--json` payloads carry a `tracking` list. Each journaled attempt records its
+own target SHA.
+
+A lane already at the head is skipped. A lane on a newer descendant of the
+head is also skipped, because nothing is ever downgraded. A lane on a SHA that
+diverged from the head, or a head that does not descend from the pin, is
+blocked. Release lanes are planned exactly as without tracking.
+
+The rollout id is still derived from the report. A later rollout under the
+same report, after `main` has moved, deploys the new head as a fresh attempt
+for each tracked lane. That is allowed only when the new attempt differs from
+the lane's previous one in nothing but the target: the same argv with the
+old SHA replaced by the new one. The previous attempt must also have
+succeeded. A failed attempt allows it only after its failure has been
+reconciled and a retry authorized, the same condition as for a retry at the
+old target. An unknown or unfinished attempt keeps its refusal, whatever
+`main` did since. A driver self-update re-enters with the heads its parent resolved, so
+the lanes deploy what the plan showed.
+
+**`--only-tracking`** advances only the tracking lanes. Release lanes,
+scheduler helpers, each host's own vq and untracked programs that would
+update are reported as deferred (`out of rollout scope: --only-tracking
+(...)`). Lanes that are skipped or blocked keep that decision, and blocks
+there neither stop the refresh nor keep the host held afterwards. A host
+whose own vq or scheduler helper is not on its report pin gets no tracked
+update either: its tracked lanes are deferred with `own vq is not on its
+report pin; run a full rollout before --only-tracking`, so a lane is never
+deployed by a vq the report does not pin. The driver's own vq lane is still evaluated first, as in every
+rollout, because the pinned vq is the one that stages and verifies everything
+else; when the driver is already on its pin, that is a skip. A tracking
+refresh composes with `--only`/`--skip`, keeps the same serialization,
+markers, holds and drain bracketing, and never marks the rollout complete.
+
+**`--verify-only`** judges a tracking lane against its report pin. Any healthy
+SHA descending from the pin is converged, so a lane that has fallen behind
+`main` but not behind the pin stays green. A lane behind the pin, or on a
+divergent SHA, is degraded. The output adds one line per tracking lane:
+
+```text
+TRACKING host_d           vibeqc-dev       3f2a9c1e7b44  5h old, behind-head main 8e01d5aa2c90
+```
+
+This line gives the lane's SHA, the age of that commit, and whether the lane
+is at, behind or ahead of the head. In `--json` the same data is the
+`tracking` list. If the tracked branch cannot be fetched or no longer
+contains the pin, `--verify-only` warns (`tracking heads unavailable`) and
+still gives its verdict; an actual rollout refuses in that case.
+
+Exact-pin submission is unchanged: `vq submit --program vibeqc-dev
+--expected-sha <sha>` still selects one generation, and the job's
+`program_runtime_pin.resolved_git_sha` still records what ran.
+
+Since #138, `--supersede-plan-hold` also accepts a healthy lane on a later
+commit that descends from the new pin, so a host whose tracked lane runs
+ahead can be superseded. A vq older than `fleet_tracking_lanes` ignores the key with a
+warning and keeps tracked lanes at or after their pin, which is why the
+example raises `min_vq_version`. On direct hosts an in-place dev rebuild still pauses
+dev-branch jobs until those lanes are runtime slots.
+
+---
+
 ## The fleet console drifts silently (v0.25.0+)
 
 ```sh
@@ -2507,6 +3832,145 @@ compares its own version against the local daemon on every page.
 
 Setup, `[web]` configuration, accounts and troubleshooting:
 [`fleet_console.md`](fleet_console.md).
+
+---
+
+## Declared `extras`: where the floor is applied, and where it is not
+
+```sh
+vq admin install <env> <host> --expected-sha <40-hex>   # or --from-report
+```
+
+Clones the program's `upstream` at a pin and runs its own `install_script`.
+A program that declares what its venv is for --
+
+```toml
+[programs.vibeqc-queue]
+extras = ["web"]
+```
+
+-- has that floor applied **here too**, not only on the next managed update.
+vq appends `--extras PROFILE` to the installer, resolved to the smallest
+published profile covering both the declaration and whatever the configured
+command already asked for, so `install_script = "scripts/install.sh --editable
+--extras dev"` plus `extras = ["web"]` builds `all`. A configured profile that
+already covers the declaration is left exactly as written.
+
+It appends that only to vq's **own** `scripts/install.sh` or
+`scripts/update.sh`, proved against the checkout the program points at -- the
+same proof a managed update makes before it names an install target. Any other
+installer is free text that has never heard of `--extras`, so the install is
+**refused**:
+
+```
+env 'vibeqc-queue' declares extras ['web'], which a fresh install applies only
+through vq's own scripts/install.sh or scripts/update.sh. Its install_script is
+'bin/setup.sh', so this provision would build the venv without the runtime the
+program declares -- refusing instead of installing it. Point install_script at
+the checkout's own scripts/install.sh. If update_script is the checkout's own
+scripts/update.sh, you can instead drop the declaration, provision, then restore
+it and apply it with: vq admin update vibeqc-queue (scripts/update.sh refuses a
+venv vq's own scripts did not build, so this route needs install_script to
+build through the checkout's scripts/install.sh)
+```
+
+That is the refusal before the clone. It cannot yet read a configured
+`update_script` to prove it, so it names the second route conditionally; a
+program with no `update_script` is told instead that it has only the first.
+Two conditions are part of the second route. The declaration has to be
+restored: an ordinary update applies the floor the program declares, so an
+update of a program that declares nothing appends no `--extras`. And
+`scripts/update.sh` has to accept the venv, and it refuses one that none of
+vq's own scripts built -- an unmarked virtualenv -- so the route is real for an
+installer that wraps vq's `scripts/install.sh`, not for one that builds the venv
+itself.
+
+A refusal that comes only **after** the clone -- the installer names one of
+vq's scripts but the checkout does not prove it, or an `--install-script-arg
+--extras` asks for less than the declaration -- comes before anything is
+built. It leaves the checkout in place, and a provision refuses an occupied
+`git_dir`, so the refusal ends by naming the machine the provision ran on and
+saying to empty `git_dir` there before any way out it names. "Empty" because
+`git_dir` may be a mount point created for the provision, which it accepts as
+long as it is empty. It clears its own admin-update marker rather than leaving
+it failed, and says so. Earlier releases left that marker, and no one command
+to clear it was right on every route: a forwarded install runs on the far side
+as `localhost`, a scheduler cluster's install runs on the cluster while
+`clear-update-marker CLUSTER` goes to its `scheduler_driver`, and
+`clear-update-marker --yes` requires an unambiguous marker in that host scope. A
+checkout that is not a vq tree at all is told that no route applies the
+declaration there.
+
+The refusal, not a notice, is the point: a venv provisioned without the runtime
+it declares is what the key exists to prevent, and it is exactly what a notice
+that nobody reads leaves behind -- a console unit failing on every start with
+"vq web requires the 'web' extra" until some later managed update converges it.
+When the `install_script` does not even name one of vq's scripts, the refusal
+comes **before the clone**, so the fix is a config edit with nothing to clean
+up first.
+
+### A program with no `update_script` has one route, not two
+
+The second way out above -- provision without the declaration, then set the
+profile -- is `vq admin update`, and `vq admin update` runs the program's
+`update_script` and nothing else. A program that configures only
+`install_script` therefore has no route to rebuild the environment it already
+has: the update pulls the checkout, reports success and rebuilds nothing. That
+shape is loadable (`extras` asks for `install_script` **or** `update_script`,
+because a provision really does apply the floor once), so vq words the refusal
+for it differently -- pointing `install_script` at the checkout's own installer
+is the only route it has, and adding `update_script = "scripts/update.sh"` is
+what makes the second one real.
+
+### An ordinary update applies it on the same proof
+
+`vq admin update ENV` applies the declaration too, wherever the configured
+`update_script` resolves to the checkout's own `scripts/install.sh` or
+`scripts/update.sh`. That was the one build vq performs that ignored the key:
+a program declaring `extras = ["web"]` that was not the daemon-serving env
+could be rebuilt without uvicorn by the very verb an operator reaches for to
+fix that, and the asymmetry had no reason an operator could predict from the
+outside.
+
+The profile is resolved over whatever that run was going to install anyway --
+an operator's `--update-script-arg --extras PROFILE`, else the profile
+`.vq-install-metadata` records, else `core` -- and appended last, so it can
+only add capability. It asks for no `--recreate-venv`: the reinstall goes into
+the environment that is already there, which is what puts the declared runtime
+in it. A request that does not cover the declaration is refused in the same
+words the install uses, and a newly raised floor is not satisfied by
+`--expected-sha` idempotence: a checkout at the target commit says nothing
+about what its venv carries, which is exactly the state a console host can sit
+in for days.
+
+The managed daemon transaction is unchanged -- what it accepts, what it plans
+and what it refuses are all as before.
+
+The same asymmetry decides what an ordinary `vq admin update` says about a
+declaration it is *not* applying. With an `update_script` that is the
+program's own script it names what it found and the config change that would
+give the program a route; without an `update_script` at all it says that this
+update rebuilds nothing and that only the provision ever applied the
+declaration. Neither note offers `vq admin install` as a way out: that
+environment's checkout exists, and a provision refuses to build over one.
+Neither offers the managed transaction either, which requires the same
+canonical script and refuses without it.
+
+`vq web install` and `vq web status` word their runtime remedy on the same
+rule. A console pointed at a managed venv that cannot import uvicorn is told to
+declare `extras` and rebuild; when the program configures no `update_script`,
+it is told to add one first, because `vq admin update PROGRAM` on that program
+would exit 0 and leave the unit failing on every start.
+
+A program that declares no `extras` is installed and updated exactly as it
+always was, which is every vibe-qc and vibe-view program: they are provisioned
+and rebuilt by their own scripts and declare nothing.
+
+An operator's `--install-script-arg --extras PROFILE` sets the base, as the
+per-update request does for an update; the declaration is the floor under it.
+A request that does not cover the declaration is refused rather than silently
+widened -- two instructions contradicting each other, named rather than
+reconciled.
 
 ---
 
@@ -2545,6 +4009,24 @@ walking the list by hand.
 
 ---
 
+## Fetches fail after the state root moved — `vq admin repair-state-paths`
+
+A spec retains the absolute `cwd`, `workdir` and `archive_path` recorded when
+its job ran. Copying state does not repoint those fields, so a preserved
+workspace under a new root can remain unreachable to fetch. This differs from
+an unreadable member inside a workspace: per-entry skipping cannot locate an
+absent workspace root.
+
+Use the [state-path repair guide](state_path_repair.md) for a read-only plan,
+field and residue counts, the current-referent preservation contract and the
+exact-plan apply procedure. The tool requires explicit roots and preserves raw
+originals before any record replacement. An absent old root is reported as
+unproven and blocks application; matching job IDs alone do not establish
+artifact correspondence. A compatibility alias must be separately approved and
+created by the operator. The repair command never changes host configuration.
+
+---
+
 ## Post-mortem reference: 2026-05-16 (two hard resets, compute-d)
 
 * **Incident #1, ~06:00 UTC.** Interactive
@@ -2566,7 +4048,9 @@ walking the list by hand.
   reset #2.
 * **vq v0.5.41** + **scripts/update.sh** changes (this commit)
   closed both paths: tighter formula (15 GB / worker, hard caps 6
-  and 8) + idle CPU/IO priority everywhere a build is invoked.
+  and 8) + idle CPU/IO priority everywhere a build is invoked. (vq's
+  own injected level was removed in #133; the product's build helper
+  now sizes parallelism from available memory.)
 
 Two lessons that aren't already encoded in code:
 
@@ -2576,3 +4060,15 @@ Two lessons that aren't already encoded in code:
 2. `systemctl --user restart` waits politely for SIGTERM ack. On
    a zombie manager that wait never ends. Go straight to
    `systemctl kill --signal=SIGKILL` if the manager is sick.
+
+
+### Selecting a failed runtime update marker
+
+`vq admin clear-update-marker HOST` includes local `runtime-slot:<env>`
+markers as well as ordinary environment markers. If more than one marker
+matches the requested host scope, it refuses to guess. Inspect
+`vq admin status HOST --json`, then pass the exact `marker_id` with
+`vq admin clear-update-marker HOST --marker-id ID --yes`.
+The selector cannot cross into another scheduler host's scope. Live updater
+and durable transaction recovery checks still apply; selecting an ID does not
+bypass them.

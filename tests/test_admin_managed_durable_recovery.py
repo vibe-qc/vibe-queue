@@ -24,6 +24,24 @@ from click.testing import CliRunner
 from vq import admin, cli, config, paths
 from vq.pause_resume import PauseError
 
+# Budget for a wait that only has to tell "it happened" from "it is stuck":
+# a contending thread finishing its attempt, then being joined.
+#
+# A liveness guard: it asserts nothing about speed -- a healthy run clears it
+# in milliseconds -- and it exists so a genuine hang fails the test instead of
+# blocking the suite. At 2 s it was sized like a performance claim, which a
+# host starved of CPU for seconds at a time can miss; that is the shape #5
+# fixed in tests/test_transport.py with this same constant, and the shape #41
+# audits across the suite.
+#
+# No self-exiting process bounds it here: both waits are on a thread that
+# returns as soon as it has been refused the marker lock. The refusal itself
+# is not a race -- the main thread holds the lock across the wait through the
+# `with` block -- so a longer budget cannot make the test vacuous. Ten
+# seconds matches tests/test_transport.py and tests/test_pause_resume.py.
+_LIVENESS_SECONDS = 10.0
+
+
 pytestmark = [
     pytest.mark.no_autopatch_branch_check,
     pytest.mark.no_autopatch_lifecycle_lock,
@@ -464,15 +482,29 @@ def test_verified_success_commits_and_removes_real_backup(
 
 
 @pytest.mark.parametrize(
-    ("spec_count", "ready_at", "identity", "override", "succeeds"),
+    ("spec_count", "ready_at", "identity", "override", "daemon_pid", "succeeds"),
     [
-        pytest.param(0, 45.0, "exact", None, True, id="idle-startup"),
-        pytest.param(21_683, 300.0, "exact", None, True, id="loaded-startup"),
-        pytest.param(21_683, 550.0, "exact", None, True, id="loaded-headroom"),
-        pytest.param(21_683, 650.0, "exact", None, False, id="bounded-timeout"),
-        pytest.param(21_683, 650.0, "exact", "900", True, id="operator-override"),
-        pytest.param(21_683, 300.0, "wrong-sha", None, False, id="wrong-sha"),
-        pytest.param(21_683, 300.0, "wrong-tree", None, False, id="wrong-tree"),
+        pytest.param(0, 45.0, "exact", None, 4242, True, id="idle-startup"),
+        pytest.param(21_683, 300.0, "exact", None, 4242, True, id="loaded-startup"),
+        pytest.param(21_683, 550.0, "exact", None, 4242, True, id="loaded-headroom"),
+        pytest.param(
+            21_683, 650.0, "exact", None, 4242, True, id="past-the-allowance",
+        ),
+        pytest.param(
+            21_683, 650.0, "exact", None, None, False, id="no-daemon-process",
+        ),
+        pytest.param(
+            21_683, 4000.0, "exact", None, 4242, False, id="wedged-daemon",
+        ),
+        pytest.param(
+            21_683, 650.0, "exact", "900", 4242, True, id="operator-override",
+        ),
+        pytest.param(
+            21_683, 300.0, "wrong-sha", None, 4242, False, id="wrong-sha",
+        ),
+        pytest.param(
+            21_683, 300.0, "wrong-tree", None, 4242, False, id="wrong-tree",
+        ),
     ],
 )
 def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
@@ -482,6 +514,7 @@ def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
     ready_at: float,
     identity: str,
     override: str | None,
+    daemon_pid: int | None,
     succeeds: bool,
 ) -> None:
     """#53: delayed exact readiness commits; timeout/stale identity restores.
@@ -489,6 +522,14 @@ def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
     Model the directory entry count and elapsed startup time, not a claim
     about this machine's filesystem speed. Service operations are stubbed;
     the provenance poll, receipt transitions and file rollback are real.
+
+    #67 widened what "the window expired" means, and the cases follow:
+    a daemon whose process the service manager can still see is waited for
+    past its allowance (``past-the-allowance``, which rolled back before),
+    one the service manager cannot see fails at the window instead of being
+    waited out (``no-daemon-process``), and one that is there but never
+    answers is still bounded (``wedged-daemon``). A daemon that has answered
+    is never extended, so a stale identity still fails at the window.
     """
     from vq import rpc
 
@@ -503,11 +544,13 @@ def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
     else:
         monkeypatch.setenv("VQ_DAEMON_HEALTH_TIMEOUT", override)
     queue = paths.queue_dir()
-    original_glob = Path.glob
+    queue.mkdir(parents=True, exist_ok=True)
+    original_iterdir = Path.iterdir
     monkeypatch.setattr(
-        Path, "glob",
-        lambda path, pattern, **kwargs: iter(range(spec_count))
-        if path == queue and pattern == "*.json" else original_glob(path, pattern, **kwargs),
+        Path, "iterdir",
+        lambda path: (SimpleNamespace(name=f"spec{i}.json", read_bytes=lambda: b"{}")
+                      for i in range(spec_count))
+        if path == queue else original_iterdir(path),
     )
     elapsed = [0.0]
     # Replace only admin's clock; do not alter subprocess/test harness timing.
@@ -534,6 +577,30 @@ def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
 
     monkeypatch.setattr(admin, "_start_managed_daemon_update", start)
     monkeypatch.setattr(rpc, "ping_user_daemon", ping)
+    # #67: the lane now asks the service manager whether a daemon process
+    # exists once the window expires. Stub it rather than shelling out.
+    monkeypatch.setattr(
+        admin, "_service_daemon_alive_probe", lambda manager: lambda: daemon_pid is not None,
+    )
+
+    # The allowance the shipped constants give this modelled host, and how
+    # far a *running* daemon may be waited for past it.
+    window = (
+        float(override)
+        if override is not None
+        else min(
+            admin.DAEMON_HEALTH_TIMEOUT_SECONDS
+            + spec_count * admin.DAEMON_HEALTH_SECONDS_PER_SPEC,
+            float(admin.DAEMON_HEALTH_TIMEOUT_MAX_SECONDS),
+        )
+    )
+    alive_limit = max(
+        window,
+        min(
+            window * admin.DAEMON_HEALTH_ALIVE_EXTENSION_FACTOR,
+            float(admin.DAEMON_HEALTH_TIMEOUT_ALIVE_MAX_SECONDS),
+        ),
+    )
 
     admin._complete_managed_daemon_update(prog, result, lifecycle)
 
@@ -549,11 +616,23 @@ def test_managed_completion_waits_for_loaded_queue_without_weakening_identity(
         assert _git(Path(prog.git_dir), "rev-parse", "HEAD") == new_sha
     else:
         assert starts == ["new", "old"]
-        assert elapsed[0] == pytest.approx(600.0, abs=0.11)
         assert receipt["phase"] == "old_restored"
         _assert_old_state(prog, old_sha, venv, lifecycle)
-        expected = "did not respond" if ready_at > 600 else "strict identity mismatch"
-        assert expected in result.daemon_restart_message
+        if identity != "exact":
+            # Answered, with the wrong identity: no extension, and the
+            # verdict names the mismatch rather than the window.
+            assert elapsed[0] == pytest.approx(window, abs=0.11)
+            assert "strict identity mismatch" in result.daemon_restart_message
+        elif daemon_pid is None:
+            # The service manager sees no daemon: a failed start, called
+            # that, at the window rather than at the extended limit.
+            assert elapsed[0] == pytest.approx(window, abs=0.11)
+            assert "no running daemon process" in result.daemon_restart_message
+        else:
+            # Alive but wedged: bounded, and past the plain window.
+            assert elapsed[0] == pytest.approx(alive_limit, abs=0.11)
+            assert elapsed[0] > window
+            assert "did not respond" in result.daemon_restart_message
 
 
 def test_target_digest_failure_restores_real_backup_and_attached_checkout(
@@ -2158,8 +2237,8 @@ def test_marker_admission_refuses_another_thread(
     with admin._admin_update_marker_lock():
         thread = admin.threading.Thread(target=contend)
         thread.start()
-        assert release.wait(timeout=2)
-    thread.join(timeout=2)
+        assert release.wait(timeout=_LIVENESS_SECONDS)
+    thread.join(timeout=_LIVENESS_SECONDS)
     assert results == ["refused"]
 
 
@@ -2787,6 +2866,7 @@ def test_update_cli_can_use_integrity_checked_driver_runtime_and_valid_json(
                 "remote_auth_args": expected_auth,
                 "stdin_data": expected_stdin,
                 "as_json": True,
+                "acknowledge_failed_marker": False,
                 "update_script_args": ("--recreate-venv",),
                 "show_output": True,
                 "remote_timeout_env": {
@@ -4657,7 +4737,7 @@ def test_current_driver_adopts_unmarked_historical_install(tmp_path, monkeypatch
     venv = console.parent.parent
     (venv / '.vq-install-metadata').unlink()
     site = next(venv.glob('lib/python*/site-packages'))
-    metadata = site / 'vq-0.11.0.dist-info/direct_url.json'
+    metadata = site / 'vibe_queue-0.11.0.dist-info/direct_url.json'
     metadata.parent.mkdir()
     metadata.write_text(json.dumps({'url': (repo / 'vibe-queue').as_uri(), 'dir_info': {}}))
     if not (venv / 'lib64').exists():
@@ -4703,3 +4783,83 @@ def test_current_driver_adopts_unmarked_historical_install(tmp_path, monkeypatch
     assert _git(repo, 'rev-parse', 'HEAD') == new_sha
     assert (venv / '.vq-install-metadata').is_file()
     assert not (state_root / admin.ADMIN_UPDATE_MARKER_FILENAME).exists()
+
+
+@pytest.mark.parametrize("identity_matches", [False, True])
+def test_terminal_recovery_observes_identity_without_a_restart_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity_matches: bool,
+) -> None:
+    """The real terminal recovery route checks RPC once and retains a mismatch."""
+    from vq import rpc
+
+    prog, old_sha, new_sha, venv, backup = _fixture(tmp_path)
+    lifecycle = _lifecycle(prog, old_sha, venv, backup)
+    lifecycle.receipt_phase = "old_restored"
+    lifecycle.backup_moved = False
+    admin.shutil.rmtree(backup)
+    (venv / "identity.txt").write_text("old\n", encoding="utf-8")
+    marker_path = _arm_receipt(prog, lifecycle)
+    _patch_common_completion(monkeypatch, prog, old_sha, new_sha)
+    marker = admin.read_admin_update_marker()
+    assert marker is not None
+    marker.pid, marker.pid_start_time = 999_999, 0
+    admin._write_admin_update_marker_atomic(marker)
+    admin._set_owned_admin_update_marker_path(None)
+    monkeypatch.setattr(admin, "_pid_liveness", lambda unused: False)
+    monkeypatch.setattr(admin, "_daemon_health_timeout", lambda: 1800.0)
+    elapsed = [0.0]
+    clock = SimpleNamespace(**{
+        name: getattr(time, name) for name in dir(time) if not name.startswith("_")
+    })
+    clock.monotonic = lambda: elapsed[0]
+    clock.sleep = lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds)
+    monkeypatch.setattr(admin, "time", clock)
+    answers = []
+
+    def ping() -> dict[str, str]:
+        answers.append(True)
+        return {"source_sha": old_sha if identity_matches else new_sha,
+                "source_tree_sha256": OLD_TREE}
+
+    monkeypatch.setattr(rpc, "ping_user_daemon", ping)
+    monkeypatch.setattr(admin, "_start_managed_daemon_update",
+                        lambda *_: pytest.fail("terminal recovery must not start a daemon"))
+    recovered = admin.recover_managed_update(
+        config.Config(programs={"vibeqc-queue": prog}), marker_id=marker.marker_id,
+    )
+    assert recovered.recovered is identity_matches
+    assert len(answers) == 1 and elapsed[0] == 0
+    assert (venv / "identity.txt").read_text() == "old\n"
+    if not identity_matches:
+        assert marker_path.exists()
+        receipt = _managed_receipt(marker_path)
+        assert receipt is not None and receipt["phase"] == "old_restored"
+
+
+@pytest.mark.parametrize(
+    ("target", "scheduler_topology", "error"),
+    [
+        ("localhost", False, "bootstrap-self-update requires a non-local direct host"),
+        ("host_f", True, 'bootstrap-self-update requires a direct host with scheduler = "local"'),
+    ],
+)
+def test_bootstrap_refusals_name_the_bootstrap_not_another_flag(
+    monkeypatch: pytest.MonkeyPatch, target: str, scheduler_topology: bool, error: str,
+) -> None:
+    """#123: the shared checks used to say --with-driver-runtime, a flag it lacks."""
+    cfg = _driver_update_runtime_config(scheduler_topology=scheduler_topology)
+    monkeypatch.setattr(config, "load_config", lambda: cfg)
+    result = CliRunner().invoke(cli.main, [
+        "admin", "bootstrap-self-update", target, "--expected-sha", "a" * 40,
+    ])
+    assert result.exit_code == 2, result.output
+    assert error in result.output
+    assert "--with-driver-runtime" not in result.output
+
+
+def test_bootstrap_help_describes_every_option() -> None:
+    """#123: --json and the three token options had no help."""
+    text = CliRunner().invoke(cli.main, ["admin", "bootstrap-self-update", "--help"]).output
+    for needle in ("Emit machine-readable JSON", "Bearer token for the admin gate",
+                   "one line on stdin", "owner-only file", "exact 40-hex vq commit"):
+        assert needle in text
