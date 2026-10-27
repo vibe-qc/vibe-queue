@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -24,6 +27,9 @@ from pathlib import Path
 from time import monotonic
 
 from vq import capacity, config, host_status, overview, transport
+from vq import top as top_mod
+from vq.final_usage import read_final_usage
+from vq.gpu_usage import read_gpu_usage
 from vq.host import is_local_host
 from vq.listing import (
     effective_queue_state,
@@ -37,7 +43,8 @@ from vq.listing import (
     scheduler_running_confirmed,
     scheduler_target_is_safe,
 )
-from vq.spec import JobSpec
+from vq.overview import AdminMarkerSnapshot
+from vq.spec import TERMINAL_STATES, JobSpec, JobState
 from vq.status import terminal_diagnosis_for_spec
 
 log = logging.getLogger(__name__)
@@ -46,6 +53,15 @@ log = logging.getLogger(__name__)
 #: a ~8-host fleet takes a few seconds; 30 s keeps the console fresh
 #: without hammering the fleet.
 DEFAULT_INTERVAL_SECONDS = 30
+
+#: How long the console keeps showing a host's last-known jobs while its
+#: queue cannot be listed (#168). Past this they are dropped, so a host
+#: gone for good stops posing as a source of calculations.
+LAST_KNOWN_MAX_AGE = timedelta(hours=24)
+
+#: How many sweeps of fleet totals the console keeps for its trend plots
+#: (#168): two hours at the default 30 s interval. In memory only.
+TREND_POINTS = 240
 
 #: Cap the SSH fan-out parallelism (same spirit as the CLI's
 #: ``_fanout_max_workers``): enough to overlap the slow hosts, not
@@ -94,6 +110,34 @@ class HostSnapshot:
     #: ``reachable``/``error`` state: an overview can succeed while the
     #: queue listing fails (and vice versa).
     jobs_error: str | None = None
+    #: Resource-sample collection failure on the owning driver, if any
+    #: (#168). The rows are still listed; their measurements read unknown.
+    usage_error: str | None = None
+    #: Scheduler lanes only (#168 readiness). The driver daemon that owns
+    #: this lane's queue, and every admin-update lease on that driver: the
+    #: projected overview keeps only the leases that hold this lane, so a
+    #: background runtime build for it would otherwise be invisible here.
+    driver: str | None = None
+    driver_leases: list[AdminMarkerSnapshot] = field(default_factory=list)
+    #: Scheduler lanes only: the first config key among the lanes that log
+    #: in through the same SSH destination, i.e. the one cluster they share.
+    #: A label, never the destination itself.
+    cluster: str | None = None
+    #: #168: while this host's queue cannot be listed, the rows of its last
+    #: successful listing and when that listing was observed. Kept apart from
+    #: :attr:`jobs`, so no live count or total includes them; see
+    #: :func:`carry_last_known`.
+    last_known: list[dict] = field(default_factory=list)
+    last_known_at: str | None = None
+
+    @property
+    def unlisted(self) -> bool:
+        """No row of this host's queue is in the snapshot: not probed, or
+        the listing failed outright (a listing with some invalid rows still
+        lists the rest)."""
+        return bool(self.overview.admin_down) or (
+            self.jobs_error is not None and not self.jobs
+        )
 
 
 @dataclass
@@ -156,10 +200,54 @@ class FleetSnapshot:
                     "overview": overview.format_overview_json(h.overview),
                     "job_count": len(h.jobs),
                     "jobs_error": h.jobs_error,
+                    "usage_error": h.usage_error,
+                    "last_known_count": len(h.last_known),
+                    "last_known_at": h.last_known_at,
                 }
                 for h in self.hosts
             ],
         }
+
+
+def carry_last_known(
+    previous: FleetSnapshot | None,
+    current: FleetSnapshot,
+    *,
+    max_age: timedelta = LAST_KNOWN_MAX_AGE,
+) -> FleetSnapshot:
+    """Give each unlisted host of ``current`` its last-known rows (#168).
+
+    The rows come from ``previous``: the host's own listing if it had one,
+    otherwise what ``previous`` was already carrying, with the time it was
+    observed then rather than now. A host that lists again carries
+    nothing, and rows older than ``max_age`` are dropped. Kept in this
+    console's memory only; nothing is read from or written to a host.
+    """
+    if previous is None:
+        return current
+    now = _parse_time(current.gathered_at)
+    before = {h.host: h for h in previous.hosts}
+    for host in current.hosts:
+        old = before.get(host.host)
+        if not host.unlisted or old is None:
+            continue
+        if not old.unlisted:
+            rows, observed_at = old.jobs, previous.gathered_at
+        else:
+            rows, observed_at = old.last_known, old.last_known_at
+        observed = _parse_time(observed_at)
+        if not rows or now is None or observed is None or now - observed > max_age:
+            continue
+        host.last_known, host.last_known_at = rows, observed_at
+    return current
+
+
+def _parse_time(value: str | None) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
 
 
 def _job_row(
@@ -186,6 +274,11 @@ def _job_row(
     row["configured_capacity_overages"] = [
         overage.to_payload() for overage in overages
     ]
+    row["resource_usage"] = read_final_usage(Path(spec.cwd)) if spec.is_terminal else None
+    if spec.gpus is not None:
+        # #168: a finished GPU job's measured GPU use, beside its receipt.
+        row["gpu_usage"] = (read_gpu_usage(Path(spec.cwd), spec.gpus, summary_only=True)
+                            if spec.is_terminal else None)
     return row
 
 
@@ -217,6 +310,10 @@ def _normalize_rows(
             )
         else:
             row_queue_host = queue_host_for_scheduler_target(target, queue_host)
+            # Raw remote dictionaries may predate the CPU sentinel fix even
+            # though the validated model already rejected that value (#197).
+            if "scheduler_cpu_used" in row:
+                row["scheduler_cpu_used"] = spec.scheduler_cpu_used
             # Override stale derived values from an older remote driver.
             row["effective_state"] = effective_queue_state(spec)
             row["scheduler_running_confirmed"] = scheduler_running_confirmed(spec)
@@ -317,10 +414,228 @@ def _gather_host_jobs(
     ]
     invalid = sum(spec is None for _, spec in selected)
     error = observation.error or (f"{invalid} invalid queue rows" if invalid else None)
-    return _normalize_rows(
+    rows = _normalize_rows(
         [row for row, _ in selected], host,
         validated_specs=[spec for _, spec in selected],
-    ), error
+    )
+    for row in rows:
+        # The daemon that owns the spec: the host itself, or the scheduler
+        # driver for a cluster target. The console labels it separately
+        # from where the job executes.
+        row["queue_owner"] = owner
+    return rows, error
+
+
+#: Statuses of a row's ``resource_observation`` (#168). Live samples,
+#: scheduler reports and final receipts keep their distinct scopes; an
+#: unavailable observation never stands in for zero usage.
+USAGE_OBSERVED = "observed"
+USAGE_STALE = "stale"
+USAGE_NO_SAMPLE = "no_sample"
+USAGE_SCHEDULER = "scheduler"
+#: A Torque/PBS job whose scheduler reports its memory and CPU time (#168).
+USAGE_SCHEDULER_REPORTED = "scheduler_reported"
+USAGE_FINAL = "final"
+USAGE_FINAL_ABSENT = "final_absent"
+USAGE_FINAL_INVALID = "final_invalid"
+USAGE_FINAL_ERROR = "final_error"
+USAGE_NOT_RUNNING = "not_running"
+USAGE_COLLECTOR_ERROR = "collector_error"
+USAGE_NOT_COLLECTED = "not_collected"
+
+
+@dataclass
+class _UsageObservation:
+    """One driver's latest watchdog samples, read once per sweep."""
+
+    #: ``vq top --json`` rows keyed by job id. Job ids are unique per
+    #: driver, and each driver has its own observation.
+    by_job: dict[str, dict[str, object]] = field(default_factory=dict)
+    collected_at: str | None = None
+    error: str | None = None
+
+
+def _observe_usage(
+    owner: str,
+    cfg: config.Config,
+    queue: _QueueObservation,
+    *,
+    now: datetime,
+) -> _UsageObservation:
+    """Read the latest resource sample of every running direct job, in one go.
+
+    The same rows ``vq top --json`` prints: one local read, or one remote
+    ``vq top localhost --json`` per driver -- never one request per job.
+    Skipped entirely when the driver runs no direct job, so a fleet of
+    scheduler targets or idle hosts pays nothing for it. Scheduler jobs
+    are not sampled: the watchdog runs on the daemon host, not on the
+    compute node.
+    """
+    wanted = {
+        spec.id for spec in queue.specs
+        if spec.state == JobState.RUNNING and spec.scheduler_target is None
+    }
+    if not wanted:
+        return _UsageObservation()
+    collected_at = now.isoformat()
+    try:
+        if is_local_host(owner):
+            rows = [
+                top_mod.top_row_payload(row)
+                for row in top_mod.gather_top_rows(
+                    [spec for spec in queue.specs if spec.id in wanted],
+                    host=owner, now=now,
+                )
+            ]
+        else:
+            proc = transport.run_remote_vq(cfg.host(owner), "top", "localhost", "--json")
+            raw = json.loads(proc.stdout or "[]")
+            if not isinstance(raw, list):
+                raise ValueError("top response must be an array")
+            rows = [row for row in raw if isinstance(row, dict)]
+    except (transport.RemoteError, config.ConfigError, ValueError, OSError) as exc:
+        return _UsageObservation(
+            collected_at=collected_at, error=f"{type(exc).__name__}: {exc}",
+        )
+    by_job = {
+        row["jobid"]: row for row in rows
+        if isinstance(row.get("jobid"), str) and row["jobid"] in wanted
+    }
+    return _UsageObservation(by_job=by_job, collected_at=collected_at)
+
+
+def _sample_time(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.isoformat() if parsed.tzinfo is not None else None
+
+
+def _resource_observation(
+    row: dict[str, object], usage: _UsageObservation,
+) -> dict[str, object]:
+    """What was measured for one row this sweep, or why nothing was.
+
+    ``cpu_percent`` is the job's whole process group (an 8-core job at
+    full use reads ~800); ``rss_mb`` is the resident memory of that
+    group's processes. Both come from the watchdog's latest sample and
+    are never filled in from the job's declared ``cpus`` or ``mem_mb``.
+    """
+    observation: dict[str, object] = {
+        "status": USAGE_NOT_COLLECTED,
+        "source": None,
+        "cpu_percent": None,
+        "rss_mb": None,
+        "rss_peak_mb": None,
+        "rss_peak_since": None,
+        # "job" for the watchdog's whole process group; "largest task" for
+        # Slurm's sstat, which reports only its largest task's peak.
+        "rss_peak_scope": None,
+        "sample_at": None,
+        "collected_at": usage.collected_at,
+    }
+    state = row.get("state")
+    if isinstance(state, str) and state in TERMINAL_STATES:
+        observation.update(_final_reported(row))
+    elif row.get("state") != JobState.RUNNING.value:
+        observation["status"] = USAGE_NOT_RUNNING
+    elif row.get("scheduler_target") is not None:
+        observation.update(_scheduler_reported(row) or {"status": USAGE_SCHEDULER})
+    elif usage.error is not None:
+        observation["status"] = USAGE_COLLECTOR_ERROR
+    elif usage.collected_at is not None:
+        sample = usage.by_job.get(str(row.get("id")))
+        cpu = top_mod.sample_nonnegative_float(
+            sample.get("cpu_percent") if sample else None
+        )
+        rss = top_mod.sample_nonnegative_float(
+            sample.get("rss_mb") if sample else None
+        )
+        if sample is None or (cpu is None and rss is None):
+            observation["status"] = USAGE_NO_SAMPLE
+        else:
+            # A peak without the time its tracking began cannot be read
+            # honestly, so the pair is kept or dropped together.
+            peak_since = _sample_time(sample.get("rss_peak_since"))
+            peak = top_mod.sample_nonnegative_float(sample.get("rss_peak_mb"))
+            observation.update(
+                status=USAGE_STALE if sample.get("sample_stale") is True else USAGE_OBSERVED,
+                source="watchdog",
+                cpu_percent=cpu,
+                rss_mb=rss,
+                rss_peak_mb=peak if peak_since is not None else None,
+                rss_peak_since=peak_since if peak is not None else None,
+                rss_peak_scope="job" if peak is not None and peak_since is not None else None,
+                sample_at=_sample_time(sample.get("sample_at")),
+            )
+    return observation
+
+
+def _final_reported(row: dict[str, object]) -> dict[str, object]:
+    """Normalize the owning driver's final receipt summary without any I/O."""
+    if "resource_usage" not in row:
+        return {"status": USAGE_NOT_COLLECTED}
+    usage = row["resource_usage"]
+    if usage is None:
+        return {"status": USAGE_FINAL_ABSENT}
+    if not isinstance(usage, dict):
+        return {"status": USAGE_FINAL_INVALID}
+    if usage.get("status") != "ok":
+        return {"status": (USAGE_FINAL_ERROR if usage.get("status") == "error"
+                           else USAGE_FINAL_INVALID)}
+    cores = top_mod.sample_nonnegative_float(usage.get("average_cores"))
+    peak = top_mod.sample_nonnegative_float(usage.get("peak_rss_mb"))
+    scope = usage.get("peak_rss_scope")
+    if not isinstance(scope, str) or not scope:
+        peak, scope = None, None
+    return {
+        "status": USAGE_FINAL,
+        "source": usage.get("collector"),
+        "cpu_percent": top_mod.sample_nonnegative_float(cores * 100) if cores is not None else None,
+        # A final peak is not a current RSS reading and not a sampled peak.
+        "rss_peak_mb": peak,
+        "rss_peak_scope": scope,
+        "sample_at": _sample_time(row.get("finished_at")),
+    }
+
+
+def _scheduler_reported(row: dict[str, object]) -> dict[str, object] | None:
+    """What a scheduler says a running job uses, at its last poll (#168).
+
+    Torque/PBS ``resources_used``: memory in use, and CPU time over the
+    walltime so far, which is an average number of busy cores, not a current
+    reading. Slurm's ``sstat``: the same CPU average, and the peak RSS of the
+    largest task, which is a peak since the job started and not the job's
+    memory. None when the scheduler reported none of them (an older vq).
+    """
+    from vq.scheduler_dialect import slurm_cpu_seconds, torque_memory_mb
+    from vq.usage import _hms_to_seconds
+
+    def text(key: str) -> str | None:
+        value = row.get(key)
+        return value if isinstance(value, str) and value else None
+
+    mem = torque_memory_mb(text("scheduler_mem_used"))
+    cpu_text = text("scheduler_cpu_used")
+    cpu = slurm_cpu_seconds(cpu_text) if cpu_text is not None else None
+    wall = _hms_to_seconds(text("scheduler_walltime_used"))
+    task_peak = torque_memory_mb(text("scheduler_task_peak_rss"))
+    peak_since = _sample_time(row.get("started_at")) if task_peak is not None else None
+    if mem is None and cpu is None and peak_since is None:
+        return None
+    return {
+        "status": USAGE_SCHEDULER_REPORTED,
+        "source": "scheduler",
+        "cpu_percent": round(100.0 * cpu / wall, 1) if cpu is not None and wall else None,
+        "rss_mb": mem,
+        "rss_peak_mb": task_peak if peak_since is not None else None,
+        "rss_peak_since": peak_since,
+        "rss_peak_scope": "largest task" if peak_since is not None else None,
+        "sample_at": _sample_time(row.get("last_heartbeat_at")),
+    }
 
 
 def _gather_host_overview(
@@ -381,6 +696,12 @@ def gather_fleet_snapshot(
     scheduler_host_names = {
         name for name, hc in cfg.hosts.items() if hc.scheduler != "local"
     }
+    lanes_by_login: dict[str, list[str]] = {}
+    for name in sorted(scheduler_host_names):
+        lanes_by_login.setdefault(cfg.hosts[name].ssh, []).append(name)
+    cluster_of = {
+        name: lanes[0] for lanes in lanes_by_login.values() for name in lanes
+    }
     down = host_status.load_down()
 
     observed_at = datetime.now(UTC)
@@ -388,12 +709,14 @@ def gather_fleet_snapshot(
         host: resolve_owner_host(cfg, host) for host in host_names if host not in down
     }
 
-    def _observe(owner: str) -> tuple[_QueueObservation, overview.HostOverview]:
+    def _observe(
+        owner: str,
+    ) -> tuple[_QueueObservation, overview.HostOverview, _UsageObservation]:
         if owner in down:
             detail = down[owner].describe()
             return _QueueObservation(error=detail), overview.HostOverview(
                 host=owner, reachable=False, admin_down=detail, error=detail,
-            )
+            ), _UsageObservation()
         queue = _observe_queue(owner, cfg, multi_user=multi_user)
         if is_local_host(owner):
             ov = overview.gather_overview_local(
@@ -404,7 +727,8 @@ def gather_fleet_snapshot(
             ov = _gather_host_overview(
                 owner, cfg, recent_window=recent_window, multi_user=multi_user,
             )
-        return queue, ov
+        usage = _observe_usage(owner, cfg, queue, now=datetime.now(UTC))
+        return queue, ov, usage
 
     unique_owners = list(dict.fromkeys(owner for owner in owners.values() if owner is not None))
     workers = min(_MAX_WORKERS, max(1, len(unique_owners)))
@@ -413,20 +737,22 @@ def gather_fleet_snapshot(
 
     snapshots = []
     for host in host_names:
+        lane = host in scheduler_host_names
         if host in down:
             snapshots.append(HostSnapshot(host=host, overview=overview.HostOverview(
                 host=host, reachable=False, admin_down=down[host].describe(),
-            )))
+            ), cluster=cluster_of.get(host)))
             continue
         owner = owners[host]
         if owner is None:
             snapshots.append(HostSnapshot(host=host, overview=overview.HostOverview(
                 host=host, reachable=False,
                 error="scheduler host has no scheduler_driver configured",
-            ), jobs_error="scheduler host has no scheduler_driver configured"))
+            ), jobs_error="scheduler host has no scheduler_driver configured",
+                cluster=cluster_of.get(host)))
             continue
-        queue, driver_overview = observations[owner]
-        if host in scheduler_host_names:
+        queue, driver_overview, usage = observations[owner]
+        if lane:
             ov = overview.project_scheduler_overview(
                 host, driver_overview, queue.specs,
                 recent_window=recent_window, now=observed_at,
@@ -448,7 +774,20 @@ def gather_fleet_snapshot(
             host, cfg, multi_user=multi_user, scheduler_host_names=scheduler_host_names,
             observation=queue,
         )
-        snapshots.append(HostSnapshot(host=host, overview=ov, jobs=jobs, jobs_error=jobs_error))
+        for row in jobs:
+            row["resource_observation"] = _resource_observation(row, usage)
+        snapshots.append(HostSnapshot(
+            host=host, overview=ov, jobs=jobs, jobs_error=jobs_error,
+            # A scheduler alias shares its driver's observation but has no
+            # direct jobs to sample, so the failure is reported once, on
+            # the driver's own host.
+            usage_error=None if lane else usage.error,
+            driver=owner if lane else None,
+            driver_leases=(
+                list(overview._admin_marker_snapshots(driver_overview)) if lane else []
+            ),
+            cluster=cluster_of.get(host),
+        ))
 
     return FleetSnapshot(
         gathered_at=observed_at.isoformat(),
@@ -524,6 +863,90 @@ def resolve_owner_host(cfg: config.Config, queue_host: str) -> str | None:
     if host_cfg is not None and host_cfg.scheduler != "local":
         return host_cfg.scheduler_driver
     return queue_host
+
+
+PREVIEW_TAIL_LINES = 2000
+"""Stdout lines a preview reads: the same status tail the drill-down shows, deeper."""
+
+
+def fetch_job_preview(
+    cfg: config.Config,
+    queue_host: str,
+    jobid: str,
+    *,
+    multi_user: bool = False,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Calculation preview for one job (#65, V1); ``(payload, error)``.
+
+    Reads only what the drill-down already reads, ``vq status --json`` with a
+    stdout tail, on the owning host, and parses it with :mod:`vq.previews`.
+    It opens no other file and walks no workdir. ``preview`` is ``None`` when
+    no parser knows the job's program.
+    """
+    from vq import previews
+    from vq.status import show_status_json
+
+    owner = resolve_owner_host(cfg, queue_host)
+    if owner is None:
+        return None, f"scheduler host {queue_host!r} has no scheduler_driver configured"
+    try:
+        if is_local_host(owner):
+            status_payload = json.loads(show_status_json(
+                owner, jobid, tail=PREVIEW_TAIL_LINES, multi_user=multi_user,
+            ))
+        else:
+            proc = transport.run_remote_vq(
+                cfg.host(owner), "status", "localhost", jobid, "--json",
+                "-n", str(PREVIEW_TAIL_LINES),
+            )
+            status_payload = json.loads(proc.stdout)
+    except FileNotFoundError as e:
+        return None, str(e)
+    except transport.RemoteError as e:
+        return None, str(e)
+    except (config.ConfigError, json.JSONDecodeError, ValueError, OSError) as e:
+        return None, f"{type(e).__name__}: {e}"
+    program = status_payload.get("program")
+    stdout = status_payload.get("stdout")
+    text = stdout[-previews.MAX_TAIL_BYTES:] if isinstance(stdout, str) else ""
+    source = "stdout"
+    output_name = (
+        previews.orca_output_name(status_payload.get("command"))
+        if previews.parser_for(program if isinstance(program, str) else None) == "orca"
+        else None
+    )
+    if output_name is not None:
+        # Maintainer decision (2026-09-25): an ORCA job run through
+        # run-orca.sh writes to one named output file; read exactly that
+        # file's bounded tail through vq tail, never a directory walk.
+        tail_args = ("tail", queue_host, jobid, "--name", output_name, "--json",
+                     "-n", str(PREVIEW_TAIL_LINES))
+        try:
+            if is_local_host(owner):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "vq.cli", *tail_args],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                    timeout=60, check=False,
+                )
+                tail_text = proc.stdout if proc.returncode == 0 else ""
+            else:
+                tail_text = transport.run_remote_vq(cfg.host(owner), *tail_args).stdout
+            tailed = json.loads(tail_text).get("text") if tail_text else None
+        except (transport.RemoteError, json.JSONDecodeError, OSError,
+                subprocess.SubprocessError, AttributeError):
+            tailed = None
+        if isinstance(tailed, str):
+            text = tailed[-previews.MAX_TAIL_BYTES:]
+            source = output_name
+    return {
+        "source": source,
+        "jobid": jobid,
+        "queue_host": queue_host,
+        "owner_host": owner,
+        "state": status_payload.get("state"),
+        "program": program if isinstance(program, str) else None,
+        "preview": previews.preview(program if isinstance(program, str) else None, text),
+    }, None
 
 
 def fetch_job_detail(
@@ -714,6 +1137,7 @@ class FleetCache:
         self._last_refresh_finished_at: str | None = None
         self._last_refresh_error: str | None = None
         self._last_manual = 0.0
+        self._trend: deque[dict[str, object]] = deque(maxlen=TREND_POINTS)
 
     def snapshot(self) -> FleetSnapshot | None:
         with self._lock:
@@ -723,6 +1147,18 @@ class FleetCache:
         """Inject a snapshot (tests, or a synchronous first fill)."""
         with self._lock:
             self._snapshot = snapshot
+
+    def record_trend(self, snapshot: FleetSnapshot) -> None:
+        """Add one sweep's totals to the bounded trend history (#168)."""
+        from vq.web import calculations  # noqa: PLC0415 -- calculations imports this module
+
+        point = calculations.trend_point(snapshot)
+        with self._lock:
+            self._trend.append(point)
+
+    def trend(self) -> list[dict[str, object]]:
+        with self._lock:
+            return list(self._trend)
 
     def refresh_state(self) -> dict[str, object]:
         with self._lock:
@@ -755,8 +1191,9 @@ class FleetCache:
 
     def _run_refresh(self) -> FleetSnapshot:
         try:
-            snapshot = gather_fleet_snapshot()
+            snapshot = carry_last_known(self.snapshot(), gather_fleet_snapshot())
             self.set_snapshot(snapshot)
+            self.record_trend(snapshot)
             return snapshot
         except Exception as exc:
             with self._lock:

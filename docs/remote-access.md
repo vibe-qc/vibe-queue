@@ -1,12 +1,21 @@
 # Reaching the queue from the internet
 
+**Audience: operators.** Part of [Running a host](operator/index.md).
+
 How to submit jobs to a vq queue host that lives behind a home/lab
 router, from anywhere — securely.
 
-The short version: **SSH on a non-standard port, key-only auth, and vq
-needs no code changes.** vq's entire transport is already SSH (`ssh
-HOST vq <verb>` for everything; `scp` for `vq fetch`). Make SSH
-reachable and hardened, and vq is reachable and hardened — for free.
+There are two implemented routes:
+
+- **SSH access:** this page covers key authentication and router forwarding
+  for direct CLI submission and result transfer.
+- **HTTPS access:** the opt-in [submission gateway](gateway.md) accepts
+  project-scoped API keys through `vq remote`. It supports resumable uploads,
+  status, logs, cancellation and checksummed downloads. Relay mode uses an
+  outbound broker connector when inbound access to the fleet is unavailable.
+
+Choose the route your operator has configured. Neither enables itself on a
+host when vq is installed.
 
 This is not the web dashboard. The dashboard (`vq web`) is read-only
 plus a few kill/pause/resume endpoints; it has no submit path and is
@@ -111,7 +120,7 @@ own. If it fails, fix it now — do not proceed to step 4.
 ### 4. Harden sshd on the queue host
 
 vq ships a ready drop-in at
-[`contrib/sshd_config.d/vq-hardening.conf`](../contrib/sshd_config.d/vq-hardening.conf).
+[`contrib/sshd_config.d/vq-hardening.conf`](https://github.com/vibe-qc/vibe-queue/blob/main/contrib/sshd_config.d/vq-hardening.conf).
 It disables password auth, scopes login to the queue user, and trims
 unused SSH features. On the queue host:
 
@@ -207,7 +216,7 @@ vq doctor pbs-cluster
 ```
 == vq doctor: pbs-cluster ==
 OK config: configured ssh='pbs-cluster' scheduler='pbs'
-OK ssh_route: 'pbs-cluster' -> ProxyJump 'gateway' -> gw.example.org:22 -> user@pbs-cluster.example.org:22
+OK ssh_route: 'pbs-cluster' -> ProxyJump 'gateway' -> gw.example.org:22 -> user@pbs-cluster.example:22
 FAIL ssh_first_hop: jump host 'gateway' gw.example.org:22: connection refused
   verdict: gw.example.org:22 refused the connection, so the jump host is up
     but its sshd is not accepting on that port
@@ -313,6 +322,7 @@ entry in the sshd drop-in. Adding a second authorized submitter is:
    account.
 
 vq's `JobSpec` already records a `submitter` field, so per-job
-attribution works. Per-user *quotas* and ownership checks on
-`kill`/`fetch` are a genuine feature — tracked on the roadmap under
-v0.6 multi-user — but they aren't needed while it's just you.
+attribution works. Per-user quotas and ownership checks are implemented;
+use [multi-user deployment](multi_user_deployment.md) for the current contract.
+For scoped API-key submission without fleet SSH access, use the separate
+[HTTPS gateway](gateway.md), within its documented trusted-group boundary.

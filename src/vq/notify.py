@@ -40,7 +40,7 @@ everywhere we care about.
 **Failure model.** Fire-and-forget on a daemon thread by default
 (:func:`send_terminal_notification` returns immediately so the
 caller — typically the daemon's tick loop — isn't blocked on HTTP).
-A POST that times out, errors, or returns >= 400 is logged at
+A request that cannot be prepared, times out, errors, or returns >= 400 is logged at
 WARNING level and dropped. There is no retry, no buffering, no
 persistence. If you need delivery guarantees, point the webhook at
 something that owns retry policy (a relay / queue / Lambda).
@@ -111,14 +111,14 @@ def _do_post(url: str, payload: dict[str, Any], jobid: str) -> None:
     a thread for fire-and-forget AND tests can call it directly with
     a mocked ``urllib.request.urlopen`` for deterministic assertions.
     """
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=POST_TIMEOUT_SECONDS) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             if status is not None and status >= 400:

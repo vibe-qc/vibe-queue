@@ -1,0 +1,1 @@
+Add opt-in managed local Docker execution with immutable image/container bindings, authenticated worker accounting, durable cancellation and restart recovery. Unknown outcomes retain capacity and refuse resubmission or cleanup. Run shell payloads inside this managed route; arbitrary scripts that launch daemon-owned containers remain unsupported.

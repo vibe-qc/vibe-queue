@@ -32,7 +32,7 @@
   <text x="96" y="410" font-family="Georgia, 'Times New Roman', serif"
         font-size="30" fill="#475569">Submit here. Run there. Fetch the results back.</text>
   <text x="96" y="470" font-family="'SF Mono', Menlo, Consolas, monospace"
-        font-size="26" fill="#0F766E">vq submit compute -- python optimise.py</text>
+        font-size="26" fill="#0F766E">vq submit compute optimise.py</text>
 
   <!-- The queue itself: lit near the viewer, fading out past the right edge,
        because the rail is never shown to end. -->

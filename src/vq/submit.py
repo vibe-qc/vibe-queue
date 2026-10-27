@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -32,20 +33,26 @@ import tarfile
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from typing import Any
 
-from vq import capacity, config, drain, events, paths, spec_access, transport
+from vq import capacity, config, dirfd, drain, events, paths, spec_access, transport
 from vq.config import HostConfig, VenvProgram
 from vq.host import is_local_host
-from vq.scheduler_dialect import enforce_scheduler_wall_time_limit
+from vq.scheduler_dialect import (
+    enforce_scheduler_wall_time_limit,
+    scheduler_width_warning,
+)
 from vq.spec import (
     JOB_NAME_MAX_LEN,
     JOB_NAME_PATTERN,
     JobSpec,
     JobState,
     ProgramRuntimePin,
+    RuntimeBundlePin,
+    utcnow_iso,
     validate_job_id,
 )
 from vq.vibeqc_preflight import vibeqc_dry_run_preflight
@@ -74,6 +81,7 @@ _IMPOSSIBLE_CAPACITY_WARNING_PATTERNS = (
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _IDEMPOTENCY_CLAIM_SCHEMA = "vq.submit-idempotency.v1"
+_IDEMPOTENCY_FENCE_SCHEMA = "vq.submit-idempotency-fence.v1"
 _IDEMPOTENCY_CLAIM_LIMIT = 16 * 1024
 REMOTE_SUBMIT_STDOUT_MAX_BYTES = 1024 * 1024
 REMOTE_SUBMIT_STDERR_MAX_BYTES = 64 * 1024
@@ -89,6 +97,10 @@ def _non_masking_warning(message: str, *args: object) -> None:
 
 class IdempotencyConflict(ValueError):
     """One owner reused a submit key for a different canonical intent."""
+
+
+class IdempotencyFenced(IdempotencyConflict):
+    """The key was fenced on this host, so no submission can ever claim it (#64)."""
 
 
 class _AuthorityReplacedError(ValueError):
@@ -222,6 +234,22 @@ class _NormalizedSubmitRequest:
     refresh_before: str | None
     qvf_force: bool
     idempotency_key: str | None = None
+    allow_helper_mismatch: bool = False
+    #: #168: GPUs for the job, scheduler targets only.
+    gpus: int | None = None
+    #: #161: a portable runtime deployment on the execution host, and
+    #: optionally which of its generations; daemon hosts only.
+    runtime_root: str | None = None
+    runtime_artifact: str | None = None
+    managed_generation: str | None = None
+    managed_native_sha256: str | None = None
+    managed_content_sha256: str | None = None
+    #: #159: a `vq estimate --json` receipt to attach, as recorded.
+    estimate: dict[str, Any] | None = None
+    #: #159: where mem_mb came from, when not declared ("calibrated-estimate").
+    mem_mb_source: str | None = None
+    #: #159: where wall_time_seconds came from, likewise.
+    wall_time_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -263,7 +291,15 @@ def _resolve_requested_submit_target(
         host_opt == "auto"
         or (not host_opt and args and args[0] == "auto")
     )
-    if pool is not None and not auto_selected:
+    candidate = host_opt or (
+        args[0] if args and args[0] in cfg.hosts else cfg.default_host
+    )
+    names_broker = (
+        candidate is not None
+        and candidate in cfg.hosts
+        and cfg.hosts[candidate].broker
+    )
+    if pool is not None and not auto_selected and not names_broker:
         raise ValueError(
             "--pool only applies to `vq submit auto` (it scopes the "
             "memory-aware host pick to a [pools.POOL] group)."
@@ -385,8 +421,9 @@ def _resolve_submit_payload(
         if len(args) > 1:
             raise ValueError(
                 f"single-file submit takes exactly one INPUT file "
-                f"(got {len(args)} positionals); use --dir or --compressed "
-                f"for multi-file"
+                f"(got {len(args)} positionals); to run a command, put it "
+                f"after `--` (`-- {' '.join(args)}`), and add -d DIR or "
+                f"-c ARCHIVE to send the files it needs"
             )
         input_file = args[0]
         command = None
@@ -985,7 +1022,8 @@ def _regular_input_source(input_file: str) -> Path:
     if not stat.S_ISREG(mode):
         raise FileNotFoundError(
             "input file not found or not a regular file: "
-            f"{source.absolute()}"
+            f"{source.absolute()}; to run a command rather than an input "
+            f"file, put it after `--` (`-- {input_file}`)"
         )
     return source.resolve()
 
@@ -1186,8 +1224,10 @@ def _validated_archive_members(
                     f"{member.name!r} has a non-file terminal path "
                     f"component in staged archive payload {source_archive}"
                 )
-            if ".." in filtered.name.split("/"):
-                traversal_members.append(filtered)
+            # Some tarfile versions normalize away parent components. Keep
+            # vq's rejection policy bound to the original archive spelling.
+            if ".." in member.name.split("/"):
+                traversal_members.append(member)
             if not member_parts and not filtered.isdir():
                 raise PayloadValidationError(
                     "payload validation failed: archive member "
@@ -1605,6 +1645,24 @@ def _resolve_submit_plan(
     request: _NormalizedSubmitRequest,
 ) -> _ResolvedSubmitPlan:
     """Resolve runtime identities and execution placement in authority order."""
+    if ((request.managed_native_sha256 or request.managed_content_sha256)
+            and request.managed_generation is None):
+        raise ValueError("managed identity digests require --managed-generation")
+    if request.managed_generation is not None:
+        from vq.runtime_admission import HEX40
+        if (not HEX40.fullmatch(request.managed_generation) or not request.program
+                or not target.scheduler_target or not request.idempotency_key
+                or request.array != 1 or request.chain != 1 or request.retry
+                or request.rerun_until_file_exists or request.refresh_before
+                or request.runtime_root or request.runtime_artifact):
+            raise ValueError("--managed-generation requires a full SHA, scheduler program, "
+                             "idempotency key, one job, retry 0 and no bundle/rerun/refresh")
+    _validate_runtime_bundle_request(
+        request.runtime_root, request.runtime_artifact,
+        scheduler_target=target.scheduler_target,
+    )
+    if request.estimate is not None:
+        _check_estimate_payload(request)
     if target.scheduler_target is not None:
         try:
             scheduler_cfg = cfg.host(target.scheduler_target)
@@ -1645,6 +1703,7 @@ def _resolve_submit_plan(
         managed_scheduler_program
         or request.is_qvf_input
         or request.expected_sha is not None
+        or request.managed_generation is not None
         or managed_python_payload
     )
     # Runtime identity comes only from the executable slot. Payload arguments
@@ -1664,6 +1723,7 @@ def _resolve_submit_plan(
     # A direct local request owns registry validation before any hidden
     # scheduler target is consulted.
     if directly_requested_local:
+        _validate_program_execution_target(cfg, request.program, target.scheduler_target)
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1677,6 +1737,9 @@ def _resolve_submit_plan(
                     request.program,
                     request.expected_sha,
                     command_candidates=command_candidates,
+                    managed_generation=request.managed_generation,
+                    managed_native_sha256=request.managed_native_sha256,
+                    managed_content_sha256=request.managed_content_sha256,
                 )
                 if needs_scheduler_runtime
                 else None
@@ -1718,6 +1781,9 @@ def _resolve_submit_plan(
                     request.program,
                     request.expected_sha,
                     command_candidates=command_candidates,
+                    managed_generation=request.managed_generation,
+                    managed_native_sha256=request.managed_native_sha256,
+                    managed_content_sha256=request.managed_content_sha256,
                 )
             )
         receipt_runtime_pin = scheduler_runtime_pin
@@ -1742,6 +1808,9 @@ def _resolve_submit_plan(
     if is_local_host(execution_target.execution_host) and not directly_requested_local:
         # A local scheduler driver contributes only an observational fallback
         # when the target did not require an authoritative runtime lookup.
+        _validate_program_execution_target(
+            cfg, request.program, execution_target.scheduler_target,
+        )
         _validate_program_for_submit(
             cfg,
             request.program,
@@ -1775,6 +1844,281 @@ def _resolve_submit_plan(
         program_runtime_pin=program_runtime_pin,
         receipt_runtime_pin=receipt_runtime_pin,
     )
+
+
+def _probe_scheduler_helper(
+    cfg: config.Config, scheduler_host: str,
+) -> dict[str, object]:
+    """Run the doctor's ``scheduler_remote_vq`` check for one submit (#127).
+
+    One function so a test can answer the probe without a transport. The
+    budget is the doctor's, ``[fleet] check_timeout_seconds`` when set.
+    """
+    from vq import doctor  # noqa: PLC0415
+
+    host_cfg = cfg.host(scheduler_host)
+    timeout = cfg.fleet.check_timeout_seconds
+    return doctor.scheduler_remote_vq_check(
+        host_cfg,
+        host_label=scheduler_host,
+        check_timeout=(
+            timeout if timeout is not None else doctor.DEFAULT_CHECK_TIMEOUT_SECONDS
+        ),
+    )
+
+
+def _refuse_stale_scheduler_helper(
+    cfg: config.Config,
+    scheduler_host: str,
+    *,
+    allow_mismatch: bool,
+    warning_sink: Callable[[str], None] | None,
+) -> None:
+    """Warn, or in strict mode refuse, for a helper proven to differ (#127).
+
+    The driver polls a scheduler job through the host's remote vq helper. A
+    helper from another source tree left jobs on a host ``unpolled`` with no
+    scheduler job id, silently (#127). The doctor already reports the
+    mismatch; this is the same verdict, asked on the driver before the spec
+    is written.
+
+    By maintainer decision the default only warns: a proven mismatch queues
+    the job with a warning naming both identities and the remedy, so a
+    driver-first rollout never refuses submits while helpers catch up. With
+    ``[fleet] strict_helper_identity = true`` on the driver, a verdict that
+    names both identities refuses, and ``--allow-helper-mismatch`` turns that
+    refusal back into the warning. A helper that did not answer in time or
+    could not be reached leaves the question open and is always a warning: a
+    queue-now, dispatch-later submit to a host that is briefly unreachable
+    must keep working.
+    """
+    from vq import doctor  # noqa: PLC0415
+
+    verdict = _probe_scheduler_helper(cfg, scheduler_host)
+    if verdict.get("ok") is True:
+        return
+    message = str(verdict.get("message") or "(no detail)")
+    if not doctor.helper_identity_mismatch(verdict):
+        if warning_sink is not None:
+            warning_sink(
+                f"scheduler helper on {scheduler_host} not verified, queued "
+                f"anyway: {message}"
+            )
+        return
+    if not cfg.fleet.strict_helper_identity or allow_mismatch:
+        if warning_sink is not None:
+            why = "--allow-helper-mismatch" if allow_mismatch else "warn-only by default"
+            warning_sink(
+                f"queued despite a scheduler helper mismatch on {scheduler_host} "
+                f"({why}): {message}; the driver may not poll this job until "
+                f"`vq admin update {scheduler_host}` brings the helper level"
+            )
+        return
+    raise ValueError(
+        f"scheduler helper on {scheduler_host} does not match this driver: "
+        f"{message}; the driver cannot show it can poll a job it queues there, "
+        f"and such a job sits unpolled. Run `vq admin update {scheduler_host}` "
+        "to bring the helper level with the driver, or pass "
+        "--allow-helper-mismatch to queue it anyway ([fleet] "
+        "strict_helper_identity is set on this driver)"
+    )
+
+
+def _validate_runtime_bundle_request(
+    runtime_root: str | None, runtime_artifact: str | None, *, scheduler_target: str | None,
+) -> None:
+    """Shape checks for ``--runtime-root``/``--runtime-artifact`` before any
+    host is contacted; the execution host resolves and verifies the root.
+
+    A scheduler target's root is on the cluster, which its driver does not
+    read: the generation is named explicitly and verified on the node."""
+    if runtime_root is None:
+        if runtime_artifact is not None:
+            raise ValueError("--runtime-artifact requires --runtime-root")
+        return
+    if not runtime_root.startswith("/"):
+        raise ValueError("--runtime-root must be an absolute path on the execution host")
+    if runtime_artifact is not None and not re.fullmatch(r"[0-9a-f]{64}", runtime_artifact):
+        raise ValueError("--runtime-artifact is a generation's full SHA256 identity")
+    if scheduler_target is not None:
+        if runtime_artifact is None:
+            raise ValueError(
+                "--runtime-root on a scheduler target needs --runtime-artifact ID: the "
+                "driver does not read the cluster's selection, so name the generation"
+            )
+        if (".." in PurePosixPath(runtime_root).parts or len(runtime_root) > 4096
+                or any(ord(char) < 32 for char in runtime_root)):
+            raise ValueError("--runtime-root must be a plain absolute path on the cluster")
+
+
+def split_estimate_document(
+    document: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """An attached estimate as its raw receipt record and its calibration record.
+
+    A raw `vq.resource-estimate/1` receipt has no calibration; a
+    `vq.calibrated-estimate/1` is checked and split. Raises ValueError,
+    prefixed ``--estimate:``, for anything else.
+    """
+    from vq import estimate_calibration as calibrations
+    from vq import resource_estimate as estimates
+
+    try:
+        if document.get("schema_name") == calibrations.CALIBRATED_SCHEMA:
+            receipt, record = calibrations.check_calibrated(document)
+            return estimates.receipt_record(receipt), record
+        return estimates.receipt_record(estimates.load_receipt(json.dumps(document))), None
+    except ValueError as exc:
+        raise ValueError(f"--estimate: {exc}") from None
+
+
+def mem_mb_from_calibrated_estimate(document: dict[str, Any]) -> int:
+    """#159: the memory limit a calibrated estimate gives a job, in MiB.
+
+    Only a ``vq.calibrated-estimate/1`` whose status is calibrated and whose
+    estimate is job-scope gives one; its calibrated peak is rounded up.
+    Raises ValueError, prefixed ``--mem-from-estimate:``, otherwise.
+    """
+    if document.get("schema_name") != "vq.calibrated-estimate/1":
+        raise ValueError("--mem-from-estimate needs a calibrated estimate "
+                         "(`vq estimate --calibration ... --json`) as --estimate")
+    record, calibration = split_estimate_document(document)
+    assert calibration is not None
+    return _calibrated_mem_mb(record, calibration)
+
+
+def _calibrated_mem_mb(record: dict[str, Any], calibration: dict[str, Any]) -> int:
+    if calibration.get("status") != "calibrated":
+        raise ValueError(f"--mem-from-estimate: the estimate is uncalibrated "
+                         f"({calibration.get('reason')})")
+    scope = record.get("memory", {}).get("scope")
+    if scope != "job":
+        raise ValueError(f"--mem-from-estimate: only a job-scope estimate can set a job's "
+                         f"memory limit; this one is {scope}-scope")
+    peak = calibration["calibrated_peak_bytes"]
+    return -(-int(peak) // (1024 * 1024))
+
+
+def _check_mem_mb_source(source: str, mem_mb: int | None, record: dict[str, Any] | None,
+                         calibration: dict[str, Any] | None) -> None:
+    """A recorded memory-limit source must match the estimate it names."""
+    if source != "calibrated-estimate":
+        raise ValueError(f"unknown memory limit source {source!r}")
+    if record is None or calibration is None:
+        raise ValueError("--mem-from-estimate needs a calibrated estimate as --estimate")
+    if mem_mb != _calibrated_mem_mb(record, calibration):
+        raise ValueError("--mem-from-estimate: the memory limit is not the calibrated "
+                         "estimate's peak in MiB")
+
+
+def require_daemon_gpu_admission(gpus: int, *, multi_user: bool) -> None:
+    """#168: refuse ``--gpus`` unless this host's running daemon admits GPU jobs.
+
+    Its admission snapshot must list at least ``gpus`` devices. An older
+    daemon would ignore the request and oversubscribe the devices, so no
+    snapshot, or one without ``gpu_devices``, refuses too.
+    """
+    from vq import rpc
+
+    try:
+        snapshot = rpc.call("get_admission_snapshot", multi_user=multi_user, timeout=5.0)
+    except Exception:  # noqa: BLE001 - an older or absent daemon proves nothing
+        snapshot = None
+    devices = snapshot.get("gpu_devices") if isinstance(snapshot, dict) else None
+    if not isinstance(devices, list) or not devices:
+        raise ValueError(
+            "--gpus needs this host's running daemon to admit GPU jobs: start it "
+            "with --gpu-devices (or [daemon] gpu_devices) on a vq that supports them"
+        )
+    if gpus > len(devices):
+        raise ValueError(f"--gpus {gpus}: this host's daemon has only {len(devices)} "
+                         "GPU device(s)")
+
+
+def wall_time_from_calibrated_estimate(document: dict[str, Any]) -> int:
+    """#159: the wall-time limit a calibrated estimate gives a job, in seconds.
+
+    Only a ``vq.calibrated-estimate/1`` whose runtime is calibrated gives one:
+    its calibrated runtime upper bound, rounded up to whole minutes. Raises
+    ValueError, prefixed ``--time-from-estimate:``, otherwise.
+    """
+    if document.get("schema_name") != "vq.calibrated-estimate/1":
+        raise ValueError("--time-from-estimate needs a calibrated estimate "
+                         "(`vq estimate --calibration ... --json`) as --estimate")
+    _record, calibration = split_estimate_document(document)
+    assert calibration is not None
+    return _calibrated_wall_time(calibration)
+
+
+def runtime_seconds_from_calibrated_estimate(document: dict[str, Any]) -> tuple[float, float]:
+    """#159: the execution interval a broker ranks a job by, in seconds.
+
+    The receipt's runtime lower bound and the calibrated upper bound, from a
+    ``vq.calibrated-estimate/1`` whose runtime is calibrated. Raises
+    ValueError, prefixed ``--estimate:``, otherwise.
+    """
+    if document.get("schema_name") != "vq.calibrated-estimate/1":
+        raise ValueError("--estimate: a broker job ranks by a calibrated estimate "
+                         "(`vq estimate --calibration ... --json`), not a raw receipt")
+    record, calibration = split_estimate_document(document)
+    assert calibration is not None
+    if calibration.get("runtime_status") != "calibrated":
+        reason = calibration.get("runtime_reason") or "this calibrated estimate has no runtime part"
+        raise ValueError(f"--estimate: the runtime is uncalibrated ({reason})")
+    upper = float(calibration["calibrated_runtime_upper_seconds"])
+    return float(record["runtime_seconds"][0]), upper
+
+
+def _calibrated_wall_time(calibration: dict[str, Any]) -> int:
+    if calibration.get("runtime_status") != "calibrated":
+        reason = calibration.get("runtime_reason") or "this calibrated estimate has no runtime part"
+        raise ValueError(f"--time-from-estimate: the runtime is uncalibrated ({reason})")
+    upper = float(calibration["calibrated_runtime_upper_seconds"])
+    return math.ceil(upper / 60) * 60
+
+
+def _check_wall_time_source(source: str, wall_time_seconds: int | None,
+                            calibration: dict[str, Any] | None) -> None:
+    """A recorded wall-time source must match the estimate it names."""
+    if source != "calibrated-estimate":
+        raise ValueError(f"unknown wall-time limit source {source!r}")
+    if calibration is None:
+        raise ValueError("--time-from-estimate needs a calibrated estimate as --estimate")
+    if wall_time_seconds != _calibrated_wall_time(calibration):
+        raise ValueError("--time-from-estimate: the wall-time limit is not the calibrated "
+                         "runtime upper bound in whole minutes")
+
+
+def _check_estimate_payload(request: _NormalizedSubmitRequest) -> None:
+    """Refuse an estimate made for inputs this submission does not carry (#159)."""
+    from vq import resource_estimate as estimates
+
+    assert request.estimate is not None
+    record, _calibration = split_estimate_document(request.estimate)
+    try:
+        receipt = estimates.load_receipt(json.dumps(record))
+        estimates.check_inputs(
+            receipt,
+            input_file=Path(request.input_file) if request.input_file else None,
+            directory=Path(request.directory) if request.directory else None,
+            archive=Path(request.archive) if request.archive else None,
+        )
+    except estimates.EstimateError as exc:
+        raise ValueError(f"--estimate: {exc}") from None
+
+
+def _resolve_runtime_bundle(
+    runtime_root: str, runtime_artifact: str | None,
+) -> RuntimeBundlePin:
+    """Bind a job to a verified generation of a deployment on this host."""
+    from vq import runtime_bundle as rb
+
+    root = Path(runtime_root).resolve()
+    try:
+        artifact_id, _payload = rb.verified_generation(root, runtime_artifact)
+    except rb.BundleError as exc:
+        raise ValueError(f"--runtime-root: {exc}") from None
+    return RuntimeBundlePin(root=str(root), artifact_id=artifact_id)
 
 
 def _execute_submit_plan(
@@ -1816,8 +2160,23 @@ def _execute_submit_plan(
             "multi_user": multi_user,
             "scheduler_target": target.scheduler_target,
         }
+        if request.managed_generation is not None:
+            common["managed_generation"] = request.managed_generation
+            common["managed_native_sha256"] = request.managed_native_sha256
+            common["managed_content_sha256"] = request.managed_content_sha256
         if request.idempotency_key is not None:
             common["idempotency_key"] = request.idempotency_key
+        if request.gpus is not None:
+            common["gpus"] = request.gpus
+        if request.runtime_root is not None:
+            common["runtime_root"] = request.runtime_root
+            common["runtime_artifact"] = request.runtime_artifact
+        if request.estimate is not None:
+            common["resource_estimate"] = request.estimate
+        if request.mem_mb_source is not None:
+            common["mem_mb_source"] = request.mem_mb_source
+        if request.wall_time_source is not None:
+            common["wall_time_source"] = request.wall_time_source
         if warning_sink is not None:
             common["warning_sink"] = warning_sink
         if request.chain > 1:
@@ -1846,6 +2205,23 @@ def _execute_submit_plan(
         # wire. Otherwise an unpinned submit can audit launcher A on the client,
         # then silently re-resolve launcher B when the driver receives it.
         forwarded_expected_sha = plan.receipt_runtime_pin.expected_git_sha
+    # Off the call unless set, so the remote plan is unchanged without it.
+    optional: dict[str, Any] = {}
+    if request.managed_generation is not None:
+        optional["managed_generation"] = request.managed_generation
+        optional["managed_native_sha256"] = request.managed_native_sha256
+        optional["managed_content_sha256"] = request.managed_content_sha256
+    if request.gpus is not None:
+        optional["gpus"] = request.gpus
+    if request.runtime_root is not None:
+        optional["runtime_root"] = request.runtime_root
+        optional["runtime_artifact"] = request.runtime_artifact
+    if request.estimate is not None:
+        optional["resource_estimate"] = request.estimate
+    if request.mem_mb_source is not None:
+        optional["mem_mb_source"] = request.mem_mb_source
+    if request.wall_time_source is not None:
+        optional["wall_time_source"] = request.wall_time_source
     return submit_remote(
         host=target.execution_host,
         host_cfg=host_cfg,
@@ -1883,7 +2259,25 @@ def _execute_submit_plan(
             if request.idempotency_key is not None
             else {}
         ),
+        # Off the wire unless set: an older driver would refuse the option.
+        **({"allow_helper_mismatch": True} if request.allow_helper_mismatch else {}),
+        **optional,
     )
+
+
+def _validate_program_execution_target(
+    cfg: config.Config, program_name: str | None, scheduler_target: str | None,
+) -> None:
+    """A scheduler-only registration must never authorize local execution."""
+    if (
+        program_name is not None
+        and isinstance(cfg.programs.get(program_name), config.SchedulerProgram)
+        and scheduler_target is None
+    ):
+        raise ValueError(
+            f"--program {program_name!r} is scheduler-only; submit to a "
+            "configured scheduler host or register a local installation"
+        )
 
 
 def _validate_program_for_submit(
@@ -1909,12 +2303,20 @@ def _validate_program_for_submit(
     if local_spec:
         prog = cfg.programs[program_name]
         if isinstance(prog, VenvProgram):
+            prog = _execution_program_for_submit(prog)
             mismatches = prog.runtime_pin_mismatches()
             if mismatches:
                 raise ValueError(
                     f"--program {program_name!r} runtime pin mismatch: "
                     + "; ".join(mismatches)
                 )
+
+
+def _execution_program_for_submit(prog: VenvProgram) -> VenvProgram:
+    try:
+        return prog.execution_program()
+    except config.ConfigError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _git_sha_matches(actual: str, expected: str) -> bool:
@@ -1957,6 +2359,8 @@ def _validate_expected_sha_for_submit(
             f"--expected-sha {expected_sha!r} is too short: use at least "
             f"{EXPECTED_SHA_MIN_PREFIX_LEN} hex characters"
         )
+    if len(expected_sha) > 40:
+        raise ValueError("--expected-sha must contain at most 40 hex characters")
     if program_name is None:
         raise ValueError("--expected-sha requires --program NAME")
     if not local_spec:
@@ -1967,7 +2371,10 @@ def _validate_expected_sha_for_submit(
             f"--expected-sha requires --program {program_name!r} to be a "
             "venv program with a git_dir"
         )
-    actual_sha = prog.current_git_sha(full=len(expected_sha) == 40)
+    prog = _execution_program_for_submit(prog)
+    # A display abbreviation cannot validate the remaining digits of a longer
+    # submitted pin. Read the full identity whenever the caller supplies them.
+    actual_sha = prog.current_git_sha(full=len(expected_sha) > 12)
     if actual_sha is None:
         raise ValueError(
             f"--program {program_name!r} expected git SHA {expected_sha}, "
@@ -1978,8 +2385,9 @@ def _validate_expected_sha_for_submit(
             f"--program {program_name!r} expected git SHA {expected_sha}, "
             f"got {actual_sha}"
         )
-    # Do not shorten a full operator-supplied identity after matching it.
-    return expected_sha.lower() if len(expected_sha) == 40 else actual_sha
+    # Preserve every supplied digit; shortening a pin can make retained-runtime
+    # selection ambiguous or admit a different generation after activation.
+    return expected_sha.lower() if len(expected_sha) > 12 else actual_sha
 
 
 _WRAPPER_IDENTITY_RE = re.compile(
@@ -2006,6 +2414,7 @@ def _scheduler_registry_identity(
         proc = transport.run_remote_vq(
             host_cfg,
             "programs",
+            "localhost",
             "--json",
             check=False,
             timeout=transport.DEFAULT_REMOTE_VQ_TIMEOUT_SECONDS,
@@ -2078,7 +2487,7 @@ def _command_wrapper_identity(
     command_candidates: Sequence[str],
     scheduler_host: str,
 ) -> ProgramRuntimePin | None:
-    """Resolve an immutable runtime wrapper named in the submit command."""
+    """Parse requested wrapper identity; target evidence must authenticate it."""
     for token in command_candidates:
         base = Path(token).name
         if not base.startswith(f"{program_name}-"):
@@ -2107,6 +2516,51 @@ def _command_wrapper_identity(
     return None
 
 
+def scheduler_immutable_runtime_paths(
+    pin: ProgramRuntimePin,
+) -> tuple[str | None, str | None, str | None]:
+    """Check the provider's immutable launcher contract, never resolve current.
+
+    Only registry/deployment evidence may authorize these paths. A spelling
+    supplied by a submitter is not an identity attestation. Providers must keep
+    per-SHA launchers and release directories immutable and retained while jobs
+    reference them; arbitrary stable wrappers cannot satisfy this contract.
+    """
+    executable = pin.resolved_executable or ""
+    expected = pin.expected_git_sha or ""
+    path = Path(executable)
+    if path.is_absolute() and ".." not in path.parts:
+        # Managed slot layout. Do not resolve a target path on the driver.
+        source = path.parent.parent.parent
+        if (path.name.startswith("python") and path.parent.name == "bin"
+                and path.parent.parent.name == ".venv" and source.name == "source"
+                and source.parent.parent.name == "releases"
+                and re.fullmatch(r"[0-9a-f]{40}", source.parent.name)
+                and expected and _git_sha_matches(source.parent.name, expected)):
+            return str(source.parent.parent.parent), str(source), executable
+        # The managed MACE provider publishes a generation-local launcher
+        # beside source/ so it can set the provider's required environment.
+        # Accept only authenticated deployment pins, never a command's path
+        # spelling or a mutable registry wrapper. Keep that exact launcher.
+        if (path.name == "mace-python"
+                and pin.program_kind == "scheduler-runtime"
+                and pin.artifact_identity == executable
+                and pin.scheduler_host is not None
+                and path.parent.parent.name == "releases"
+                and re.fullmatch(r"[0-9a-f]{40}", path.parent.name)
+                and expected and _git_sha_matches(path.parent.name, expected)):
+            return str(path.parent.parent.parent), str(path.parent / "source"), executable
+        match = _WRAPPER_IDENTITY_RE.search(path.name)
+        if match is not None and expected and _git_sha_matches(match.group("sha"), expected):
+            return None, None, None
+    raise ValueError(
+        "scheduler runtime pin requires a verified immutable per-SHA launcher; "
+        f"{executable!r} cannot enforce git SHA {expected!r} after scheduler wait. "
+        "Register or verify an immutable launcher with its required environment "
+        "and retain it until referencing jobs finish; a current wrapper is not a pin"
+    )
+
+
 def _validate_scheduler_target_expected_sha(
     cfg: config.Config,
     scheduler_host: str,
@@ -2114,13 +2568,94 @@ def _validate_scheduler_target_expected_sha(
     expected_sha: str | None,
     *,
     command_candidates: Sequence[str] | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+) -> ProgramRuntimePin | None:
+    # A command spelling is intent, not proof. Authenticate against the target
+    # registry or deployment receipt before accepting or normalizing any argv.
+    if managed_generation is not None:
+        from vq.runtime_admission import describe
+        if program_name is None:
+            raise ValueError("--managed-generation requires --program")
+        if expected_sha is not None and expected_sha != managed_generation:
+            raise ValueError("--expected-sha conflicts with --managed-generation")
+        pin = describe(cfg, scheduler_host, program_name, managed_generation,
+                       native_sha256=managed_native_sha256, content_sha256=managed_content_sha256)
+    else:
+        pin = _scheduler_target_identity(cfg, scheduler_host, program_name, expected_sha)
+    if pin is None:
+        return None
+    scheduler_immutable_runtime_paths(pin)
+    for token in command_candidates or ():
+        candidate = _command_wrapper_identity(
+            program_name or "", pin.expected_git_sha or "", [token], scheduler_host,
+        )
+        generation_path = "releases" in Path(token).parts
+        if (candidate is not None or generation_path) and token != pin.resolved_executable:
+            raise ValueError(
+                f"explicit runtime {token!r} is not the verified scheduler launcher "
+                f"{pin.resolved_executable!r}; refusing to replace it or authenticate "
+                "a generation from its path alone"
+            )
+    return pin
+
+
+def _scheduler_deployment_authority(
+    cfg: config.Config,
+    scheduler_host: str,
+    program_name: str,
+) -> str | None:
+    """The host whose ``scheduler_runtime_deployments`` manage this program.
+
+    That is the target itself, or the ``fleet_canonical_host`` of a queue
+    alias: an alias submits to the same cluster under another queue and
+    shares its canonical host's deployments.
+    """
+    try:
+        host_cfg = cfg.host(scheduler_host)
+    except config.ConfigError:
+        return None
+    if program_name in host_cfg.scheduler_runtime_deployments:
+        return scheduler_host
+    canonical = host_cfg.fleet_canonical_host
+    if canonical is None:
+        return None
+    try:
+        canonical_cfg = cfg.host(canonical)
+    except config.ConfigError:
+        return None
+    if program_name in canonical_cfg.scheduler_runtime_deployments:
+        return canonical
+    return None
+
+
+def _is_immutable_runtime_pin(pin: ProgramRuntimePin) -> bool:
+    try:
+        scheduler_immutable_runtime_paths(pin)
+    except ValueError:
+        return False
+    return True
+
+
+def _scheduler_target_identity(
+    cfg: config.Config,
+    scheduler_host: str,
+    program_name: str | None,
+    expected_sha: str | None,
 ) -> ProgramRuntimePin | None:
     """Resolve the scheduler target's authoritative runtime identity.
 
     Scheduler placement later rewrites execution to a driver. Identity must
     remain anchored to what the target job executes, never a same-named
-    driver-local venv. Authority order is an immutable command wrapper, the
-    target registry, then the target's verified deployment record.
+    driver-local venv. Authority order is the target registry, then the
+    target's verified deployment record.
+
+    A registry entry that names a mutable current wrapper cannot carry an
+    exact pin through scheduler wait (#177). When the program is a
+    ``scheduler_runtime_deployments`` lane of the target -- or, for a queue
+    alias, of its ``fleet_canonical_host`` -- the deployment record's
+    per-SHA launcher is the immutable identity instead (#181).
     """
     if program_name is None:
         if expected_sha is None:
@@ -2128,33 +2663,27 @@ def _validate_scheduler_target_expected_sha(
         raise ValueError("--expected-sha requires --program NAME")
     if expected_sha is not None:
         expected_sha = expected_sha.strip()
-    # A wrapper named in argv is the exact executable and outranks a registry
-    # that may intentionally have rolled forward.
-    if command_candidates and expected_sha is not None:
-        command_pin = _command_wrapper_identity(
-            program_name,
-            expected_sha,
-            command_candidates,
-            scheduler_host,
-        )
-        if command_pin is not None:
-            return command_pin
     registry_pin = _scheduler_registry_identity(
         cfg,
         scheduler_host,
         program_name,
         expected_sha,
     )
-    if registry_pin is not None:
+    authority = _scheduler_deployment_authority(cfg, scheduler_host, program_name)
+    if registry_pin is not None and (
+        authority is None or _is_immutable_runtime_pin(registry_pin)
+    ):
         return registry_pin
 
     # Deployment records are the fail-closed fallback when target registry
-    # metadata cannot identify the executable.
+    # metadata cannot identify an immutable executable.
     # Avoid loading the large admin service graph for ordinary submit imports.
     from vq import admin as admin_module
 
     records = admin_module.load_scheduler_runtime_status()
     record = records.get(f"{scheduler_host}:{program_name}")
+    if record is None and authority is not None:
+        record = records.get(f"{authority}:{program_name}")
     if record is None:
         try:
             target_ssh = cfg.host(scheduler_host).ssh
@@ -2170,6 +2699,10 @@ def _validate_scheduler_target_expected_sha(
                         break
                 except config.ConfigError:
                     continue
+    if record is None and registry_pin is not None:
+        # No deployment evidence to replace the mutable registry launcher:
+        # refuse it exactly as before.
+        scheduler_immutable_runtime_paths(registry_pin)
     if record is None:
         raise ValueError(
             f"--expected-sha on scheduler target {scheduler_host!r}: no "
@@ -2216,6 +2749,35 @@ def _validate_scheduler_target_expected_sha(
     )
 
 
+def resolve_defaulted_interpreter(
+    cfg: config.Config,
+    *,
+    program: str | None,
+    expected_sha: str | None,
+    command: Sequence[str] | None,
+    defaulted: str,
+    scheduler_target: str | None,
+) -> list[str]:
+    """The command a forwarded single-file submit should run (#209).
+
+    The client could not see this host's program registry, so it sent its
+    default interpreter and marked it as one. A pinned venv program runs the
+    script itself: a bare ``python`` is bound to the pinned interpreter at
+    dispatch, exactly as for a single-file submit made on this host. Any other
+    program keeps the client's default, and a bare ``python`` default becomes
+    this vq's interpreter, as a local single-file submit would use.
+    """
+    if not command or command[0] != defaulted:
+        raise ValueError("--defaulted-python must name the command's interpreter")
+    if (scheduler_target is None and program is not None
+            and _program_runtime_pin_for_submit(cfg, program, expected_sha=expected_sha)
+            is not None):
+        return ["python", *command[1:]]
+    if defaulted == "python":
+        return [sys.executable, *command[1:]]
+    return list(command)
+
+
 def _program_runtime_pin_for_submit(
     cfg: config.Config,
     program_name: str | None,
@@ -2228,10 +2790,14 @@ def _program_runtime_pin_for_submit(
     prog = cfg.programs.get(program_name)
     if not isinstance(prog, VenvProgram):
         return None
+    prog = _execution_program_for_submit(prog)
     # An explicit or configured SHA is enforced. A discovered SHA without
     # either requirement is observational and must survive runtime rollovers.
     expected_git_sha = expected_sha or prog.expected_git_sha
     enforce_git_sha = bool(expected_git_sha)
+    if expected_git_sha:
+        # Canonical form, as the scheduler pin paths store it (#175).
+        expected_git_sha = expected_git_sha.strip().lower()
     if not expected_git_sha:
         expected_git_sha = prog.current_git_sha(full=True)
     if not expected_git_sha and not prog.expected_import_version:
@@ -2268,10 +2834,9 @@ def _qvf_command(
 ) -> list[str]:
     """Resolve a complete-calculation QVF to its managed vibe-qc command.
 
-    Local jobs use the registered venv interpreter.  Scheduler jobs use the
-    target's configured command wrapper, which names the immutable runtime on
-    the compute host; including it in the stored command also makes scheduler
-    wrapper injection idempotent.
+    Local jobs use the registered venv interpreter. Scheduler jobs use the
+    launcher already verified in the target runtime pin, just as managed
+    Python payloads do. A legacy hook must not add a different launcher.
     """
     if program is None:
         raise ValueError(
@@ -2288,6 +2853,13 @@ def _qvf_command(
             "automatically"
         )
     if scheduler_target is not None:
+        launcher = program_runtime_pin.resolved_executable
+        if program_runtime_pin.scheduler_host != scheduler_target or not launcher:
+            raise ValueError(
+                f"single-QVF submit to scheduler host {scheduler_target!r} "
+                "requires a verified target ProgramRuntimePin.resolved_executable; "
+                "repair or verify the managed runtime before submitting"
+            )
         try:
             target_cfg = config.load_config().host(scheduler_target)
         except config.ConfigError as exc:
@@ -2296,20 +2868,20 @@ def _qvf_command(
                 f"{scheduler_target!r}: {exc}"
             ) from exc
         hooks = target_cfg.scheduler_program_hooks.get(program)
-        if hooks is None or not hooks.command_wrapper:
-            raise ValueError(
-                f"single-QVF submit to scheduler host {scheduler_target!r} "
-                f"requires [hosts.{scheduler_target}."
-                f"scheduler_program_hooks.{program}].command_wrapper; "
-                "vq will not guess a compute-node executable"
-            )
-        command = [
-            *hooks.command_wrapper,
-            "-m",
-            "vibeqc._cli",
-            "run",
-            artifact_name,
-        ]
+        command = [launcher, "-m", "vibeqc._cli", "run", artifact_name]
+        if hooks is not None and hooks.command_wrapper:
+            from vq.scheduler_dispatch import wrapper_already_applied
+
+            if not wrapper_already_applied(hooks.command_wrapper, command):
+                raise ValueError(
+                    f"single-QVF submit to scheduler host {scheduler_target!r} "
+                    f"resolves to managed launcher {launcher!r}, but "
+                    f"[hosts.{scheduler_target}.scheduler_program_hooks."
+                    f"{program}].command_wrapper would also prepend "
+                    f"{hooks.command_wrapper!r}. Refusing an ambiguous double "
+                    "launcher; remove the legacy command_wrapper or make it "
+                    "name the verified managed launcher."
+                )
     else:
         cfg = config.load_config()
         prog = cfg.programs.get(program)
@@ -2319,6 +2891,7 @@ def _qvf_command(
                 f"single-QVF submit requires --program {program!r} to be a "
                 f"managed venv program; known programs: {known}"
             )
+        prog = _execution_program_for_submit(prog)
         command = [prog.python, "-m", "vibeqc._cli", "run", artifact_name]
     if force:
         command.append("--force")
@@ -2428,6 +3001,40 @@ def new_array_group_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _scheduler_width_warnings(
+    *,
+    cpus: int,
+    jobid: str,
+    scheduler_target: str,
+) -> tuple[str, ...]:
+    """Warn when a request is wider than its scheduler lane can ever run.
+
+    vibe-qc#148: five ``ppn=128`` jobs were accepted onto a lane whose only
+    nodes that wide were one busy and one offline, and queued for six days.
+    The scheduler accepts such a request without complaint, and until now so
+    did vq -- this path returned nothing at all for a scheduler target, so
+    the one moment a human was watching passed in silence.
+
+    Advisory and best effort in both directions: an unreadable config costs
+    the warning and never the submission, and an exceeded limit warns rather
+    than refuses, because a declared lane width goes stale as nodes return
+    to service.
+    """
+    try:
+        host_cfg = config.load_config().host(scheduler_target)
+    except Exception:
+        return ()
+    lane = host_cfg.scheduler_lane_metadata()
+    partition = lane.get("partition") if lane is not None else None
+    message = scheduler_width_warning(
+        cpus,
+        host_cfg.scheduler_max_cpus,
+        scheduler_host=scheduler_target,
+        partition=partition if isinstance(partition, str) else None,
+    )
+    return () if message is None else (f"job {jobid}: {message}",)
+
+
 def _impossible_capacity_warnings(
     *,
     cpus: int,
@@ -2436,9 +3043,13 @@ def _impossible_capacity_warnings(
     multi_user: bool,
     scheduler_target: str | None,
 ) -> tuple[str, ...]:
-    """Describe requests that can never fit this local daemon."""
+    """Describe requests this host can never run as asked."""
     if scheduler_target is not None:
-        return ()
+        return _scheduler_width_warnings(
+            cpus=cpus,
+            jobid=jobid,
+            scheduler_target=scheduler_target,
+        )
     try:
         caps = capacity.read_daemon_capacity(multi_user=multi_user)
     except Exception:
@@ -2681,7 +3292,7 @@ def _copy_directory_snapshot(
     destination: Path,
 ) -> None:
     """Recursively copy a stable no-follow view from one directory fd."""
-    names_before = sorted(os.listdir(source_fd), key=os.fsencode)
+    names_before = sorted(dirfd.listdir(source_fd), key=os.fsencode)
     for name in names_before:
         metadata = os.stat(
             name,
@@ -2767,7 +3378,7 @@ def _copy_directory_snapshot(
                 "payload validation failed: directory payload contains an "
                 f"unsupported filesystem object at {name!r}"
             )
-    if sorted(os.listdir(source_fd), key=os.fsencode) != names_before:
+    if sorted(dirfd.listdir(source_fd), key=os.fsencode) != names_before:
         raise PayloadValidationError(
             "payload directory changed while its immutable submission "
             "snapshot was created"
@@ -2776,7 +3387,7 @@ def _copy_directory_snapshot(
 
 def _copy_directory_snapshot_at(source_fd: int, destination_fd: int) -> None:
     """Copy a stable tree between already-open directory authorities."""
-    names_before = sorted(os.listdir(source_fd), key=os.fsencode)
+    names_before = sorted(dirfd.listdir(source_fd), key=os.fsencode)
     for name in names_before:
         metadata = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
@@ -2872,7 +3483,7 @@ def _copy_directory_snapshot_at(source_fd: int, destination_fd: int) -> None:
                 "payload validation failed: directory payload contains an "
                 f"unsupported filesystem object at {name!r}"
             )
-    if sorted(os.listdir(source_fd), key=os.fsencode) != names_before:
+    if sorted(dirfd.listdir(source_fd), key=os.fsencode) != names_before:
         raise PayloadValidationError(
             "payload directory changed while its immutable submission "
             "snapshot was staged"
@@ -3010,7 +3621,7 @@ def _directory_payload_digest_at(directory_fd: int) -> str:
     digest.update(b"vq.payload.directory.v2\0")
 
     def visit(parent_fd: int, prefix: tuple[str, ...]) -> None:
-        for name in sorted(os.listdir(parent_fd), key=os.fsencode):
+        for name in sorted(dirfd.listdir(parent_fd), key=os.fsencode):
             relative = (*prefix, name)
             metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
@@ -3088,11 +3699,18 @@ def _submission_intent_digest(
     runtime_pin = (
         spec.program_runtime_pin.model_dump(
             mode="json",
-            exclude={"resolved_git_sha"},
+            # Dispatch receipts are observations, not submission intent. Omit
+            # even absent additive fields to preserve pre-upgrade claim hashes.
+            exclude={"resolved_git_sha", "resolved_runtime_root",
+                     "resolved_runtime_source", "resolved_runtime_python", "managed_generation"},
         )
         if spec.program_runtime_pin is not None
         else None
     )
+    if runtime_pin is not None and spec.program_runtime_pin.managed_generation is not None:
+        managed = dict(spec.program_runtime_pin.managed_generation)
+        managed.pop("reservation", None)
+        runtime_pin["managed_generation"] = managed
     intent: dict[str, object] = {
         "schema": "vq.submission-intent.v1",
         "scheduler_target": spec.scheduler_target,
@@ -3126,6 +3744,27 @@ def _submission_intent_digest(
             "vibeqc_preflight": vibeqc_preflight,
         },
     }
+    if spec.gpus is not None:
+        # Only when requested, so claims made before the field existed keep
+        # their hashes.
+        resources = intent["resources"]
+        assert isinstance(resources, dict)
+        resources["gpus"] = spec.gpus
+    if spec.runtime_bundle is not None:
+        # Same rule: only when bound, so earlier claims keep their hashes.
+        intent["runtime_bundle"] = spec.runtime_bundle.model_dump(mode="json")
+    if spec.resource_estimate is not None:
+        intent["resource_estimate_sha256"] = hashlib.sha256(json.dumps(
+            spec.resource_estimate, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+    if spec.mem_mb_source is not None:
+        intent["mem_mb_source"] = spec.mem_mb_source
+    if spec.wall_time_source is not None:
+        intent["wall_time_source"] = spec.wall_time_source
+    if spec.resource_estimate_calibration is not None:
+        intent["resource_estimate_calibration_sha256"] = hashlib.sha256(json.dumps(
+            spec.resource_estimate_calibration, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
     encoded = json.dumps(
         intent,
         ensure_ascii=False,
@@ -3401,7 +4040,7 @@ def _remove_tree_at(
         opened = os.fstat(child_fd)
         if not _same_inode(metadata, opened):
             raise ValueError("owned workspace changed during rollback")
-        for child_name in os.listdir(child_fd):
+        for child_name in dirfd.listdir(child_fd):
             _remove_tree_at(child_fd, child_name)
         final_entry = os.stat(
             name,
@@ -3656,6 +4295,19 @@ def _read_idempotency_claim(
         payload = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid durable idempotency claim record") from exc
+    if isinstance(payload, dict) and payload.get("schema") == _IDEMPOTENCY_FENCE_SCHEMA:
+        if (
+            set(payload) != {"schema", "owner_hash", "key_hash", "fenced_at"}
+            or payload.get("owner_hash") != binding.owner_hash
+            or payload.get("key_hash") != binding.key_hash
+            or not isinstance(payload.get("fenced_at"), str)
+        ):
+            raise ValueError("invalid durable idempotency fence record")
+        _revalidate_idempotency_store(store)
+        raise IdempotencyFenced(
+            "idempotency key was fenced on this host; a submission under it "
+            "can never be accepted"
+        )
     required = {
         "schema",
         "owner_hash",
@@ -3689,7 +4341,6 @@ def _write_idempotency_claim(
     job_id: str,
     store: _IdempotencyStore,
 ) -> None:
-    _revalidate_idempotency_store(store)
     payload = {
         "schema": _IDEMPOTENCY_CLAIM_SCHEMA,
         "owner_hash": binding.owner_hash,
@@ -3697,6 +4348,20 @@ def _write_idempotency_claim(
         "intent_digest": binding.intent_digest,
         "job_id": validate_job_id(job_id),
     }
+    if not _link_idempotency_record(store, payload):
+        existing = _read_idempotency_claim(binding, store)
+        if existing != (job_id, binding.intent_digest):
+            raise IdempotencyConflict(
+                "durable idempotency key is already bound to a "
+                "different job"
+            )
+
+
+def _link_idempotency_record(
+    store: _IdempotencyStore, payload: Mapping[str, object],
+) -> bool:
+    """Publish one create-once record at the claim name; False if one exists."""
+    _revalidate_idempotency_store(store)
     encoded = (
         json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -3734,18 +4399,79 @@ def _write_idempotency_claim(
                 follow_symlinks=False,
             )
         except FileExistsError:
-            existing = _read_idempotency_claim(binding, store)
-            if existing != (job_id, binding.intent_digest):
-                raise IdempotencyConflict(
-                    "durable idempotency key is already bound to a "
-                    "different job"
-                ) from None
+            created = False
         else:
             _fsync_durable_directory(store.owner_fd)
+            created = True
         _revalidate_idempotency_store(store)
+        return created
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=store.owner_fd)
+
+
+def fence_idempotency_key(queue_dir: Path, key: str) -> dict[str, object]:
+    """Settle whether a keyed submission was accepted here, and forbid it if not.
+
+    A broker whose keyed transfer to this host was refused, or whose answer
+    was lost, cannot tell from outside whether a copy of that request might
+    still land (#64). Under the same per-key lock every keyed submit holds:
+
+    * a claim, or a spec left by a crash before its claim, means the
+      submission was accepted: the claim is repaired if needed and its job
+      id is returned (``"accepted"``);
+    * otherwise a create-once fence record is written at the claim's name,
+      so any later submission under the key is refused (``"fenced"``).
+
+    Repeatable: an existing fence answers ``"fenced"`` again.
+    """
+    _validate_idempotency_key(key)
+    binding = _idempotency_binding(queue_dir, key=key, intent_digest="0" * 64)
+    with _idempotency_store_lock(
+        queue_dir,
+        binding,
+        create_namespace=True,
+        create_lock=True,
+    ) as store:
+        assert store is not None
+        try:
+            claim = _read_idempotency_claim(binding, store)
+        except IdempotencyFenced:
+            return {"state": "fenced", "job_id": None}
+        if claim is not None:
+            return {"state": "accepted", "job_id": claim[0]}
+        matches = _idempotency_spec_matches(queue_dir, binding, store)
+        if len(matches) > 1:
+            raise IdempotencyConflict(
+                "idempotency key is bound to multiple durable job specs"
+            )
+        if matches:
+            spec = matches[0]
+            _write_idempotency_claim(
+                replace(
+                    binding, intent_digest=str(spec.submission_intent_digest),
+                ),
+                spec.id,
+                store,
+            )
+            return {"state": "accepted", "job_id": spec.id}
+        fence = {
+            "schema": _IDEMPOTENCY_FENCE_SCHEMA,
+            "owner_hash": binding.owner_hash,
+            "key_hash": binding.key_hash,
+            "fenced_at": utcnow_iso(),
+        }
+        if not _link_idempotency_record(store, fence):
+            # Lost a race to a submit or another fence under our own lock
+            # cannot happen; read what is there rather than guess.
+            try:
+                claim = _read_idempotency_claim(binding, store)
+            except IdempotencyFenced:
+                return {"state": "fenced", "job_id": None}
+            if claim is None:
+                raise ValueError("idempotency record vanished while fencing")
+            return {"state": "accepted", "job_id": claim[0]}
+        return {"state": "fenced", "job_id": None}
 
 
 def ensure_idempotency_claim_for_spec(
@@ -3892,6 +4618,29 @@ def _lookup_idempotent_submission(
         _revalidate_idempotency_store(store)
         return job_id, False
 
+    matches = _idempotency_spec_matches(queue_dir, binding, store)
+    if not matches:
+        _revalidate_idempotency_store(store)
+        return None
+    if len(matches) != 1:
+        raise IdempotencyConflict(
+            "idempotency key is bound to multiple durable job specs"
+        )
+    match = matches[0]
+    if match.submission_intent_digest != binding.intent_digest:
+        raise IdempotencyConflict(
+            "idempotency key was already used for a different submission intent"
+        )
+    _revalidate_idempotency_store(store)
+    return match.id, True
+
+
+def _idempotency_spec_matches(
+    queue_dir: Path,
+    binding: _IdempotencyBinding,
+    store: _IdempotencyStore,
+) -> list[JobSpec]:
+    """Every durable spec bound to this owner and key (crash-repair evidence)."""
     # Scan through the same held queue descriptor whose ancestry and inode are
     # revalidated above. Reopening ``queue_dir`` by pathname here would admit
     # a rename/restore ABA: both pathname checks could see the right directory
@@ -3899,7 +4648,7 @@ def _lookup_idempotent_submission(
     _fsync_durable_directory(store.queue_fd)
     spec_names = sorted(
         name
-        for name in os.listdir(store.queue_fd)
+        for name in dirfd.listdir(store.queue_fd)
         if name.endswith(".json")
     )
     candidates: list[tuple[str, JobSpec]] = []
@@ -3941,20 +4690,7 @@ def _lookup_idempotent_submission(
             and candidate.idempotency_key_hash == binding.key_hash
         ):
             matches.append(candidate)
-    if not matches:
-        _revalidate_idempotency_store(store)
-        return None
-    if len(matches) != 1:
-        raise IdempotencyConflict(
-            "idempotency key is bound to multiple durable job specs"
-        )
-    match = matches[0]
-    if match.submission_intent_digest != binding.intent_digest:
-        raise IdempotencyConflict(
-            "idempotency key was already used for a different submission intent"
-        )
-    _revalidate_idempotency_store(store)
-    return match.id, True
+    return matches
 
 
 def _write_spec_exclusive(
@@ -4096,7 +4832,7 @@ def _fsync_workspace_tree(directory: Path) -> None:
 
 def _fsync_workspace_tree_at(directory_fd: int) -> None:
     """Durably sync a staged tree below one held directory descriptor."""
-    for name in os.listdir(directory_fd):
+    for name in dirfd.listdir(directory_fd):
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = os.open(
@@ -4159,6 +4895,11 @@ def _commit_local_submission(
     capacity_warnings: tuple[str, ...],
 ) -> str:
     """Publish one already-validated spec, workspace, and optional claim."""
+    if getattr(spec.program_runtime_pin, "managed_generation", None) is not None:
+        from vq import runtime_admission
+        if binding is None or idempotency_store is None:
+            raise ValueError("managed generation requires durable idempotent publication")
+        runtime_admission.reserve_spec(spec, queue_dir)
     jobid = spec.id
     workspace = Path(spec.cwd)
     spec_path = queue_dir / f"{jobid}.json"
@@ -4409,6 +5150,11 @@ def _commit_local_submission(
             # observer interrupt follows, retain the spec/workspace and let a
             # replay return the durable claim instead of hiding acceptance.
             claim_published = True
+        if getattr(spec.program_runtime_pin, "managed_generation", None) is not None:
+            # The durable spec/claim already owns acceptance. The provider
+            # reservation remains protected; dispatch retries this exact commit.
+            with contextlib.suppress(ValueError, OSError, TimeoutError):
+                runtime_admission.commit_spec(spec)
     except _WorkspaceAuthorityReplacedError:
         workspace_authority_failed = True
         raise
@@ -4518,6 +5264,7 @@ def _commit_local_submission(
             command=final_command,
             cpus=spec.cpus,
             scheduler_tasks=spec.scheduler_tasks,
+            **({"gpus": spec.gpus} if spec.gpus is not None else {}),
             mem_mb=spec.mem_mb,
             wall_time_seconds=spec.wall_time_seconds,
             priority=spec.priority,
@@ -4548,6 +5295,15 @@ def submit_local(
     python: str | None = None,
     cpus: int = 1,
     scheduler_tasks: int | None = None,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+    resource_estimate: dict[str, Any] | None = None,
+    mem_mb_source: str | None = None,
+    wall_time_source: str | None = None,
     mem_mb: int | None = None,
     wall_time_seconds: int | None = None,
     priority: int = 0,
@@ -4610,6 +5366,51 @@ def submit_local(
             "use submit_remote for cross-machine submission"
         )
 
+    if ((managed_native_sha256 is not None or managed_content_sha256 is not None)
+            and managed_generation is None):
+        raise ValueError("managed identity digests require --managed-generation")
+    managed_pin = getattr(program_runtime_pin, "managed_generation", None)
+    if managed_generation is not None or managed_pin is not None:
+        from vq.runtime_admission import HEX40
+        if (not isinstance(managed_generation, str) or not HEX40.fullmatch(managed_generation)
+                or managed_pin is None or program_runtime_pin.expected_git_sha != managed_generation
+                or not scheduler_target or not idempotency_key or retry
+                or runtime_root or runtime_artifact or rerun_until_file_exists or refresh_before):
+            raise ValueError("managed generation requires its authenticated pin, explicit full "
+                             "SHA, scheduler target, idempotency key and retry 0")
+    if managed_pin is not None:
+        identity = managed_pin["identity"]
+        for expected, field in ((managed_native_sha256, "native_sha256"),
+                                (managed_content_sha256, "content_sha256")):
+            if expected is not None and expected != identity[field]:
+                raise ValueError("managed generation does not match the requested " + field)
+    _validate_runtime_bundle_request(
+        runtime_root, runtime_artifact, scheduler_target=scheduler_target,
+    )
+    # Resolved before anything is written: a missing or unverified
+    # generation refuses the submission outright. A scheduler job's is on the
+    # cluster, so it is recorded as named and verified on its node.
+    runtime_bundle: RuntimeBundlePin | None = None
+    if runtime_root is not None and scheduler_target is not None:
+        assert runtime_artifact is not None  # _validate_runtime_bundle_request
+        runtime_bundle = RuntimeBundlePin(root=str(PurePosixPath(runtime_root)),
+                                          artifact_id=runtime_artifact)
+    elif runtime_root is not None:
+        runtime_bundle = _resolve_runtime_bundle(runtime_root, runtime_artifact)
+    # #159: a calibrated estimate is kept as its raw receipt plus its calibration.
+    resource_estimate_calibration: dict[str, Any] | None = None
+    if resource_estimate is not None:
+        resource_estimate, resource_estimate_calibration = split_estimate_document(
+            resource_estimate)
+    if mem_mb_source is not None:
+        _check_mem_mb_source(mem_mb_source, mem_mb, resource_estimate,
+                             resource_estimate_calibration)
+    if wall_time_source is not None:
+        _check_wall_time_source(wall_time_source, wall_time_seconds,
+                                resource_estimate_calibration)
+    if gpus is not None and scheduler_target is None:
+        require_daemon_gpu_admission(gpus, multi_user=multi_user)
+
     if idempotency_key is not None:
         _validate_idempotency_key(idempotency_key)
         if any(
@@ -4657,6 +5458,12 @@ def submit_local(
             )
         else:
             interp = python or sys.executable
+            if (python is None and scheduler_target is None
+                    and program_runtime_pin is not None):
+                # #209: a pinned venv program runs the script itself. A bare
+                # `python` is bound to the pinned interpreter at dispatch,
+                # exactly as for `-d DIR -- python input.py`.
+                interp = "python"
             if python is None:
                 _reject_driver_local_interpreter(
                     scheduler_target,
@@ -4743,7 +5550,13 @@ def submit_local(
         cwd=str(workspace.resolve()),
         cpus=cpus,
         scheduler_tasks=scheduler_tasks,
+        gpus=gpus,
+        runtime_bundle=runtime_bundle,
+        resource_estimate=resource_estimate,
+        resource_estimate_calibration=resource_estimate_calibration,
         mem_mb=mem_mb,
+        mem_mb_source=mem_mb_source,
+        wall_time_source=wall_time_source,
         wall_time_seconds=wall_time_seconds,
         priority=priority,
         recover_on_reboot=auto_resume,
@@ -4947,6 +5760,15 @@ def submit_local_array(
     python: str | None = None,
     cpus: int = 1,
     scheduler_tasks: int | None = None,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+    resource_estimate: dict[str, Any] | None = None,
+    mem_mb_source: str | None = None,
+    wall_time_source: str | None = None,
     mem_mb: int | None = None,
     wall_time_seconds: int | None = None,
     priority: int = 0,
@@ -5038,6 +5860,15 @@ def submit_local_array(
             python=python,
             cpus=cpus,
             scheduler_tasks=scheduler_tasks,
+            gpus=gpus,
+            runtime_root=runtime_root,
+            runtime_artifact=runtime_artifact,
+            managed_generation=managed_generation,
+            managed_native_sha256=managed_native_sha256,
+            managed_content_sha256=managed_content_sha256,
+            resource_estimate=resource_estimate,
+            mem_mb_source=mem_mb_source,
+            wall_time_source=wall_time_source,
             mem_mb=mem_mb,
             wall_time_seconds=wall_time_seconds,
             priority=priority,
@@ -5085,6 +5916,15 @@ def submit_local_chain(
     python: str | None = None,
     cpus: int = 1,
     scheduler_tasks: int | None = None,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+    resource_estimate: dict[str, Any] | None = None,
+    mem_mb_source: str | None = None,
+    wall_time_source: str | None = None,
     mem_mb: int | None = None,
     wall_time_seconds: int | None = None,
     priority: int = 0,
@@ -5187,6 +6027,15 @@ def submit_local_chain(
             python=python,
             cpus=cpus,
             scheduler_tasks=scheduler_tasks,
+            gpus=gpus,
+            runtime_root=runtime_root,
+            runtime_artifact=runtime_artifact,
+            managed_generation=managed_generation,
+            managed_native_sha256=managed_native_sha256,
+            managed_content_sha256=managed_content_sha256,
+            resource_estimate=resource_estimate,
+            mem_mb_source=mem_mb_source,
+            wall_time_source=wall_time_source,
             mem_mb=mem_mb,
             wall_time_seconds=wall_time_seconds,
             priority=priority,
@@ -5246,6 +6095,17 @@ def _build_remote_submit_argv(
     scheduler_target: str | None,
     qvf_force: bool,
     idempotency_key: str | None = None,
+    allow_helper_mismatch: bool = False,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+    resource_estimate: dict[str, Any] | None = None,
+    mem_mb_source: str | None = None,
+    wall_time_source: str | None = None,
+    defaulted_python: str | None = None,
 ) -> list[str]:
     """Serialize resolved submit inputs for the remote ``vq`` CLI.
 
@@ -5259,6 +6119,28 @@ def _build_remote_submit_argv(
     remote_argv.extend(["--cpus", str(cpus)])
     if scheduler_tasks is not None:
         remote_argv.extend(["--scheduler-tasks", str(scheduler_tasks)])
+    if gpus is not None:
+        # Off the wire unless set: an older driver would refuse the option.
+        remote_argv.extend(["--gpus", str(gpus)])
+    if runtime_root is not None:
+        # The receiving host resolves and verifies it; same wire rule.
+        remote_argv.extend(["--runtime-root", runtime_root])
+        if runtime_artifact is not None:
+            remote_argv.extend(["--runtime-artifact", runtime_artifact])
+    if managed_generation is not None:
+        remote_argv.extend(["--managed-generation", managed_generation])
+        if managed_native_sha256 is not None:
+            remote_argv.extend(["--managed-native-sha256", managed_native_sha256])
+        if managed_content_sha256 is not None:
+            remote_argv.extend(["--managed-content-sha256", managed_content_sha256])
+    if mem_mb_source is not None:
+        remote_argv.extend(["--mem-mb-source", mem_mb_source])
+    if wall_time_source is not None:
+        remote_argv.extend(["--wall-time-source", wall_time_source])
+    if resource_estimate is not None:
+        # The receiving host checks it again against the payload it gets.
+        remote_argv.extend(["--estimate-json", json.dumps(
+            resource_estimate, sort_keys=True, separators=(",", ":"))])
     if mem_mb is not None:
         remote_argv.extend(["--mem-mb", str(mem_mb)])
     if wall_time_seconds is not None:
@@ -5303,6 +6185,16 @@ def _build_remote_submit_argv(
         remote_argv.extend(["--scheduler-target", scheduler_target])
     if idempotency_key is not None:
         remote_argv.extend(["--idempotency-key", idempotency_key])
+    if allow_helper_mismatch:
+        # The driver runs the helper check (#127); carry the operator's
+        # decision to it. Absent by default, so an older driver's wire is
+        # unchanged.
+        remote_argv.append("--allow-helper-mismatch")
+    if defaulted_python is not None:
+        # #209: absent unless a single-file --program submit defaulted its
+        # interpreter, so every other submit's wire is unchanged. An older
+        # remote reads it as the start of the command and refuses the submit.
+        remote_argv.extend(["--defaulted-python", defaulted_python])
     if remote_input_file is not None:
         if qvf_force:
             remote_argv.append("--qvf-force")
@@ -5339,8 +6231,25 @@ def _validate_remote_submit_fields(
     refresh_before: str | None,
     scheduler_target: str | None,
     idempotency_key: str | None = None,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
 ) -> None:
     """Validate the remote wire intent before temp, upload, or SSH mutation."""
+    if (managed_generation is not None or managed_native_sha256 is not None
+            or managed_content_sha256 is not None):
+        from vq.runtime_admission import HEX40, HEX64
+        if not isinstance(managed_generation, str) or not HEX40.fullmatch(managed_generation):
+            raise ValueError("managed identity requires an explicit full generation SHA")
+        for value in (managed_native_sha256, managed_content_sha256):
+            if value is not None and not HEX64.fullmatch(value):
+                raise ValueError("managed identity digests require full SHA256 values")
+    _validate_runtime_bundle_request(
+        runtime_root, runtime_artifact, scheduler_target=scheduler_target,
+    )
     validated_depends_on = [
         validate_job_id(value) for value in (depends_on or ())
     ]
@@ -5375,6 +6284,7 @@ def _validate_remote_submit_fields(
         cwd="/vq-submit-validation",
         cpus=cpus,
         scheduler_tasks=scheduler_tasks,
+        gpus=gpus,
         mem_mb=mem_mb,
         wall_time_seconds=wall_time_seconds,
         priority=priority,
@@ -5412,6 +6322,15 @@ def submit_remote(
     python: str | None = None,
     cpus: int = 1,
     scheduler_tasks: int | None = None,
+    gpus: int | None = None,
+    runtime_root: str | None = None,
+    runtime_artifact: str | None = None,
+    managed_generation: str | None = None,
+    managed_native_sha256: str | None = None,
+    managed_content_sha256: str | None = None,
+    resource_estimate: dict[str, Any] | None = None,
+    mem_mb_source: str | None = None,
+    wall_time_source: str | None = None,
     mem_mb: int | None = None,
     wall_time_seconds: int | None = None,
     priority: int = 0,
@@ -5435,6 +6354,7 @@ def submit_remote(
     qvf_force: bool = False,
     idempotency_key: str | None = None,
     warning_sink: Callable[[str], None] | None = None,
+    allow_helper_mismatch: bool = False,
 ) -> list[str]:
     """Submit a job to a remote host via SSH.
 
@@ -5500,6 +6420,7 @@ def submit_remote(
     remote_input_file: str | None = None
     temp_source_file: Path | None = None
     temp_source_directory: Path | None = None
+    defaulted_python: str | None = None
 
     if input_file is not None:
         if command is not None:
@@ -5527,6 +6448,10 @@ def submit_remote(
                 _reject_driver_local_interpreter(
                     scheduler_target, interpreter=interp
                 )
+                if program is not None and scheduler_target is None:
+                    # #209: the remote owns the program registry; let it
+                    # replace this default with the program's interpreter.
+                    defaulted_python = interp
             remote_command = [interp, src.name]
             local_tar = src
             temp_source_file = src
@@ -5563,6 +6488,12 @@ def submit_remote(
         command=remote_command,
         cpus=cpus,
         scheduler_tasks=scheduler_tasks,
+        gpus=gpus,
+        runtime_root=runtime_root,
+        runtime_artifact=runtime_artifact,
+        managed_generation=managed_generation,
+            managed_native_sha256=managed_native_sha256,
+            managed_content_sha256=managed_content_sha256,
         mem_mb=mem_mb,
         wall_time_seconds=wall_time_seconds,
         priority=priority,
@@ -5632,6 +6563,15 @@ def submit_remote(
             remote_command=remote_command,
             cpus=cpus,
             scheduler_tasks=scheduler_tasks,
+            gpus=gpus,
+            runtime_root=runtime_root,
+            runtime_artifact=runtime_artifact,
+            managed_generation=managed_generation,
+            managed_native_sha256=managed_native_sha256,
+            managed_content_sha256=managed_content_sha256,
+            resource_estimate=resource_estimate,
+            mem_mb_source=mem_mb_source,
+            wall_time_source=wall_time_source,
             mem_mb=mem_mb,
             wall_time_seconds=wall_time_seconds,
             priority=priority,
@@ -5654,6 +6594,8 @@ def submit_remote(
             scheduler_target=scheduler_target,
             qvf_force=qvf_force,
             idempotency_key=idempotency_key,
+            allow_helper_mismatch=allow_helper_mismatch,
+            defaulted_python=defaulted_python,
         )
         proc = transport.run_remote_vq(
             host_cfg,

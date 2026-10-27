@@ -1,0 +1,1 @@
+`vq fetch-all` no longer reports a job as completely fetched when its `$VQ_WORKDIR` may hold output it did not copy, the case where `vq fetch` refuses to report success. Such a job is tagged `[WORKDIR NOT FETCHED]`, counted in the summary with a note naming `vq fetch HOST JOBID --workdir`, and marked `workdir_unfetched` in each report row and in the totals.

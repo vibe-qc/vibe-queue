@@ -53,8 +53,15 @@ def _parse_iso(ts: str | None) -> datetime | None:
 
 
 def _hms_to_seconds(value: str | None) -> int | None:
+    """Seconds from ``HH:MM:SS``, or Slurm's ``D-HH:MM:SS`` past a day."""
     if value is None:
         return None
+    days = 0
+    if "-" in value:
+        day_part, value = value.split("-", 1)
+        if not day_part.isdigit():
+            return None
+        days = int(day_part)
     parts = value.split(":")
     if len(parts) != 3:
         return None
@@ -64,7 +71,7 @@ def _hms_to_seconds(value: str | None) -> int | None:
         return None
     if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
         return None
-    return hours * 3600 + minutes * 60 + seconds
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 def _paused_seconds(spec: JobSpec, *, end: datetime) -> float:
@@ -86,17 +93,17 @@ def _runtime_seconds(
     Scheduler jobs prefer the cluster-reported walltime because vq's
     ``started_at`` can include time spent queued by the batch scheduler.
     """
-    if spec.scheduler_target is not None:
-        scheduler_seconds = _hms_to_seconds(spec.scheduler_walltime_used)
-        if scheduler_seconds is not None:
-            return float(scheduler_seconds)
-
     if spec.is_terminal:
         end = _parse_iso(spec.finished_at)
     elif include_active and spec.state in {JobState.RUNNING, JobState.SUSPENDED}:
         end = now
     else:
         return None
+
+    if spec.scheduler_target is not None:
+        scheduler_seconds = _hms_to_seconds(spec.scheduler_walltime_used)
+        if scheduler_seconds is not None:
+            return float(scheduler_seconds)
 
     start = _parse_iso(spec.started_at)
     if start is None or end is None:

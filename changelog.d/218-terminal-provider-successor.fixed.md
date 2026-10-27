@@ -1,0 +1,1 @@
+Allow terminal reservation reconciliation through a verified successor at the same provider authority, preserving original execution pins and requiring exact binding and durable terminal proof; admission and dispatch remain bound to their original provider.

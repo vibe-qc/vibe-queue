@@ -180,6 +180,14 @@ def kill_job(
         if spec.is_terminal:
             raise ValueError(f"job {jobid} already in terminal state ({spec.state.value})")
 
+        from vq import managed_container
+        if managed_container.present(spec_path):
+            managed_container.request_stop(spec_path, "killed", _format_kill_failure_reason(reason))
+            return (
+                f"cancellation requested for managed container job {jobid}; "
+                "capacity retained until confirmed worker exit"
+            )
+
         workspace = Path(spec.cwd)
         failure_reason = _format_kill_failure_reason(reason)
         events.append_event(

@@ -740,3 +740,59 @@ class TestStopScope:
         monkeypatch.setattr(cgroup.subprocess, "run", fake_run)
         cgroup.stop_scope("vq-job-abc")  # no .scope suffix
         assert any("vq-job-abc.scope" in arg for arg in captured[0])
+
+    @pytest.mark.parametrize("multi_user", [False, True])
+    def test_stop_timeout_escalates_whole_scope_and_waits_for_stop(
+        self, monkeypatch: pytest.MonkeyPatch, multi_user: bool,
+    ) -> None:
+        """Model a manager whose stop grace outlives the client's wait.
+
+        No processes or system manager are invoked here. The live Linux
+        control remains required to prove descendant cleanup.
+        """
+        monkeypatch.setattr(cgroup, "_systemctl_path", lambda: "/usr/bin/systemctl")
+        calls = []
+        survivors = True
+
+        def run(argv, **kwargs):
+            nonlocal survivors
+            calls.append((argv, kwargs))
+            if "kill" in argv:
+                assert "--signal=SIGKILL" in argv
+                survivors = False
+            elif survivors:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(cgroup.subprocess, "run", run)
+        assert cgroup.stop_scope("vq-job-abc", multi_user=multi_user) is True
+        assert survivors is False
+        manager = ["/usr/bin/systemctl"] + ([] if multi_user else ["--user"])
+        assert [argv for argv, _ in calls] == [
+            [*manager, "stop", "vq-job-abc.scope"],
+            [*manager, "kill", "--signal=SIGKILL", "vq-job-abc.scope"],
+            [*manager, "stop", "vq-job-abc.scope"],
+        ]
+        assert [kw["timeout"] for _, kw in calls] == [10, 5, 5]
+        assert all(kw["stdin"] == subprocess.DEVNULL for _, kw in calls)
+
+    @pytest.mark.parametrize("failure", ["kill-rc", "kill-timeout", "stop-rc", "stop-timeout"])
+    def test_failed_escalation_or_stop_is_not_success(
+        self, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ) -> None:
+        monkeypatch.setattr(cgroup, "_systemctl_path", lambda: "/usr/bin/systemctl")
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            operation = "kill" if "kill" in argv else "stop"
+            if failure == operation + "-timeout":
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            rc = 1 if failure == operation + "-rc" else 0
+            return subprocess.CompletedProcess(argv, rc, "", "failure" if rc else "")
+
+        monkeypatch.setattr(cgroup.subprocess, "run", run)
+        assert cgroup.stop_scope("vq-job-abc") is False
+        assert len(calls) == (2 if failure.startswith("kill") else 3)

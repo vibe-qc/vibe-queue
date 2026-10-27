@@ -116,7 +116,7 @@ def test_a_scoped_marker_claims_only_its_own_target(state_dir: Path) -> None:
 
 def test_a_live_marker_for_this_target_is_named(state_dir: Path) -> None:
     admin.write_admin_update_marker(
-        envs=["scheduler-runtime:host_f:vibeqc-release"], host="host_f"
+        envs=["scheduler:host_f"], host="host_f"
     )
 
     check = _check(_pbs_payload(started=False))
@@ -124,7 +124,7 @@ def test_a_live_marker_for_this_target_is_named(state_dir: Path) -> None:
     dispatch = check["scheduler_dispatch"]
     assert dispatch["admin_update_marker_active"] is True
     assert dispatch["admin_update_marker_envs"] == [
-        "scheduler-runtime:host_f:vibeqc-release"
+        "scheduler:host_f"
     ]
     assert dispatch["admin_update_marker_started_at"]
     assert dispatch["authority"] == "scheduler_admin_and_vq"

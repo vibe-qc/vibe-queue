@@ -57,19 +57,21 @@ def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _registry_answers(monkeypatch: pytest.MonkeyPatch, binary: str) -> None:
-    """The target's helper reports one registered immutable wrapper."""
+    """A target helper with no default host reports its local wrapper (#172)."""
     import subprocess as _subprocess
 
     payload = json.dumps(
         [{"name": "vibeqc-release", "kind": "binary", "status": "OK",
           "binary": binary}]
     )
-    monkeypatch.setattr(
-        "vq.cli.transport.run_remote_vq",
-        lambda *a, **k: _subprocess.CompletedProcess(
-            args=[], returncode=0, stdout=payload, stderr=""
-        ),
-    )
+    def helper(_host, *args, **kwargs):
+        if args != ("programs", "localhost", "--json"):
+            return _subprocess.CompletedProcess(
+                args=args, returncode=2, stdout="", stderr="HOST is required"
+            )
+        return _subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr("vq.cli.transport.run_remote_vq", helper)
 
 
 def _git(*args: str, cwd: Path) -> str:
@@ -264,6 +266,35 @@ def _submit_directory_unpinned(tmp_path: Path, target: str):  # type: ignore[no-
 
 def _queued_specs() -> list[JobSpec]:
     return [JobSpec.read(p) for p in sorted(paths.queue_dir().glob("*.json"))]
+
+
+@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_scheduler_only_registration_preserves_target_identity(
+    state_dir: Path, tmp_path: Path, verified: bool, matching: bool,
+) -> None:
+    _write_config(
+        state_dir / "cfg",
+        driver_program_block='[programs.vibeqc-release]\nkind = "scheduler"',
+    )
+    if verified:
+        _record_host_c_runtime()
+    result = _submit(tmp_path, "host_c", host_c_SHA if matching else "f" * 40)
+    if not verified or not matching:
+        assert result.exit_code != 0
+        assert not _queued_specs()
+        return
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    assert spec.command == [host_c_WRAPPER, "run.py"]
+    assert spec.program_runtime_pin is not None
+    assert spec.program_runtime_pin.expected_git_sha == host_c_SHA
+    assert spec.program_runtime_pin.scheduler_host == "host_c"
+    from vq.daemon import _program_runtime_pin_dispatch_resolution
+
+    resolution = _program_runtime_pin_dispatch_resolution(spec)
+    assert resolution.failure is None
+    assert resolution.resolved_git_sha == host_c_SHA
 
 
 def test_matching_target_sha_submits_despite_driver_drift(
@@ -620,13 +651,13 @@ def test_mismatched_non_head_wrapper_does_not_reject_target_pin(
     ]
 
 
-def test_explicit_python_is_sole_runtime_authority(
+def test_explicit_python_cannot_self_authenticate_against_another_registry(
     state_dir: Path,
     driver_checkout: tuple[Path, str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--python A -- B input.py`` validates A, never payload head B."""
+    """A version-shaped --python path cannot authenticate itself."""
     repo, _ = driver_checkout
     _write_config(
         state_dir / "cfg",
@@ -642,11 +673,9 @@ def test_explicit_python_is_sole_runtime_authority(
         python=host_c_WRAPPER,
     )
 
-    assert result.exit_code == 0, result.output
-    pin = json.loads(result.output)["program_runtime_pin"]
-    assert pin["resolved_executable"] == host_c_WRAPPER
-    assert pin["expected_git_sha"] == host_c_SHA
-    assert _queued_specs()[0].command == [host_c_WRAPPER, "input.py"]
+    assert result.exit_code != 0
+    assert "registered runtime is" in result.output
+    assert _queued_specs() == []
 
 
 def test_unpinned_python_directory_uses_verified_target_launcher(
@@ -689,25 +718,20 @@ def test_unpinned_python_directory_uses_verified_target_launcher(
     assert spec.program_runtime_pin.resolved_executable == host_c_WRAPPER
 
 
-def test_wrapper_in_the_command_outranks_a_rolled_forward_registry(
+def test_command_wrapper_cannot_self_authenticate_after_registry_rollover(
     state_dir: Path, driver_checkout: tuple[Path, str], tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE v0.15.58 SCENARIO: the registry rolled forward to 0.15.58 while
-    the wave deliberately executes the immutable 0.15.50 wrapper named in
-    its command. The pin must describe the argv that runs."""
+    """A retired wrapper needs target evidence, not just an old SHA in argv."""
     repo, _ = driver_checkout
     _write_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
     _registry_answers(monkeypatch, NEW_WRAPPER)
 
     result = _submit_dir(tmp_path, "host_c", host_c_SHA, host_c_WRAPPER)
 
-    assert result.exit_code == 0, result.output
-    pin = json.loads(result.output)["program_runtime_pin"]
-    assert pin["resolved_executable"] == host_c_WRAPPER
-    assert pin["program_version"] == "0.15.50"
-    assert pin["expected_git_sha"] == host_c_SHA
-    assert _queued_specs()[0].command == [host_c_WRAPPER, "input.py"]
+    assert result.exit_code != 0
+    assert "registered runtime is" in result.output
+    assert _queued_specs() == []
 
 
 def test_pin_mismatching_the_command_wrapper_is_rejected(
@@ -729,3 +753,310 @@ def test_pin_mismatching_the_command_wrapper_is_rejected(
     assert "the submit command executes" in result.output
     assert host_c_WRAPPER in result.output
     assert _queued_specs() == []
+
+
+@pytest.mark.parametrize("payload", ["directory", "single-file"])
+def test_mutable_registry_launcher_refuses_before_queueing(
+    state_dir, driver_checkout, tmp_path, monkeypatch, payload,
+):
+    """Current A at submit must not authorize a launcher that later executes B."""
+    repo, _ = driver_checkout
+    _write_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    entry = {"name": "vibeqc-release", "kind": "venv", "status": "OK",
+             "python": "/site/bin/vibeqc-release-python",
+             "current_git_sha_full": host_f_SHA}
+    monkeypatch.setattr(transport, "run_remote_vq", lambda *a, **k:
+        subprocess.CompletedProcess(a, 0, stdout=json.dumps([entry]), stderr=""))
+    if payload == "directory":
+        result = _submit_dir_command(tmp_path, "host_c", host_f_SHA,
+                                     [host_f_PYTHON, "input.py"])
+    else:
+        result = _submit(tmp_path, "host_c", host_f_SHA, "--python", host_f_PYTHON)
+    assert result.exit_code != 0
+    assert "immutable per-SHA launcher" in result.output
+    # Activation during scheduler wait would change the wrapper's runtime.
+    entry["current_git_sha_full"] = "b" * 40
+    assert _queued_specs() == []
+
+
+@pytest.mark.parametrize("payload", ["directory", "single-file"])
+def test_verified_generation_survives_registry_activation(
+    state_dir, driver_checkout, tmp_path, monkeypatch, payload,
+):
+    import os
+    import shlex
+    import sys
+
+    from vq import daemon
+
+    repo, _ = driver_checkout
+    _write_host_f_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    root = tmp_path / "runtime"
+    interpreters = []
+    for sha in (host_f_SHA, "b" * 40):
+        python = root / "releases" / sha / "source" / ".venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        # A synthetic provider launcher also verifies that its environment is
+        # preserved instead of bypassed for a different bare interpreter.
+        python.write_text(f"#!/bin/sh\nexport GENERATION={sha}\n"
+                          f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+        python.chmod(0o755)
+        interpreters.append(str(python))
+    current = root / "current"
+    current.symlink_to(root / "releases" / host_f_SHA, target_is_directory=True)
+    entry = {"name": "vibeqc-release", "kind": "venv", "status": "OK",
+             "python": interpreters[0], "current_git_sha_full": host_f_SHA}
+    monkeypatch.setattr(transport, "run_remote_vq", lambda *a, **k:
+        subprocess.CompletedProcess(a, 0, stdout=json.dumps([entry]), stderr=""))
+    if payload == "directory":
+        result = _submit_dir_command(tmp_path, "host_f", host_f_SHA,
+                                     [interpreters[0], "input.py"])
+        script = tmp_path / "wavejob" / "input.py"
+    else:
+        result = _submit(tmp_path, "host_f", host_f_SHA, "--python", interpreters[0])
+        script = tmp_path / "run.py"
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    current.unlink()
+    current.symlink_to(root / "releases" / ("b" * 40), target_is_directory=True)
+    entry.update(python=interpreters[1], current_git_sha_full="b" * 40)
+    resolution = daemon._program_runtime_pin_dispatch_resolution(spec)
+    assert resolution.failure is None
+    assert spec.command[0] == interpreters[0]
+    assert resolution.resolved_git_sha == host_f_SHA
+    assert resolution.runtime_python == interpreters[0]
+    assert resolution.runtime_source == interpreters[0].removesuffix("/.venv/bin/python")
+    assert resolution.runtime_root == str(root)
+    script.write_text("import os; print(os.environ['GENERATION'])\n")
+    ran = subprocess.run(spec.command, cwd=script.parent, env=os.environ.copy(),
+                         capture_output=True, text=True, check=True)
+    assert ran.stdout.strip() == host_f_SHA
+
+
+def test_mutable_deployment_receipt_fails_closed(state_dir, driver_checkout, tmp_path):
+    repo, _ = driver_checkout
+    _write_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    _record_host_c_runtime()
+    records = admin.load_scheduler_runtime_status()
+    record = records["host_c:vibeqc-release"]
+    record.active_path = "/site/runtime/current/source/.venv/bin/python"
+    from unittest.mock import patch
+    with patch.object(admin, "load_scheduler_runtime_status", return_value=records):
+        result = _submit(tmp_path, "host_c", host_c_SHA)
+    assert result.exit_code != 0
+    assert "immutable per-SHA launcher" in result.output
+    assert _queued_specs() == []
+
+
+def test_explicit_generation_path_cannot_replace_verified_launcher(
+    state_dir, driver_checkout, tmp_path,
+):
+    repo, _ = driver_checkout
+    _write_host_f_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    _record_host_f_runtime()
+    other = host_f_PYTHON.replace("/source/", "/another/source/")
+    result = _submit_dir_command(tmp_path, "host_f", host_f_SHA, [other, "input.py"])
+    assert result.exit_code != 0
+    assert "not the verified scheduler launcher" in result.output
+    assert _queued_specs() == []
+
+
+def test_pending_legacy_mutable_pin_is_rejected_at_dispatch(
+    state_dir, driver_checkout, tmp_path,
+):
+    from vq import daemon
+
+    repo, _ = driver_checkout
+    _write_host_f_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    _record_host_f_runtime()
+    result = _submit(tmp_path, "host_f", host_f_SHA)
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    spec.program_runtime_pin.resolved_executable = "/site/bin/vibeqc-release-python"
+    resolution = daemon._program_runtime_pin_dispatch_resolution(spec)
+    assert "immutable per-SHA launcher" in resolution.failure
+    assert resolution.resolved_git_sha is None
+
+
+# #181: a queue alias (``fleet_role = "alias"``) shares its canonical host's
+# ``scheduler_runtime_deployments``. The target registry reports the mutable
+# current wrapper, so an exact pin must bind the deployment record's per-SHA
+# launcher instead -- for the canonical host and for its alias alike.
+CLUSTER_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+CLUSTER_PYTHON = (
+    "/home/USER/vq/runtimes/vibeqc-release/"
+    f"releases/{CLUSTER_SHA}/source/.venv/bin/python"
+)
+
+
+def _write_alias_config(cfg_dir: Path, *, driver_program_block: str, deployed: bool) -> None:
+    def scheduler_host(name: str, *extra: str) -> list[str]:
+        return [
+            f"[hosts.{name}]",
+            'ssh = "cluster-login"',
+            'scheduler = "pbs"',
+            'scheduler_dialect = "torque"',
+            'scratch_root = "/scratch/USER"',
+            'scheduler_driver = "localhost"',
+            *extra,
+            "",
+        ]
+
+    lines = [
+        'default_host = "localhost"',
+        "",
+        "[hosts.localhost]",
+        'ssh = "localhost"',
+        "",
+        *scheduler_host("cluster", 'fleet_role = "managed"'),
+        *scheduler_host(
+            "cluster-queue",
+            'fleet_role = "alias"',
+            'fleet_canonical_host = "cluster"',
+            'submit_extra = ["-q", "other"]',
+        ),
+    ]
+    if deployed:
+        lines += [
+            "[hosts.cluster.scheduler_runtime_deployments.vibeqc-release]",
+            'update_command = "/site/bin/deploy-cluster-runtime"',
+            'verify_command = "/site/bin/verify-cluster-runtime"',
+            "",
+        ]
+    lines += [driver_program_block, ""]
+    (cfg_dir / "config.toml").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _record_cluster_runtime() -> None:
+    result = admin.SchedulerRuntimeUpdateResult(
+        host="cluster",
+        program="vibeqc-release",
+        mode="update",
+        command="/site/bin/deploy-cluster-runtime",
+        command_ssh="cluster-login",
+        verify_command="/site/bin/verify-cluster-runtime",
+        verify_ssh="cluster-login",
+        expected_sha=CLUSTER_SHA,
+        expected_tag="v1.2.3",
+    )
+    result.command_rc = 0
+    result.verify_rc = 0
+    result.actual_sha = CLUSTER_SHA
+    result.actual_tag = "v1.2.3"
+    result.healthy = True
+    result.activation = "atomic"
+    result.quiescent = True
+    result.updater_pid = None
+    result.active_path = CLUSTER_PYTHON
+    admin.record_scheduler_runtime_outcome(result)
+
+
+def _registry_reports_mutable_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    entry = {"name": "vibeqc-release", "kind": "venv", "status": "OK",
+             "python": "/site/bin/vibeqc-release-python",
+             "current_git_sha_full": CLUSTER_SHA}
+    monkeypatch.setattr(transport, "run_remote_vq", lambda *a, **k:
+        subprocess.CompletedProcess(a, 0, stdout=json.dumps([entry]), stderr=""))
+
+
+@pytest.mark.parametrize("target", ["cluster", "cluster-queue"])
+def test_alias_binds_canonical_deployment_launcher(
+    state_dir, driver_checkout, tmp_path, monkeypatch, target,
+):
+    repo, _ = driver_checkout
+    _write_alias_config(state_dir / "cfg",
+                        driver_program_block=_venv_program_block(repo), deployed=True)
+    _record_cluster_runtime()
+    _registry_reports_mutable_wrapper(monkeypatch)
+
+    result = _submit(tmp_path, target, CLUSTER_SHA)
+
+    assert result.exit_code == 0, result.output
+    pin = json.loads(result.output)["program_runtime_pin"]
+    assert pin["resolved_executable"] == CLUSTER_PYTHON
+    assert pin["scheduler_host"] == target
+    assert pin["expected_git_sha"] == CLUSTER_SHA
+    spec = _queued_specs()[0]
+    assert spec.scheduler_target == target
+    assert spec.command == [CLUSTER_PYTHON, "run.py"]
+
+
+def test_alias_without_canonical_deployment_still_refuses(
+    state_dir, driver_checkout, tmp_path, monkeypatch,
+):
+    repo, _ = driver_checkout
+    _write_alias_config(state_dir / "cfg",
+                        driver_program_block=_venv_program_block(repo), deployed=False)
+    _record_cluster_runtime()
+    _registry_reports_mutable_wrapper(monkeypatch)
+
+    result = _submit(tmp_path, "cluster-queue", CLUSTER_SHA)
+
+    assert result.exit_code != 0
+    assert "immutable per-SHA launcher" in result.output
+    assert _queued_specs() == []
+
+
+def test_alias_with_canonical_deployment_but_no_record_still_refuses(
+    state_dir, driver_checkout, tmp_path, monkeypatch,
+):
+    repo, _ = driver_checkout
+    _write_alias_config(state_dir / "cfg",
+                        driver_program_block=_venv_program_block(repo), deployed=True)
+    _registry_reports_mutable_wrapper(monkeypatch)
+
+    result = _submit(tmp_path, "cluster-queue", CLUSTER_SHA)
+
+    assert result.exit_code != 0
+    assert "immutable per-SHA launcher" in result.output
+    assert _queued_specs() == []
+
+
+def test_verified_mace_generation_launcher_survives_deployment_change(
+    state_dir, driver_checkout, tmp_path, monkeypatch,
+):
+    from vq import daemon
+
+    repo, _ = driver_checkout
+    _write_config(state_dir / "cfg", driver_program_block=_venv_program_block(repo))
+    _record_host_c_runtime()
+    records = admin.load_scheduler_runtime_status()
+    record = records["host_c:vibeqc-release"]
+    launcher = f"/site/runtime/releases/{host_c_SHA}/mace-python"
+    record.active_path = launcher
+    monkeypatch.setattr(admin, "load_scheduler_runtime_status", lambda: records)
+    result = _submit_dir(tmp_path, "host_c", host_c_SHA, launcher)
+    assert result.exit_code == 0, result.output
+    spec = _queued_specs()[0]
+    assert spec.command[0] == launcher
+    assert spec.program_runtime_pin.artifact_identity == launcher
+    record.active_path = f"/site/runtime/releases/{'b' * 40}/mace-python"
+    record.actual_sha = 'b' * 40
+    resolved = daemon._program_runtime_pin_dispatch_resolution(spec)
+    assert resolved.failure is None
+    assert resolved.resolved_git_sha == host_c_SHA
+    assert resolved.runtime_root == "/site/runtime"
+    assert resolved.runtime_source == f"/site/runtime/releases/{host_c_SHA}/source"
+    assert resolved.runtime_python == launcher
+
+
+@pytest.mark.parametrize("change", [
+    {"program_kind": "binary"},
+    {"artifact_identity": "/site/other"},
+    {"scheduler_host": None},
+    {"resolved_executable": "/site/runtime/current/mace-python"},
+    {"resolved_executable": f"/site/runtime/releases/{'b' * 40}/mace-python"},
+    {"resolved_executable": f"/site/runtime/releases/{host_c_SHA}/../mace-python"},
+    {"resolved_executable": f"/site/runtime/releases/{host_c_SHA}/arbitrary-python"},
+])
+def test_mace_launcher_rejects_unauthenticated_or_mutable_identity(change):
+    from vq.spec import ProgramRuntimePin
+    from vq.submit import scheduler_immutable_runtime_paths
+
+    launcher = f"/site/runtime/releases/{host_c_SHA}/mace-python"
+    fields = dict(expected_git_sha=host_c_SHA, scheduler_host="host_c",
+                  resolved_executable=launcher, artifact_identity=launcher,
+                  program_kind="scheduler-runtime")
+    fields.update(change)
+    with pytest.raises(ValueError, match="verified immutable"):
+        scheduler_immutable_runtime_paths(ProgramRuntimePin(**fields))

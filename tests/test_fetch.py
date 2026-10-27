@@ -448,7 +448,7 @@ class TestEmitWorkspaceTar:
         _enable_multi_user_config(state, monkeypatch)
         _materialize_multi_user_job(
             str(os.geteuid()),
-            "marsfetch001",
+            "hostfetch001",
             workspace_files={"out.txt": "host_a stdout\n"},
             job_name="vibeview-p04-bands",
         )
@@ -461,13 +461,13 @@ class TestEmitWorkspaceTar:
 
         monkeypatch.setattr(fetch_module.sys, "stdout", _FakeStdout())
 
-        fetch.emit_workspace_tar("marsfetch001", multi_user=True)
+        fetch.emit_workspace_tar("hostfetch001", multi_user=True)
 
         buf.seek(0)
         with tarfile.open(fileobj=buf, mode="r|") as tf:
             names = tf.getnames()
-        assert "vibeview-p04-bands-marsfetch001" in names
-        assert "vibeview-p04-bands-marsfetch001/out.txt" in names
+        assert "vibeview-p04-bands-hostfetch001" in names
+        assert "vibeview-p04-bands-hostfetch001/out.txt" in names
 
     def test_archived_job_streams_archive_bytes_to_stdout(
         self, state: Path, monkeypatch: pytest.MonkeyPatch
@@ -600,7 +600,8 @@ class TestFetchRemote:
     ) -> bytes:
         """Build a tar archive with the given files under top_dir/, return bytes."""
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in files.items():
                 data = content.encode()
                 info = tarfile.TarInfo(f"{top_dir}/{name}")
@@ -947,7 +948,9 @@ class TestFetchRemote:
         argv = captured[0]
         assert argv[0] == "ssh"
         assert "BatchMode=yes" in argv  # the hardened _ssh_base prefix
-        assert argv[-2:] == ["host_d", "vq tar-workspace abc123def456"]
+        assert argv[-2:] == [
+            "host_d", "vq tar-workspace abc123def456 --fetch-protocol-token " + "0" * 32,
+        ]
 
     def test_remote_failure_raises(
         self,
@@ -1003,7 +1006,8 @@ class TestFetchRemote:
         import io
         import tarfile
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tf:
+        with tarfile.open(fileobj=buf, mode="w",
+                          pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             info = tarfile.TarInfo("abc123def456")
             info.type = tarfile.DIRTYPE
             tf.addfile(info)
@@ -1185,7 +1189,8 @@ class TestFetchRemote:
         atomic os.replace only on full success; on failure the staging dir is
         rmtree'd and no destination is created."""
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             d = tarfile.TarInfo("destdir")
             d.type = tarfile.DIRTYPE
             tf.addfile(d)
@@ -1553,7 +1558,7 @@ class TestFetchWorkdirLocal:
         self, state: Path
     ) -> None:
         spec = _materialize_job(state, "schednowdir1", {"stdout.log": "done\n"})
-        spec.scheduler_target = "host_f-itwin"
+        spec.scheduler_target = "host_f-lanea"
         spec.scheduler_job_id = "123.host_f"
         spec.write(paths.spec_path("schednowdir1"))
 
@@ -1564,7 +1569,7 @@ class TestFetchWorkdirLocal:
         assert "scheduler jobs are workspace-only in vq" in msg
         assert "preserved scheduler workspace" in msg
         assert "stdout, stderr, _vq markers, and generated output files" in msg
-        assert "vq fetch host_f-itwin schednowdir1 -o DIR" in msg
+        assert "vq fetch host_f-lanea schednowdir1 -o DIR" in msg
 
     def test_workdir_missing_on_disk_raises(self, state: Path) -> None:
         # Spec has a workdir field but the directory is gone.
@@ -1717,7 +1722,7 @@ class TestEmitWorkdirTar:
         _enable_multi_user_config(state, monkeypatch)
         _materialize_multi_user_job(
             str(os.geteuid()),
-            "marsfetch002",
+            "hostfetch002",
             workspace_files={"input.py": "print('hi')\n"},
             workdir_files={"_vq/events.jsonl": '{"state":"failed"}\n'},
             job_name="vibeview-p04-bands",
@@ -1729,14 +1734,14 @@ class TestEmitWorkdirTar:
 
         monkeypatch.setattr("sys.stdout", _FakeStdout())
 
-        fetch.emit_workdir_tar("marsfetch002", multi_user=True)
+        fetch.emit_workdir_tar("hostfetch002", multi_user=True)
 
         buf.seek(0)
         with tarfile.open(fileobj=buf, mode="r|") as tf:
             names = tf.getnames()
-        assert "vibeview-p04-bands-marsfetch002-workdir" in names
+        assert "vibeview-p04-bands-hostfetch002-workdir" in names
         assert (
-            "vibeview-p04-bands-marsfetch002-workdir/_vq/events.jsonl"
+            "vibeview-p04-bands-hostfetch002-workdir/_vq/events.jsonl"
             in names
         )
 
@@ -1982,20 +1987,20 @@ class TestInternalTarCommandsMultiUser:
         _enable_multi_user_config(state, monkeypatch)
         _materialize_multi_user_job(
             str(os.geteuid()),
-            "marscli001",
+            "hostcli001",
             workspace_files={"stdout.log": "located\n"},
             job_name="vibeview-p04-bands",
         )
 
         result = CliRunner().invoke(
-            main, ["tar-workspace", "marscli001"], standalone_mode=False
+            main, ["tar-workspace", "hostcli001"], standalone_mode=False
         )
 
         assert result.exit_code == 0, getattr(result, "output", "")
         raw = getattr(result, "stdout_bytes", None) or result.output.encode()
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r|") as tf:
             names = tf.getnames()
-        assert "vibeview-p04-bands-marscli001/stdout.log" in names
+        assert "vibeview-p04-bands-hostcli001/stdout.log" in names
 
     def test_tar_workdir_uses_multi_user_autodetect(
         self, state: Path, monkeypatch: pytest.MonkeyPatch
@@ -2008,14 +2013,14 @@ class TestInternalTarCommandsMultiUser:
         _enable_multi_user_config(state, monkeypatch)
         _materialize_multi_user_job(
             str(os.geteuid()),
-            "marscli002",
+            "hostcli002",
             workspace_files={"input.py": "print('hi')\n"},
             workdir_files={"_vq/events.jsonl": '{"state":"failed"}\n'},
             job_name="vibeview-p04-bands",
         )
 
         result = CliRunner().invoke(
-            main, ["tar-workdir", "marscli002"], standalone_mode=False
+            main, ["tar-workdir", "hostcli002"], standalone_mode=False
         )
 
         assert result.exit_code == 0, getattr(result, "output", "")
@@ -2023,7 +2028,7 @@ class TestInternalTarCommandsMultiUser:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r|") as tf:
             names = tf.getnames()
         assert (
-            "vibeview-p04-bands-marscli002-workdir/_vq/events.jsonl"
+            "vibeview-p04-bands-hostcli002-workdir/_vq/events.jsonl"
             in names
         )
 
@@ -2035,7 +2040,8 @@ class TestFetchWorkdirRemote:
 
     def _build_tar_bytes(self, files: dict[str, str], top_dir: str) -> bytes:
         buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w|") as tf:
+        with tarfile.open(fileobj=buf, mode="w|",
+                      pax_headers={"VQ.fetch-protocol.v1": "0" * 32}) as tf:
             for name, content in files.items():
                 data = content.encode()
                 info = tarfile.TarInfo(f"{top_dir}/{name}")
@@ -2111,7 +2117,7 @@ class TestFetchWorkdirRemote:
         argv = captured[0]
         assert argv[0] == "ssh"
         assert "BatchMode=yes" in argv
-        assert argv[-2:] == ["host_d", "vq tar-workdir abc999"]
+        assert argv[-2:] == ["host_d", "vq tar-workdir abc999 --fetch-protocol-token " + "0" * 32]
 
     def test_remote_failure_raises(
         self,
@@ -2405,3 +2411,11 @@ class TestSelectedWorkdirArtifact:
         result = CliRunner().invoke(main, ["fetch", "localhost", "selectedwd12", *options])
         assert result.exit_code == 2
         assert "--subdir requires" in result.output or "mutually exclusive" in result.output
+
+
+@pytest.fixture(autouse=True)
+def negotiated_fetch_protocol():
+    """Bind synthetic current-emitter tar streams to their fixture request."""
+    with pytest.MonkeyPatch.context() as protocol_patch:
+        protocol_patch.setattr(fetch, "_new_fetch_protocol_token", lambda: "0" * 32)
+        yield

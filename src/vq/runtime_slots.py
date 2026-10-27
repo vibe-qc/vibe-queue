@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -208,6 +209,65 @@ def resolve_current(root: str | Path) -> str | None:
     return _pointer_sha(paths, paths.current)
 
 
+@dataclass(frozen=True)
+class RuntimeSelection:
+    root: Path
+    sha: str
+    source: Path
+    python: Path
+
+
+def select_python(
+    root: str | Path, *, expected_sha: str | None = None,
+) -> RuntimeSelection:
+    """Select and structurally verify one generation without executing or writing."""
+    paths = layout(root)
+    if expected_sha is not None:
+        slot_path(paths.root, expected_sha)
+    sha = resolve_current(paths.root)
+    if sha is None:
+        raise RuntimeSlotError(f"no active runtime slot at {paths.root}")
+    if expected_sha is not None and sha != expected_sha:
+        raise RuntimeSlotError(
+            f"active runtime SHA mismatch: expected {expected_sha}, got {sha}"
+        )
+    return _select_generation_python(paths, sha)
+
+
+def select_retained_python(root: str | Path, expected_sha: str) -> RuntimeSelection:
+    """Select an exact submitted generation without following the active pointer.
+
+    Short pins must identify one retained generation. Apply the same verified
+    markers and structural checks as active execution; never fall back to current.
+    Like every other SHA comparison in vq, the pin is case-insensitive: submit
+    accepts upper-case hex, and a queued spec carries the pin as typed (#175).
+    """
+    paths = layout(root)
+    _assert_releases_root(paths)
+    expected_sha = expected_sha.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", expected_sha):
+        raise RuntimeSlotError("retained runtime requires a hexadecimal source SHA")
+    matches = [entry.name for entry in paths.releases.iterdir()
+               if _SHA40.fullmatch(entry.name) and entry.name.startswith(expected_sha)]
+    if len(matches) != 1:
+        raise RuntimeSlotError(
+            f"retained runtime SHA {expected_sha} has {len(matches)} matching generations"
+        )
+    sha = matches[0]
+    _assert_generation(paths, sha)
+    return _select_generation_python(paths, sha)
+
+
+def _select_generation_python(paths: SlotLayout, sha: str) -> RuntimeSelection:
+    source = slot_source(paths.root, sha)
+    python = slot_python(paths.root, sha)
+    for directory in (source, python.parent.parent, python.parent):
+        _assert_directory_not_symlink(directory, "runtime launch directory")
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise RuntimeSlotError(f"runtime-slot interpreter is not executable: {python}")
+    return RuntimeSelection(paths.root, sha, source, python)
+
+
 def exec_current_python(
     root: str | Path,
     arguments: list[str],
@@ -226,29 +286,64 @@ def exec_current_python(
     dependencies for each job. This relies on the immutable-generation contract;
     it is not an integrity audit of owner-modified runtime bytes.
     """
-    paths = layout(root)
-    if expected_sha is not None:
-        slot_path(paths.root, expected_sha)  # validate before reading the pointer
-    sha = resolve_current(paths.root)
-    if sha is None:
-        raise RuntimeSlotError(f"no active runtime slot at {paths.root}")
-    if expected_sha is not None and sha != expected_sha:
-        raise RuntimeSlotError(
-            f"active runtime SHA mismatch: expected {expected_sha}, got {sha}"
-        )
-    source = slot_source(paths.root, sha)
-    python = slot_python(paths.root, sha)
-    for directory in (source, python.parent.parent, python.parent):
-        _assert_directory_not_symlink(directory, "runtime launch directory")
-    if not python.is_file() or not os.access(python, os.X_OK):
-        raise RuntimeSlotError(f"runtime-slot interpreter is not executable: {python}")
+    selected = select_python(root, expected_sha=expected_sha)
+    python = selected.python
     env = dict(os.environ)
     env.update(
-        VQ_RUNTIME_SLOT_SHA=sha,
-        VQ_RUNTIME_SLOT_SOURCE=str(source),
+        VQ_RUNTIME_SLOT_SHA=selected.sha,
+        VQ_RUNTIME_SLOT_SOURCE=str(selected.source),
         VQ_RUNTIME_SLOT_PYTHON=str(python),
     )
     os.execve(str(python), [str(python), *arguments], env)
+
+
+def render_launcher(root: str | Path, bootstrap_python: Path, arguments: list[str]) -> str:
+    """Export a standalone selector; only its retained base Python is external.
+
+    The generated file embeds this standard-library module, so selecting the
+    next generation never imports vq through an old checkout or a moving
+    ``current`` path. No files are installed or bindings changed here.
+    """
+    import base64
+
+    selected = select_python(root)
+    if not bootstrap_python.is_absolute():
+        raise RuntimeSlotError("launcher bootstrap Python must be an absolute path")
+    python = bootstrap_python.resolve(strict=True)
+    if python.is_relative_to(selected.root):
+        raise RuntimeSlotError("launcher bootstrap Python must be outside the runtime store")
+    if any(c in str(python) for c in ("\x00", "\n", "\r")):
+        raise RuntimeSlotError("launcher bootstrap Python path contains a control character")
+    if any(not isinstance(arg, str) or "\x00" in arg for arg in arguments):
+        raise RuntimeSlotError("launcher arguments must be strings without NUL characters")
+    try:
+        probe = subprocess.run(
+            [str(python), "-I", "-c", "import sys; "
+             "sys.exit(0 if sys.version_info >= (3, 12) and "
+             "sys.prefix == sys.base_prefix else 1)"],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeSlotError(f"cannot probe launcher bootstrap Python: {exc}") from exc
+    if probe.returncode:
+        raise RuntimeSlotError("launcher bootstrap requires a base Python 3.12 or newer")
+    # Reuse the exact selector and marker contract. The export stays usable
+    # after this package is removed; a future incompatible slot schema refuses
+    # until the operator exports a new reviewed launcher.
+    source = base64.b64encode(Path(__file__).read_bytes()).decode("ascii")
+    command = shlex.quote(str(python))
+    return (
+        "#!/bin/sh\n"
+        f"'''exec' {command} -I \"$0\" \"$@\"\n' '''\n"
+        "# Standalone vq runtime launcher, format 1. Retain the base Python.\n"
+        "import base64\n"
+        f"exec(compile(base64.b64decode({source!r}), '<vq runtime selector>', 'exec'))\n"
+        "try:\n"
+        f"    exec_current_python({str(selected.root)!r}, {arguments!r} + sys.argv[1:])\n"
+        "except (RuntimeSlotError, OSError) as exc:\n"
+        "    print(f'Error: {exc}', file=sys.stderr)\n"
+        "    raise SystemExit(1)\n"
+    )
 
 
 def create_slot(root: str | Path, sha: str) -> Path:
@@ -264,8 +359,19 @@ def create_slot(root: str | Path, sha: str) -> Path:
         raise RuntimeSlotError(
             f"refusing to reopen verified immutable runtime slot {sha[:12]}"
         )
-    target.mkdir(parents=True, exist_ok=True)
+    _create_slot_directories(layout(root))
+    target.mkdir(mode=0o700, exist_ok=True)
     return target
+
+
+def _create_slot_directories(paths: SlotLayout) -> None:
+    """Create private store boundaries without changing existing permissions."""
+    # parents=True applies the requested mode only to the leaf. Create the
+    # root and releases separately so neither inherits a permissive umask.
+    paths.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _assert_runtime_root(paths.root)
+    paths.releases.mkdir(mode=0o700, exist_ok=True)
+    _assert_releases_root(paths)
 
 
 def begin_slot_build(
@@ -274,6 +380,7 @@ def begin_slot_build(
     *,
     transaction_id: str,
     in_use: Callable[[], set[str] | frozenset[str]],
+    venv_subdir: str = ".venv",
 ) -> bool:
     """Reserve the final absolute generation path for an immutable build.
 
@@ -289,12 +396,12 @@ def begin_slot_build(
     """
     if not _TRANSACTION_ID.fullmatch(transaction_id):
         raise RuntimeSlotError("runtime-slot transaction id is malformed")
+    _validate_venv_subdir(venv_subdir)
     paths = layout(root)
     target = slot_path(root, sha)
     receipt = _slot_build_receipt(root, sha)
 
-    paths.releases.mkdir(parents=True, exist_ok=True)
-    _assert_releases_root(paths)
+    _create_slot_directories(paths)
 
     if target.is_symlink():
         raise RuntimeSlotError(f"refusing symlinked runtime slot {target}")
@@ -302,6 +409,8 @@ def begin_slot_build(
         raise RuntimeSlotError(f"runtime slot path is not a directory: {target}")
 
     if target.is_dir() and _verified_markers_match(root, sha):
+        if _slot_venv_subdir(root, sha) != venv_subdir:
+            raise RuntimeSlotError("verified runtime slot has a different virtualenv binding")
         if receipt.exists() or receipt.is_symlink():
             old_receipt = _read_exact_marker(
                 receipt,
@@ -314,6 +423,8 @@ def begin_slot_build(
                 raise RuntimeSlotError(
                     f"runtime slot {sha[:12]} has a stale mismatched build receipt"
                 )
+            if _marker_venv_subdir(old_receipt) != venv_subdir:
+                raise RuntimeSlotError("runtime-slot build receipt has a different virtualenv")
             _unlink_and_sync(receipt)
         return False
 
@@ -324,6 +435,8 @@ def begin_slot_build(
             expected_id=sha,
             expected_states={"building"},
         )
+        if _marker_venv_subdir(old_receipt) != venv_subdir:
+            raise RuntimeSlotError("runtime-slot retry has a different virtualenv binding")
         if target.is_dir():
             state_path = target / SLOT_STATE_MARKER
             if not state_path.exists() and not state_path.is_symlink():
@@ -339,7 +452,10 @@ def begin_slot_build(
                     expected_id=sha,
                     expected_states={"building"},
                 )
-            if state["transaction"] != old_receipt["transaction"]:
+            if (
+                state["transaction"] != old_receipt["transaction"]
+                or _marker_venv_subdir(state) != venv_subdir
+            ):
                 raise RuntimeSlotError(
                     f"runtime slot {sha[:12]} has mismatched build receipts"
                 )
@@ -376,10 +492,10 @@ def begin_slot_build(
             _fsync_directory(paths.releases)
         _unlink_and_sync(receipt)
 
-    receipt_payload = _build_marker_payload(sha, transaction_id)
+    receipt_payload = _build_marker_payload(sha, transaction_id, venv_subdir)
     _write_json_exclusive(receipt, receipt_payload)
     try:
-        target.mkdir()
+        target.mkdir(mode=0o700)
         _fsync_directory(paths.releases)
         _write_json_exclusive(
             target / SLOT_STATE_MARKER,
@@ -417,6 +533,7 @@ def seal_slot_build(
     if (
         state["transaction"] != transaction_id
         or build_receipt["transaction"] != transaction_id
+        or _marker_venv_subdir(state) != _marker_venv_subdir(build_receipt)
     ):
         raise RuntimeSlotError(
             f"runtime slot {sha[:12]} does not belong to this build transaction"
@@ -442,7 +559,8 @@ def seal_slot_build(
     else:
         _write_json_exclusive(
             immutable,
-            {"schema": _MARKER_SCHEMA, "kind": _SLOT_STATE_KIND, "id": sha},
+            {**_marker_layout_fields(_marker_venv_subdir(state)),
+             "kind": _SLOT_STATE_KIND, "id": sha},
         )
     _seal_state(
         root,
@@ -657,9 +775,11 @@ def _slot_build_receipt(root: str | Path, sha: str) -> Path:
     return layout(root).releases / f".{sha}{_SLOT_BUILD_RECEIPT_SUFFIX}"
 
 
-def _build_marker_payload(sha: str, transaction_id: str) -> dict[str, object]:
+def _build_marker_payload(
+    sha: str, transaction_id: str, venv_subdir: str = ".venv",
+) -> dict[str, object]:
     return {
-        "schema": _MARKER_SCHEMA,
+        **_marker_layout_fields(venv_subdir),
         "kind": _SLOT_BUILD_KIND,
         "id": sha,
         "transaction": transaction_id,
@@ -678,7 +798,7 @@ def _seal_state(
     _write_json_replace(
         slot_path(root, sha) / SLOT_STATE_MARKER,
         {
-            "schema": _MARKER_SCHEMA,
+            **_marker_layout_fields(_slot_venv_subdir(root, sha)),
             "kind": _SLOT_STATE_KIND,
             "id": sha,
             "transaction": transaction_id,
@@ -709,8 +829,8 @@ def _verified_markers_match(root: str | Path, sha: str) -> bool:
 
 def _read_verified_state(path: Path, sha: str) -> dict[str, object]:
     payload = _read_json_regular(path)
-    if set(payload) != {
-        "schema",
+    layout_fields = _marker_layout_fields(_marker_venv_subdir(payload))
+    if set(payload) != set(layout_fields) | {
         "kind",
         "id",
         "transaction",
@@ -720,8 +840,7 @@ def _read_verified_state(path: Path, sha: str) -> dict[str, object]:
     }:
         raise RuntimeSlotError(f"runtime-slot verified marker has invalid fields: {path}")
     if (
-        payload.get("schema") != _MARKER_SCHEMA
-        or payload.get("kind") != _SLOT_STATE_KIND
+        payload.get("kind") != _SLOT_STATE_KIND
         or payload.get("id") != sha
         or payload.get("state") != "verified"
         or not isinstance(payload.get("transaction"), str)
@@ -751,7 +870,9 @@ def source_content_sha256(root: str | Path, sha: str) -> str:
     """Digest all source/build bytes that an editable runtime may import."""
     source = slot_source(root, sha)
     _assert_directory_not_symlink(source, "runtime-slot source")
-    return _content_tree_sha256(source, excluded_names={".git", VENV_SUBDIR})
+    return _content_tree_sha256(
+        source, excluded_names={".git", _slot_venv_subdir(root, sha)},
+    )
 
 
 def _content_tree_sha256(path_root: Path, *, excluded_names: set[str]) -> str:
@@ -811,7 +932,7 @@ def _content_tree_sha256(path_root: Path, *, excluded_names: set[str]) -> str:
 def _immutable_marker_matches(path: Path, sha: str) -> bool:
     payload = _read_json_regular(path)
     return payload == {
-        "schema": _MARKER_SCHEMA,
+        **_marker_layout_fields(path.parent.name),
         "kind": _SLOT_STATE_KIND,
         "id": sha,
     }
@@ -825,11 +946,11 @@ def _read_exact_marker(
     expected_states: set[str],
 ) -> dict[str, object]:
     payload = _read_json_regular(path)
-    if set(payload) != {"schema", "kind", "id", "transaction", "state"}:
+    layout_fields = _marker_layout_fields(_marker_venv_subdir(payload))
+    if set(payload) != set(layout_fields) | {"kind", "id", "transaction", "state"}:
         raise RuntimeSlotError(f"runtime-slot marker has invalid fields: {path}")
     if (
-        payload.get("schema") != _MARKER_SCHEMA
-        or payload.get("kind") != expected_kind
+        payload.get("kind") != expected_kind
         or payload.get("id") != expected_id
         or payload.get("state") not in expected_states
         or not isinstance(payload.get("transaction"), str)
@@ -961,6 +1082,72 @@ SOURCE_SUBDIR = "source"
 VENV_SUBDIR = ".venv"
 
 
+def _validate_venv_subdir(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", value)
+        or value in {".", "..", ".git", "current", "previous"}
+    ):
+        raise RuntimeSlotError("runtime-slot virtualenv must be one source-local directory")
+    return value
+
+
+def _marker_layout_fields(venv_subdir: str) -> dict[str, object]:
+    _validate_venv_subdir(venv_subdir)
+    # Keep default generations byte/schema compatible. Older readers must
+    # refuse a custom layout instead of silently executing its .venv sibling.
+    if venv_subdir == VENV_SUBDIR:
+        return {"schema": _MARKER_SCHEMA}
+    return {"schema": 2, "venv_subdir": venv_subdir}
+
+
+def _marker_venv_subdir(payload: dict[str, object]) -> str:
+    if type(payload.get("schema")) is not int:
+        raise RuntimeSlotError("runtime-slot marker schema must be an integer")
+    if payload.get("schema") == _MARKER_SCHEMA and "venv_subdir" not in payload:
+        return VENV_SUBDIR
+    if payload.get("schema") == 2:
+        value = _validate_venv_subdir(payload.get("venv_subdir"))
+        if value != VENV_SUBDIR:
+            return value
+    raise RuntimeSlotError("runtime-slot marker has an invalid virtualenv layout")
+
+
+def _slot_venv_subdir(root: str | Path, sha: str) -> str:
+    marker = slot_path(root, sha) / SLOT_STATE_MARKER
+    if not marker.exists() and not marker.is_symlink():
+        return VENV_SUBDIR
+    payload = _read_json_regular(marker)
+    if payload.get("state") == "building":
+        payload = _read_exact_marker(
+            marker, expected_kind=_SLOT_BUILD_KIND, expected_id=sha,
+            expected_states={"building"},
+        )
+    else:
+        payload = _read_verified_state(marker, sha)
+    return _marker_venv_subdir(payload)
+
+
+def program_venv_subdir(prog: VenvProgram) -> str:
+    """Preserve a registered source-local venv, without resolving Python's symlink.
+
+    External/nested environments need a separate reviewed build adapter; their
+    absolute targets cannot safely be relocated by guessing script arguments.
+    """
+    source = Path(os.path.abspath(prog.git_dir))
+    python = Path(os.path.abspath(prog.python))
+    try:
+        parts = python.relative_to(source).parts
+    except ValueError as exc:
+        raise RuntimeSlotError("runtime-slot interpreter must be source-local") from exc
+    if len(parts) != 3 or parts[1:] != ("bin", "python"):
+        raise RuntimeSlotError(
+            "runtime-slot interpreter must be SOURCE/VENV/bin/python; "
+            "this registration needs a reviewed build adapter"
+        )
+    return _validate_venv_subdir(parts[0])
+
+
 def slot_source(root: str | Path, sha: str) -> Path:
     """Checkout directory inside ``sha``'s slot."""
     return slot_path(root, sha) / SOURCE_SUBDIR
@@ -968,7 +1155,7 @@ def slot_source(root: str | Path, sha: str) -> Path:
 
 def slot_python(root: str | Path, sha: str) -> Path:
     """Interpreter inside ``sha``'s slot."""
-    return slot_path(root, sha) / SOURCE_SUBDIR / VENV_SUBDIR / "bin" / "python"
+    return slot_source(root, sha) / _slot_venv_subdir(root, sha) / "bin" / "python"
 
 
 def slot_local_program(
@@ -996,7 +1183,11 @@ def slot_local_program(
     ``docs/design_immutable_venv_runtimes.md`` §0.
     """
     source = slot_source(root, sha)
-    python = slot_python(root, sha)
+    venv_subdir = program_venv_subdir(prog)
+    marker = slot_path(root, sha) / SLOT_STATE_MARKER
+    if (marker.exists() or marker.is_symlink()) and _slot_venv_subdir(root, sha) != venv_subdir:
+        raise RuntimeSlotError("runtime slot has a different registered virtualenv binding")
+    python = source / venv_subdir / "bin" / "python"
     for path in (source, python):
         if CURRENT_LINK in path.parts:
             raise RuntimeSlotError(
@@ -1012,8 +1203,100 @@ def slot_local_program(
             "git_dir": str(source),
             "python": str(python),
             "runtime_slot_root": None,
+            "update_script": _slot_script(prog.update_script, prog.git_dir),
+            "post_update_script": _slot_script(prog.post_update_script, prog.git_dir),
+            "healthcheck_command": _slot_healthcheck(
+                prog.healthcheck_command, prog.git_dir, source,
+            ),
+            "runtime_slot_execution": False,
+            # This object names one concrete generation. It has no store
+            # pointer to resolve again, including when read from a receipt.
+            "runtime_slot_build_input": "legacy",
+            "runtime_slot_seed_adapter": None,
         }
     )
+
+
+
+def _slot_healthcheck(
+    command: str | None, live_source: str, selected_source: Path,
+) -> str | None:
+    """Rebind complete source-local argv paths, never shell/code substrings.
+
+    Health checks are argv (not shell programs). External executables remain
+    external; bare commands use the probe's selected-venv PATH. Embedded legacy
+    paths in code or compound arguments need an explicit slot-aware adapter.
+    """
+    if command is None:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise RuntimeSlotError(f"invalid runtime-slot healthcheck: {exc}") from exc
+    if not argv:
+        raise RuntimeSlotError("runtime-slot healthcheck is empty")
+    live = Path(os.path.abspath(live_source))
+    rebound = []
+    for arg in argv:
+        prefix, value = "", arg
+        if arg.startswith("--") and "=" in arg:
+            option, value = arg.split("=", 1)
+            prefix = option + "="
+        relative = None
+        if os.path.isabs(value) and ":/" not in value:
+            try:
+                relative = Path(os.path.abspath(value)).relative_to(live)
+            except ValueError:
+                pass
+        if relative is not None:
+            rebound.append(prefix + str(selected_source / relative))
+        elif re.search(re.escape(str(live)) + r"(?=$|[/\s\"':])", arg):
+            raise RuntimeSlotError(
+                "runtime-slot healthcheck embeds a legacy source path; "
+                "use a complete argv path or explicit slot-aware adapter"
+            )
+        else:
+            rebound.append(arg)
+    return shlex.join(rebound)
+
+
+def slot_install_script(prog: VenvProgram) -> str | None:
+    """The registration's installer, rebound into a generation (#104).
+
+    A generation's first build creates its environment, which is what
+    ``install_script`` exists for; ``update_script`` refreshes an environment
+    that is already there, and a strict updater refuses outright in a fresh
+    tree. The same source-local rule as for the updater applies: an external
+    installer needs a reviewed adapter, so it refuses here rather than run from
+    a tree the generation does not own.
+    """
+    return _slot_script(prog.install_script, prog.git_dir)
+
+def _slot_script(command: str | None, live_source: str) -> str | None:
+    """Rebind an updater entry point without changing its argv or symlink name.
+
+    Keep the source-relative spelling: the selected commit may change a
+    relative symlink's target. The build boundary validates its resolved target
+    in the materialized generation immediately before each script executes.
+    """
+    if command is None:
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        raise RuntimeSlotError(f"invalid runtime-slot script: {exc}") from exc
+    if not parts:
+        raise RuntimeSlotError("runtime-slot script is empty")
+    live = Path(os.path.abspath(live_source))
+    entry = Path(os.path.abspath(live / parts[0]))
+    try:
+        relative = entry.relative_to(live)
+    except ValueError as exc:
+        raise RuntimeSlotError(
+            "runtime-slot script must be inside the configured source tree; "
+            "external updater entry points need an explicit slot-aware adapter"
+        ) from exc
+    return shlex.join([str(relative), *parts[1:]])
 
 
 def materialize_source(
@@ -1029,14 +1312,17 @@ def materialize_source(
     than that checkout, fetches it into the unpublished slot from the live
     checkout's configured origin. The live checkout and its refs stay untouched.
     Already available commits need no network access (offline hosts may use a
-    push-fed mirror).
+    push-fed mirror). New clones inherit a readable configured origin even when
+    no fetch is needed, so future preparation need not reach through the legacy
+    input checkout. Inputs without an origin remain local-only; existing slots
+    returned by the idempotent path are not rewritten.
 
-    ``--local`` hardlinks the object store, and here that is safe where it was
-    NOT safe for a venv: git objects are immutable and content-addressed, never
-    rewritten in place, and a hardlink keeps the slot's own reference alive even
-    if the source repository later prunes or repacks. A venv, by contrast,
-    records absolute paths and cannot be shared at all -- see
-    :func:`slot_local_program`.
+    ``--local --no-hardlinks`` copies local Git objects without requiring the
+    source and runtime store to share a filesystem. No network is needed for
+    available commits, and pruning or removing the source cannot break the
+    generation. ``--dissociate`` also copies borrowed alternate objects, so an
+    input created with ``clone --shared`` leaves no external object dependency.
+    Venvs still must be built at their final path; see :func:`slot_local_program`.
 
     Idempotent: a slot already checked out at ``sha`` is left alone, so a retried
     deployment does not re-clone. The checkout is verified against ``sha``
@@ -1058,6 +1344,8 @@ def materialize_source(
                 "git",
                 "clone",
                 "--local",
+                "--no-hardlinks",
+                "--dissociate",
                 "--no-checkout",
                 str(Path(live_git_dir)),
                 str(source),
@@ -1073,23 +1361,17 @@ def materialize_source(
                 f"could not clone {live_git_dir} into slot {sha[:12]}: {detail}"
             )
 
-    available = runner(
-        ["git", "-C", str(source), "cat-file", "-e", f"{sha}^{{commit}}"],
+    # Preserve the configured upstream even when the commit was already available
+    # locally. Otherwise the next generation inherits an origin pointing back to
+    # this build input, keeping a hidden dependency on a legacy checkout.
+    origin = runner(
+        ["git", "-C", str(Path(live_git_dir)), "remote", "get-url", "origin"],
         capture_output=True, text=True, check=False, timeout=60,
     )
-    if available.returncode != 0:
-        origin = runner(
-            ["git", "-C", str(Path(live_git_dir)), "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=False, timeout=60,
-        )
-        origin_url = (origin.stdout or "").strip()
-        if origin.returncode != 0 or not origin_url:
-            raise RuntimeSlotError(
-                f"could not check out {sha[:12]}: commit is absent locally and "
-                "the live checkout has no readable configured origin"
-            )
-        # Relative filesystem remotes are relative to the live repository,
-        # not to the new slot. Leave URL and SCP-style transports verbatim.
+    origin_url = (origin.stdout or "").strip() if origin.returncode == 0 else ""
+    if origin_url:
+        # Relative filesystem remotes belong to the input repository, not the
+        # new slot. Preserve URL and SCP-style transports verbatim.
         if ":" not in origin_url:
             origin_path = Path(origin_url).expanduser()
             if not origin_path.is_absolute():
@@ -1101,6 +1383,17 @@ def materialize_source(
         )
         if configured.returncode != 0:
             raise RuntimeSlotError("could not configure the unpublished slot's origin")
+
+    available = runner(
+        ["git", "-C", str(source), "cat-file", "-e", f"{sha}^{{commit}}"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if available.returncode != 0:
+        if not origin_url:
+            raise RuntimeSlotError(
+                f"could not check out {sha[:12]}: commit is absent locally and "
+                "the live checkout has no readable configured origin"
+            )
         fetched = runner(
             ["git", "-C", str(source), "-c", "gc.auto=0", "-c",
              "maintenance.auto=false", "fetch", "--no-tags",
@@ -1157,7 +1450,10 @@ def _head_sha(
     return head if _SHA40.match(head) else None
 
 
-def slots_in_use(root: str | Path, specs: Iterable[Any]) -> set[str]:
+def slots_in_use(
+    root: str | Path, specs: Iterable[Any], *,
+    remote_scheduler_targets: frozenset[str] = frozenset(),
+) -> set[str]:
     """Slot SHAs that non-terminal jobs are executing from.
 
     A command containing an exact ``<root>/releases/<sha>/`` path proves which
@@ -1168,10 +1464,14 @@ def slots_in_use(root: str | Path, specs: Iterable[Any]) -> set[str]:
     jobs are terminal is safe, while guessing can delete an executing runtime.
 
     Terminal jobs are ignored because their process is gone.  Any non-terminal
-    spec without an exact generation path is treated as potentially slot-backed
-    rather than ignored.
+    spec without an exact generation path is treated as potentially slot-backed.
+    The caller may supply configured scheduler targets proven to execute on
+    another host. Their remote-only commands cannot hold this local store;
+    exact references to this store still take precedence over that exemption.
     """
-    releases_prefix = f"{layout(root).releases}{os.sep}"
+    paths = layout(root)
+    releases_prefix = f"{paths.releases}{os.sep}"
+    local_prefix = f"{paths.root}{os.sep}"
     found: set[str] = set()
     has_unresolved_live_spec = False
     for spec in specs:
@@ -1187,6 +1487,19 @@ def slots_in_use(root: str | Path, specs: Iterable[Any]) -> set[str]:
                 found.add(candidate)
                 matched = True
         if not matched:
+            target = getattr(spec, "scheduler_target", None)
+            names_local_store = any(
+                isinstance(arg, str) and arg.startswith(local_prefix)
+                for arg in getattr(spec, "command", None) or ()
+            )
+            pin = getattr(spec, "program_runtime_pin", None)
+            pin_root = getattr(pin, "resolved_runtime_root", None)
+            names_local_store |= pin_root == str(paths.root)
+            if (
+                isinstance(target, str) and target in remote_scheduler_targets
+                and not names_local_store
+            ):
+                continue
             has_unresolved_live_spec = True
     if has_unresolved_live_spec:
         return set(list_slots(root))

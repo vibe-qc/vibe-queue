@@ -56,18 +56,25 @@ def _parse_iso(ts: str | None) -> datetime | None:
 
 
 def _hms_to_seconds(value: str | None) -> int | None:
+    """Parse HH:MM:SS, including Slurm's D-HH:MM:SS day prefix."""
     if value is None:
         return None
+    day_part = "0"
+    if "-" in value:
+        day_part, value = value.split("-", 1)
+        if not day_part.isdigit():
+            return None
     parts = value.split(":")
     if len(parts) != 3:
         return None
     try:
+        days = int(day_part)
         hours, minutes, seconds = (int(part) for part in parts)
     except ValueError:
         return None
     if hours < 0 or not (0 <= minutes < 60) or not (0 <= seconds < 60):
         return None
-    return hours * 3600 + minutes * 60 + seconds
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 def _duration_seconds(spec: JobSpec) -> float | None:

@@ -1,0 +1,1 @@
+Submit examples in the README and guides that ran a command without a workspace (`vq submit HOST -- CMD`), which vq refuses, now give one with `-d`, and the refusal says to. The `vq submit --help` watchdog note no longer says macOS falls back to a process-group walk: there the watchdog reads no process usage.

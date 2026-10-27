@@ -83,6 +83,16 @@ class TestResubmitLocal:
         assert new_spec.state == JobState.PENDING
         assert new_spec.parent_jobid == "deadbeef0001"
 
+    def test_status_names_the_parent_as_resubmitted_from(self, state: Path) -> None:
+        # #206: the label was "auto-resumed from" whatever made the job.
+        from vq.status import show_status
+
+        _materialize_job("deadbeef0010", workspace_files={"input.py": "print('hi')"})
+        new_id = resubmit_local("deadbeef0010")
+        text = show_status("localhost", new_id)
+        assert "parent_jobid: deadbeef0010 (resubmitted from)" in text
+        assert "auto-resumed" not in text
+
     def test_workspace_deep_copied_not_shared(self, state: Path) -> None:
         _materialize_job(
             "deadbeef0002",

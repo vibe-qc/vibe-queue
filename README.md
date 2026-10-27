@@ -11,7 +11,7 @@ to queue [vibe-qc](https://github.com/vibe-qc/vibe-qc) calculations
 and it does not care whether that is what you run.
 
 ```sh
-vq submit compute -- python optimise.py
+vq submit compute optimise.py
 vq queue
 vq fetch <jobid> -o results/
 ```
@@ -146,6 +146,20 @@ because this corpus serves three readers who want almost nothing in common:
 - **[The agent contract](docs/agent/index.md)** -- stable JSON shapes, exit
   codes, lifecycle states, and the invariants that hold across versions.
 
+Guides and walkthroughs:
+
+- [Installing vq on machines and clusters](docs/cluster_install.md) and
+  [machines with and without a batch scheduler](docs/backends.md), for daemon
+  hosts and PBS/Torque or Slurm login nodes.
+- [Adding programs](docs/user/programs.md),
+  [running vibe-qc calculations](docs/user/vibe_qc.md) and
+  [vibe-sketch and vibe-view with the queue](docs/user/vibe_family.md).
+- [Running ORCA and CRYSTAL](docs/user/orca_crystal.md) with the shipped
+  wrappers, and [troubleshooting](docs/user/troubleshooting.md) by symptom.
+- [Tutorials](docs/user/tutorials.md), from a first job to a rendered figure.
+- [`config/public-example.toml`](config/public-example.toml), a starter
+  configuration for all three kinds of host.
+
 Also: [cutting a release](docs/release_process.md),
 [version compatibility](docs/version_compatibility.md),
 [contributing](CONTRIBUTING.md), [security policy](SECURITY.md),
@@ -165,3 +179,9 @@ inherited `0.25.7`, the version the fleet was already running.
 Mozilla Public License 2.0. See [LICENSE](LICENSE).
 
 Copyright (c) 2026 Michael F. Peintinger and vibe-qc contributors.
+
+## Self-contained macOS package
+
+Apple Silicon users can use the [macOS package](packaging/macos/README.md),
+which includes Python, the CLI and web console dependencies. Build recipes
+remain available from Git; installed packages do not need Python or Homebrew.

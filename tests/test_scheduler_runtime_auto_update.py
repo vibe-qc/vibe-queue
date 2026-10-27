@@ -196,7 +196,7 @@ class TestCheckSchedulerRuntimeDrift:
         # deprecated and warns on use, would be advice to undo a migration.
         assert "no vibe-qc checkout is configured" in d.reason
         assert "pin_source_repos" in d.reason
-        assert "mpei/vibe-qc" in d.reason
+        assert '"vibe-qc" = "/path/to/vibe-qc"' in d.reason
         assert "scheduler_runtime_source_repo" not in d.reason
 
     def test_the_deprecated_spelling_still_satisfies_the_check(

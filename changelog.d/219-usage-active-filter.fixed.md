@@ -1,0 +1,1 @@
+**Honor active-job filtering for scheduler usage.** Scheduler walltime observations no longer cause running or suspended jobs to enter default terminal-only usage totals. `--include-active` includes those states while pending jobs remain excluded, even when they retain timing observations. (#219)

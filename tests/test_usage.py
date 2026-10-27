@@ -123,6 +123,26 @@ class TestUsageAccounting:
         assert with_active.total.wall_hours == pytest.approx(2.0)
         assert with_active.total.cpu_hours == pytest.approx(3.0)
 
+    @pytest.mark.parametrize("state", [JobState.RUNNING, JobState.SUSPENDED, JobState.PENDING])
+    @pytest.mark.parametrize("include_active", [False, True])
+    def test_scheduler_walltime_respects_active_filter(
+        self, state: JobState, include_active: bool,
+    ) -> None:
+        spec = _spec(
+            "scheduler-active", state=state, finished_at=None, cpus=4,
+            scheduler_target="cluster", scheduler_walltime_used="00:30:00",
+        )
+
+        report = usage.build_usage_report(
+            [spec], host="localhost", include_active=include_active, now=_NOW,
+        )
+
+        included = include_active and state in {JobState.RUNNING, JobState.SUSPENDED}
+        assert report.total.jobs == int(included)
+        assert report.skipped_jobs == int(not included)
+        assert report.total.wall_seconds == (1800 if included else 0)
+        assert report.total.cpu_seconds == (7200 if included else 0)
+
     def test_json_contains_seconds_and_hours(self) -> None:
         report = usage.build_usage_report(
             [_spec("job-a", cpus=2, submitter="alice")],

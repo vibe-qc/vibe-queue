@@ -122,8 +122,9 @@ numbers rather than an assumed footprint:
     vq submit compute --cpus 4 --mem-mb 8000 --time-limit 00:30:00 \
         input-mgo-pbe0.py
 
-On Linux the caps are enforced with cgroup v2, so one greedy job cannot take
-the box down.
+On a Linux host where systemd delegates memory control, the caps are enforced
+with cgroup v2, so one greedy job cannot take the box down. Elsewhere vq falls
+back to polling and signals.
 ```
 
 ```{note}
@@ -136,10 +137,11 @@ also disable automatic preflight.
 ## Step 3, monitor
 
 ```sh
-# Snapshot of the queue.
+# Snapshot of the queue: one row per job, archived ones hidden, under the
+# columns ID, STATE, CPUS, SUBMITTED (UTC) and COMMAND. A NAME column appears
+# once some listed job was given one with --job-name; CLUSTER, PRI and TASKS
+# appear when a listed job needs them.
 vq queue
-# JOBID         STATE     ELAPSED   NAME              SCRIPT
-# c0ff50a06462  running   00:00:08  input-mgo-pbe0    input-mgo-pbe0.py
 
 # One job in detail, with the tails of stdout and stderr.
 vq status c0ff50a06462
@@ -171,13 +173,18 @@ the job back to `running`.
 
 ```{warning}
 Terminal is not the same as successful. `vq wait` returning tells you the job
-finished, not that the calculation worked. Check the state.
+finished, not that the calculation worked. Check the state. `vq wait` exits
+with the job's own exit code when it completed or failed, and with 1 for every
+other terminal state, so `vq wait ID && vq fetch ID` stops on a failure. Even
+zero means only that the process exited 0.
 ```
 
 Separately from the job state, the `.system` manifest's `[outputs].status`
-field tracks the **output side**: `"running"` while the job is alive, then
-`"complete"` or `"crashed"`. That is what lets vq distinguish "the SCF
-crashed and wrote a dump" from "the daemon died and the job was orphaned".
+field is vibe-qc's own record of the **output side** of the run. vq does not
+read it. When a daemon restarts, vq tells a job that finished from one that was
+orphaned by the exit code the job leaves in its workspace, in
+`_vq/exit-code`: a job with no exit code there ends in the
+`aborted_by_queue` state.
 
 ## Step 4, fetch the outputs
 
@@ -186,6 +193,13 @@ Once the job is `completed`:
 ```sh
 vq fetch c0ff50a06462 -o ./outputs/
 ```
+
+This script writes its outputs into the submitted workspace. A plain
+`vq fetch` copies that workspace and succeeds when the host proves the
+separate scratch directory is empty. If a job writes into `$VQ_WORKDIR`, use
+`--workdir` to retrieve those results. When scratch contains files or cannot
+be checked, the plain command copies the workspace but exits with a hint to
+choose `--workdir` or, for workspace files only, `--workspace`.
 
 The workspace streams back over SSH. With `--job-name` at submit time the
 destination is `./outputs/<jobname>-<jobid>/`; otherwise `./outputs/<jobid>/`:
@@ -202,10 +216,14 @@ outputs/c0ff50a06462/
     output-mgo-pbe0.references
     stdout.log                    # vq-captured stdout
     stderr.log                    # vq-captured stderr
+    _vq/                          # vq's record: events, exit code, fetch manifest
 ```
 
 The listing illustrates the file family; the exact sidecars depend on output
-settings and successful completion. The `.bibtex` and `.references` files are assembled automatically, as
+settings and successful completion. The `_vq/` directory is always in a
+workspace fetch. If a file could not be read, the rest still arrives, the
+command prints `PARTIAL`, and `_vq/fetch-exclusions.json` names what is
+missing. The `.bibtex` and `.references` files are assembled automatically, as
 [citations](../user_guide/citations.md) describes. Drop the BibTeX file into
 your manuscript and cite from it.
 
@@ -350,23 +368,31 @@ vq submit -d ./my_sweep_dir/ -- python run.py
 `-d` names the directory to copy across, `--` ends vq's own options, and the
 rest is the literal command to run inside the workspace.
 
-For a genuine sweep, `--array N` submits N parallel siblings from one source
-and `--chain N` runs N in strict sequence, each waiting for the previous to
-succeed.
+For a genuine sweep, `--array N` submits N parallel siblings from one source.
+`--chain N` runs N in strict sequence, each waiting for the previous to
+succeed, but vq refuses it for an ordinary remote host, because that host's
+daemon never receives the chain. Submit it from the machine that will run the
+jobs instead.
 
 (pausing-the-queue)=
 
 ### Holding the queue back
 
 ```sh
-vq pause                 # stop dispatching; running jobs continue
-vq resume                # dispatch again
-vq drain --max-jobs 1    # partial drain: cap concurrency without pausing
+vq drain                 # stop dispatching; running jobs continue
+vq drain --max-jobs 1    # partial: cap concurrency instead of stopping
+vq drain --release       # dispatch again
 ```
 
 Useful when you want the box for an interactive session and would rather vq
-did not fill the CPU underneath you. To make one *running* job step aside
-instead, `vq throttle` lowers its CPU weight; see
+did not fill the CPU underneath you. Drain gates new dispatches only, and the
+daemon records it, so it outlives a daemon restart or a reboot until you
+release it.
+
+Work that is already running is a different set of verbs, and each one needs a
+job id or `--all`: `vq pause` stops a job's process group and moves it into the
+`suspended` state, `vq resume` returns it to `running`, and `vq throttle`
+lowers a job's CPU weight without stopping it. See
 [throttling](https://vibe-qc.com/vibe-queue/docs/throttle.html).
 
 (why-vibeqc-preflight-matters)=
@@ -415,5 +441,8 @@ manifest, and adjust the next request from that evidence.
 * [Auto-citations, from `.out` to manuscript bibliography](auto_citations.md).
 * [Cross-validating against ORCA, Psi4 and PySCF](cross_validation.md), which
   runs the same input through several codes over vq.
+* [vq's tutorials](https://vibe-qc.com/vibe-queue/docs/user/tutorials.html), including the same
+  kind of job on a PBS or SLURM cluster and a structure taken from vibe-sketch
+  to a vibe-view figure.
 * [vq's own documentation](https://vibe-qc.com/vibe-queue/docs/) for
   everything the queue does that is not about vibe-qc.

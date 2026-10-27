@@ -37,6 +37,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -183,6 +184,13 @@ class WatchdogJobState:
     # values (near-zero) while starve_since_monotonic was already
     # ticking. See docs/audit_2026-05-17 § 2f.
     last_observed_spec_state: JobState | None = None
+    # #168: the highest RSS this job's samples have shown and since when.
+    # Resumed from the last sample a previous daemon wrote for the same
+    # process, so a restart does not reset it; spikes between samples are
+    # not seen. ``rss_peak_seeded`` marks that resume as already tried.
+    rss_peak_mb: float | None = None
+    rss_peak_since: str | None = None
+    rss_peak_seeded: bool = False
 
 
 @dataclass
@@ -434,6 +442,7 @@ class Watchdog:
         *,
         cgroup_unit_name: str | None = None,
         cgroup_multi_user: bool = False,
+        external_usage: tuple[float | None, int | None, str] | None = None,
     ) -> Verdict:
         """Return what to do with this running job, this iteration.
 
@@ -557,41 +566,51 @@ class Watchdog:
         cputime_source: str | None = None  # WD-1: tag the reader (see below)
         cgroup_path: str | None = None
         cgroup_lookup: str | None = None
-        if cgroup_unit_name is not None:
-            cgroup_path = cgroup.cgroup_path_for_scope(
-                cgroup_unit_name, multi_user=cgroup_multi_user
-            )
+        if external_usage is not None:
+            cputime, rss_mb, cputime_source = external_usage
+            cgroup_lookup = "managed-container"
+        else:
+            if cgroup_unit_name is not None:
+                cgroup_path = cgroup.cgroup_path_for_scope(
+                    cgroup_unit_name, multi_user=cgroup_multi_user
+                )
+                if cgroup_path is not None:
+                    cgroup_lookup = "scope"
+            if cgroup_path is None:
+                cgroup_path = cgroup.cgroup_path_for_pid(pid)
+                if cgroup_path is not None:
+                    cgroup_lookup = "pid"
             if cgroup_path is not None:
-                cgroup_lookup = "scope"
-        if cgroup_path is None:
-            cgroup_path = cgroup.cgroup_path_for_pid(pid)
-            if cgroup_path is not None:
-                cgroup_lookup = "pid"
-        if cgroup_path is not None:
-            cputime = cgroup.read_cpu_usage_seconds(cgroup_path)
-            if cputime is not None:
-                cputime_source = "cgroup"
-            rss_mb = cgroup.read_memory_current_mb(cgroup_path)
-        # Fall back to the pgid-walk for any field cgroup didn't fill
-        # (covers: (a) macOS / no cgroup-v2, (b) cgroup present but
-        # cpu.stat / memory.current absent — e.g. host without
-        # delegation of the relevant controllers).
-        if cputime is None or rss_mb is None:
-            if pgid is not None:
-                if rss_mb is None:
-                    rss_mb = read_rss_mb_pgid(pgid)
-                if cputime is None:
-                    cputime = read_cputime_seconds_pgid(pgid)
-                    if cputime is not None:
-                        cputime_source = "pgid"
-            else:
-                if rss_mb is None:
-                    rss_mb = read_rss_mb(pid)
-                if cputime is None:
-                    cputime = read_cputime_seconds(pid)
-                    if cputime is not None:
-                        cputime_source = "pid"
+                cputime = cgroup.read_cpu_usage_seconds(cgroup_path)
+                if cputime is not None:
+                    cputime_source = "cgroup"
+                rss_mb = cgroup.read_memory_current_mb(cgroup_path)
+            # Fall back to the pgid-walk for any field cgroup didn't fill
+            # (covers: (a) macOS / no cgroup-v2, (b) cgroup present but
+            # cpu.stat / memory.current absent — e.g. host without
+            # delegation of the relevant controllers).
+            if cputime is None or rss_mb is None:
+                if pgid is not None:
+                    if rss_mb is None:
+                        rss_mb = read_rss_mb_pgid(pgid)
+                    if cputime is None:
+                        cputime = read_cputime_seconds_pgid(pgid)
+                        if cputime is not None:
+                            cputime_source = "pgid"
+                else:
+                    if rss_mb is None:
+                        rss_mb = read_rss_mb(pid)
+                    if cputime is None:
+                        cputime = read_cputime_seconds(pid)
+                        if cputime is not None:
+                            cputime_source = "pid"
         if rss_mb is None and cputime is None:
+            if external_usage is not None:
+                # Unknown engine/cgroup intervals are not evidence of idleness.
+                st.starve_since_monotonic = None
+                st.last_cputime_seconds = None
+                st.last_cputime_source = None
+                st.last_wall_monotonic = None
             # Either the process is gone or /proc isn't available
             # (macOS dev box). On Linux, "both None" almost always means
             # the pid disappeared between the daemon's reconciler and
@@ -634,10 +653,14 @@ class Watchdog:
 
         # Persist the sample line. Watchdog evaluation does not mutate JobSpec.
         elapsed = now_mono - st.started_monotonic
+        sampled_at = utcnow_iso()
+        _track_rss_peak(st, spec, pgid, rss_mb, sampled_at)
         sample = {
-            "ts": utcnow_iso(),
+            "ts": sampled_at,
             "elapsed_seconds": round(elapsed, 3),
             "rss_mb": rss_mb,
+            "rss_peak_mb": st.rss_peak_mb,
+            "rss_peak_since": st.rss_peak_since,
             "cpu_percent": round(cpu_pct, 1) if cpu_pct is not None else None,
             "cpu_time_seconds": round(cputime, 3) if cputime is not None else None,
             "cpu_time_source": cputime_source,
@@ -889,6 +912,81 @@ def read_cputime_seconds_pgid(pgid: int) -> float | None:
             total += ct
             seen_any = True
     return total if seen_any else None
+
+
+#: How much of ``samples.jsonl`` :func:`last_sample` reads from its end.
+_SAMPLE_TAIL_BYTES = 64 * 1024
+
+
+def last_sample(workspace: Path) -> dict | None:
+    """The last complete record of ``<workspace>/_vq/samples.jsonl``.
+
+    Reads only the file's tail, since a long job's file grows by a line
+    every few seconds. None when there is no readable record.
+    """
+    path = workspace / "_vq" / "samples.jsonl"
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - _SAMPLE_TAIL_BYTES))
+            tail = handle.read()
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:  # also a line the tail cut in half
+            continue
+        if isinstance(record, dict):
+            return record
+    return None
+
+
+def _peak_value(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value >= 0 and value == value and value != float("inf") else None
+
+
+def _track_rss_peak(
+    st: WatchdogJobState, spec: JobSpec, pgid: int | None, rss_mb: float | None, now_iso: str,
+) -> None:
+    """Fold this sample's RSS into the job's peak (#168).
+
+    On a job's first sample in this daemon, resume the peak from the last
+    sample on disk, but only one the same attempt wrote: the same process
+    group, sampled after this attempt started. A retry reuses the job's
+    workspace, and an earlier attempt's peak is not this one's.
+    """
+    if not st.rss_peak_seeded:
+        st.rss_peak_seeded = True
+        previous = last_sample(Path(spec.cwd))
+        if previous is not None and _same_attempt(previous, spec, pgid):
+            peak = _peak_value(previous.get("rss_peak_mb"))
+            since = previous.get("rss_peak_since")
+            if peak is not None and isinstance(since, str) and since:
+                st.rss_peak_mb, st.rss_peak_since = peak, since
+    if rss_mb is None:
+        return
+    if st.rss_peak_since is None:
+        st.rss_peak_since = now_iso
+    if st.rss_peak_mb is None or rss_mb > st.rss_peak_mb:
+        st.rss_peak_mb = float(rss_mb)
+
+
+def _same_attempt(record: dict, spec: JobSpec, pgid: int | None) -> bool:
+    def _parsed(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
+
+    sampled, started = _parsed(record.get("ts")), _parsed(spec.started_at)
+    return (pgid is not None and record.get("sample_pgid") == pgid
+            and sampled is not None and started is not None and sampled >= started)
 
 
 def _append_sample(workspace: Path, sample: dict) -> None:

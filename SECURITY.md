@@ -169,6 +169,194 @@ posture deliberately. A report that the shared bearer is not a per-user
 identity tells us something we have written down; a report that it can be
 *bypassed* does not.
 
+### Broker boundary
+
+The fleet broker (#64, `docs/design_broker.md`) is off unless a host's own
+config sets `[broker] enabled = true` with an explicit list of `targets`.
+It reuses the existing SSH transport as the operator account, adds no network
+listener and has no per-client authorization model: anyone who can run
+commands on the broker as the operator can submit, inspect and cancel broker
+jobs, as with `vq submit` to any host today. The broker holds the SSH
+credentials needed to submit and control work on its targets. **Compromising
+the broker compromises every listed target.** Scheduler lanes, alias and
+excluded host entries, and multi-user hosts (as broker or as target) are
+refused in this contract.
+
+Broker records, payloads, target mappings and ranking inputs are private
+operator state under `<state root>/broker/` (owner-only directories and files,
+no symlinks). They are outside the anonymous snapshot envelope. A transfer uses
+the target's existing keyed `vq submit`, so the target's ownership checks
+apply; an ambiguous transfer is never sent to another host, and a cancelled
+one is never resent. To settle one, `vq broker reconcile` runs `vq admin
+fence-idempotency-key KEY` on the recorded target over the same SSH transport
+as the operator: it either reports the accepted job or durably refuses KEY for
+that account's queue. It adds no listener or daemon RPC, and it has the same
+trust as a keyed submit by that account. The store has one host and no HA; its writers are
+serialized per transition and refuse stale views.
+
+Targets answer `vq broker capacity --json`, a read-only command that reports
+admission evidence, free headroom, program statuses and the host's job IDs.
+Its source is one read-only daemon RPC method, `get_admission_snapshot`. Like
+`get_daemon_capacity`, it is open to any caller of the daemon socket
+(owner-only in single-user mode). It returns scheduling facts only: dispatch
+holds, caps, local CPU, memory and job usage, and the count of pending local
+jobs. It returns no job content, command, path or owner. The broker's
+daemon runs `vq broker pass` as a separate process; its report, with target
+names and job IDs, goes to `<state root>/broker-pass.log`.
+
+When the console runs on the broker, `/fleet/jobs` lists the broker's jobs
+read-only to the same authenticated console users as the other fleet jobs
+(maintainer decision on #64 B7, 2026-09-29). It shows metadata only: the
+broker job id, state, target host and target job id, CPUs, memory, job name,
+created and updated times, and the per-host blockers or operator action. It
+never shows the command, program, payload or free-text diagnostics. Blockers
+are projected to known reason codes; detailed refusal text remains in the CLI. The
+console reads the store in place and never creates broker state. It adds no
+API route, and the public snapshot does not include these rows.
+
+### Submission gateway boundary
+
+The HTTPS submission gateway (#163, `docs/gateway.md`) is off unless the broker
+host's own config sets `[gateway] enabled = true`. `vq gateway serve` refuses
+to start unless `[broker] enabled = true` too. It is a **separate network
+listener** beside the console, never mounted on it, and it is the only vq
+surface meant to be reached from outside the fleet network.
+
+- **Transport.** It binds loopback by default, behind an operator's TLS reverse
+  proxy, or terminates TLS itself when `tls_cert` and `tls_key` are set. A
+  plaintext bind on a non-loopback address is refused.
+- **Credentials.** Clients present a per-client API key,
+  `Authorization: Bearer vqk_<id>_<secret>`, issued once by
+  `vq gateway key create`. The store under `<state root>/gateway/` keeps only
+  `HMAC-SHA256(pepper, secret)` with the principal, project, scopes, expiry
+  and revocation. The pepper is a separate owner-only random file. Every
+  request re-reads the store, so revocation and expiry apply on the next
+  request. Keys in URLs or query strings are not read. The shared admin bearer
+  token is never accepted, and gateway keys grant nothing on the console or the
+  daemon socket.
+- **Trusted group only (maintainer decision on #163, 2026-10-18).** A key
+  selects a project and its server-side policy: allowed programs, resource caps
+  and quotas. It does **not** select an OS identity. Every gateway job runs
+  under the broker's execution account and its targets' configured accounts.
+  Uploaded scripts run arbitrary code as those accounts, so issue keys only to
+  people and services you would let run jobs as that account. Mapping projects
+  to separate execution accounts is future work.
+- **Audit.** `<state root>/gateway/audit.jsonl` (owner-only) records time, key
+  ID, principal, project, method, path and status for every request. It never
+  records keys, headers or payloads.
+- **Client (slice 5).** `vq remote` reads the URL and key only from an
+  owner-only credentials file, never from argv. It refuses plain `http://` to a
+  non-loopback host and verifies TLS with the system store or the file's
+  `ca_file`. It checks every downloaded file against the manifest SHA-256. Its
+  retries are safe because every request is idempotent: uploads resume by
+  offset, submissions carry the client's idempotency key, and finalize and
+  cancel repeat harmlessly.
+- **Routes (slices 1 to 4).**
+  - `GET /v1/healthz`, unauthenticated, returns only `{"ok": true}`.
+  - `GET /v1/whoami` echoes the presented key's own grant.
+  - With the `submit` scope: resumable uploads (`/v1/uploads`) and
+    `POST /v1/jobs`. With `read`: `GET /v1/jobs` and `GET /v1/jobs/{id}`.
+  - **Uploads.** Each is digest-checked and accepted only as an uncompressed
+    tar of plain files and directories, with bounded members and expanded
+    size, and no absolute paths, `..` or links. Uploads count against the
+    principal's project quota.
+  - **Submissions.** A submission maps an external schema onto a broker intent
+    under project policy: allowed programs and CPU, memory and wall caps. It
+    never takes a uid, path, target or hook. It is admitted through the
+    broker's keyed intake, under a key namespaced by project and principal.
+  - **Ownership.** Uploads and jobs belong to the submitting principal in its
+    project. Another principal's IDs read as missing.
+  - **Job views.** They omit the command, payload, target host and free-text
+    diagnostics.
+  - **Logs and cancel.** With `read`, `GET /v1/jobs/{id}/logs` pages a placed
+    job's stdout or stderr by byte offset. The gateway reads it on the target
+    over the broker's SSH transport, capped at 64 MiB. With `cancel`,
+    `POST /v1/jobs/{id}/cancel` cancels at the broker and, once placed, kills
+    the target job. A transfer in doubt is reported as not stopped and is left
+    to the broker's operator action. Transport failures surface as 502 without
+    host or error detail.
+  - **Results.** With `download`, `GET /v1/jobs/{id}/results` collects a
+    placed job's workspace once its target reports a terminal state. It streams
+    the target's `tar-workspace` into `<state root>/gateway/results/`
+    (owner-only). It keeps only regular files under safe relative paths:
+    links, absolute and `..` paths are skipped and listed by name. It returns a
+    SHA-256 manifest. `GET /v1/jobs/{id}/results/{path}` serves a file only by
+    an exact manifest path, with its digest in `X-Content-SHA256`. Collected
+    bytes count against the principal's storage quota.
+    `vq gateway prune` removes results and uploads past the project's
+    retention.
+
+### Outbound connector boundary
+
+Relay mode (#164, `docs/gateway.md`) splits the gateway from the fleet. A
+gateway with `[gateway] mode = "relay"` runs where clients can reach it and
+holds **no broker, SSH keys or fleet inventory**. A connector on the internal
+broker host (`vq connector run`, `[connector]`) makes **only outbound HTTPS
+requests** to it. Nothing listens on the broker host for it, and there is no
+reverse port forwarding, shell channel or credential export.
+
+- **Enrollment and credentials.** `vq gateway connector enroll --project P`
+  prints a one-use enrollment token, valid for 10 minutes. The connector
+  exchanges it for a `vqc_` key, which the gateway stores only as an HMAC under
+  its own pepper. On the broker host the key lives in owner-only
+  `<state root>/connector/credentials.toml`. Connector keys and client keys
+  are never accepted on each other's routes. `vq connector rotate` replaces
+  the key online, and the old one keeps working for 10 minutes. `vq gateway
+  connector revoke` stops new claims on the next request.
+- **One authority per project.** At most one active connector serves a
+  project, and it sees only that project's work items and payloads. Replacing
+  it is an operator action: revoke, then enroll. There is no automatic
+  failover (maintainer decision on #164, 2026-10-18).
+- **Delivery, not execution.** Claims carry an epoch that rises on every
+  claim, and an acknowledgement with an older epoch is refused. A lease only
+  lets an unacknowledged item be claimed again. The connector admits a job to
+  its broker under the same scoped idempotency key a local gateway uses, so a
+  replay returns the job already admitted. An expired lease never proves a
+  job stopped and never causes a launch elsewhere. The connector journals each
+  admitted job before acknowledging it.
+- **What crosses.** Inbound to the broker host: the client's validated request
+  and the payload, checked against its SHA-256. Outbound to the gateway: each
+  job's client view (state, placement, waiting-reason codes), never the
+  target host or diagnostics. The payload runs as the broker's execution
+  account, exactly as in local mode, so the trusted-group limit above applies
+  unchanged.
+- **Cancellation (slice 2).** A client cancel is recorded durably at the
+  gateway. A job no connector has claimed is cancelled there and never
+  delivered. For an admitted job it becomes a `cancel` work item with its own
+  fencing epoch. The connector runs the broker's kill locally and acknowledges
+  `stopped` or `not-stopped`, the latter for a transfer in doubt. Clients see
+  `requested` until then: a request is never reported as a cancellation. A
+  kill that cannot reach its target is retried after the lease and never
+  dropped. A refused submission settles a pending cancel, since it never ran.
+- **Logs (slice 3).** A client's logs request marks that job's output as
+  wanted for 10 minutes. Only then does the connector read the logs on the
+  broker host, over the broker's SSH transport. It pushes new bytes by offset
+  into an owner-only per-job buffer at the gateway, capped at 16 MiB per
+  stream. A push at the wrong offset is refused, and pushes for another
+  project's jobs are refused. Clients read only what has been pushed, with
+  its time.
+- **Results (slice 4).** A client's results request becomes a `collect`
+  work item with its own epoch and a byte budget: what remains of the
+  principal's storage quota. The connector collects the workspace locally with
+  the same plain-file filter as local mode. It pushes each file by offset into
+  the gateway's per-job incoming area, and pushes beyond the budget are
+  refused. It then acknowledges with the manifest. The gateway publishes the
+  files only if every pushed file matches the manifest's size and SHA-256 and
+  no extra file was pushed, and serves them through the same digest-checked
+  download route. Result paths are confined: no absolute or `..` paths. The
+  connector deletes its local copy afterwards. A job still running is reported
+  `not-finished` and can be requested again.
+- **Backpressure (slice 5).** Each claim reports the connector's free spool
+  (`[connector] spool_mb`). A submit or collect item that would not fit stays
+  at the gateway rather than filling the broker host's disk, and clients see
+  `connector_backpressure`.
+- **Acceptance (slice 5).** `tests/test_gateway_relay_acceptance_164.py` runs
+  the gateway as a real loopback HTTP server. The coordinator is forbidden to
+  listen, and may connect only to the gateway. It also interrupts the
+  connection before claim, after local acceptance before acknowledgement,
+  during logs, during result upload and during cancel, restarting both sides
+  each time. Every case keeps one durable job identity with no second launch.
+
 ### Console session and write-audit boundary
 
 Fleet local-account cookies are signed and require a matching record in the
@@ -189,11 +377,113 @@ Secure cookies follow the ASGI request scheme. Configure only trusted proxy
 addresses at the ASGI server, restrict direct backend access and use TLS at the
 edge. Do not trust forwarded headers from arbitrary clients.
 
+The fleet overview JSON (`vq overview --json`, the console's `/api/v1/fleet`)
+shows an admin-update marker with its managed-update receipt, but never the
+registry or service file bytes that an immutable-slot transaction retains for
+recovery: those stay in the owner-only marker file on the host, and the
+overview carries only the transaction's root, SHA and staged flag. A finding is
+any path by which those bytes reach the console or another host.
+
 Authenticated single-host API writes retain start and outcome audit records
 under one request ID, with the shared identity `bearer-token`. A start-record
 failure refuses execution. A missing outcome after a crash or append failure
 means the result needs investigation, not that replay is safe. These records
 do not identify a person or provide the future tamper-evident audit chain.
+
+### Console calculation overview
+
+The `/fleet/jobs` table and `/api/v1/fleet/jobs` (#168) add, per job, the
+latest watchdog CPU and resident-memory sample, the scheduler-reported compute
+node(s) and walltime, the program's recorded version, and the config key of
+the driver that owns the job. Each already reaches the same identity through
+the job drill-down (`vq status --json` and its resource samples). The sweep
+reads them with `vq top localhost --json`, a read-only listing, over the same
+SSH transport as the queue listing. It adds no route, no write and no
+anonymous access, and the public snapshot's allowlist does not include these
+fields. A finding is a path by which they reach a viewer the drill-down
+would refuse, or the public snapshot.
+
+While a host's queue cannot be listed, the console keeps showing the rows of
+its last successful listing for up to 24 hours (#168), apart from the live
+rows and in its own memory only. They are rows the same identity was
+already shown; nothing new is read or stored on disk.
+
+The `/fleet` execution-readiness panel (#168) is computed from that same
+snapshot and makes no further request. It shows admin-update lease
+summaries and recorded actions, which the host cards already show, and,
+for a job the queue refused, its ID, program and failure reason, which the
+jobs table and drill-down already show to the same identity. Lanes that
+share an SSH destination are grouped under one lane's config key; the
+destination itself is not stored in the snapshot or rendered.
+
+### Console campaign graphs
+
+`/fleet/campaigns` and `/api/v1/fleet/campaigns` (#165) read, as the
+console's own user and on the console host only, the registrations that
+user's `vq campaign run` wrote under its vq state, then the campaign file and
+run-directory journal each registration names. Registrations are created in
+that user's own state directory, so only that user, or root, can point the
+console at a file. The page shows campaign and stage ids, statuses, blockers,
+job IDs and hosts, output names and their verification verdicts. It shows
+paths only as the run directory's name, and strips the registered
+directories from error messages. It writes nothing, makes no SSH request,
+sits behind the same login or bearer gate as the rest of the console, and is
+not part of the public snapshot. A finding is a path by which it shows a
+campaign to an identity the console login would refuse, or reads a file
+that no registration in the console user's state names.
+
+### Console calculation previews
+
+`/api/v1/fleet/jobs/<id>/preview` (#65) returns a structured summary of a
+job's calculation: formula, method and basis, SCF convergence, headline
+energies. It is derived from the stdout tail that the job drill-down already
+shows the same identity, fetched through the same `vq status --json` path.
+There is one exception: an ORCA job whose command runs `run-orca.sh` writes its
+output to a single named file (the wrapper's explicit output argument, or
+`<input>.out`). For that job the preview reads that file's tail through
+`vq tail --name`, which rejects absolute and `..` paths. Either source is
+bounded to 2000 lines and 256 KiB and parsed as text. It walks no workdir and
+deserialises no result container. It sits
+behind the same login or bearer gate as the rest of the fleet API. Structures
+and energies of unpublished work are sensitive: no preview field belongs in
+any anonymous or public view (#66).
+
+### Public fleet snapshot
+
+The only anonymous surface is a static snapshot, schema `vq.public-fleet/1`
+(#66), defined in `src/vq/web/public_snapshot.py`. The authenticated
+console does not serve it and is unchanged: it stays on loopback behind the
+TLS proxy. The intended deployment has an operator-side process, which holds
+the fleet credentials, write the files, and a separate unprivileged account,
+with no fleet credentials and no inbound path to the console, serve them.
+vq ships no public server or listener.
+
+The schema is the complete allowlist, default deny, and every object in it
+forbids additional properties. `vq web public-snapshot` re-checks each
+document against the schema's key sets and value constraints (types, allowed
+values, the alias pattern, the display-name bound, the timestamp format)
+before it writes, so a value outside the allowlist is refused, not published:
+
+- **Hosts:** a display name the operator configured under
+  `[public_snapshot.hosts]`, a coarse availability (`up`, `down`, `unknown`)
+  and a coarse load bucket. A host with no configured name is left out
+  entirely, never shown under its config key. A down or unreachable host
+  keeps its card, with no reason, error or diagnostic.
+- **Calculations:** only a job whose submitter tagged it `public.<alias>`
+  appears, as that alias, a coarse lifecycle state and the display name of
+  its host (or `null`). No job is public by default. Two different public
+  tags on one job leave it out.
+- **Snapshot metadata:** the schema id, when the fleet was observed, when the
+  page turns stale, and an optional operator-chosen title.
+
+Never included: job ids, program names and arguments, structures, energies
+and other preview fields, paths, logs, submitters or account names, host
+config keys, SSH aliases, addresses, and anything a host reports about
+itself (hostname, versions, errors). Display names, the title and aliases are
+operator- or submitter-chosen text published verbatim; choosing them is a
+publication decision. A finding is any path by which a value outside this
+list reaches the snapshot, or by which the public page can reach the console
+or the fleet.
 
 If you are unsure whether a finding is in scope, email it to the address above
 and we will triage together.

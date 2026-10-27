@@ -139,8 +139,10 @@ class TestRuntimePythonLauncher:
         with pytest.raises(runtime_slots.RuntimeSlotError):
             runtime_slots.exec_current_python(tmp_path, [])
 
+    @pytest.mark.parametrize("venv_subdir", [".venv", ".venv-viewer"])
+    @pytest.mark.parametrize("standalone", [False, True])
     def test_real_venvs_keep_late_imports_and_process_identity_across_activation(
-        self, tmp_path: Path,
+        self, tmp_path: Path, venv_subdir: str, standalone: bool,
     ) -> None:
         repo = tmp_path / "upstream"
         repo.mkdir()
@@ -162,7 +164,7 @@ class TestRuntimePythonLauncher:
             shas.append(sha)
             transaction = ("1" if version == "A" else "2") * 32
             runtime_slots.begin_slot_build(root, sha, transaction_id=transaction,
-                                           in_use=lambda: set())
+                                           in_use=lambda: set(), venv_subdir=venv_subdir)
             runtime_slots.materialize_source(repo, root, sha)
             py = runtime_slots.slot_python(root, sha)
             venv.EnvBuilder(with_pip=False, symlinks=True).create(py.parent.parent)
@@ -178,6 +180,13 @@ class TestRuntimePythonLauncher:
         env = dict(os.environ)
         env["PYTHONPATH"] = str(Path(runtime_slots.__file__).parents[1])
         base = [sys.executable, "-m", "vq", "runtime-python", "--root", str(root), "--"]
+        if standalone:
+            launcher = tmp_path / "standalone python"
+            launcher.write_text(runtime_slots.render_launcher(root, Path(sys.executable), []))
+            launcher.chmod(0o700)
+            base = [str(launcher)]
+            env.pop("PYTHONPATH", None)
+            repo.rename(tmp_path / "retired-upstream")
         program = (
             "import os, sys, json; print(os.getpid(), flush=True); input(); "
             "import late; print(json.dumps([late.VERSION, sys.executable, "
@@ -538,6 +547,80 @@ class TestSlotLocalProgram:
         assert a.git_dir != b.git_dir
 
 
+class TestSlotHealthcheckBinding:
+    def program(self, command: str):
+        from vq.config import VenvProgram
+        return VenvProgram(kind="venv", git_dir="/opt/live tree",
+                           python="/opt/live tree/.venv/bin/python",
+                           healthcheck_command=command)
+
+    @pytest.mark.parametrize("command,expected", [
+        ("'/opt/live tree/.venv/bin/python' -c 'print(42)'",
+         [".venv/bin/python", "-c", "print(42)"]),
+        ("'/opt/live tree/check script.py' 'two words'",
+         ["check script.py", "two words"]),
+    ])
+    def test_source_entry_rebound_without_argument_corruption(self, command, expected):
+        import shlex
+        original = self.program(command)
+        selected = runtime_slots.slot_local_program(original, "/rt", SHA_A)
+        assert shlex.split(selected.healthcheck_command) == [
+            selected.git_dir + "/" + expected[0], *expected[1:],
+        ]
+        assert original.healthcheck_command == command
+
+    def test_external_wrapper_and_source_arguments(self):
+        import shlex
+        selected = runtime_slots.slot_local_program(self.program(
+            "/usr/bin/env '/opt/live tree/.venv/bin/python' "
+            "'/opt/live tree/check.py' '--data=/opt/live tree/data.json'"
+        ), "/rt", SHA_A)
+        assert shlex.split(selected.healthcheck_command) == [
+            "/usr/bin/env", selected.python, selected.git_dir + "/check.py",
+            "--data=" + selected.git_dir + "/data.json",
+        ]
+
+    @pytest.mark.parametrize("command", [
+        "python -c 'print(42)'", "xvfb-run -a vibe-view capture-selftest",
+        "/usr/bin/python3 -c 'print(42)'", "'/opt/live tree-external/check'",
+        "./.venv/bin/python check.py",
+    ])
+    def test_path_relative_and_explicit_external_commands_preserved(self, command):
+        import shlex
+        selected = runtime_slots.slot_local_program(self.program(command), "/rt", SHA_A)
+        assert shlex.split(selected.healthcheck_command) == shlex.split(command)
+
+    @pytest.mark.parametrize("command", [
+        "sh -c '\"/opt/live tree/.venv/bin/python\" -V'",
+        "python -c 'open(\"/opt/live tree/data\")'",
+        "python '--paths=/opt/live tree/a:/external/b'",
+    ])
+    def test_embedded_legacy_paths_refused(self, command):
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="embeds a legacy"):
+            runtime_slots.slot_local_program(self.program(command), "/rt", SHA_A)
+
+    def test_actual_probe_observes_selected_generation_failure(self, tmp_path):
+        from vq.config import VenvProgram
+        from vq._program_probe import classify_venv_healthcheck
+        import shlex
+        live = tmp_path / "legacy source"
+        old = live / ".venv/bin/python"
+        old.parent.mkdir(parents=True)
+        old.write_text("#!/bin/sh\necho legacy-PASS\nexit 0\n")
+        old.chmod(0o755)
+        program = VenvProgram(kind="venv", git_dir=str(live), python=str(old),
+                              healthcheck_command=shlex.join([str(old), "-c", "check() "]))
+        selected = runtime_slots.slot_local_program(program, tmp_path / "runtimes", SHA_A)
+        new = Path(selected.python)
+        new.parent.mkdir(parents=True)
+        new.write_text("#!/bin/sh\necho selected-FAIL\nexit 7\n")
+        new.chmod(0o755)
+        outcome = classify_venv_healthcheck(selected.healthcheck_command,
+                                          python=selected.python, git_dir=Path(selected.git_dir))
+        assert outcome.status == "failed"
+        assert "selected-FAIL" in outcome.detail
+
+
 def _git(repo: Path, *args: str) -> str:
     import subprocess
 
@@ -569,6 +652,48 @@ def _live_repo(tmp_path: Path) -> tuple[Path, str, str]:
 
 class TestMaterializeSource:
     """Populating a slot with a checkout at exactly its own SHA."""
+
+    @pytest.mark.parametrize("relative_origin", [False, True])
+    def test_generation_can_prepare_next_commit_without_legacy_checkout(
+        self, tmp_path: Path, relative_origin: bool,
+    ) -> None:
+        repo, _first, second = _live_repo(tmp_path)
+        upstream = tmp_path / "upstream"
+        _git(tmp_path, "clone", "--quiet", str(repo), str(upstream))
+        _git(repo, "remote", "add", "origin",
+             "../upstream" if relative_origin else str(upstream))
+        root = tmp_path / "rt"
+        old = runtime_slots.materialize_source(repo, root, second)
+        refs_before = _git(old, "show-ref")
+        (upstream / "VERSION").write_text("three")
+        _git(upstream, "add", "VERSION")
+        _git(upstream, "-c", "user.name=T", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "commit", "-m", "three", "--quiet")
+        target = _git(upstream, "rev-parse", "HEAD")
+        # A sandbox-only unavailable legacy path exposes hidden Git dependencies.
+        repo.rename(tmp_path / "retained-legacy")
+
+        new = runtime_slots.materialize_source(old, root, target)
+
+        assert _git(new, "rev-parse", "HEAD") == target
+        assert _git(old, "rev-parse", "HEAD") == second
+        assert _git(old, "show-ref") == refs_before
+        assert (old / "VERSION").read_text() == "two"
+        assert _git(old, "remote", "get-url", "origin") == str(upstream)
+        assert _git(new, "remote", "get-url", "origin") == str(upstream)
+
+    def test_generation_does_not_borrow_source_alternate_objects(self, tmp_path: Path) -> None:
+        repo, _first, second = _live_repo(tmp_path)
+        shared = tmp_path / "shared"
+        _git(tmp_path, "clone", "--quiet", "--shared", str(repo), str(shared))
+        assert (shared / ".git/objects/info/alternates").is_file()
+
+        source = runtime_slots.materialize_source(shared, tmp_path / "rt", second)
+        repo.rename(tmp_path / "retained-object-source")
+
+        assert _git(source, "show", f"{second}:VERSION") == "two"
+        assert not (source / ".git/objects/info/alternates").exists()
+        assert _git(source, "fsck", "--full") == ""
 
     @pytest.mark.parametrize("relative_origin", [False, True])
     def test_fetches_new_commit_only_into_unpublished_slot(
@@ -688,22 +813,178 @@ class TestMaterializeSource:
                 repo, root, first, runner=lying_runner
             )
 
-    def test_objects_are_shared_with_the_source_not_copied(
-        self, tmp_path: Path
+    @pytest.mark.parametrize("packed", [False, True])
+    def test_materialization_copies_objects_without_hardlink_dependency(
+        self, tmp_path: Path, packed: bool,
     ) -> None:
-        """`--local` hardlinks git's object store. Safe here precisely because
-        git objects are immutable and content-addressed -- unlike a venv, which
-        records absolute paths and cannot be shared at all."""
+        """Independent object bytes work when a filesystem cannot hardlink."""
+        import shutil
+
         repo, first, _ = _live_repo(tmp_path)
+        if packed:
+            _git(repo, "gc", "--prune=now")
         root = tmp_path / "rt"
-
         source = runtime_slots.materialize_source(repo, root, first)
+        objects = repo / ".git" / "objects"
+        files = [p for p in objects.rglob("*") if p.is_file() and p.parent.name != "info"]
+        assert files
+        for original in files:
+            copied = source / ".git" / "objects" / original.relative_to(objects)
+            assert copied.read_bytes() == original.read_bytes()
+            assert not copied.samefile(original), "runtime objects must not require hardlinks"
+        shutil.rmtree(repo)
+        assert _git(source, "rev-parse", "HEAD") == first
+        _git(source, "fsck", "--full")
 
-        assert (source / ".git").exists()
+    def test_cross_device_clone_refusal_is_avoided(self, tmp_path: Path) -> None:
+        """Model Git's EXDEV failure; all successful Git operations stay real."""
+        import subprocess
+
+        repo, first, _ = _live_repo(tmp_path)
+
+        def cross_device_runner(argv, **kwargs):
+            if argv[:2] == ["git", "clone"] and "--no-hardlinks" not in argv:
+                return subprocess.CompletedProcess(argv, 128, "", "Invalid cross-device link")
+            return subprocess.run(argv, **kwargs)
+
+        source = runtime_slots.materialize_source(
+            repo, tmp_path / "rt", first, runner=cross_device_runner,
+        )
         assert _git(source, "rev-parse", "HEAD") == first
 
 
 class TestDurableSlotBuild:
+    @pytest.mark.parametrize("umask", [0o000, 0o002, 0o022, 0o077])
+    @pytest.mark.parametrize("existing_store", [False, True])
+    @pytest.mark.parametrize("reserve", [False, True])
+    def test_new_directories_are_private_regardless_of_umask(
+        self, tmp_path: Path, umask: int, existing_store: bool, reserve: bool,
+    ) -> None:
+        root = tmp_path / "rt"
+        if existing_store:
+            root.mkdir(mode=0o700)
+            (root / "releases").mkdir(mode=0o700)
+        previous_umask = os.umask(umask)
+        try:
+            if reserve:
+                assert runtime_slots.begin_slot_build(
+                    root, SHA_A, transaction_id="1" * 32, in_use=lambda: set(),
+                )
+            else:
+                runtime_slots.create_slot(root, SHA_A)
+            assert os.umask(umask) == umask
+        finally:
+            os.umask(previous_umask)
+
+        for directory in (root, root / "releases", root / "releases" / SHA_A):
+            assert directory.stat().st_mode & 0o777 == 0o700
+
+    def test_permissive_umask_build_can_activate_and_reuse(
+        self, tmp_path: Path,
+    ) -> None:
+        repo, sha, _second = _live_repo(tmp_path)
+        root = tmp_path / "rt"
+        transaction = "1" * 32
+        previous_umask = os.umask(0o002)
+        try:
+            self._start(repo, root, sha, transaction)
+            self._add_venv(root, sha)
+            runtime_slots.seal_slot_build(root, sha, transaction_id=transaction)
+            assert runtime_slots.activate(root, sha) is None
+            assert not runtime_slots.begin_slot_build(
+                root, sha, transaction_id="2" * 32, in_use=lambda: {sha},
+            )
+            assert runtime_slots.select_python(root).sha == sha
+        finally:
+            os.umask(previous_umask)
+
+    def test_creation_does_not_rewrite_existing_store_or_generation_modes(
+        self, tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "rt"
+        generation = _build(root, SHA_A)
+        directories = (root, root / "releases", generation)
+        for directory in directories:
+            directory.chmod(0o755)
+        before = [(p.stat().st_ino, p.stat().st_mode) for p in directories]
+        marker = (generation / runtime_slots.SLOT_STATE_MARKER).read_bytes()
+
+        assert not runtime_slots.begin_slot_build(
+            root, SHA_A, transaction_id="2" * 32, in_use=lambda: set(),
+        )
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="reopen verified"):
+            runtime_slots.create_slot(root, SHA_A)
+
+        assert [(p.stat().st_ino, p.stat().st_mode) for p in directories] == before
+        assert (generation / runtime_slots.SLOT_STATE_MARKER).read_bytes() == marker
+
+    @pytest.mark.parametrize(
+        "patch",
+        [
+            {"venv_subdir": "../outside"},
+            {"venv_subdir": "/outside"},
+            {"venv_subdir": ".venv"},
+            {"schema": 1},
+            {"schema": 3},
+            {"extra": "unexpected"},
+        ],
+    )
+    def test_custom_layout_receipt_cannot_redirect_interpreter(
+        self, tmp_path: Path, patch: dict[str, object],
+    ) -> None:
+        root = tmp_path / "rt"
+        runtime_slots.begin_slot_build(
+            root, SHA_A, transaction_id="1" * 32, in_use=lambda: set(),
+            venv_subdir=".venv-viewer",
+        )
+        marker = runtime_slots.slot_path(root, SHA_A) / runtime_slots.SLOT_STATE_MARKER
+        payload = json.loads(marker.read_text())
+        marker.write_text(json.dumps({**payload, **patch}))
+        with pytest.raises(runtime_slots.RuntimeSlotError):
+            runtime_slots.slot_python(root, SHA_A)
+
+    @pytest.mark.parametrize("sealed", [False, True])
+    def test_custom_venv_binding_cannot_change_on_retry_or_reuse(
+        self, tmp_path: Path, sealed: bool,
+    ) -> None:
+        repo, sha, _second = _live_repo(tmp_path)
+        root = tmp_path / "rt"
+        runtime_slots.begin_slot_build(
+            root, sha, transaction_id="1" * 32, in_use=lambda: set(),
+            venv_subdir=".venv-viewer",
+        )
+        runtime_slots.materialize_source(repo, root, sha)
+        self._add_venv(root, sha)
+        if sealed:
+            runtime_slots.seal_slot_build(root, sha, transaction_id="1" * 32)
+        before = {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+        }
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="different virtualenv"):
+            runtime_slots.begin_slot_build(
+                root, sha, transaction_id="2" * 32, in_use=lambda: set(),
+                venv_subdir=".venv",
+            )
+        assert before == {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+        }
+
+    @pytest.mark.parametrize(
+        "name", ["../outside", "/absolute", ".git", "current", "..", "nested/env"],
+    )
+    def test_custom_venv_must_be_one_source_local_directory(
+        self, tmp_path: Path, name: str,
+    ) -> None:
+        root = tmp_path / "rt"
+        with pytest.raises(runtime_slots.RuntimeSlotError, match="source-local directory"):
+            runtime_slots.begin_slot_build(
+                root, SHA_A, transaction_id="1" * 32, in_use=lambda: set(),
+                venv_subdir=name,
+            )
+        assert not root.exists()
+
     def _start(
         self,
         repo: Path,

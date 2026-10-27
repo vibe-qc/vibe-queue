@@ -168,6 +168,9 @@ def resubmit_local(
         source_path = queue_dir / f"{jobid}.json"
         if not source_path.exists():
             raise FileNotFoundError(f"no such job: {jobid}")
+    from vq import managed_container
+    if managed_container.pending(source_path):
+        raise ValueError("cannot resubmit: managed container outcome is not confirmed terminal")
     source = JobSpec.read(source_path)
     # ISO-2 (v0.8.25): ownership gate. Pre-fix, `vq resubmit` had no owner
     # check, so on a multi-user host user A could re-run user B's job — and
@@ -251,9 +254,17 @@ def resubmit_local(
             if overrides.scheduler_tasks is not None
             else source.scheduler_tasks
         ),
+        gpus=source.gpus,
+        runtime_bundle=source.runtime_bundle,
+        resource_estimate=source.resource_estimate,
+        resource_estimate_calibration=source.resource_estimate_calibration,
         mem_mb=(
             overrides.mem_mb if overrides.mem_mb is not None else source.mem_mb
         ),
+        # A limit the estimate gave keeps its source unless it is overridden.
+        mem_mb_source=source.mem_mb_source if overrides.mem_mb is None else None,
+        wall_time_source=(source.wall_time_source if overrides.wall_time_seconds is None
+                          else None),
         wall_time_seconds=(
             overrides.wall_time_seconds
             if overrides.wall_time_seconds is not None
@@ -279,11 +290,9 @@ def resubmit_local(
         ),
         branch=source.branch,
         program=source.program,
+        qvf_artifact_name=source.qvf_artifact_name,
         program_runtime_pin=(
-            source.program_runtime_pin.model_copy(
-                update={"resolved_git_sha": None},
-                deep=True,
-            )
+            source.program_runtime_pin.without_resolution()
             if source.program_runtime_pin is not None
             else None
         ),

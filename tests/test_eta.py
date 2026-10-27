@@ -105,7 +105,18 @@ class TestJobDurationEstimate:
 
         assert eta.estimate_job_duration(target, history) is None
 
-    def test_scheduler_history_prefers_reported_walltime(self) -> None:
+    @pytest.mark.parametrize(
+        ("walltime", "expected_seconds"),
+        [
+            ("00:20:00", 1200),
+            ("1-02:03:04", 93784),
+            ("-1-02:03:04", 208800),
+            ("1-02:60:04", 208800),
+        ],
+    )
+    def test_scheduler_history_prefers_reported_walltime(
+        self, walltime: str, expected_seconds: int,
+    ) -> None:
         target = _spec(
             "pending",
             state=JobState.PENDING,
@@ -116,16 +127,16 @@ class TestJobDurationEstimate:
             _spec(
                 "done",
                 scheduler_target="host_f",
-                scheduler_walltime_used="00:20:00",
+                scheduler_walltime_used=walltime,
                 started_at="2026-06-30T00:00:00+00:00",
-                finished_at="2026-06-30T10:00:00+00:00",
+                finished_at="2026-07-02T10:00:00+00:00",
             )
         ]
 
         estimate = eta.estimate_job_duration(target, history)
 
         assert estimate is not None
-        assert estimate.seconds == pytest.approx(1200)
+        assert estimate.seconds == pytest.approx(expected_seconds)
 
 
 class TestPendingWaitEstimate:

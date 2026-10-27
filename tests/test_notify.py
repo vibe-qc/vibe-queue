@@ -218,6 +218,28 @@ class TestSendTerminalNotification:
         # Timeout must be set — a hung webhook can't stall us forever.
         assert captured["timeout"] is not None and captured["timeout"] > 0
 
+    def test_malformed_url_is_logged_without_escaping(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        calls: list[object] = []
+        monkeypatch.setattr(
+            notify.urllib.request, "urlopen", lambda *a, **k: calls.append(a),
+        )
+
+        notify.send_terminal_notification(
+            _terminal_spec(), "hook.example.com/missing-scheme", blocking=True,
+        )
+
+        assert calls == []
+        assert any(
+            rec.levelname == "WARNING"
+            and "abc123def456" in rec.message
+            and "ValueError" in rec.message
+            for rec in caplog.records
+        )
+
     def test_url_error_swallowed_silently(
         self,
         monkeypatch: pytest.MonkeyPatch,

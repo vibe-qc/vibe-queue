@@ -87,7 +87,7 @@
       "properties": {
         "repo": {
           "type": "string",
-          "description": "Repository this pin resolves in, e.g. \"mpei/vibe-qc\". Recorded for humans; project_id is what callers query."
+          "description": "Repository this pin resolves in, e.g. \"example-org/vibe-qc\". Recorded for humans; project_id is what callers query."
         },
         "project_id": {
           "type": "integer",

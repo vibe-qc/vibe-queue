@@ -6,10 +6,9 @@ Build locally from the repository root:
 
 Naming
 ------
-* The product is **vq**, the command users type. The repository and the
-  GitLab project are **vibe-queue**; the distribution on PyPI-style
-  metadata is ``vq``. Use "vq" in prose and "vibe-queue" only when the
-  repository itself is meant.
+* The product and Python distribution are **vibe-queue**. The command and
+  import package remain ``vq``. Use ``vibe-queue`` for installation metadata
+  and ``vq`` for command examples.
 
 Audience
 --------
@@ -38,29 +37,11 @@ copyright = f"{datetime.date.today().year}, {author}"
 
 
 def _read_release() -> str:
-    """Version from the installed distribution, else from pyproject.toml.
+    """Read the documented source version, independent of the build environment."""
+    import tomllib
 
-    The CI docs build runs in a slim container with only Sphinx installed
-    and no vq, so the pyproject fallback is what actually runs in
-    production.
-    """
-    try:
-        from importlib.metadata import PackageNotFoundError
-        from importlib.metadata import version as _pkg_version
-
-        try:
-            return _pkg_version("vq")
-        except PackageNotFoundError:
-            pass
-    except ImportError:
-        pass
-    try:
-        import tomllib
-
-        with open(_REPO_ROOT / "pyproject.toml", "rb") as f:
-            return str(tomllib.load(f)["project"]["version"])
-    except Exception:
-        return "0.0.0"
+    with open(_REPO_ROOT / "pyproject.toml", "rb") as source:
+        return str(tomllib.load(source)["project"]["version"])
 
 
 release = _read_release()
@@ -130,10 +111,8 @@ intersphinx_mapping = {
 # but they are not product documentation and several of them would be the
 # largest pages on the site.
 #
-# Two of these are excluded for a second reason: the fleet runbooks describe
-# named real hosts. `docs/hosts.md` is sanitized and publishable; the
-# runbooks are not, and are not worth sanitizing for an audience that does
-# not exist.
+# The portable fleet runbooks remain source-tree references for maintenance
+# agents; the operator index links to their public source copies.
 exclude_patterns = [
     "_build",
     "README.md",
@@ -149,12 +128,12 @@ exclude_patterns = [
     "design_*.md",
     "pbs_dispatcher_backend_design.md",
     "v0_7_1_lamports_clock_design.md",
-    # Fleet-internal runbooks: name real hosts, no external audience.
+    # Maintenance references: linked from the operator index in the source tree.
     "fleet_update_runbook.md",
     "fleet_update_prompt.md",
     "state_file_audit.md",
     # Written for a different site. `vibe-qc-site/` holds the vq pages that
-    # the vibe-qc documentation chat lands in mpei/vibe-qc, under /docs/ on
+    # the vibe-qc documentation chat lands in example-org/vibe-qc, under /docs/ on
     # vibe-qc.com. They are authored here because vq is what changes
     # underneath them, but publishing them here too would put the same prose
     # at two URLs on one domain, which is the drift these pages exist to
@@ -162,9 +141,9 @@ exclude_patterns = [
     "vibe-qc-site/**",
 ]
 
-# Cross-references into excluded pages are expected: the published pages
-# legitimately point at working-memory documents that live in the
-# repository. Do not "fix" these by publishing the target.
+# Link to excluded pages through their public source URL, since relative
+# cross-references render as plain text. Do not publish a working-memory
+# document merely to make a link resolve.
 suppress_warnings = ["myst.xref_missing"]
 
 

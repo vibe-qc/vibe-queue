@@ -503,15 +503,22 @@ class TestSchedulerRemoteWorkspaceCleanup:
         spec.array_index = 2
         spec.array_total = 5
         spec.array_group_id = "cleanup-array"
-        captured: list[tuple[str, str, int | None]] = []
+        captured: list[tuple[str, str, int | None, str | None]] = []
 
         class RecordingDispatcher:
             def remote_workspace(self, jobid: str) -> str:
                 return f"/remote/{jobid}"
 
-            def cleanup_remote_workspace(self, handle) -> None:  # type: ignore[no-untyped-def]
+            def cleanup_remote_workspace(  # type: ignore[no-untyped-def]
+                self, handle, *, vq_job_id: str | None = None
+            ) -> None:
                 captured.append(
-                    (handle.job_id, handle.remote_workspace, handle.array_size)
+                    (
+                        handle.job_id,
+                        handle.remote_workspace,
+                        handle.array_size,
+                        vq_job_id,
+                    )
                 )
 
         dispatcher = RecordingDispatcher()
@@ -524,8 +531,10 @@ class TestSchedulerRemoteWorkspaceCleanup:
 
         cli_mod._scheduler_workspace_reaper(cfg)(spec)
 
+        # #63: the reaper also pins the final path component to the vq job
+        # id, so a scheduler id fallback can never widen what is removed.
         assert captured == [
-            (expected_job_id, "/remote/sched-projection", None)
+            (expected_job_id, "/remote/sched-projection", None, "sched-projection")
         ]
 
     def test_cleanup_scheduler_remote_workspace_stamps_spec(self, state: Path) -> None:

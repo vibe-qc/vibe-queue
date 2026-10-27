@@ -1,0 +1,1 @@
+Estimate calibrations now record, per group, the observed range of each numeric feature (Nbf, Naux, occupied/virtual, roots, k-points, ranks, threads). `vq estimate --calibration` and `vq estimate-evaluate --calibration` leave an estimate outside those ranges, or missing such a feature, uncalibrated and say why, instead of extrapolating the multiplier.

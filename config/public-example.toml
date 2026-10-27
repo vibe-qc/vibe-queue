@@ -1,7 +1,40 @@
 # Copy outside the source checkout as config.toml. All values are examples.
+# The annotated reference for every key is docs/config.toml.example; the
+# walkthrough is docs/cluster_install.md.
 default_host = "compute"
 
+# A machine with no batch scheduler, running the vq daemon.
 [hosts.compute]
 ssh = "compute.example.org"
 remote_vq = "vq"
 remote_python = "/opt/vibe-qc/venv/bin/python"
+
+# A PBS/Torque login node. No daemon runs there; the daemon host named by
+# scheduler_driver writes the batch script, submits and polls.
+# [hosts.pbs-cluster]
+# ssh = "pbs-login.example.org"
+# remote_vq = "/home/USER/vibe-queue/.venv/bin/vq"
+# scheduler = "pbs"
+# scheduler_dialect = "torque"
+# scheduler_driver = "compute"
+# scratch_root = "/home/USER/vq"
+# submit_extra = ["-q", "batch"]
+
+# A Slurm login node, driven the same way.
+# [hosts.slurm-cluster]
+# ssh = "slurm-login.example.org"
+# remote_vq = "/home/USER/vibe-queue/.venv/bin/vq"
+# scheduler = "slurm"
+# scheduler_dialect = "slurm"
+# scheduler_driver = "compute"
+# scratch_root = "/work/USER/vq"
+# submit_extra = ["--account", "my-group", "--partition", "standard"]
+
+# Programs go in the config of the machine that has them; see
+# docs/user/programs.md.
+# [programs.vibeqc-dev]
+# kind = "venv"
+# python = "/home/USER/vibe-qc/.venv/bin/python"
+# git_dir = "/home/USER/vibe-qc"
+# branch = "main"
+# import_check = "vibeqc"

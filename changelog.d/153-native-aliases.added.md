@@ -1,0 +1,1 @@
+- Preserve contained native library file aliases during qualified slot seeding, rejecting escaping, cyclic, dangling and directory aliases before copying.

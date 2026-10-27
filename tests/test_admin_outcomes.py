@@ -495,6 +495,10 @@ class TestAcknowledgeFailedMarker:
     marker sat about five hours behind exactly that.
     """
 
+    @pytest.fixture(autouse=True)
+    def previous_writer_exited(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(admin, "_pid_liveness", lambda pid: False)
+
     def _failed_marker(self, envs: list[str]) -> None:
         admin.acquire_admin_update_marker(envs=envs, host="localhost")
         admin.transition_admin_update_state(

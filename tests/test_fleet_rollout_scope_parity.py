@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from contextlib import nullcontext
 
 import pytest
 from click.testing import CliRunner
 
 from tests.test_fleet_rollout_cli import _action, _patch_discovery, _plan, _report
+from vq import cli, config
 from vq import fleet_rollout as rollout
 from vq.cli import main
 
@@ -20,8 +22,8 @@ TARGETS = (
     "host_f-big2",
     "host_f-big3",
     "host_f-inf",
-    "host_f-itwin",
-    "host_f-jtwin",
+    "host_f-lanea",
+    "host_f-laneb",
 )
 
 
@@ -228,3 +230,88 @@ def test_cli_scoped_result_exits_two_for_alias_or_unreleased_owned_hold(
     assert payload["selection"]["verdict"] == "degraded"
     if retained:
         assert len(payload["retained_rollout_holds"]) == 8
+
+
+def test_scoped_rollout_collects_only_driver_and_selected_scheduler_targets(monkeypatch):
+    report, plan, doctor, run = case()
+    plan.topology["host_c"]["role"] = "excluded"
+    doctor["driver_b"] = {"ok": True, "checks": []}
+    run.holds["host_c"] = hold("host_c")
+    collect_snapshots = rollout.collect_snapshots
+    build_kwargs = []
+    _patch_discovery(
+        monkeypatch, report=report, plans=[plan, plan],
+        extra_hosts=(*TARGETS, "host_c", "host_f-unrelated", "driver_b", "host_a"),
+        build_kwargs=build_kwargs,
+    )
+    cfg = cli.config.load_config()
+    cfg.fleet.check_timeout_seconds = 17
+    for name in (*TARGETS, "host_c", "host_f-unrelated"):
+        cfg.hosts[name] = config.HostConfig(
+            ssh=name, scheduler="pbs", scheduler_dialect="torque",
+            scheduler_driver="driver_b" if name in {"host_c", "host_f-unrelated"} else "localhost",
+            scratch_root="/scratch",
+            fleet_role=(
+                "excluded" if name == "host_c" else "managed" if name == "host_f" else "alias"
+            ),
+            fleet_canonical_host=(
+                None if name in {"host_f", "host_c"}
+                else "host_c" if name == "host_f-unrelated" else "host_f"
+            ),
+        )
+    calls = []
+
+    def runner(argv, **kwargs):
+        args = argv[3:]
+        calls.append(args)
+        kind = args[0]
+        if "--all" in args:
+            payload = doctor if kind == "doctor" else {}
+        elif kind == "doctor":
+            payload = doctor[args[1]]
+        elif kind == "programs":
+            payload = []
+        else:
+            payload = {"envs": []}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(
+        rollout, "collect_snapshots", lambda **kw: collect_snapshots(runner=runner, **kw)
+    )
+    monkeypatch.setattr(rollout, "rollout_execution_lock", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(cli.admin_module, "toolset_lifecycle_lock", lambda *a, **k: nullcontext())
+    reconciliation = []
+    def reconcile(**kwargs):
+        reconciliation.append(kwargs)
+        return rollout.OperationReconciliation(
+            retained_legacy_holds=(("prior-report", "host_c", "owner recovery pending"),),
+        )
+    monkeypatch.setattr(rollout, "reconcile_durable_operations", reconcile)
+    monkeypatch.setattr(
+        rollout, "abort_unselected_pre_authorization_operations", lambda *a, **k: None
+    )
+    monkeypatch.setattr(rollout, "execute_plan", lambda *a, **k: run)
+    monkeypatch.setattr(rollout, "reconcile_scheduler_parity_holds", lambda *a, **k: run)
+    monkeypatch.setattr(rollout, "finalize_run", lambda *a, **k: run)
+    response = CliRunner().invoke(main, ["admin", "rollout-latest", "--only", "host_f", "--json"])
+    assert response.exit_code == 0, (response.output, response.exception)
+    assert len(build_kwargs) == 2  # discovery and final verification both ran
+    assert not any("--all" in args for args in calls), calls
+    expected = {"localhost", *TARGETS}
+    assert len(calls) == 2 * 3 * len(expected)
+    for snapshot in build_kwargs:
+        assert all(set(snapshot[key]) == expected for key in ("admin_status", "programs", "doctor"))
+        assert snapshot["programs"]["host_f"] == []
+    assert all(args[-2:] == ["--check-timeout", "17"] for args in calls if args[0] == "doctor")
+    assert len(reconciliation) == 1
+    assert reconciliation[0]["configured_retention_hosts"] == frozenset(cfg.hosts)
+    payload = json.loads(response.output)
+    assert payload["selection"]["verdict"] == "converged"
+    assert payload["status"] != "complete"
+    assert payload["retained_rollout_holds"][0]["host"] == "host_c"
+    assert payload["retained_legacy_holds"][0]["host"] == "host_c"
+    # A direct-host recovery still needs the report-pinned controller, but not
+    # a driver configured only for an unrelated excluded scheduler host.
+    assert rollout.snapshot_hosts(cfg, rollout.HostSelection(only=("host_a",))) == (
+        "host_a", "localhost",
+    )

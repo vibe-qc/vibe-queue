@@ -1,0 +1,1 @@
+**`vq broker show` names the figures a completion-time blocker rests on.** The broker job view (`vq broker show`, `vq broker list --json` and the broker part of `vq status BROKER b-...`) now includes `wall_time_seconds` and `runtime_seconds` (`null` when unset), and `vq broker show` prints `wall_time_seconds:` and `runtime estimate:` lines when they are set. (#159)

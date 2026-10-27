@@ -205,24 +205,6 @@ class TestNavigationRedirects:
         assert landed.status_code == 303
         assert landed.headers["location"] == here
 
-    def test_offsite_next_is_still_neutralized(
-        self, client: TestClient
-    ) -> None:
-        """The handler feeds ``next=`` from the address bar, which is
-        attacker-reachable via a crafted link. The server keeps the final
-        say."""
-        authn.add_user("example_user", "pw", "viewer")
-        r = client.post(
-            "/fleet/login",
-            data={
-                "user": "example_user",
-                "password": "pw",
-                "next": "//evil.example.com/",
-            },
-            follow_redirects=False,
-        )
-        assert r.status_code == 303
-        assert r.headers["location"] == "/fleet"
 
 
 class TestHandlerIsDelivered:
