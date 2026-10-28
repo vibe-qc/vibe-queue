@@ -559,6 +559,15 @@
   },
   {
     "changed": false,
+    "export_sha256": "0af6d29520fe214cd64697e856ad83d3c40c39a22a07670901841ebdb7b8c131",
+    "mode": "100644",
+    "path": "changelog.d/224-artifact-receipt.fixed.md",
+    "reasons": [],
+    "source_blob": "7ddb857bc756ff6cbc927c086fa3968abaa798d1",
+    "source_sha256": "0af6d29520fe214cd64697e856ad83d3c40c39a22a07670901841ebdb7b8c131"
+  },
+  {
+    "changed": false,
     "export_sha256": "04736a3a21d20904ee460b9263e5f3af54da441655f425da2a3172dc0b5452a0",
     "mode": "100644",
     "path": "changelog.d/README.md",
@@ -1090,12 +1099,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "e4c5cb3a3ef87415f2d6a11aaa598049f4a1ac704c879091ceb20b7248d26564",
+    "export_sha256": "180e15fbab04cd0bde297b32ebe13e9913f0a1309ec4f8ff224647d92d5087f8",
     "mode": "100644",
     "path": "docs/agent_interaction.md",
     "reasons": [],
-    "source_blob": "0e39490688e85458c7ee02133d9a5a4022b4151b",
-    "source_sha256": "e4c5cb3a3ef87415f2d6a11aaa598049f4a1ac704c879091ceb20b7248d26564"
+    "source_blob": "90a4070602547280fe57c32fc9da13b82c337a62",
+    "source_sha256": "180e15fbab04cd0bde297b32ebe13e9913f0a1309ec4f8ff224647d92d5087f8"
   },
   {
     "changed": false,
@@ -1135,12 +1144,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "160dc2acec3805ca733a6e03b545aff092038df41157806d37a41649659b3f51",
+    "export_sha256": "3e5ebd129467261b06cbe0906f21f3a9b8f212cad943d4bffa2c6cf779dcaaa9",
     "mode": "100644",
     "path": "docs/campaigns.md",
     "reasons": [],
-    "source_blob": "f0605b948c3a418c2a767c5a0d0dc230768f6a5e",
-    "source_sha256": "160dc2acec3805ca733a6e03b545aff092038df41157806d37a41649659b3f51"
+    "source_blob": "379ee129b26741d94dbaab5c5a20edc6d37cda5c",
+    "source_sha256": "3e5ebd129467261b06cbe0906f21f3a9b8f212cad943d4bffa2c6cf779dcaaa9"
   },
   {
     "changed": false,
@@ -1684,12 +1693,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "a6ce18b1f8958aeb7250745fcec2d899090d6cd6f71966d35640c9cb2c739202",
+    "export_sha256": "ce69ec497e8703ebd3825b2e6df0ad5c0ff9c6b8c7d1f6740877410a2709769a",
     "mode": "100644",
     "path": "docs/version_compatibility.md",
     "reasons": [],
-    "source_blob": "6a252f4382ebadd0adb998c23e74da09c9bd382d",
-    "source_sha256": "a6ce18b1f8958aeb7250745fcec2d899090d6cd6f71966d35640c9cb2c739202"
+    "source_blob": "ef6c3a105968246a4be9bb44ffa7e3fdc9483c27",
+    "source_sha256": "ce69ec497e8703ebd3825b2e6df0ad5c0ff9c6b8c7d1f6740877410a2709769a"
   },
   {
     "changed": false,
@@ -2251,12 +2260,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "8cd5f598bf0c7eba0811ed43421e5a26d2aed0a1812bfe162d498113413e8854",
+    "export_sha256": "5f698c81a8e328ea0e12bb487c37a8e7f621e8ce9831a2a7e10280a41248a197",
     "mode": "100644",
     "path": "src/vq/cli.py",
     "reasons": [],
-    "source_blob": "2d343ad4bd757f7a941bdf1e1a28daac98260915",
-    "source_sha256": "8cd5f598bf0c7eba0811ed43421e5a26d2aed0a1812bfe162d498113413e8854"
+    "source_blob": "9e4c4557ac256dce44241fc58ccf13683b42bd39",
+    "source_sha256": "5f698c81a8e328ea0e12bb487c37a8e7f621e8ce9831a2a7e10280a41248a197"
   },
   {
     "changed": false,
@@ -5959,12 +5968,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "6608a59fa1afddec0f3b11063791a8de9ecf05ae267afb76030e3ceb6488f262",
+    "export_sha256": "64d9ab1b93e59547f9f6d079f3b90278b94656100ec8cc6df17c5384894f1673",
     "mode": "100644",
     "path": "tests/test_qvf_queue_contract.py",
     "reasons": [],
-    "source_blob": "dd1bb97053809f784337785f20989668f9679f10",
-    "source_sha256": "6608a59fa1afddec0f3b11063791a8de9ecf05ae267afb76030e3ceb6488f262"
+    "source_blob": "af9fe86499730010d6716dda78c4f4390ded143b",
+    "source_sha256": "64d9ab1b93e59547f9f6d079f3b90278b94656100ec8cc6df17c5384894f1673"
   },
   {
     "changed": false,

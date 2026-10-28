@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import codecs
 import contextlib
+import hashlib
 import json
 import logging
 import math
@@ -10360,8 +10361,8 @@ def fetch(
         else ("fetched workdir" if fetch_workdir else "fetched")
     )
     # (#111): report WHEN these bytes were fetched, so an operator or
-    # a poller reading the line does not have to take "fetched" on faith. A
-    # single-artifact fetch writes no sidecar, so it has no manifest.
+    # a poller reading the line does not have to take "fetched" on faith.
+    # Named artifacts have no sidecar; their receipt describes this retrieval.
     manifest = None
     if artifact_name is None:
         try:
@@ -10376,7 +10377,7 @@ def fetch(
             raise click.ClickException(
                 f"fetched tree at {dst}, but {exc}; refusing to report success"
             ) from None
-    fetched_at = manifest.get("fetched_at") if manifest else None
+    fetched_at = manifest.get("fetched_at") if manifest else utcnow_iso()
     stale = bool(manifest.get("stale")) if manifest else False
     # (#62): a partial tree is a successful fetch of an INCOMPLETE workspace.
     # It must never read as a whole one, so the count is on the success line
@@ -10384,6 +10385,18 @@ def fetch(
     excluded = manifest.get("excluded_count") if manifest else None
     excluded_count = excluded if isinstance(excluded, int) and excluded > 0 else 0
     if as_json:
+        artifact_identity: dict[str, object] = {}
+        if artifact_name is not None and dst.is_file():
+            try:
+                with dst.open("rb") as handle:
+                    artifact_identity = {
+                        "artifact_sha256": hashlib.file_digest(handle, "sha256").hexdigest(),
+                        "artifact_size_bytes": os.fstat(handle.fileno()).st_size,
+                    }
+            except OSError as exc:
+                raise click.ClickException(
+                    f"cannot identify fetched artifact at {dst}: {exc}"
+                ) from None
         click.echo(
             json.dumps(
                 {
@@ -10402,6 +10415,7 @@ def fetch(
                     "partial": excluded_count > 0,
                     "excluded_count": excluded_count,
                     "queue_handle": queue_handle,
+                    **artifact_identity,
                 },
                 indent=2,
                 sort_keys=True,
@@ -15715,8 +15729,11 @@ def admin_fence_idempotency_key(key: str) -> None:
 @click.argument("host")
 @click.argument("program")
 @click.option("--marker-id", default=None)
-@click.option("--current-without-marker", is_flag=True,
-              help="Observe current immutable runtime only when no update marker conflicts; no build or activation.")
+@click.option(
+    "--current-without-marker", is_flag=True,
+    help=("Observe current immutable runtime only when no update marker conflicts; "
+          "no build or activation."),
+)
 @click.option("--expected-sha", required=True)
 @click.option("--tag", "expected_tag", default=None)
 @click.option("--dry-run", is_flag=True)

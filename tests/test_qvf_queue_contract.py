@@ -1,15 +1,19 @@
 """First-class complete-calculation QVF queue protocol tests."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shlex
 import subprocess
 import sys
+import tarfile
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -574,6 +578,55 @@ def test_artifact_only_fetch_returns_no_queue_sidecars(tmp_path: Path) -> None:
     assert result == out / "job.qvf"
     assert result.read_bytes() == qvf.read_bytes()
     assert sorted(path.name for path in out.iterdir()) == ["job.qvf"]
+
+    for content in (qvf.read_bytes(), b"changed opaque archive bytes"):
+        qvf.write_bytes(content)
+        receipt = CliRunner().invoke(main, [
+            "fetch", "localhost", "abc123def456", "--name", "job.qvf",
+            "-o", str(out), "--json",
+        ])
+        assert receipt.exit_code == 0, receipt.output
+        data = json.loads(receipt.output)
+        assert data["fetched_at"]
+        assert data["stale"] is False and data["partial"] is False
+        assert data["artifact_sha256"] == hashlib.sha256(content).hexdigest()
+        assert data["artifact_size_bytes"] == len(content)
+        assert result.read_bytes() == content
+        assert sorted(path.name for path in out.iterdir()) == ["job.qvf"]
+
+
+@pytest.mark.parametrize("failure", ["truncated", "late_exit", "missing"])
+def test_interrupted_named_qvf_retrieval_preserves_previous_bytes(
+    tmp_path: Path, monkeypatch, failure: str,
+) -> None:
+    source = tmp_path / "source.qvf"
+    _write_qvf(source)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        if failure != "missing":
+            archive.add(source, arcname="job.qvf")
+    payload = buffer.getvalue()
+    if failure == "truncated":
+        payload = payload[:600]
+
+    @contextlib.contextmanager
+    def stream(*args):
+        yield SimpleNamespace(stdout=io.BytesIO(payload), stderr_text="interrupted")
+        if failure == "late_exit":
+            raise transport.RemoteError("interrupted after transfer")
+
+    monkeypatch.setattr(transport, "stream_remote_vq", stream)
+    out = tmp_path / "retrieved"
+    out.mkdir()
+    previous = out / "job.qvf"
+    previous.write_bytes(b"previous result: never report as freshly fetched")
+    before = previous.read_bytes()
+    with pytest.raises(transport.RemoteError):
+        fetch.fetch_artifact_remote(
+            HostConfig(ssh="compute.example.invalid"), "abc123def456", "job.qvf", out,
+        )
+    assert previous.read_bytes() == before
+    assert list(out.iterdir()) == [previous]
 
 
 def test_qvf_status_requires_complete_sequenced_run_record(

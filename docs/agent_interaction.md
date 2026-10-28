@@ -298,8 +298,14 @@ Fetch only the updated container, leaving queue logs and metadata server-side:
 vq fetch HOST JOBID --name job.qvf -o results/
 ```
 
-This publishes `results/job.qvf` atomically. A retry is idempotent only when
-the existing file is byte-identical; vq never overwrites a different result.
+This publishes `results/job.qvf` atomically. A successful refresh replaces an
+older snapshot; a failed transfer leaves the previous file unchanged and
+returns an error. Use a separate destination per job/attempt to retain history.
+Add `--json` and save stdout outside that destination for a receipt containing
+`fetched_at`, `stale`, `partial`, `artifact_sha256` and `artifact_size_bytes`
+(the last two describe named regular files). No sidecar is added to the QVF.
+A receipt proves transport of those bytes, not scientific acceptance or that
+a running producer has finished. See [QVF stage handoffs](campaigns.md#qvf-stage-handoffs).
 
 The queue's format compatibility tests use canonical QVF v0.4.0 archives
 (`qvf_version` 1), including unrestricted NTO results. Scientific sections

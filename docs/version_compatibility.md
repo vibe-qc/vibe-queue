@@ -968,3 +968,13 @@ regular-file hash/mode checks remain. Loaded-library observations must name the
 resolved regular file. Older Queue readers reject this variant safely; adapters
 using it require a Queue version containing the internal-file-alias support.
 It conveys no additional source provenance or permission to reuse an install.
+
+
+## Named artifact retrieval receipts (#224)
+
+Named artifact `vq fetch --json` responses now populate `fetched_at`. Regular
+files additionally report `artifact_sha256` and `artifact_size_bytes`; directory
+artifacts retain their existing response shape. These additive response fields
+require no persisted job, campaign, or QVF migration. Older clients may ignore
+them; consumers requiring them must reject receipts from older clients that
+omit them. A fresh complete transfer does not imply scientific acceptance.

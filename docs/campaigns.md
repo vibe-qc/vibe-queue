@@ -389,8 +389,11 @@ See [Campaigns in the console](fleet_console.md#campaigns-in-the-console).
 * Storage policies other than controller relay, such as a direct
   host-to-host transfer or a shared filesystem reference.
 * Integration with resource estimates (#159) and placement (#160).
-* The live acceptance: a three-node campaign across two hosts with a
-  directory/QVF artifact.
+
+The initial cross-host calculate → validate → render acceptance is recorded
+on #165, including a failed validator that blocked rendering. This establishes
+the generic transport route; it does not qualify every producer's chemistry
+or a later application-specific campaign.
 
 ### Recovering a frozen managed launcher after rollover
 
@@ -407,3 +410,170 @@ bind archive and launcher hashes; a filename alone never authenticates a runtime
 An already accepted submission with a different binding remains an idempotency
 conflict; do not clear its key or journal. Unsupported terminal-release proofs
 retain the reservation conservatively.
+
+## QVF stage handoffs
+
+Use the existing campaign graph for staged QVF calculations. The producer owns
+scientific requests, geometry, results, provenance and acceptance in QVF. Queue
+manifests and journals identify bytes, jobs, attempts and runtimes; they are not
+scientific archives. A `verified` artifact is byte-verified, and a `succeeded`
+compute node is a successful queue process. Neither is scientific acceptance.
+
+For each species/stage, the exported graph must place an explicit producer or
+validator acceptance node on a **success** edge before dependent computation.
+The validator checks the exact parent QVF, referenced structure/geometry digest,
+state, method and convergence. It must return failure for rejection or an
+inconsistent geometry cache and publish its accepted QVF only on acceptance.
+Consumers read scientific coordinates from that archive. A hash-matching JSON
+cache alone does not establish that its coordinates came from the QVF.
+
+Preserve input/output separation: stage the immutable parent at `parent.qvf`,
+then have the producer write its request/result to a different path. Campaign
+inputs and outputs cannot overlap. The campaign's source pin preserves the
+original request; each input binding identifies the producer attempt and
+manifest digest. Record species, stage and scientific parent references in the
+producer's registered QVF fields, without adding a Queue-owned format schema.
+
+### Reproducible operator procedure
+
+1. Export and review the producer's QVF campaign and pinned sources. Retain the
+   editable sketch and original request archives. Require the QVF route; an
+   XYZ/script-only fallback is a different workflow. Verify every downstream
+   scientific stage is acceptance-gated, including branches such as a
+   single-point energy on the optimized geometry after Hessian acceptance.
+2. Record `vq --version` and `vq programs HOST --require PROGRAM` for each
+   selected host/program. For a publication restricted to a release family,
+   check the actual producer release satisfies that range (for example
+   `>=0.18,<0.19`), without requiring a particular patch. A program name is not
+   release evidence. Bind immutable generations or authenticated retained
+   launchers as described above; do not update a running generation.
+3. Validate without submitting:
+
+   ```sh
+   vq campaign validate campaign.json
+   ```
+
+4. The campaign owner starts or resumes the **same** file and run directory:
+
+   ```sh
+   vq campaign run campaign.json RUN_DIR --once
+   vq campaign status campaign.json RUN_DIR/journal.json --json
+   ```
+
+   Save receipts externally. Repeat the controller command to progress, or omit
+   `--once` for its normal loop. Preserve the same retained-runtime option when
+   required. Do not export a second graph/run directory to recover a lost reply.
+   Failed chemistry remains failed until an explicit, reviewed retry; never
+   change the original QVF or rewrite the journal to manufacture success.
+5. Recheck final artifacts before handing them to the viewer:
+
+   ```sh
+   vq campaign artifact-verify RUN_DIR/artifacts/NODE/1/result.manifest.json \
+     RUN_DIR/artifacts/NODE/1/result
+   ```
+
+   Substitute the actual node, attempt and output name from the journal. This
+   detects missing/corrupted archived bytes after publication; campaign status
+   alone is not a fresh disk-integrity scan. Keep manifests and the journal with
+   all original, rejected and restarted attempts.
+6. For a single-QVF job outside a campaign, retain the submitted request hash,
+   returned job ID and actual runtime status; retrieve into an attempt-specific
+   directory:
+
+   ```sh
+   vq status HOST JOBID --json > attempt-status.json
+   vq fetch HOST JOBID --name job.qvf -o retrieved/JOBID --json > fetch-receipt.json
+   ```
+
+   Continue only on successful exit. Independently compare the file's SHA-256
+   and size with the receipt before viewer validation/analysis. `partial=false`
+   covers the selected artifact, not every job output or scientific completeness.
+   `stale=false` means this transfer succeeded; it is not a claim that a live job
+   cannot write a later result. Keep final receipts after terminal engine status
+   and explicit scientific acceptance.
+
+### Bounded live acceptance
+
+Reuse existing accepted cross-host transport evidence and preserved jobs where
+possible. In coordination with the calculation owner, retrieve one accepted
+terminal QVF from its original host into a new evidence directory; record actual
+Queue/producer identities, source job/attempt, receipt and independent hash.
+Verify a copy with the campaign manifest and open it with the supported viewer.
+Do not launch another publication calculation to test copying.
+
+Use disposable copies for negative controls: remove/truncate/alter an artifact
+and require `artifact-verify` to fail; pass a rejected parent or a mismatching
+geometry cache through the producer validator and require failure with no
+consumer submission. Interrupt a retrieval in the isolated transport test lane
+and confirm no partial result is published or reported successful. Restart the
+controller against its original journal to confirm the submission key is reused.
+Archive those receipts separately from scientific results. Synthetic producer
+fixtures test protocol behavior only; final chemistry and browser-to-viewer
+acceptance require the owner's released producer campaign.
+
+
+## Continuing on another host
+
+A bare `--depends-on JOBID` is resolved in the destination queue's dependency
+namespace. It is not a global job handle and does not relay an artifact.
+Never submit a predecessor ID from `workstation-a` as a dependency on
+`cluster-b`, even if both queues use the same driver or happen to contain that
+ID. A same-spelled ID can identify unrelated work. Use explicit host-qualified
+receipts for every lookup; do not infer ownership from a job name or ID prefix.
+
+For an already-running predecessor, continue through this bounded procedure:
+
+1. Retain its original submission receipt and `(host, job_id)` pair. Query
+   `vq status workstation-a PREDECESSOR --json`. A submit receipt's
+   `acceptance_scope=queue` means admission only. For a scheduler job, preserve
+   `scheduler_job_id`, `scheduler_state`, `effective_state` and
+   `scheduler_running_confirmed`; driver `state=running` alone does not prove
+   that SLURM started an allocation. An unknown/stale scheduler observation is
+   not running confirmation. On a direct daemon host, use its process state.
+2. Wait for the predecessor's terminal outcome, then collect from that same
+   owning host. Direct-daemon scratch outputs use `--workdir` when applicable;
+   scheduler outputs use the preserved workspace (omit `--workdir`). Check the
+   fetch exit code and require explicit `stale=false` and `partial=false`.
+   Missing flags mean unknown, not complete. Hash the selected files and keep
+   the fetch receipt. Failed/killed/OOM/time-limited attempts may have useful
+   outputs; collecting them never promotes them to successful chemistry.
+3. Obtain explicit producer/validator acceptance tied to those hashes. Keep
+   requested resources (`cpus`, `mem_mb`, wall limit, scheduler tasks) separate
+   from observed allocation and `resource_usage`. Retain `program_runtime_pin`
+   when present and the producer's actual source/native/runtime report; null
+   runtime or usage evidence remains unknown. A version observed before
+   submission does not prove what eventually executed.
+4. If scientific review requires a continuation, register a new immutable
+   input payload on `cluster-b`, containing the accepted predecessor artifact
+   and provenance. Record the external parent as `(workstation-a, PREDECESSOR,
+   artifact SHA-256)` in the workflow ledger. **Do not pass that predecessor
+   as `--depends-on` on cluster-b.** The explicit acceptance in step 3 is this
+   cross-host gate. For automatic orchestration from the outset, use the
+   existing artifact campaign graph with explicit host and validation nodes.
+5. Submit the continuation once with its own stable idempotency key and
+   `--retry 0`. Keep the exact payload, target and arguments for reconciliation.
+   If acknowledgement is lost, replay that same request/key on the same host;
+   do not generate another key. Changed inputs need a deliberately linked new
+   attempt, never a silent resubmission of the original. Restarting a controller
+   does not authorize retrying rejected science or moving running work.
+
+Compact command sequence (placeholders refer to reviewed artifacts, not live
+jobs to replay):
+
+```sh
+vq status workstation-a PREDECESSOR --json > parent-status.json
+vq fetch workstation-a PREDECESSOR --workdir --name result.qvf \
+  -o parent-retrieval --json > parent-fetch.json
+# Validate terminal outcome, hashes and scientific acceptance before continuing.
+# Place the accepted artifact and producer driver in the pinned continuation/.
+vq submit cluster-b --dir continuation --program PROGRAM --retry 0 \
+  --cpus 8 --mem-mb 16384 --time-limit 01:00:00 \
+  --idempotency-key REVIEWED_CONTINUATION_KEY --json -- PRODUCER_COMMAND
+```
+
+The resources above are illustrative. Use the reviewed plan and existing host
+policy. Keep an attempt-specific collection directory rather than merging a
+new file subset into older results. Retain original failed outputs and raw
+receipts; archive normalization must record both original and retained hashes.
+A terminal process, a complete transfer and scientific acceptance are three
+separate observations.
