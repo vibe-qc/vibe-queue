@@ -318,3 +318,25 @@ def test_no_vq_subprocess_call_inherits_stdin() -> None:
         "these subprocess call sites inherit the caller's stdin (#118); pass "
         "stdin=subprocess.DEVNULL:\n  " + "\n  ".join(offenders)
     )
+
+
+@pytest.mark.parametrize("operation", ["call('info')", "logs('container-id')"])
+def test_managed_container_engine_preserves_caller_input(tmp_path, operation):
+    """A real child engine cannot drain input intended for its caller (#225)."""
+    engine = tmp_path / "engine"
+    engine.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\nprint('engine done')\n")
+    engine.chmod(0o700)
+    caller = (
+        "import sys; from vq.managed_container import Engine; "
+        f"Engine({str(engine)!r}, 'unix:///unused').{operation}; "
+        "sys.stdout.write(sys.stdin.read())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", caller],
+        input="remaining caller input\n",
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    assert result.stdout == "remaining caller input\n"

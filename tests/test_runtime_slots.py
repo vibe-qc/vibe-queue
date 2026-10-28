@@ -600,9 +600,10 @@ class TestSlotHealthcheckBinding:
             runtime_slots.slot_local_program(self.program(command), "/rt", SHA_A)
 
     def test_actual_probe_observes_selected_generation_failure(self, tmp_path):
-        from vq.config import VenvProgram
-        from vq._program_probe import classify_venv_healthcheck
         import shlex
+
+        from vq._program_probe import classify_venv_healthcheck
+        from vq.config import VenvProgram
         live = tmp_path / "legacy source"
         old = live / ".venv/bin/python"
         old.parent.mkdir(parents=True)

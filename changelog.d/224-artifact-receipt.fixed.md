@@ -1,1 +1,0 @@
-Named artifact fetch receipts now include a retrieval timestamp and, for regular files, SHA-256 and byte size without adding archive sidecars. Document QVF acceptance-gated campaign handoffs and correct refresh semantics.

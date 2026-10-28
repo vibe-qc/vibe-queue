@@ -99,6 +99,9 @@ _FORMATS = ("text", "json")
 # (#160), when the scheduler accepted a job and when the cluster was first seen
 # running it: every json payload gains exactly those two nullable JobSpec keys
 # and nothing else; the text digests are unchanged because no line renders them.
+# And for the additive `managed_container` (#221): each JSON fixture gains
+# exactly this nullable key. Removing that single serialized line reproduces
+# every previous digest; text and read-stamp contracts are unchanged (#225).
 # To update one, temporarily replace that digest with zeros and run the focused
 # case: the assertion prints the complete normalized output and new digest for
 # review.  Never update a digest without reviewing that output diff.
@@ -110,13 +113,13 @@ _OUTPUT_SHA256 = {
     ("dependency", "text"): "fe02636c0c1059904f8327bb01cfef64adac9bc9b0ce9ab9ddb4ca51e2fb3cba",
     ("qvf", "text"): "206afbcf785783de46ee3ae4ec62a653a502d435a435dcc579d4e046a59cbf3d",
     ("terminal", "text"): "4f7442bf729216211947120167be895fee74a44c4144e394ca04f72ba7e59667",
-    ("pending", "json"): "8066c046b87d1ba85e555dd50d3e6bed68a3097449e2e36f361c3126fe09a160",
-    ("running", "json"): "9b39b4ae30ced33b5dcff3b484e49c8c728fa1aec23e874c63003e29f554cae5",
-    ("scheduler", "json"): "e66bbc36f4cf3ec180cfb638e96e6f3e5eab7f62102bd1a94897caba19435b52",
-    ("archived", "json"): "ca3d8cd731524c6a33debc1029362a6c0829cc172e94f99ea4fc1f73cd361b82",
-    ("dependency", "json"): "5b9fc912aec457c1a02787956ed2840eceb15c08d683fa239922d9707c613a55",
-    ("qvf", "json"): "94624889469b57ace2e5276a936a8b0ee3e5515b2ac71972403804536cc16441",
-    ("terminal", "json"): "b421d9fa772ab3beda52e10e86b0fceb32e9d6ebf4bfe239569aec3bfee90508",
+    ("pending", "json"): "df537728c71a7e1a782799cb8bbd51c4000ff3ec8befca453a7222079c2d6add",
+    ("running", "json"): "563452efe8e39c06caf4f91906ec4c15e0c0c013fa65328c391c4b259f975c4c",
+    ("scheduler", "json"): "6fd05b405eb7891712340fc28aa2bea96e0f2f13a50fc08dc13e9d0126b85e4f",
+    ("archived", "json"): "079490db0efd6b06cfb599237b4bb6b603440944e69b8048aba0b3044e985de7",
+    ("dependency", "json"): "355099dd71cf4801a55b05e8cc95453d37f36095fb63260ecdd9d98989dc5df4",
+    ("qvf", "json"): "74b9335c6a4c520975eaa6320a73b1caa143e672a12006c2ad9699e61c0ca636",
+    ("terminal", "json"): "588ee647d1773d8c2586573060cfdee93a1e1c5794eae82254c9b33690cb75dc",
 }
 
 

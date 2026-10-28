@@ -1,4 +1,4 @@
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # The distribution's name, as `pyproject.toml` declares it (#68). The command
 # and this package are `vq`; only what an index or a requirement resolves is

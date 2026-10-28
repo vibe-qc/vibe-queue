@@ -18,6 +18,109 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+## [v1.0.1] - 2026-10-28 - *Meyer's Contract*
+
+### Added
+
+- Preserve contained native library file aliases during qualified slot seeding, rejecting escaping, cyclic, dangling and directory aliases before copying.
+
+- **A broker job can carry its calibrated runtime estimate, and the completion-time policy plans with it.** `vq submit BROKER --estimate CALIBRATED` sends the estimate's runtime interval (the receipt's lower bound, the calibrated upper bound) as `vq broker accept --runtime-seconds LOW HIGH`, recorded on the intent as `runtime_seconds`. With `[broker] policy = "completion-time"`, a host where the predicted execution could overrun the job's time limit or the host's walltime limit is then refused with that reason. A raw receipt or an uncalibrated runtime is refused, and `--mem-from-estimate`/`--time-from-estimate` stay refused for broker jobs. The field is written only when set, so other broker records and intent digests are unchanged; a vq without it reports a record that carries it as corrupt, so use the option only when every host reading the broker store knows it. (#159)
+
+- **`vq broker show` names the figures a completion-time blocker rests on.** The broker job view (`vq broker show`, `vq broker list --json` and the broker part of `vq status BROKER b-...`) now includes `wall_time_seconds` and `runtime_seconds` (`null` when unset), and `vq broker show` prints `wall_time_seconds:` and `runtime estimate:` lines when they are set. (#159)
+
+- **A gateway submission can carry its calibrated runtime estimate.** `POST /v1/jobs` accepts an optional `runtime_seconds: [low, high]`, checked like `vq broker accept --runtime-seconds` and recorded on the broker intent for the completion-time policy to rank by. `vq remote submit --estimate CALIBRATED` sends it from a calibrated estimate and refuses a raw receipt or an uncalibrated runtime before uploading. Relay connectors receive the field only when it is set. (#159)
+
+- **The broker can place PBS and Slurm jobs through a driver daemon on another host.** A broker scheduler lane's `scheduler_driver` may now name a daemon host reached over SSH. The broker and the driver each digest the lane's definition (`lane_sha256`: scheduler, dialect, `submit_extra`, scratch roots, job/CPU/walltime caps and runtime deployments) from their own config, leaving out per-machine routing such as SSH aliases and the driver's name. A lane whose definition differs, a driver that does not drive the lane itself, or a driver whose vq reports no lane digest gives no evidence. The payload is staged in the driver's home for the keyed submit, removed once the driver answers and kept while its answer is unknown. A driver on the broker machine is unchanged. (#160)
+
+- **A runtime bundle build can run on a remote build host.** `vq runtime-bundle build --host NAME -d SRC ...` checks the paths, builder and description locally, stages a tar of the source tree and the description in that host's home, and runs the host's own `vq runtime-bundle build -a TAR ...`. The staging is removed afterwards, or kept with a clear error when SSH cannot tell whether the build was accepted; a rerun is then refused by the build record already there. `vq runtime-bundle build-finish --host NAME RECORD` packs on that host and relays its answer and exit code. `build -a/--archive` takes a source archive in place of `-d`. (#161)
+
+- **A benchmark plan variant can take its identity from a portable runtime bundle.** `vq benchmark variant BUNDLE --name NAME` checks a packed or published #161 bundle's archive against its manifest and prints a plan `variants` entry. Its `runtime_digest` is the artifact ID, which `vq benchmark measure --runtime-root` reports for a deployment of it. `build_flags`, the `toolchain` and `dependencies` libraries and `storage_bytes` come from the bundle; `--library` and the build and deployment costs are added as given. Plan and result schemas are unchanged. (#162)
+
+- New guides: installing vq on a workstation, a server or a PBS/Slurm cluster without root access, what changes for a job on each kind of host, registering programs (binaries, Python environments and cluster-only programs with their scheduler hooks), running vibe-qc calculations through the queue, and using vq from vibe-sketch and vibe-view. Four tutorials walk from a first job to a pinned vibe-qc calculation and a headless vibe-view figure. The starter configuration `config/public-example.toml` now shows a daemon host, PBS and Slurm login nodes and a registered vibe-qc program. Two more pages cover running ORCA and CRYSTAL with the shipped `contrib/` wrappers, on a daemon host and on a cluster, and troubleshooting by symptom: unreachable hosts, refused submissions, pending gates, terminal states and fetch failures. A further page works through arrays, dependencies, chains and reruns with a parameter sweep and its analysis, including what each job can see of another's files. Another page covers asking for CPUs, memory and time: what a job sees, how the queue orders and admits it, and which limits stop a job on Linux and on macOS, where only the time limit is enforced. A page on managing jobs covers names and tags, pausing, killing, resubmitting, archiving and deleting finished jobs, and usage totals.
+
+- Consume product-owned analytical memory allocations with domains and scopes in estimate receipts; incomplete route models remain unknown instead of falling back to a heuristic scalar.
+  Preserve resolved zero occupied/virtual dimensions in receipts and calibration ranges.
+
+- Estimate calibrations now record, per group, the observed range of each numeric feature (Nbf, Naux, occupied/virtual, roots, k-points, ranks, threads). `vq estimate --calibration` and `vq estimate-evaluate --calibration` leave an estimate outside those ranges, or missing such a feature, uncalibrated and say why, instead of extrapolating the multiplier.
+
+- Preserve explicit runtime-bound empirical memory-baseline provenance separately from analytical allocations, and reject inconsistent identities, domains or residual evidence.
+
+- `vq estimate-evaluate` reports gain `route_groups`, keyed by method, algorithm and hardware class. The new `--thresholds` option reads a `vq.estimate-thresholds/1` document and gives each route group a pass, fail, undecided or insufficient verdict from its underprediction bounds.
+
+- Consume product-observed input digests and resolved resource features, refusing mismatched input bytes and conflicting operator overrides while preserving legacy receipt serialization.
+
+- `vq submit HOST -- CMD` with no `-d` or `-c` now runs CMD in an empty workspace, so a command that needs no files, such as the `-- hostname` canary, no longer needs a directory. Without `--` the positionals still name one input file, and `-- input.py` keeps the single-file form. The refusals for a command given without `--` say how to write it.
+
+- Add opt-in managed local Docker execution with immutable image/container bindings, authenticated worker accounting, durable cancellation and restart recovery. Unknown outcomes retain capacity and refuse resubmission or cleanup. Run shell payloads inside this managed route; arbitrary scripts that launch daemon-owned containers remain unsupported.
+
+### Changed
+
+- Reconcile the roadmap with the published 1.0.0 release and accepted article demonstrations, retaining outstanding qualification limits and identifying 1.0.x maintenance as the next target.
+
+- `vq submit --help` now describes how `--mem-mb` is enforced: by cgroups or the watchdog on Linux, by the scheduler on PBS and Slurm, and not at all on macOS.
+
+### Fixed
+
+- **A broker log or result stream through a local scheduler driver no longer reads the caller's stdin.** The driver helper that `broker_target.stream()` starts for a driver on the broker machine now gets `/dev/null` as stdin, like every other vq subprocess (#118), so a `vq logs`/`vq fetch` or gateway result collection through such a lane cannot consume input meant for the caller. (#195)
+
+- **Portable release-check launchers.** Release checks use the executing Python for the real driver helper and explicitly restore catchable signals before testing scheduler finalization, including when CI ignores SIGHUP. The 1.0 codename is registered as "Meyer's Contract" for its stable interface and compatibility boundary. (#199)
+
+- `vq estimate` now prints `Job memory: unknown` instead of `unknown bytes` when the job's memory figure is unknown.
+
+- Accept matching method labels with display capitalization in product dry-run evidence while still rejecting conflicting methods.
+
+- Add explicit campaign recovery through authenticated retained managed runtimes,
+  including packed archive and launcher identities, without changing campaign
+  bytes or submission keys after an active-runtime rollover.
+
+- `vq status`, `vq logs`, `vq output` and `vq events` now refuse a malformed job id with a one-line usage error instead of a Python traceback.
+
+- `vq status` labels a job's parent as `(resubmitted from)` instead of `(auto-resumed from)`, which was wrong for `vq resubmit` and `vq kill --resubmit`.
+
+- Submit examples in the README and guides that ran a command without a workspace (`vq submit HOST -- CMD`), which vq refuses, now give one with `-d`, and the refusal says to. The `vq submit --help` watchdog note no longer says macOS falls back to a process-group walk: there the watchdog reads no process usage.
+
+- Scheduler polls recognize standalone OpenSSH address/UNKNOWN connection-close diagnostics and use the existing bounded refusal cooldown. Authentication and host-key errors remain visible even when a jump host appends connection-close text. Scheduler submission and staging replay behavior is unchanged.
+
+- `vq submit HOST --program NAME input.py` for a `venv` program now runs `input.py` with that program's interpreter, on the daemon host and on a remote host, including one with `remote_python` set; it used vq's own Python or `remote_python` while recording the program and its revision on the job. A remote single-file `--program` submit without `--python` now needs a receiving vq at least as new as the client: an older one refuses it with `invalid command executable '--defaulted-python'`. `-d . -- python input.py` and an explicit `--python` work with any version.
+
+- **Keep managed-generation jobs pending during provider contention.** Dispatch retries the same durable reservation after a bounded delay while retaining strict identity checks. (#210)
+
+- `vq fetch-all` no longer reports a job as completely fetched when its `$VQ_WORKDIR` may hold output it did not copy, the case where `vq fetch` refuses to report success. Such a job is tagged `[WORKDIR NOT FETCHED]`, counted in the summary with a note naming `vq fetch HOST JOBID --workdir`, and marked `workdir_unfetched` in each report row and in the totals.
+
+- **Add `vq admin reconcile-runtime` to verify an immutable scheduler runtime
+  after a standalone updater loses its recorder.** It preserves the old marker
+  and receipt, records a new current-state observation for future admission,
+  and never relaunches a build or changes existing job pins. (#212)
+
+- **Admit eligible local jobs before slow scheduler submissions and rotate
+  canonical cluster pools across bounded dispatch passes.** Preserve each
+  pool's priority/FIFO order, alias-shared limits and existing admission gates. (#213)
+
+- Classify scheduler attempts fenced before start separately from command failures, preserving explicit owner control over replacement and the distinction from proven non-admission.
+
+- Bind source-local health-check argv paths to the selected immutable generation, preserve PATH and explicit external commands, and refuse embedded legacy paths that cannot be relocated without interpreting code.
+
+- Scheduler runtime reconciliation accepts an explicitly authenticated immutable
+  artifact-publication identity from the configured verifier, alongside the
+  existing store layout. Incomplete or mismatched identities fail closed;
+  current-state observations retain failed-update history and existing job pins.
+
+- Allow terminal reservation reconciliation through a verified successor at the same provider authority, preserving original execution pins and requiring exact binding and durable terminal proof; admission and dispatch remain bound to their original provider.
+
+- **Honor active-job filtering for scheduler usage.** Scheduler walltime observations no longer cause running or suspended jobs to enter default terminal-only usage totals. `--include-active` includes those states while pending jobs remain excluded, even when they retain timing observations. (#219)
+
+- **Use day-prefixed scheduler walltimes in queue ETA history.** Slurm durations such as `1-02:03:04` now contribute their reported execution time instead of falling back to queue timestamps that can include scheduler waiting time. (#220)
+
+- **Keep malformed webhook URLs within best-effort notification handling.** Request preparation errors are now logged and dropped instead of escaping the blocking sender or terminating the background sender with an uncaught exception. (#222)
+
+- Allow an explicitly requested, verifier-authenticated scheduler runtime observation
+  when no update marker exists, preserving prior admission history and existing job
+  pins while refusing conflicting writers or state changes (#223).
+
+- Named artifact fetch receipts now include a retrieval timestamp and, for regular files, SHA-256 and byte size without adding archive sidecars. Document QVF acceptance-gated campaign handoffs and correct refresh semantics.
+
+- Detach managed-container engine commands and log collection from caller input, preserving stdin for batch submission and monitoring loops.
+
 ## [v1.0.0] - 2026-10-23 - *Meyer's Contract*
 
 This release establishes the documented 1.x compatibility boundary for the

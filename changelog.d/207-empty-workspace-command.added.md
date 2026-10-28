@@ -1,1 +1,0 @@
-`vq submit HOST -- CMD` with no `-d` or `-c` now runs CMD in an empty workspace, so a command that needs no files, such as the `-- hostname` canary, no longer needs a directory. Without `--` the positionals still name one input file, and `-- input.py` keeps the single-file form. The refusals for a command given without `--` say how to write it.

@@ -1,1 +1,0 @@
-**Portable release-check launchers.** Release checks use the executing Python for the real driver helper and explicitly restore catchable signals before testing scheduler finalization, including when CI ignores SIGHUP. The 1.0 codename is registered as "Meyer's Contract" for its stable interface and compatibility boundary. (#199)

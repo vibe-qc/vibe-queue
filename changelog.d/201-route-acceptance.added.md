@@ -1,1 +1,0 @@
-`vq estimate-evaluate` reports gain `route_groups`, keyed by method, algorithm and hardware class. The new `--thresholds` option reads a `vq.estimate-thresholds/1` document and gives each route group a pass, fail, undecided or insufficient verdict from its underprediction bounds.

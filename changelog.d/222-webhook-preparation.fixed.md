@@ -1,1 +1,0 @@
-**Keep malformed webhook URLs within best-effort notification handling.** Request preparation errors are now logged and dropped instead of escaping the blocking sender or terminating the background sender with an uncaught exception. (#222)

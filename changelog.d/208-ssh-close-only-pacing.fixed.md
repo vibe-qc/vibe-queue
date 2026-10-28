@@ -1,1 +1,0 @@
-Scheduler polls recognize standalone OpenSSH address/UNKNOWN connection-close diagnostics and use the existing bounded refusal cooldown. Authentication and host-key errors remain visible even when a jump host appends connection-close text. Scheduler submission and staging replay behavior is unchanged.

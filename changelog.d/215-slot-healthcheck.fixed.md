@@ -1,1 +1,0 @@
-Bind source-local health-check argv paths to the selected immutable generation, preserve PATH and explicit external commands, and refuse embedded legacy paths that cannot be relocated without interpreting code.

@@ -118,6 +118,7 @@ class Engine:
         try:
             p = subprocess.run(
                 [self.executable, "--host", self.endpoint, *args],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -146,6 +147,7 @@ class Engine:
                     "1000",
                     target,
                 ],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=5,

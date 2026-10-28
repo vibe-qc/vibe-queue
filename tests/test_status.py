@@ -634,7 +634,9 @@ class TestStatusJsonMonitoring:
             scheduler_target="host_c", scheduler_state=fence_state,
             failure_reason="scheduler attempt fenced before start by operator",
         )
-        diagnosis = json.loads(show_status_json("localhost", "abc", queue_dir=queue))["terminal_diagnosis"]
+        diagnosis = json.loads(
+            show_status_json("localhost", "abc", queue_dir=queue)
+        )["terminal_diagnosis"]
         assert diagnosis["category"] == "scheduler_attempt_fenced"
         assert diagnosis["action_hint"] == "review_fence_receipt_and_owner_next_action"
         assert "before its command started" in diagnosis["summary"]
@@ -653,7 +655,9 @@ class TestStatusJsonMonitoring:
     ) -> None:
         queue = _setup(tmp_path, state=JobState.FAILED, exit_code=code,
                        scheduler_target=target, scheduler_state=marker)
-        diagnosis = json.loads(show_status_json("localhost", "abc", queue_dir=queue))["terminal_diagnosis"]
+        diagnosis = json.loads(
+            show_status_json("localhost", "abc", queue_dir=queue)
+        )["terminal_diagnosis"]
         assert diagnosis["category"] == "command_failed"
 
     def test_status_json_terminal_diagnosis_for_scheduler_missing_marker(

@@ -7139,7 +7139,9 @@ def _argv_has_pair(argv: Sequence[str], flag: str, value: str) -> bool:
     )
 
 
-def _authenticated_publication_identity(payload: object, result: SchedulerRuntimeUpdateResult) -> bool:
+def _authenticated_publication_identity(
+    payload: object, result: SchedulerRuntimeUpdateResult
+) -> bool:
     """Validate the configured verifier's explicit immutable-publication attestation.
 
     Hashes are bound to the exact receipt identity, never inferred from a filename.
@@ -7216,7 +7218,9 @@ def reconcile_scheduler_runtime_observation(
             if not admin_update_scopes_conflict(marker.envs, marker.host, [scope], host):
                 continue
             if current_without_marker:
-                raise AdminError("an update marker conflicts with current observation; use its scoped recovery")
+                raise AdminError(
+                    "an update marker conflicts with current observation; use its scoped recovery"
+                )
             if marker.marker_id != marker_id or marker.envs != [scope] or marker.host != host:
                 raise AdminError("another or broader admin marker conflicts with observation")
             if selected is not None:
@@ -7273,7 +7277,9 @@ def reconcile_scheduler_runtime_observation(
             "historical_build_outcome": "unchanged-unproven",
             "prior_marker": asdict(selected) if selected else None,
             "prior_runtime_record": prior_snapshot,
-            "admission_mode": "current-without-marker" if current_without_marker else "stale-marker-recovery",
+            "admission_mode": (
+                "current-without-marker" if current_without_marker else "stale-marker-recovery"
+            ),
             "verify_command": verify_argv, "verify_host": host_cfg.ssh,
             "verification": json.loads(verified.stdout),
         }

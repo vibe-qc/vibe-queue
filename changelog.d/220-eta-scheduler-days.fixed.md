@@ -1,1 +1,0 @@
-**Use day-prefixed scheduler walltimes in queue ETA history.** Slurm durations such as `1-02:03:04` now contribute their reported execution time instead of falling back to queue timestamps that can include scheduler waiting time. (#220)

@@ -48,6 +48,8 @@ mode, not what you get by using `sudo`.
 
 * [cgroup setup](../cgroup-setup.md) — real containment for CPU and memory,
   rather than a heuristic.
+* [Managed containers](../managed-containers.md) — opt-in local Docker jobs,
+  immutable container identity and restart recovery.
 * [Draining a host](../drain.md) — stop dispatch without killing running work,
   which is what you want before maintenance.
 * [Throttling](../throttle.md) — soft CPU-priority adjustment for a job that
@@ -86,6 +88,8 @@ mode, not what you get by using `sudo`.
 * [Runtime slots](../runtime_slots.md) — verified, immutable generations for a
   program, and the reviewed `vq admin migrate-runtime` transaction that moves a
   registration onto them. Accepted on one direct host so far.
+* [Runtime observation](../runtime_observation.md) — reconcile authenticated
+  scheduler admission records without rebuilding or activating a runtime.
 * [Repair recorded state paths](../state_path_repair.md) — plan and preserve
   terminal records after an explicitly mapped state-root move.
 * [Operations](../operations.md) — the long-form operational reference.
@@ -129,6 +133,7 @@ them on the [source tree](https://github.com/vibe-qc/vibe-queue/tree/main/docs).
 :caption: Containment
 
 ../cgroup-setup
+../managed-containers
 ../drain
 ../auto-cleanup
 
@@ -152,6 +157,7 @@ them on the [source tree](https://github.com/vibe-qc/vibe-queue/tree/main/docs).
 ../gateway
 ../placement_policy
 ../runtime_slots
+../runtime_observation
 ../native_install_seeding
 ../operations
 ../orchestration

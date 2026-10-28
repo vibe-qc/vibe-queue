@@ -1244,10 +1244,8 @@ def _slot_healthcheck(
             prefix = option + "="
         relative = None
         if os.path.isabs(value) and ":/" not in value:
-            try:
+            with contextlib.suppress(ValueError):
                 relative = Path(os.path.abspath(value)).relative_to(live)
-            except ValueError:
-                pass
         if relative is not None:
             rebound.append(prefix + str(selected_source / relative))
         elif re.search(re.escape(str(live)) + r"(?=$|[/\s\"':])", arg):

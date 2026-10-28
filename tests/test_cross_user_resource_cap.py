@@ -13,21 +13,20 @@ tested this explicitly — only per-user quota tests
 test (test_daemon_orphan_budget_v0_6_29.py) exist, and neither
 exercises the cross-user case.
 
-This file ships the tripwire. If a future refactor relocates the
-global cap inside the per-user branch (turning it into a per-
-user-only enforcement) or breaks the order (per-user gate before
-global gate, which would let a user's quota-loose allocation
-bypass the host cap), these tests catch it.
-
-No production code changes; the audit found the existing
-behaviour correct.
+These tests exercise cross-user host accounting and the order of the
+global and per-user gates through actual dispatch, independently of the
+source layout of the dispatch loop.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
 
+import pytest
+
+from vq import cgroup, config, paths
 from vq.daemon import Daemon, _OrphanJob
 from vq.spec import JobSpec, JobState
 
@@ -227,49 +226,74 @@ class TestGlobalCpuCapWithOrphans:
 
 
 class TestGlobalGateOrdersBeforePerUserGate:
+    @pytest.mark.parametrize(
+        "max_cpus,user_cpus,expect_quota,expect_start",
+        [
+            pytest.param(4, 100, False, False, id="global-refusal"),
+            pytest.param(8, 1, True, False, id="per-user-refusal"),
+            pytest.param(8, 4, True, True, id="both-gates-admit"),
+        ],
+    )
     def test_global_cap_caught_before_per_user_quota_check(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        max_cpus: int, user_cpus: int, expect_quota: bool,
+        expect_start: bool,
     ) -> None:
-        """Structural test: the global cap (line 1681 of daemon.py)
-        runs ``continue`` BEFORE the per-user quota gate. So a
-        spec rejected by the global cap NEVER consults per-user
-        quota — preventing a future bug where per-user quota
-        accounting could 'unlock' a spec the global cap should
-        have rejected.
+        """Another user's usage counts globally, before this user's quota.
 
-        Verified by inspecting that ``used_cpus`` (the variable
-        feeding the global gate) is the global tally, not a
-        per-user tally."""
-        # Read the daemon source to confirm the line ordering at
-        # the time of this test's authorship. If the surrounding
-        # code is refactored in a way that moves the global gate
-        # below the per-user gate, this string-grep fails and the
-        # operator's attention is drawn to the change.
-        from pathlib import Path as _P
-        src = _P(__file__).parent.parent / "src" / "vq" / "daemon.py"
-        text = src.read_text()
-        # Find the dispatch loop's spec gates.
-        loop_start = text.find("for spec in pending:")
-        assert loop_start > 0, "dispatch loop signature changed"
-        # v0.12.0: bound the excerpt to the dispatch METHOD body (up to the
-        # next def at method indent), not a fixed char window. The loop grew
-        # past the old 2000-char window (scheduler-target gate, build-as-job
-        # skips), which pushed the per-user gate out of view and tripped this
-        # check spuriously even though the ordering was correct. Method-
-        # bounding keeps the ordering assertion valid as the loop keeps growing.
-        loop_end = text.find("\n    def ", loop_start)
-        if loop_end < 0:
-            loop_end = len(text)
-        loop_excerpt = text[loop_start:loop_end]
-        idx_global = loop_excerpt.find(
-            "if used_cpus + spec.cpus > effective_max_cpus"
+        Positive controls ensure that an unrelated early gate cannot make
+        either refusal pass. Stub only process launch; exercise the real
+        multi-user queue scan, resource accounting and quota checks.
+        """
+        monkeypatch.setenv(paths.ENV_MULTI_USER_ROOT, str(tmp_path / "mu"))
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir()
+        (cfgdir / "config.toml").write_text(
+            "[multi_user]\nenabled = true\n\n[quotas]\n"
+            f"default_max_concurrent_cpus = {user_cpus}\n"
         )
-        idx_per_user = loop_excerpt.find("max_pending = cfg.quotas")
-        assert idx_global > 0, "global cpus_total gate not found"
-        assert idx_per_user > 0, "per-user quota gate not found"
-        assert idx_global < idx_per_user, (
-            "global cpus_total gate must run BEFORE per-user "
-            "quota gate so a globally-over spec is rejected "
-            "regardless of per-user quota state. If this fires, "
-            "review the dispatch loop ordering."
+        monkeypatch.setenv(config.ENV_CONFIG_DIR, str(cfgdir))
+        monkeypatch.setattr(cgroup, "systemd_run_on_path", lambda: True)
+        d = Daemon(
+            max_cpus=max_cpus, max_jobs=99, poll_interval=0.05,
+            multi_user=True, queue_dir=tmp_path / "q", jobs_dir=tmp_path / "j",
         )
+        uid = os.getuid()
+        quota_calls: list[tuple[str, str]] = []
+        starts: list[str] = []
+        for name in ("effective_max_pending_jobs", "effective_max_concurrent_cpus"):
+            original = getattr(config.QuotaConfig, name)
+
+            def tracked(self, user, _name=name, _original=original):
+                quota_calls.append((_name, str(user)))
+                return _original(self, user)
+
+            monkeypatch.setattr(config.QuotaConfig, name, tracked)
+
+        def record_start(spec, **kwargs):
+            starts.append(spec.id)
+            return False  # No subprocess or running-job state is created.
+
+        monkeypatch.setattr(d, "_start_job", record_start)
+        try:
+            d._orphans["other-user-orphan"] = _OrphanJob(
+                pgid=900001, cpus=3, mem_mb=None, uid=str(uid + 1),
+            )
+            paths.provision_user_state(uid, os.getgid())
+            jobid = "pending-gate-order"
+            ws = paths.user_workspace_dir(uid, jobid)
+            ws.mkdir(parents=True, exist_ok=True)
+            JobSpec(
+                id=jobid, command=["true"], cwd=str(ws), cpus=2,
+                submitter=str(uid), state=JobState.PENDING,
+            ).write(paths.user_spec_path(uid, jobid))
+            d._dispatch_pending()
+            assert quota_calls == (
+                [("effective_max_pending_jobs", str(uid)),
+                 ("effective_max_concurrent_cpus", str(uid))]
+                if expect_quota else []
+            )
+            assert starts == ([jobid] if expect_start else [])
+            assert JobSpec.read(paths.user_spec_path(uid, jobid)).state == JobState.PENDING
+        finally:
+            d._queue_lock_fd.close()
