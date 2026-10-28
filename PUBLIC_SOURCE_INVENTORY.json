@@ -550,6 +550,15 @@
   },
   {
     "changed": false,
+    "export_sha256": "8c04ff5e66466f2b0bf931c434af97f58ce276329e4511ecea991aba53d7ea5a",
+    "mode": "100644",
+    "path": "changelog.d/223-current-runtime-observation.fixed.md",
+    "reasons": [],
+    "source_blob": "b5421ab3e0daed6cf5ae99ae1461c9d8edae9873",
+    "source_sha256": "8c04ff5e66466f2b0bf931c434af97f58ce276329e4511ecea991aba53d7ea5a"
+  },
+  {
+    "changed": false,
     "export_sha256": "04736a3a21d20904ee460b9263e5f3af54da441655f425da2a3172dc0b5452a0",
     "mode": "100644",
     "path": "changelog.d/README.md",
@@ -1486,6 +1495,15 @@
   },
   {
     "changed": false,
+    "export_sha256": "7fca95aa28aba8990a8571644bfe4f2291a377fd62256b2ebfc3d7576346222b",
+    "mode": "100644",
+    "path": "docs/runtime_observation.md",
+    "reasons": [],
+    "source_blob": "fd8855a550a62656a4e5f7411a240e2f1fb9c2d5",
+    "source_sha256": "7fca95aa28aba8990a8571644bfe4f2291a377fd62256b2ebfc3d7576346222b"
+  },
+  {
+    "changed": false,
     "export_sha256": "fb770534e6185b579e2e7e9ebd444c829fde9283e6c0b213a0f43f6770b091ea",
     "mode": "100644",
     "path": "docs/runtime_slots.md",
@@ -1981,12 +1999,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "3b6812e4b43fa667ceaf43ec5df0c35f9e319d8097edf1b61f49486878cccd78",
+    "export_sha256": "0093933c241960c7218624a336be9e1eafc2eee4962d287d8953e079e9129327",
     "mode": "100644",
     "path": "src/vq/admin.py",
     "reasons": [],
-    "source_blob": "140aaccbcd150eafa8acbd2c0e676c2adde16876",
-    "source_sha256": "3b6812e4b43fa667ceaf43ec5df0c35f9e319d8097edf1b61f49486878cccd78"
+    "source_blob": "eedf2a08b5cecea25c9115cc0a0edf97a5a3ee23",
+    "source_sha256": "0093933c241960c7218624a336be9e1eafc2eee4962d287d8953e079e9129327"
   },
   {
     "changed": false,
@@ -2233,12 +2251,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "db0a20ebfcbc71d51cd3bd883558c258b8e5eb3305798789fdb9bc73d81403ae",
+    "export_sha256": "8cd5f598bf0c7eba0811ed43421e5a26d2aed0a1812bfe162d498113413e8854",
     "mode": "100644",
     "path": "src/vq/cli.py",
     "reasons": [],
-    "source_blob": "db271548beca7e0dbbde3338a86fdc1496f4308e",
-    "source_sha256": "db0a20ebfcbc71d51cd3bd883558c258b8e5eb3305798789fdb9bc73d81403ae"
+    "source_blob": "2d343ad4bd757f7a941bdf1e1a28daac98260915",
+    "source_sha256": "8cd5f598bf0c7eba0811ed43421e5a26d2aed0a1812bfe162d498113413e8854"
   },
   {
     "changed": false,
@@ -6604,6 +6622,15 @@
     "reasons": [],
     "source_blob": "9307da9d472aaf9aefb5614842e9d8fa44634e7e",
     "source_sha256": "2fe02ee71cef5b3e71a3d1e5f113c24ac441712736063004f84abef0b02e857c"
+  },
+  {
+    "changed": false,
+    "export_sha256": "1dc46f6c5e4c94888afff3e610d104c8719a131ae111b16072014850458c9d81",
+    "mode": "100644",
+    "path": "tests/test_scheduler_runtime_observation_223.py",
+    "reasons": [],
+    "source_blob": "54c8421ea3a0db7d62d257dda863d22c47108e39",
+    "source_sha256": "1dc46f6c5e4c94888afff3e610d104c8719a131ae111b16072014850458c9d81"
   },
   {
     "changed": false,

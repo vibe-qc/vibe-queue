@@ -7175,8 +7175,9 @@ def _authenticated_publication_identity(payload: object, result: SchedulerRuntim
 
 
 def reconcile_scheduler_runtime_observation(
-    host: str, program: str, cfg: config.Config, *, marker_id: str,
+    host: str, program: str, cfg: config.Config, *, marker_id: str | None,
     expected_sha: str, expected_tag: str | None, dry_run: bool = False,
+    current_without_marker: bool = False,
 ) -> dict[str, object]:
     """Record new verified admission evidence, never complete an old build (#212).
 
@@ -7184,11 +7185,16 @@ def reconcile_scheduler_runtime_observation(
     may lack a bound build receipt; this path makes no assertion about that
     deployment's outcome. Preserve its marker and LAST OK history before
     recording a new observation through the configured runtime verifier.
+    Explicit no-marker mode records the same proof without inventing a marker,
+    build result or activation; every conflicting marker still refuses it.
     """
     if re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None:
         raise AdminError("expected SHA must be an exact 40-character commit")
-    if re.fullmatch(r"[0-9a-f]{32}", marker_id) is None:
-        raise AdminError("an exact owner marker ID is required")
+    if current_without_marker:
+        if marker_id is not None:
+            raise AdminError("current observation and stale-marker recovery are exclusive")
+    elif not isinstance(marker_id, str) or re.fullmatch(r"[0-9a-f]{32}", marker_id) is None:
+        raise AdminError("an exact owner marker ID or --current-without-marker is required")
     host_cfg = _resolve_scheduler_update_host(host, cfg, require_managed=True)
     deployment = host_cfg.scheduler_runtime_deployments.get(program)
     if deployment is None:
@@ -7209,6 +7215,8 @@ def reconcile_scheduler_runtime_observation(
                 raise AdminError("unreadable admin marker; observation refused")
             if not admin_update_scopes_conflict(marker.envs, marker.host, [scope], host):
                 continue
+            if current_without_marker:
+                raise AdminError("an update marker conflicts with current observation; use its scoped recovery")
             if marker.marker_id != marker_id or marker.envs != [scope] or marker.host != host:
                 raise AdminError("another or broader admin marker conflicts with observation")
             if selected is not None:
@@ -7218,9 +7226,10 @@ def reconcile_scheduler_runtime_observation(
             if marker.pause_token or marker.paused_jobids or marker.managed_transaction is not None:
                 raise AdminError("paused jobs or managed transaction require scoped recovery")
             selected = marker
-        if selected is None:
+        if selected is None and not current_without_marker:
             raise AdminError("exact stale marker was not found")
         prior = load_scheduler_runtime_status().get(f"{host}:{program}")
+        prior_snapshot = asdict(prior) if prior else None
         update = SchedulerRuntimeUpdateResult(
             host=host, program=program, mode="observe-current",
             command=shlex.join(verify_argv), command_ssh=host_cfg.ssh,
@@ -7262,8 +7271,9 @@ def reconcile_scheduler_runtime_observation(
             "observed_at": utcnow_iso(), "host": host, "program": program,
             "expected_sha": expected_sha, "expected_tag": expected_tag,
             "historical_build_outcome": "unchanged-unproven",
-            "prior_marker": asdict(selected),
-            "prior_runtime_record": asdict(prior) if prior else None,
+            "prior_marker": asdict(selected) if selected else None,
+            "prior_runtime_record": prior_snapshot,
+            "admission_mode": "current-without-marker" if current_without_marker else "stale-marker-recovery",
             "verify_command": verify_argv, "verify_host": host_cfg.ssh,
             "verification": json.loads(verified.stdout),
         }
@@ -7271,12 +7281,24 @@ def reconcile_scheduler_runtime_observation(
                    "host": host, "program": program, "actual_sha": update.actual_sha,
                    "actual_tag": update.actual_tag, "active_path": update.active_path,
                    "marker_id": marker_id, "historical_build_outcome": "unchanged-unproven"}
+        # The locks serialize supported local writers; still detect a changed
+        # record/marker rather than clobbering external or legacy writer state.
+        current_record = load_scheduler_runtime_status().get(f"{host}:{program}")
+        if (asdict(current_record) if current_record else None) != prior_snapshot:
+            raise AdminError("runtime record changed during verification; nothing recorded")
+        current = []
+        for _path, marker in _admin_update_marker_entries():
+            if marker is None:
+                raise AdminError("unreadable admin marker after verification; nothing recorded")
+            if admin_update_scopes_conflict(marker.envs, marker.host, [scope], host):
+                current.append(marker)
+        if current_without_marker:
+            if current:
+                raise AdminError("update marker appeared during verification; nothing recorded")
+        elif len(current) != 1 or asdict(current[0]) != asdict(selected):
+            raise AdminError("owner marker changed during verification; nothing recorded")
         if dry_run:
             return payload
-        current = [m for _, m in _admin_update_marker_entries()
-                   if m is not None and m.marker_id == marker_id]
-        if len(current) != 1 or asdict(current[0]) != asdict(selected):
-            raise AdminError("owner marker changed during verification; nothing recorded")
         # Keep the old failed/unknown record and exact owner marker durably.
         # Saving the archive first makes an interrupted commit safely retryable.
         archive = paths.state_root() / "scheduler-runtime-observations"
@@ -7294,8 +7316,9 @@ def reconcile_scheduler_runtime_observation(
                               "historical_build_outcome": "unchanged-unproven",
                               "observed_at": evidence["observed_at"]}
         record_scheduler_runtime_outcome(update)
-        clear_admin_update_marker(selected)
-        payload.update(recorded=True, evidence_path=str(audit), marker_cleared=True)
+        if selected is not None:
+            clear_admin_update_marker(selected)
+        payload.update(recorded=True, evidence_path=str(audit), marker_cleared=selected is not None)
         return payload
 
 

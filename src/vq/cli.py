@@ -15714,22 +15714,28 @@ def admin_fence_idempotency_key(key: str) -> None:
 @admin.command("reconcile-runtime")
 @click.argument("host")
 @click.argument("program")
-@click.option("--marker-id", required=True)
+@click.option("--marker-id", default=None)
+@click.option("--current-without-marker", is_flag=True,
+              help="Observe current immutable runtime only when no update marker conflicts; no build or activation.")
 @click.option("--expected-sha", required=True)
 @click.option("--tag", "expected_tag", default=None)
 @click.option("--dry-run", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
-def admin_reconcile_runtime(host, program, marker_id, expected_sha, expected_tag, dry_run, as_json):
+def admin_reconcile_runtime(host, program, marker_id, expected_sha, expected_tag, dry_run, as_json,
+                            current_without_marker):
     """Verify current immutable runtime and repair future admission (#212).
 
     Preserve the exact stale marker and prior receipt as history. This is a
     new observation, never proof that an unbound historical build succeeded.
-    No build, launch, activation or existing job pin is changed.
+    No build, launch, activation or existing job pin is changed. Use either
+    --marker-id for scoped dead-writer recovery, or --current-without-marker
+    to refresh stale admission evidence when no writer marker exists.
     """
     try:
         result = admin_module.reconcile_scheduler_runtime_observation(
             host, program, config.load_config(), marker_id=marker_id,
             expected_sha=expected_sha, expected_tag=expected_tag, dry_run=dry_run,
+            current_without_marker=current_without_marker,
         )
     except admin_module.AdminError as exc:
         raise click.ClickException(str(exc)) from None
