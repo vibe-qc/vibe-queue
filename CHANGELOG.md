@@ -18,6 +18,14 @@ which is the version the fleet was already running.
 
 ## [Unreleased]
 
+## [v1.0.2] - 2026-10-30 - *Meyer's Contract*
+
+### Fixed
+
+- Accept complete successful parallel CI test shards in fleet release reports; reject incomplete, duplicated, inconsistent or failed shard sets. Preserve unsharded report compatibility.
+
+- Raise portable runtime bundles to 250,000 files with bounded 64 MiB manifests and matching transfer/archive limits, allowing large ML dependency payloads while retaining trust, per-file integrity and the 64 GiB unpacked limit.
+
 ## [v1.0.1] - 2026-10-28 - *Meyer's Contract*
 
 ### Added

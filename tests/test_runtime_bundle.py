@@ -840,3 +840,54 @@ def test_smoke_timeout_leaves_selection_unset(tmp_path: Path, bundle):
     with pytest.raises(rb.BundleError, match="timed out"):
         rb.deploy(store, manifest.artifact_id, target, trust, _profile(), timeout=0.1)
     assert not (target / "selection.json").exists()
+
+
+def test_large_file_inventory_fetch_deploy_and_tamper_refusal(tmp_path: Path) -> None:
+    """A realistic ML file count crosses the old count and JSON limits."""
+    payload = tmp_path / "large-payload"
+    (payload / "bin").mkdir(parents=True)
+    probe = payload / "bin/probe"
+    probe.write_text("#!/bin/sh\ntest -f lib/group-299/module-099.dat\n")
+    probe.chmod(0o755)
+    for group in range(300):
+        directory = payload / "lib" / f"group-{group:03d}"
+        directory.mkdir(parents=True)
+        for item in range(100):
+            (directory / f"module-{item:03d}.dat").write_bytes(b"fixture\n")
+    output = tmp_path / "large-bundle"
+    manifest = rb.pack(payload, _description(tmp_path), output)
+    assert len(manifest.files) == 30_001
+    assert (output / "manifest.json").stat().st_size > 2 * 1024**2
+    assert rb.read_manifest(output / "manifest.json") == manifest
+    trust = _trust(tmp_path, manifest)
+    store = tmp_path / "large-store"
+    limits = {}
+
+    def download(name, destination, maximum):
+        limits[name] = maximum
+        source = output / name
+        assert source.stat().st_size <= maximum
+        shutil.copyfile(source, destination)
+
+    fetched = rb._fetch_trusted(manifest.artifact_id, store, trust, download,
+                                max_archive_bytes=rb._MAX_ARCHIVE_BYTES)
+    assert fetched.artifact_id == manifest.artifact_id
+    assert limits["manifest.json"] == rb._MAX_MANIFEST_BYTES
+    receipt = rb.deploy(store, manifest.artifact_id, tmp_path / "large-runtime", trust, _profile())
+    assert receipt["verified"]
+    assert receipt["artifact_id"] == manifest.artifact_id
+    assert Path(receipt["generation"], "lib/group-299/module-099.dat").read_bytes() == b"fixture\n"
+    with (output / "bundle.tar").open("ab") as handle:
+        handle.write(b"tampered")
+    with pytest.raises(rb.BundleError, match="archive digest"):
+        rb.publish(output, tmp_path / "tampered-store", trust)
+
+
+def test_manifest_allowance_does_not_expand_other_json_limits(tmp_path: Path, monkeypatch):
+    path = tmp_path / "document.json"
+    path.write_bytes(b" " * (2 * 1024**2 + 1))
+    with pytest.raises(rb.BundleError, match="exceeds 2 MiB"):
+        rb._read_json(path)
+    monkeypatch.setattr(rb, "_MAX_MANIFEST_BYTES", 1024)
+    with pytest.raises(rb.BundleError, match="JSON document exceeds"):
+        rb.read_manifest(path)

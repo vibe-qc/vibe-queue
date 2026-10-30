@@ -77,7 +77,7 @@ def test_a_published_store_is_fetched_over_ssh_and_deploys(
                              max_archive_bytes=1024**2) == manifest
     base = f"{source}/artifacts/{manifest.artifact_id}"
     assert _commands(log) == [
-        f"head -c {2 * 1024**2 + 1} -- {shlex.quote(base + '/manifest.json')}",
+        f"head -c {rb._MAX_MANIFEST_BYTES + 1} -- {shlex.quote(base + '/manifest.json')}",
         f"head -c {1024**2 + 1} -- {shlex.quote(base + '/bundle.tar')}",
     ]
     receipt = rb.deploy(local, manifest.artifact_id, tmp_path / "target", trust, _profile())

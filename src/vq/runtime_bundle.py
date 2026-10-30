@@ -41,9 +41,13 @@ from vq.runtime_slots import layout
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 Text = Annotated[str, Field(min_length=1, max_length=1024)]
-_MAX_FILES = 10_000
+_MAX_FILES = 250_000
+_MAX_ARCHIVE_MEMBERS = 2 * _MAX_FILES
+_MAX_MANIFEST_BYTES = 64 * 1024**2
+_MAX_JSON_BYTES = 2 * 1024**2
 _MAX_BYTES = 64 * 1024**3
-_MAX_ARCHIVE_BYTES = _MAX_BYTES + 32 * 1024**2
+# Allow bounded tar/PAX headers in addition to the unchanged payload byte cap.
+_MAX_ARCHIVE_BYTES = _MAX_BYTES + _MAX_ARCHIVE_MEMBERS * 4096 + 32 * 1024**2
 _MAX_BEARER_TOKEN_BYTES = 16 * 1024
 
 
@@ -120,7 +124,7 @@ class BundleManifest(BundleModel):
     @model_validator(mode="after")
     def validate_inventory(self) -> BundleManifest:
         if not 1 <= len(self.files) <= _MAX_FILES:
-            raise ValueError("bundle requires 1..10000 files")
+            raise ValueError(f"bundle requires 1..{_MAX_FILES} files")
         if sum(item.size for item in self.files.values()) > _MAX_BYTES:
             raise ValueError("bundle exceeds the 64 GiB unpacked limit")
         folded = {name.casefold() for name in self.files}
@@ -209,13 +213,18 @@ def _relative(name: str) -> str:
     return name
 
 
-def _read_json(path: Path) -> bytes:
+def _read_json(path: Path, *, limit: int = _MAX_JSON_BYTES) -> bytes:
     _regular(path)
     with path.open("rb") as handle:
-        data = handle.read(2 * 1024 * 1024 + 1)
-    if len(data) > 2 * 1024 * 1024:
-        raise BundleError("JSON document exceeds 2 MiB")
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise BundleError(f"JSON document exceeds {limit // 1024**2} MiB")
     return data
+
+
+def read_manifest(path: Path) -> BundleManifest:
+    """Read a file inventory with its own bounded JSON allowance."""
+    return BundleManifest.model_validate_json(_read_json(path, limit=_MAX_MANIFEST_BYTES))
 
 
 def _regular(path: Path) -> os.stat_result:
@@ -243,7 +252,7 @@ def _trusted(directory: Path, trust: Path) -> tuple[BundleManifest, str | None]:
     verify with a key the policy names for that publisher, and the second
     value is that key's SHA256 fingerprint.
     """
-    manifest = BundleManifest.model_validate_json(_read_json(directory / "manifest.json"))
+    manifest = read_manifest(directory / "manifest.json")
     policy = TrustPolicy.model_validate_json(_read_json(trust))
     publisher = manifest.build.publisher
     if manifest.artifact_id in policy.publishers.get(publisher, []):
@@ -322,7 +331,7 @@ def sign(directory: Path, key: Path) -> BundleManifest:
     The signature replaces any earlier one atomically.
     """
     _directory(directory)
-    manifest = BundleManifest.model_validate_json(_read_json(directory / "manifest.json"))
+    manifest = read_manifest(directory / "manifest.json")
     _archive(manifest, directory / "bundle.tar")
     keygen = _ssh_keygen()
     with tempfile.TemporaryDirectory(prefix="vq-bundle-sign-") as tmp:
@@ -365,18 +374,18 @@ def _archive(manifest: BundleManifest, archive: Path, destination: Path | None =
     """Stream and validate every member; never call tar.extract/extractall."""
     if _file_digest(archive) != manifest.archive_sha256:
         raise BundleError("archive digest mismatch")
+    directories = {parent.as_posix() for name in manifest.files
+                   for parent in PurePosixPath(name).parents if parent != PurePosixPath(".")}
     seen: set[str] = set()
     files: set[str] = set()
     with tarfile.open(archive, "r|*") as stream:
         for member in stream:
             name = _relative(member.name)
-            if name in seen or len(seen) >= 2 * _MAX_FILES:
+            if name in seen or len(seen) >= _MAX_ARCHIVE_MEMBERS:
                 raise BundleError("duplicate archive member or member limit exceeded")
             seen.add(name)
             if member.isdir():
-                if name in manifest.files or not any(
-                    p.startswith(name + "/") for p in manifest.files
-                ):
+                if name in manifest.files or name not in directories:
                     raise BundleError("unexpected archive directory")
                 continue
             expected = manifest.files.get(name)
@@ -534,7 +543,7 @@ def publish(bundle: Path, store: Path, trust: Path) -> BundleManifest:
         final = artifacts / manifest.artifact_id
         if final.exists() or final.is_symlink():
             _directory(final)
-            stored = BundleManifest.model_validate_json(_read_json(final / "manifest.json"))
+            stored = read_manifest(final / "manifest.json")
             if stored != manifest:
                 raise BundleError("published identity has different metadata")
             _archive(manifest, final / "bundle.tar")
@@ -658,7 +667,8 @@ def _fetch_trusted(
     if not re.fullmatch(r"[0-9a-f]{64}", artifact_id):
         raise BundleError("artifact ID must be a full SHA256 digest")
     if type(max_archive_bytes) is not int or not 0 < max_archive_bytes <= _MAX_ARCHIVE_BYTES:
-        raise BundleError("download byte limit must be positive and at most 64 GiB plus 32 MiB")
+        raise BundleError(
+            f"download byte limit must be positive and at most {_MAX_ARCHIVE_BYTES} bytes")
     policy = TrustPolicy.model_validate_json(_read_json(trust))
     if (not any(artifact_id in pins for pins in policy.publishers.values())
             and not any(policy.signers.values())):
@@ -673,8 +683,8 @@ def _fetch_trusted(
             return manifest
     with tempfile.TemporaryDirectory(prefix="vq-bundle-fetch-") as tmp:
         staging = Path(tmp)
-        download("manifest.json", staging / "manifest.json", 2 * 1024**2)
-        manifest = BundleManifest.model_validate_json(_read_json(staging / "manifest.json"))
+        download("manifest.json", staging / "manifest.json", _MAX_MANIFEST_BYTES)
+        manifest = read_manifest(staging / "manifest.json")
         if manifest.artifact_id != artifact_id:
             raise BundleError("downloaded manifest does not match the requested artifact identity")
         # Only an unpinned manifest needs its signature, and only signers can use it.
@@ -940,7 +950,7 @@ def verified_generation(root: Path, artifact_id: str | None = None) -> tuple[str
     generation = root / "generations" / artifact_id
     refused = BundleError(f"runtime {artifact_id[:12]} is not a verified deployment in {root}")
     try:
-        manifest = BundleManifest.model_validate_json(_read_json(generation / "manifest.json"))
+        manifest = read_manifest(generation / "manifest.json")
         receipt = json.loads(_read_json(generation / "verification.json"))
         _directory(generation / "payload")
     except (OSError, ValueError):
@@ -1036,7 +1046,7 @@ def deploy(
                 staging.rename(generation)
                 _sync_directory(generations)
         # A crash after publication or lost receipt can safely replay these gates.
-        if BundleManifest.model_validate_json(_read_json(generation / "manifest.json")) != manifest:
+        if read_manifest(generation / "manifest.json") != manifest:
             raise BundleError("retained generation metadata mismatch")
         payload = generation / "payload"
         _directory(payload)
@@ -1142,8 +1152,7 @@ def deployed_generations(root: Path) -> dict[str, Any]:
         except BundleError:
             verified = False
         try:
-            program: str | None = BundleManifest.model_validate_json(
-                _read_json(path / "manifest.json")).build.program
+            program: str | None = read_manifest(path / "manifest.json").build.program
         except (OSError, ValueError):
             program = None
         entries.append({"artifact_id": name, "program": program, "verified": verified})

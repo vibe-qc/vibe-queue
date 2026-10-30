@@ -10,6 +10,8 @@ from typing import Any
 
 import click
 
+from vq.runtime_bundle import _MAX_ARCHIVE_BYTES
+
 _PATH = click.Path(path_type=Path)
 _FILE = click.Path(exists=True, dir_okay=False, path_type=Path)
 _DIRECTORY = click.Path(exists=True, file_okay=False, path_type=Path)
@@ -212,7 +214,8 @@ def publish(bundle: Path, store: Path, trust: Path) -> None:
               help="HTTPS: connection/read socket timeout. SSH: the longest a transfer may "
               "go without data. Seconds; not a total transfer deadline.")
 @click.option("--max-download-mib", default=4096, show_default=True,
-              type=click.IntRange(min=1, max=65568), help="Maximum archive download size in MiB.")
+              type=click.IntRange(min=1, max=_MAX_ARCHIVE_BYTES // 1024**2),
+              help="Maximum archive download size in MiB.")
 def fetch(artifact_id: str, base_url: str | None, from_host: str | None,
           remote_store: str | None, store: Path, trust: Path, ca_file: Path | None,
           client_cert: Path | None, client_key: Path | None, bearer_token_file: Path | None,

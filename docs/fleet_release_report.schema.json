@@ -77,6 +77,31 @@
         "gating_job": {
           "enum": ["build-test", "test"]
         },
+        "gating_jobs": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Complete successful parallel gate members; all indices 1 through N must be present exactly once with a consistent N. Absent for historical unsharded evidence. Consumer validates completeness.",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "status"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "name": {
+                "type": "string"
+              },
+              "status": {
+                "const": "success"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "gating_job_status": { "const": "success" },
         "web_url": { "type": "string" }
       }

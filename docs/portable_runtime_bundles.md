@@ -399,9 +399,9 @@ never saved in the artifact store or deployment, and vq does not automatically
 reuse its administrative token. This option applies to `--url` only.
 
 Downloads stream into private temporary staging outside the store and its
-lifecycle lock. The manifest limit is 2 MiB; the default archive download limit
-is 4 GiB. Set `--max-download-mib` to change the archive cap, up to 65,568 MiB
-(64 GiB plus 32 MiB of archive overhead). The cap applies even if the server
+lifecycle lock. The manifest limit is 64 MiB; the default archive download limit
+is 4 GiB. Set `--max-download-mib` to change the archive cap, up to 67,521 MiB
+(64 GiB plus bounded tar/PAX header overhead). The cap applies even if the server
 omits `Content-Length`. `--timeout` sets the connection/read socket timeout
 (default 30 seconds, maximum 120), rather than a total transfer deadline.
 
@@ -447,7 +447,7 @@ the pin or signature and the digests decide.
 
 Each file is read with `head -c LIMIT+1` on the remote side, so an oversized
 file is stopped at the source and the extra byte is caught locally. The
-manifest limit is 2 MiB, and the archive limit is `--max-download-mib`. Over
+manifest limit is 64 MiB, and the archive limit is `--max-download-mib`. Over
 SSH, `--timeout` is the longest a transfer may go without data before it is
 stopped. A stalled or failed transfer kills the whole local ssh process group
 and publishes nothing. The remote's own error output is not echoed, since it
@@ -577,8 +577,9 @@ Limits:
 
 ## Limits and remaining qualification
 
-The format accepts regular files and optional directories, at most 10,000 files
-and 64 GiB unpacked. Symlinks, hard links, sparse/special files, traversal,
+The format accepts regular files and optional directories, at most 250,000 files,
+500,000 archive members and 64 GiB unpacked. Manifests are limited to 64 MiB;
+other JSON documents retain their 2 MiB limit. Symlinks, hard links, sparse/special files, traversal,
 duplicate members, privileged modes and missing/unlisted files are refused.
 Builders must dereference relocatable links safely before packaging; arbitrary
 venvs and vendor archives are not automatically portable. The local fixture

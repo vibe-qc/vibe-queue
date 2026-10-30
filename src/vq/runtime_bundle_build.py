@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from vq import paths, runtime_bundle, transport
 from vq._storage import atomic_write_text
-from vq.runtime_bundle import BuildDescription, BundleError, BundleManifest
+from vq.runtime_bundle import BuildDescription, BundleError
 from vq.spec import JobSpec, JobState
 
 if TYPE_CHECKING:
@@ -123,8 +123,7 @@ def finish_build(record: Path, *, multi_user: bool = False) -> dict[str, Any]:
         raise BundleError(f"{record}: not a {RECORD_SCHEMA} record")
     output, build_dir = Path(document["output"]), Path(document["build_dir"])
     if document["artifact_id"]:
-        manifest = BundleManifest.model_validate_json(
-            runtime_bundle._read_json(output / "manifest.json"))
+        manifest = runtime_bundle.read_manifest(output / "manifest.json")
         if manifest.artifact_id != document["artifact_id"]:
             raise BundleError(f"{output} is no longer the bundle this build packed")
         return {**document, "status": "already-packed"}

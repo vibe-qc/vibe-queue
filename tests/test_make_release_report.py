@@ -437,3 +437,52 @@ def test_sibling_pin_without_evidence_is_rejected_and_says_where_to_look(
     assert pin["ci_evidence"] is None
     # Point at the project that actually runs the gate, not at vibe-qc.
     assert "project 35" in pin["remediation"]
+
+
+@pytest.mark.parametrize("variant,accepted", [
+    ("complete", True), ("legacy", True), ("missing", False),
+    ("failed", False), ("duplicate", False), ("mixed-total", False),
+    ("mixed-legacy", False), ("zero", False), ("out-of-range", False),
+])
+def test_parallel_gate_evidence(report_script, monkeypatch, variant, accepted):
+    jobs = [{"id": i, "name": f"test {i}/4", "status": "success"} for i in range(1, 5)]
+    if variant == "legacy":
+        jobs = [{"name": "test", "status": "success"}]
+    elif variant == "missing":
+        jobs.pop()
+    elif variant == "failed":
+        jobs[2]["status"] = "failed"
+    elif variant == "duplicate":
+        jobs[2]["name"] = "test 2/4"
+    elif variant == "mixed-total":
+        jobs[2]["name"] = "test 3/5"
+    elif variant == "mixed-legacy":
+        jobs.append({"name": "test", "status": "success"})
+    elif variant == "zero":
+        jobs[0]["name"] = "test 0/4"
+    elif variant == "out-of-range":
+        jobs[0]["name"] = "test 5/4"
+    jobs.append({"name": "docs-build", "status": "failed"})
+    monkeypatch.setattr(report_script, "glab_jobs", lambda *a, **k: jobs)
+    evidence = report_script._pipeline_job_evidence(
+        _pipeline(16069, "release-candidate/v1.0.1"), gating_job="test", project_id=36
+    )
+    assert (evidence is not None) is accepted
+    if variant == "complete":
+        assert evidence["gating_jobs"] == jobs[:-1]
+
+
+def test_parallel_gate_inventory_paginates(report_script, monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv[-1])
+        page = len(calls)
+        jobs = ([{"name": "other", "status": "success"}] * 100 if page == 1 else
+                [{"name": "test 1/1", "status": "success"}])
+        return SimpleNamespace(returncode=0, stdout=json.dumps(jobs))
+    monkeypatch.setattr(report_script.subprocess, "run", run)
+    jobs = report_script.glab_jobs(16069, project_id=36)
+    assert len(jobs) == 101
+    assert "page=1&include_retried=false" in calls[0]
+    assert "page=2&include_retried=false" in calls[1]

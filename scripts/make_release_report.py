@@ -58,6 +58,7 @@ from typing import Any
 
 # Also works directly from a source checkout without an installed package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from vq.fleet_release import successful_gate_jobs
 from vq.source_projects import PIN_SOURCES
 
 # Mandatory gate per pin, named as it is in that pin's OWN project. The
@@ -185,15 +186,23 @@ def glab_pipelines(*, project_id: int, **params: str) -> list[dict[str, Any]]:
 
 
 def glab_jobs(pipeline_id: int, *, project_id: int) -> list[dict[str, Any]]:
-    proc = subprocess.run(
-        ["glab", "api", f"projects/{project_id}/pipelines/{pipeline_id}/jobs"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if proc.returncode != 0:
-        raise SystemExit(f"glab api failed: {proc.stderr.strip()}")
-    return json.loads(proc.stdout, strict=False)
+    jobs = []
+    page = 1
+    while True:
+        proc = subprocess.run(
+            ["glab", "api", f"projects/{project_id}/pipelines/{pipeline_id}/jobs"
+             f"?per_page=100&page={page}&include_retried=false"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0:
+            raise SystemExit(f"glab api failed: {proc.stderr.strip()}")
+        batch = json.loads(proc.stdout, strict=False)
+        if not isinstance(batch, list):
+            raise SystemExit("glab jobs response is not a list")
+        jobs.extend(batch)
+        if len(batch) < 100:
+            return jobs
+        page += 1
 
 
 def _pipeline_job_evidence(
@@ -202,18 +211,26 @@ def _pipeline_job_evidence(
     gating_job: str,
     project_id: int,
 ) -> dict[str, Any] | None:
-    for job in glab_jobs(pipeline["id"], project_id=project_id):
-        if job["name"] == gating_job and job["status"] == "success":
-            return {
-                "pipeline_id": pipeline["id"],
-                "pipeline_status": pipeline["status"],
-                "ref": pipeline["ref"],
-                "sha": pipeline["sha"],
-                "gating_job": gating_job,
-                "gating_job_status": "success",
-                "web_url": pipeline["web_url"],
-            }
-    return None
+    jobs = successful_gate_jobs(
+        glab_jobs(pipeline["id"], project_id=project_id), gating_job
+    )
+    if jobs is None:
+        return None
+    evidence = {
+        "pipeline_id": pipeline["id"],
+        "pipeline_status": pipeline["status"],
+        "ref": pipeline["ref"],
+        "sha": pipeline["sha"],
+        "gating_job": gating_job,
+        "gating_job_status": "success",
+        "web_url": pipeline["web_url"],
+    }
+    if any(job["name"] != gating_job for job in jobs):
+        evidence["gating_jobs"] = [
+            {key: job[key] for key in ("id", "name", "status") if key in job}
+            for job in jobs
+        ]
+    return evidence
 
 
 def is_release_gate_ref(ref: object) -> bool:

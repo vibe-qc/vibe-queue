@@ -1214,3 +1214,38 @@ class TestRuntimeRepoRefusal:
         monkeypatch.setattr(fleet_release, "__file__", str(module))
 
         assert fleet_release.runtime_repo() == checkout
+
+
+@pytest.mark.parametrize(
+    "variant", ["complete", "missing", "failed", "duplicate", "mixed-total", "unrelated"]
+)
+def test_report_parallel_gate_members(tmp_path, variant):
+    payload = _report("v1.0.1", "a" * 40)
+    jobs = [{"name": f"test {i}/4", "status": "success"} for i in range(1, 5)]
+    if variant == "missing":
+        jobs.pop()
+    elif variant == "failed":
+        jobs[1]["status"] = "failed"
+    elif variant == "duplicate":
+        jobs[1]["name"] = "test 1/4"
+    elif variant == "mixed-total":
+        jobs[1]["name"] = "test 2/3"
+    elif variant == "unrelated":
+        jobs.append({"name": "other", "status": "success"})
+    payload["pins"]["vq"]["ci_evidence"]["gating_jobs"] = jobs
+    if variant == "complete":
+        result = fleet_release.parse_report(
+            payload,
+                source_path="private/v1.0.1.json",
+                source_ref="origin/main",
+                raw_bytes=b"{}",
+        )
+        assert result.pins["vq"].gating_job == "test"
+    else:
+        with pytest.raises(fleet_release.FleetReleaseError, match="gating jobs"):
+            fleet_release.parse_report(
+                payload,
+                source_path="private/v1.0.1.json",
+                source_ref="origin/main",
+                raw_bytes=b"{}",
+            )

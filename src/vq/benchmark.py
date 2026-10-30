@@ -229,7 +229,7 @@ def variant_from_bundle(
     """
     from vq import runtime_bundle as rb
 
-    manifest = rb.BundleManifest.model_validate_json(rb._read_json(bundle / "manifest.json"))
+    manifest = rb.read_manifest(bundle / "manifest.json")
     archive = bundle / "bundle.tar"
     rb._archive(manifest, archive)
     build = manifest.build

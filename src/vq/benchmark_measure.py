@@ -60,8 +60,7 @@ def selected_runtime(root: Path) -> tuple[str, Path]:
         raise MeasureError(f"{root} has no selected runtime")
     generation = root / "generations" / current
     try:
-        manifest = rb.BundleManifest.model_validate_json(
-            rb._read_json(generation / "manifest.json"))
+        manifest = rb.read_manifest(generation / "manifest.json")
         receipt = json.loads(rb._read_json(generation / "verification.json"))
     except (OSError, ValueError) as exc:
         raise MeasureError(f"selected runtime {current[:12]} is not a verified deployment: "

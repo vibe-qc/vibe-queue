@@ -114,6 +114,35 @@ def pin_gating_jobs(schema: object) -> Mapping[str, str]:
         return LEGACY_PIN_GATING_JOBS
     return PIN_GATING_JOBS
 
+
+def successful_gate_jobs(jobs: object, gate: str) -> list[dict[str, Any]] | None:
+    """Require one successful gate, or every unique successful parallel shard.
+
+    GitLab appends `` i/N`` to parallel job names. Never combine an unsharded
+    gate with shards, mixed totals, duplicates, missing indices or failed jobs.
+    Callers must supply the complete non-retried pipeline job inventory.
+    """
+    if not isinstance(jobs, list) or not all(isinstance(j, dict) for j in jobs):
+        return None
+    relevant = [j for j in jobs if j.get("name") == gate or
+                str(j.get("name", "")).startswith(gate + " ")]
+    if not relevant or any(j.get("status") != "success" for j in relevant):
+        return None
+    if len(relevant) == 1 and relevant[0].get("name") == gate:
+        return relevant
+    pattern = re.compile(re.escape(gate) + r" ([1-9][0-9]*)/([1-9][0-9]*)")
+    parsed = [pattern.fullmatch(str(j.get("name", ""))) for j in relevant]
+    if any(m is None for m in parsed):
+        return None
+    indices = [int(m.group(1)) for m in parsed if m is not None]
+    totals = {int(m.group(2)) for m in parsed if m is not None}
+    if len(totals) != 1:
+        return None
+    total = next(iter(totals))
+    if len(indices) != total or sorted(indices) != list(range(1, total + 1)):
+        return None
+    return sorted(relevant, key=lambda j: int(str(j["name"]).rsplit(" ", 1)[1].split("/")[0]))
+
 _SHA40 = re.compile(r"^[0-9a-f]{40}$")
 _TAG = re.compile(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$")
 
@@ -405,6 +434,13 @@ def parse_report(
             raise FleetReleaseError(
                 f"{source_path}: pins.{name} gating job is not successful"
             )
+        if "gating_jobs" in evidence:
+            jobs = evidence["gating_jobs"]
+            verified = successful_gate_jobs(jobs, expected_job)
+            if verified is None or len(verified) != len(jobs):
+                raise FleetReleaseError(
+                    f"{source_path}: pins.{name} gating jobs are incomplete or unsuccessful"
+                )
         evidence_ref = evidence.get("ref")
         if not is_release_gate_ref(evidence_ref) and not (
             allow_legacy_main_evidence and evidence_ref == "main"

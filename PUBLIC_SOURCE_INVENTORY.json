@@ -127,21 +127,21 @@
   },
   {
     "changed": false,
-    "export_sha256": "abf314334130d1e9c82868b68f242e3cb92c503ba123b5f54ea1a825e910909c",
+    "export_sha256": "5e45a51bb46d8b0eee5bbf22874ff0ba6ed3913527813ec550577dbe7663e87a",
     "mode": "100644",
     "path": "CHANGELOG.md",
     "reasons": [],
-    "source_blob": "4a18267cc130ef4984b977a897ceac53c54f30b0",
-    "source_sha256": "abf314334130d1e9c82868b68f242e3cb92c503ba123b5f54ea1a825e910909c"
+    "source_blob": "77b0c84bed536d642861bba4fa4e5b757d31640e",
+    "source_sha256": "5e45a51bb46d8b0eee5bbf22874ff0ba6ed3913527813ec550577dbe7663e87a"
   },
   {
     "changed": false,
-    "export_sha256": "d2f4e83a0949c9c9ea8ea35bbac587a5209a035f19d275de1593cac4d6360a60",
+    "export_sha256": "befb88ccd62b9fd9974ccbd04e834ffd69d7cb28c561f9dad1936ec20c1bfc33",
     "mode": "100644",
     "path": "CITATION.cff",
     "reasons": [],
-    "source_blob": "48ed9229b937cbe49c03b25f6ac5db7f3213e0e4",
-    "source_sha256": "d2f4e83a0949c9c9ea8ea35bbac587a5209a035f19d275de1593cac4d6360a60"
+    "source_blob": "385d8eea80721d9ddc1d8a41fc102e76388ebd85",
+    "source_sha256": "befb88ccd62b9fd9974ccbd04e834ffd69d7cb28c561f9dad1936ec20c1bfc33"
   },
   {
     "changed": false,
@@ -901,12 +901,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "9c30feae433db8d74877d72f5078c03511fbff3dfb1842f6d383b4aec6240155",
+    "export_sha256": "051268579c624541bd985c541848a25be5e6586ec0603a0de928c1b29cb87be3",
     "mode": "100644",
     "path": "docs/fleet_release_report.schema.json",
     "reasons": [],
-    "source_blob": "f5ebcc54e7d5248ad8ba3d15df5b0a5858b16a3f",
-    "source_sha256": "9c30feae433db8d74877d72f5078c03511fbff3dfb1842f6d383b4aec6240155"
+    "source_blob": "e08f1cfc7484d8bea7cfc3230d3d9747d1505bff",
+    "source_sha256": "051268579c624541bd985c541848a25be5e6586ec0603a0de928c1b29cb87be3"
   },
   {
     "changed": false,
@@ -1063,12 +1063,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "c07f68ad0c6c5196c1baf91abaf690174b95d123eaa9ce299d3c700722897d92",
+    "export_sha256": "9dc0acca7da8f00e25665a7c8f516abbd44f6b059e27cc7241d1b9a5e56d2544",
     "mode": "100644",
     "path": "docs/portable_runtime_bundles.md",
     "reasons": [],
-    "source_blob": "bb6ad60e7d884435c9800346c0164d4b94bd78f6",
-    "source_sha256": "c07f68ad0c6c5196c1baf91abaf690174b95d123eaa9ce299d3c700722897d92"
+    "source_blob": "89b941dba0b8e3903d23ef0ecaaea4545b7348b4",
+    "source_sha256": "9dc0acca7da8f00e25665a7c8f516abbd44f6b059e27cc7241d1b9a5e56d2544"
   },
   {
     "changed": false,
@@ -1450,12 +1450,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "d47e874a0cee8349e3da3f56d7a1097831f4cfe6b17ad4a4a2a3b3b6b1e71b92",
+    "export_sha256": "174ca1c3fe7ad15095d6df27d1f8699cb498553ab5715be2ad3153587b0bd071",
     "mode": "100644",
     "path": "pyproject.toml",
     "reasons": [],
-    "source_blob": "a85f29a38f0f547790228fd1d8ca4e34000d46a9",
-    "source_sha256": "d47e874a0cee8349e3da3f56d7a1097831f4cfe6b17ad4a4a2a3b3b6b1e71b92"
+    "source_blob": "f6095d485c84f83c117e2c62cbd95ce85829f1e1",
+    "source_sha256": "174ca1c3fe7ad15095d6df27d1f8699cb498553ab5715be2ad3153587b0bd071"
   },
   {
     "changed": false,
@@ -1549,12 +1549,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "89990e2bce4dd4ece7339a974bcfd655e85dd6d97cd013299413e644867fc28f",
+    "export_sha256": "aae1cf9cf48670db5fa818639e00beca86c4578db9f55b4639c17f14fb5033df",
     "mode": "100755",
     "path": "scripts/make_release_report.py",
     "reasons": [],
-    "source_blob": "47315e3254b8e452248dc7951d96c5c30deea163",
-    "source_sha256": "89990e2bce4dd4ece7339a974bcfd655e85dd6d97cd013299413e644867fc28f"
+    "source_blob": "3a606231da0d90715c367ae664cde0beb2e9fef1",
+    "source_sha256": "aae1cf9cf48670db5fa818639e00beca86c4578db9f55b4639c17f14fb5033df"
   },
   {
     "changed": false,
@@ -1612,12 +1612,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "9afa14f45402592daaffd7a5bd513eaddc35a23ec41e27b535d7e69477334027",
+    "export_sha256": "2cc13344d61da1dfe691136dd6922220ce6cd3d6b0f240fb2667ce570b320969",
     "mode": "100644",
     "path": "src/vq/__init__.py",
     "reasons": [],
-    "source_blob": "d5fe3b0d5506b36404a21aa940009b799252d52f",
-    "source_sha256": "9afa14f45402592daaffd7a5bd513eaddc35a23ec41e27b535d7e69477334027"
+    "source_blob": "523c946df9ef3a5aaa4275a107845acf50484210",
+    "source_sha256": "2cc13344d61da1dfe691136dd6922220ce6cd3d6b0f240fb2667ce570b320969"
   },
   {
     "changed": false,
@@ -1711,12 +1711,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "101ab9c2bfdf8c2cd987bcb9f550acab81749c74adfdd32d4da43b67984aaac4",
+    "export_sha256": "bc8592c3a25d4446d61590a28448f26c4b2afd4a7d66db637f3304e186c5560f",
     "mode": "100644",
     "path": "src/vq/benchmark.py",
     "reasons": [],
-    "source_blob": "c9a99f43a0362c366b21a2a1c493a3b405e649fe",
-    "source_sha256": "101ab9c2bfdf8c2cd987bcb9f550acab81749c74adfdd32d4da43b67984aaac4"
+    "source_blob": "4345e6dbd4e30af27a0f67485da3621750e211d1",
+    "source_sha256": "bc8592c3a25d4446d61590a28448f26c4b2afd4a7d66db637f3304e186c5560f"
   },
   {
     "changed": false,
@@ -1729,12 +1729,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "c86ffd8f0c89f373ee8e1c6ca4091035a9dd7961bdb3adc9d8b55c8a1899e6b5",
+    "export_sha256": "a8573534502bbc84d836bf9e7a63943fa226807070b8bc2c14f1e74fdb1e7f74",
     "mode": "100644",
     "path": "src/vq/benchmark_measure.py",
     "reasons": [],
-    "source_blob": "6dc8f415d484c8c0fc25037b47b3871645dbea56",
-    "source_sha256": "c86ffd8f0c89f373ee8e1c6ca4091035a9dd7961bdb3adc9d8b55c8a1899e6b5"
+    "source_blob": "b0ad673c0ae79945ee25a8116a36fa441bce28f3",
+    "source_sha256": "a8573534502bbc84d836bf9e7a63943fa226807070b8bc2c14f1e74fdb1e7f74"
   },
   {
     "changed": false,
@@ -2062,12 +2062,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "9d673e6ee61e8e59cbc89dfc15edfc96e3dfcb311189c46f8191b2f54ce53ec2",
+    "export_sha256": "6c558d3b06749faf57f05b1429bb4380a83d3fd4f8be93bf91f61203dcb76e34",
     "mode": "100644",
     "path": "src/vq/fleet_release.py",
     "reasons": [],
-    "source_blob": "435c148bd5af3172f91e62c2fe21a41117a20fa0",
-    "source_sha256": "9d673e6ee61e8e59cbc89dfc15edfc96e3dfcb311189c46f8191b2f54ce53ec2"
+    "source_blob": "dc04cc626020fabc9ed5490467cda9c7994aef40",
+    "source_sha256": "6c558d3b06749faf57f05b1429bb4380a83d3fd4f8be93bf91f61203dcb76e34"
   },
   {
     "changed": false,
@@ -2458,30 +2458,30 @@
   },
   {
     "changed": false,
-    "export_sha256": "82e6aa9cdaf0aca212b79654733968599551dd5fc0c3bf18fb82bf19b4aafe81",
+    "export_sha256": "e0368f5654c05634ca395ba800f3e0204798217760ebfb666d5024e1cca40249",
     "mode": "100644",
     "path": "src/vq/runtime_bundle.py",
     "reasons": [],
-    "source_blob": "6392ee341fd05c4ca469f34214782dade684a40b",
-    "source_sha256": "82e6aa9cdaf0aca212b79654733968599551dd5fc0c3bf18fb82bf19b4aafe81"
+    "source_blob": "fcbdd7df23e721a639ad9db37d0032816b205d2f",
+    "source_sha256": "e0368f5654c05634ca395ba800f3e0204798217760ebfb666d5024e1cca40249"
   },
   {
     "changed": false,
-    "export_sha256": "4d0c627402aa79010432f155a4b2d55f3e76b36fa52aef2de2bea974605d6377",
+    "export_sha256": "7d922aa5424e1adab6160210cf28102b6e3bbfa6d90269cccdaa3b52318d0225",
     "mode": "100644",
     "path": "src/vq/runtime_bundle_build.py",
     "reasons": [],
-    "source_blob": "27a413ff519e1204a6e679176a0df15a0874a41d",
-    "source_sha256": "4d0c627402aa79010432f155a4b2d55f3e76b36fa52aef2de2bea974605d6377"
+    "source_blob": "ba02c08aa7b19c2df858b3ff242eff28734d308f",
+    "source_sha256": "7d922aa5424e1adab6160210cf28102b6e3bbfa6d90269cccdaa3b52318d0225"
   },
   {
     "changed": false,
-    "export_sha256": "0d58919eeeafb9cde651edfbbfa4d4b89bfd16512c71ebef51ab8fb8e2e337a4",
+    "export_sha256": "aa7ec37ce3e79932f43a141196d2b511326adf547631cc34591fe0aa4724b6d3",
     "mode": "100644",
     "path": "src/vq/runtime_bundle_cli.py",
     "reasons": [],
-    "source_blob": "30d91f6dde588a52b9ee82c1f65973aea8f124fe",
-    "source_sha256": "0d58919eeeafb9cde651edfbbfa4d4b89bfd16512c71ebef51ab8fb8e2e337a4"
+    "source_blob": "549cad18f658f7b652fe74b0b1581e48a745bcaf",
+    "source_sha256": "aa7ec37ce3e79932f43a141196d2b511326adf547631cc34591fe0aa4724b6d3"
   },
   {
     "changed": false,
@@ -4663,12 +4663,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "3c25ab0a0d267b7e5bef6a43eadefa93f3d96bc0b447bc858c0cfcc2d0a0821e",
+    "export_sha256": "e99115b09d50dbcc3b7287b6954f42ffd880f3e4ed55878f3fdb971f3b4352c9",
     "mode": "100644",
     "path": "tests/test_fleet_release.py",
     "reasons": [],
-    "source_blob": "0ca394ef71064168d90c0b8759b40cbae66a1bec",
-    "source_sha256": "3c25ab0a0d267b7e5bef6a43eadefa93f3d96bc0b447bc858c0cfcc2d0a0821e"
+    "source_blob": "0b736f80909805ddbec2c5df40134ac12af41adc",
+    "source_sha256": "e99115b09d50dbcc3b7287b6954f42ffd880f3e4ed55878f3fdb971f3b4352c9"
   },
   {
     "changed": false,
@@ -5104,12 +5104,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "7626a105efba0f453df7e7820fe39fdbe119fcdd6038f98b004b3ad8abbbce29",
+    "export_sha256": "83cd226513a529247d709abcd251c9ccfda1ee8030ae7fbc8936a71159db41d7",
     "mode": "100644",
     "path": "tests/test_make_release_report.py",
     "reasons": [],
-    "source_blob": "348c930b7e9d1e9f8e0c342dc129003a750e92c1",
-    "source_sha256": "7626a105efba0f453df7e7820fe39fdbe119fcdd6038f98b004b3ad8abbbce29"
+    "source_blob": "940f39c5b037975b9fe533bbffdde7f91cf8a9f8",
+    "source_sha256": "83cd226513a529247d709abcd251c9ccfda1ee8030ae7fbc8936a71159db41d7"
   },
   {
     "changed": false,
@@ -5824,12 +5824,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "34ff9d52ab125361fd76de5845061bbc84c1519f371ff0411122317880a55318",
+    "export_sha256": "e89895b4a8873d97eac6bbd6e2f1871a578a1f22acdd0222ccf93fa374070887",
     "mode": "100644",
     "path": "tests/test_runtime_bundle.py",
     "reasons": [],
-    "source_blob": "c286aa776b19c7464f53bd57a17c20efa8d8ff32",
-    "source_sha256": "34ff9d52ab125361fd76de5845061bbc84c1519f371ff0411122317880a55318"
+    "source_blob": "b9189a0bb0c6cc3ef2087091f175b759db2086d1",
+    "source_sha256": "e89895b4a8873d97eac6bbd6e2f1871a578a1f22acdd0222ccf93fa374070887"
   },
   {
     "changed": false,
@@ -5860,12 +5860,12 @@
   },
   {
     "changed": false,
-    "export_sha256": "a9f988636e47f049625b2e3e039907099b4582dab2bd8089ad6fea6feb30c11b",
+    "export_sha256": "2362df3ff09d7c05bd3097819219b9de5314eada16a8778525df9343d3564eb7",
     "mode": "100644",
     "path": "tests/test_runtime_bundle_ssh_161.py",
     "reasons": [],
-    "source_blob": "558a8b23777a7a00581d115f2c66262c0753d5a8",
-    "source_sha256": "a9f988636e47f049625b2e3e039907099b4582dab2bd8089ad6fea6feb30c11b"
+    "source_blob": "86ccbafa41e50746dfda7bea78cc78611615b271",
+    "source_sha256": "2362df3ff09d7c05bd3097819219b9de5314eada16a8778525df9343d3564eb7"
   },
   {
     "changed": false,
